@@ -476,6 +476,20 @@ body {
   background: var(--vp-c-bg-soft);
 }
 
+.package-table-scroll {
+  width: 100%;
+  max-width: 100%;
+  margin: 22px 0;
+  overflow-x: auto;
+  overscroll-behavior-inline: contain;
+  -webkit-overflow-scrolling: touch;
+}
+
+.package-table-scroll table {
+  min-width: 640px;
+  margin: 0;
+}
+
 @media (max-width: 860px) {
   .task-grid,
   .capability-grid,

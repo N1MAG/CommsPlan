@@ -1,6 +1,6 @@
 ---
 title: Configure Your First Radio
-description: Use Guided Add Radio to create one coherent radio and software configuration in FreqInOut.
+description: Use Guided Add Radio to create one coherent radio and software configuration in CommsPlan.
 ---
 
 # Configure your first radio
@@ -11,7 +11,7 @@ description: Use Guided Add Radio to create one coherent radio and software conf
   <span class="doc-badge">One saved identity</span>
 </div>
 
-Guided Add Radio prepares the radio and all selected radio-owned software identities as one reviewed change. Discovery helps propose settings, but nothing is committed until the final save.
+Guided Add Radio prepares the radio and all selected radio-owned software identities as one reviewed change. Discovery helps propose settings, but nothing is committed until the final save. The same saved identity is then used by Software Administration, Launch Control, Messages, Map, and scheduling.
 
 ## Before you open the assistant
 
@@ -33,19 +33,19 @@ Do not create separate application records first unless you are deliberately rec
 
 ### 1. Radio
 
-Choose the manufacturer and model, then give the radio a readable display name. Select its station role and whether FIO should use it after save.
+Choose the manufacturer and model, then give the radio a readable display name. Select its station role and whether CommsPlan should use it after save.
 
-### 2. FIO Behavior
+### 2. CommsPlan behavior
 
-Choose the operating model and control responsibility. This describes what FIO may do; it does not bypass RF Guard or application readiness.
+Choose the operating model and control responsibility. This describes what CommsPlan may do; it does not bypass RF Guard or application readiness.
 
 ### 3. Software
 
-Select only the software this radio actually uses. FIO can prepare the JS8Call, Fast Light, and VarAC families, while FIO Spotter and CommStat remain explicit choices.
+Select only the software this radio actually uses. CommsPlan can prepare the JS8Call, Fast Light, and VarAC families, while FIO Spotter and CommStat remain explicit choices. External JS8Spotter remains a separate optional companion identity.
 
 ### 4. Connections
 
-Review the endpoints and paths under the application that owns them. Existing files and profiles are evidence—not permission for FIO to overwrite them. Browse when the proposed resource is not clearly correct.
+Review the endpoints and paths under the application that owns them. Existing files and profiles are evidence—not permission for CommsPlan to overwrite them. Browse when the proposed resource is not clearly correct.
 
 ### 5. Safety
 
@@ -53,7 +53,7 @@ Choose antenna or shared-resource groups and supported bands. These settings hel
 
 ### 6. Schedule
 
-Choose an existing Frequency Plan, defer the assignment, or request Plan Builder after save. A newly created plan is blank until schedule content is added.
+Choose an existing Frequency Plan, defer the assignment, or request Plan Builder after save. A newly created plan is blank until schedule content is added; Plan Builder combines HF Daily, HF Nets, and SOP layers.
 
 ### 7. Review / Save
 
@@ -66,7 +66,7 @@ Review the radio identity, software responsibilities, endpoints, paths, launch r
 
 ## Warnings and blockers
 
-- A **warning** means FIO has a reasonable, non-destructive proposal that should be verified.
+- A **warning** means CommsPlan has a reasonable, non-destructive proposal that should be verified.
 - A **blocker** means saving could create an ambiguous identity, reuse an exclusive port or path, or risk an existing configuration.
 - Discovery and review do not launch applications or rewrite native configuration.
 - If preparation fails, retain the selections and use **Retry preparation**.
@@ -86,8 +86,8 @@ After save, open **Configuration → Software**:
 
 Launch Control distinguishes three separate decisions:
 
-- Whether FIO monitors an application.
-- Whether FIO starts it automatically.
+- Whether CommsPlan monitors an application.
+- Whether CommsPlan starts it automatically.
 - Whether the operator starts it manually now.
 
 Leave automatic launch off until paths, endpoints, and application ownership have been reviewed.
@@ -101,4 +101,5 @@ A configured radio can remain paused. Use **Stop Using** to preserve its setup w
 ## Continue
 
 - [Connect a Local Mesh device](/integrations/mesh)
+- [Understand the operating picture](/guide/operating-picture)
 - [Prepare a support request](/support)

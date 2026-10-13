@@ -9,6 +9,7 @@ const expectedHtmlPages = [
   "start-here.html",
   "install/index.html",
   "guide/first-radio.html",
+  "guide/operating-picture.html",
   "integrations/mesh.html",
   "support.html",
 ];
@@ -39,6 +40,32 @@ function walk(directory) {
     allFiles.push(fullPath);
     if (entry.name.endsWith(".html")) htmlFiles.push(fullPath);
   }
+}
+
+function htmlCandidates(currentFile, rawTarget) {
+  const [target, fragment] = rawTarget.split("#", 2);
+  const cleanTarget = (target || "").split("?", 1)[0];
+  const base = cleanTarget.startsWith("/CommsPlan/")
+    ? path.join(siteRoot, cleanTarget.slice("/CommsPlan/".length))
+    : cleanTarget.startsWith("/")
+      ? path.join(siteRoot, cleanTarget.slice(1))
+      : cleanTarget
+        ? path.resolve(path.dirname(currentFile), cleanTarget)
+        : currentFile;
+  const candidates = new Set([base]);
+  if (!path.extname(base)) {
+    candidates.add(`${base}.html`);
+    candidates.add(path.join(base, "index.html"));
+  }
+  return { candidates: [...candidates], fragment: fragment || "" };
+}
+
+function hasFragment(file, fragment) {
+  if (!fragment) return true;
+  const source = fs.readFileSync(file, "utf8");
+  return [...source.matchAll(/\b(?:id|name)="([^"]+)"/g)].some(
+    ([, value]) => value === fragment,
+  );
 }
 
 if (!fs.existsSync(siteRoot)) {
@@ -73,20 +100,21 @@ for (const file of allFiles) {
 
 for (const file of htmlFiles) {
   const source = fs.readFileSync(file, "utf8");
-  for (const match of source.matchAll(/(?:href|src)="([^"]+)"/g)) {
-    const value = match[1];
-    if (/^(?:https?:|mailto:|#|data:)/.test(value)) continue;
+  for (const match of source.matchAll(/(href|src)="([^"]+)"/g)) {
+    const attribute = match[1];
+    const value = match[2];
+    if (/^(?:https?:|mailto:|data:)/.test(value)) continue;
 
-    let relativeTarget = value.replace(/^\/FreqInOut\/?/, "").split(/[?#]/)[0];
-    if (!relativeTarget) relativeTarget = "index.html";
-
-    const candidates = [
-      path.join(siteRoot, relativeTarget),
-      path.join(siteRoot, `${relativeTarget}.html`),
-      path.join(siteRoot, relativeTarget, "index.html"),
-    ];
-    if (!candidates.some((candidate) => fs.existsSync(candidate))) {
+    const { candidates, fragment } = htmlCandidates(file, value);
+    const existing = candidates.find((candidate) => fs.existsSync(candidate));
+    if (!existing) {
       failures.push(`${path.relative(siteRoot, file)} has unresolved target: ${value}`);
+      continue;
+    }
+    if (attribute === "href" && fragment && !hasFragment(existing, fragment)) {
+      failures.push(
+        `${path.relative(siteRoot, file)} has unresolved fragment: ${value}`,
+      );
     }
   }
 }

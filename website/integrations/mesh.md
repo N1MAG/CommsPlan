@@ -1,6 +1,6 @@
 ---
 title: Local Mesh
-description: Connect MeshCore or Meshtastic to FreqInOut and deliberately enable outbound messages.
+description: Connect MeshCore or Meshtastic to CommsPlan and deliberately enable outbound messages.
 ---
 
 # Connect Local Mesh
@@ -11,7 +11,7 @@ description: Connect MeshCore or Meshtastic to FreqInOut and deliberately enable
   <span class="doc-badge">Receive and optional send</span>
 </div>
 
-Local Mesh connects station-level MeshCore or Meshtastic services to FIO. Received text and position evidence can join the Inbox and Map without treating the mesh device as an HF radio profile.
+Local Mesh connects station-level MeshCore or Meshtastic services to CommsPlan. Received text and position evidence can join the Inbox and Map without treating the mesh device as an HF radio profile. Mesh is a supported station transport; this guide does not promise future cross-transport relay or automatic forwarding.
 
 ## Add a saved device
 
@@ -20,21 +20,21 @@ Local Mesh connects station-level MeshCore or Meshtastic services to FIO. Receiv
 3. Choose **MeshCore** or **Meshtastic**.
 4. Choose the supported connection type for that protocol.
 5. Enter a clear connection name. This name is separate from the Bluetooth advertised name.
-6. Select how FIO may use received data: **Inbox**, **Map**, or both.
+6. Select how CommsPlan may use received data: **Inbox**, **Map**, or both.
 7. Save the device.
 
 ## Find and authenticate a Bluetooth device
 
-1. Keep FIO open and select **Scan**.
+1. Keep CommsPlan open and select **Scan**.
 2. Select the exact discovered device.
 3. Select **Use Device** so the stable discovered identity becomes part of the pending configuration.
 4. Save, then select **Connect**.
-5. On Linux, if the secured device is not paired, FIO makes one bounded pair-before-connect attempt. Respond to the desktop PIN prompt using the PIN displayed by the device.
+5. On Linux, if the secured device is not paired, CommsPlan makes one bounded pair-before-connect attempt. Respond to the desktop PIN prompt using the PIN displayed by the device.
 
-FIO does not store the Bluetooth PIN. Scanning never replaces a saved identity until the operator chooses a result.
+CommsPlan does not store the Bluetooth PIN. Scanning never replaces a saved identity until the operator chooses a result.
 
 ::: tip If Linux pauses reconnects
-If Bluetooth is powered off, the pairing is cancelled, or the device stops advertising, FIO pauses automatic reconnect attempts. Restore Bluetooth and device availability, wait for advertising, then select **Connect** once.
+If Bluetooth is powered off, the pairing is cancelled, or the device stops advertising, CommsPlan pauses automatic reconnect attempts. Restore Bluetooth and device availability, wait for advertising, then select **Connect** once.
 :::
 
 ## Enable outbound messages
@@ -58,7 +58,7 @@ Receiving data does not automatically authorize transmission.
 
 | Control | Meaning |
 |---|---|
-| **Inbox** | Store received mesh text in FIO's message pipeline. |
+| **Inbox** | Store received mesh text in CommsPlan's message pipeline. |
 | **Map** | Allow available node positions to contribute map context. |
 | **Allow Send** | Authorize outbound use of this specific qualified saved connection. Off by default. |
 | **Connect** | Start or resume the saved connection. |
@@ -66,7 +66,7 @@ Receiving data does not automatically authorize transmission.
 
 ## Avoid duplicate device entries
 
-Use **Scan → select the exact result → Use Device** when reconnecting a Bluetooth device. Do not use **Add Device** each time the same physical device advertises again. The stable saved identity—not the display name alone—is what lets FIO associate health and Compose availability with the correct connection.
+Use **Scan → select the exact result → Use Device** when reconnecting a Bluetooth device. Do not use **Add Device** each time the same physical device advertises again. The stable saved identity—not the display name alone—is what lets CommsPlan associate health and Compose availability with the correct connection.
 
 ## If Compose reports Offline
 

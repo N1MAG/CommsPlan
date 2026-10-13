@@ -1,6 +1,6 @@
-# FreqInOut documentation site
+# CommsPlan documentation site
 
-This directory is the curated source for the public FreqInOut documentation
+This directory is the curated source for the public CommsPlan documentation
 prototype. VitePress builds only this directory and explicitly selected image
 assets. Do not point GitHub Pages at the repository root or copy internal
 project documentation into this tree.
@@ -15,7 +15,9 @@ npm ci
 npm run dev
 ```
 
-The configured GitHub Pages base path is `/FreqInOut/`.
+The configured GitHub Pages base path is `/CommsPlan/` for the intended
+`N1MAG/CommsPlan` repository destination. FreqInOut remains a compatibility
+name inside established stations and source/runtime paths.
 
 ## Release verification
 
@@ -38,5 +40,6 @@ upload remains the primary public/private content boundary.
   configuration samples containing station secrets.
 - Review screenshots for callsigns, coordinates, messages, access codes, and
   local paths.
-- Keep installation claims aligned with the current public release.
+- Keep installation claims aligned with CommsPlan 2.0.5 packaging inputs and
+  label historical FreqInOut 2.0.4 compatibility details clearly.
 - Prefer one authoritative page over duplicated instructions.

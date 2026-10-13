@@ -2,25 +2,25 @@ import { defineConfig } from "vitepress";
 
 export default defineConfig({
   lang: "en-US",
-  title: "FreqInOut",
-  titleTemplate: ":title · FreqInOut",
+  title: "CommsPlan",
+  titleTemplate: ":title · CommsPlan",
   description:
-    "Install, configure, and operate FreqInOut — a coordinated operations console for HF digital stations.",
-  base: "/FreqInOut/",
+    "Install, configure, and operate CommsPlan — a coordinated operations console for HF digital stations.",
+  base: "/CommsPlan/",
   cleanUrls: true,
   lastUpdated: true,
   srcExclude: ["README.md"],
   ignoreDeadLinks: false,
   head: [
-    ["link", { rel: "icon", type: "image/png", href: "/FreqInOut/fio-mark.png" }],
+    ["link", { rel: "icon", type: "image/png", href: "/CommsPlan/commsplan-mark.png" }],
     ["meta", { name: "theme-color", content: "#12324a" }],
     ["meta", { property: "og:type", content: "website" }],
-    ["meta", { property: "og:title", content: "FreqInOut Documentation" }],
+    ["meta", { property: "og:title", content: "CommsPlan Documentation" }],
     [
       "meta",
       {
         property: "og:description",
-        content: "Clear setup, operating, and troubleshooting guidance for FreqInOut.",
+        content: "Clear setup, operating, and troubleshooting guidance for CommsPlan.",
       },
     ],
   ],
@@ -31,12 +31,13 @@ export default defineConfig({
     },
   },
   themeConfig: {
-    logo: "/fio-mark.png",
-    siteTitle: "FreqInOut",
+    logo: "/commsplan-mark.png",
+    siteTitle: "CommsPlan",
     nav: [
       { text: "Start here", link: "/start-here" },
       { text: "Install or upgrade", link: "/install/" },
       { text: "Set up a radio", link: "/guide/first-radio" },
+      { text: "Operate the station", link: "/guide/operating-picture" },
       { text: "Mesh", link: "/integrations/mesh" },
       { text: "Support", link: "/support" },
     ],
@@ -44,13 +45,17 @@ export default defineConfig({
       {
         text: "Start here",
         items: [
-          { text: "Welcome to FIO", link: "/start-here" },
+          { text: "Welcome to CommsPlan", link: "/start-here" },
           { text: "Install or upgrade", link: "/install/" },
         ],
       },
       {
         text: "Set up your station",
         items: [{ text: "Configure your first radio", link: "/guide/first-radio" }],
+      },
+      {
+        text: "Operate your station",
+        items: [{ text: "Operating picture", link: "/guide/operating-picture" }],
       },
       {
         text: "Integrations",
@@ -68,10 +73,10 @@ export default defineConfig({
       },
     },
     socialLinks: [
-      { icon: "github", link: "https://github.com/N1MAG/FreqInOut" },
+      { icon: "github", link: "https://github.com/N1MAG/CommsPlan" },
     ],
     editLink: {
-      pattern: "https://github.com/N1MAG/FreqInOut/edit/main/website/:path",
+      pattern: "https://github.com/N1MAG/CommsPlan/edit/main/website/:path",
       text: "Suggest a correction",
     },
     lastUpdated: {
@@ -89,8 +94,8 @@ export default defineConfig({
       next: "Next",
     },
     footer: {
-      message: "Operator-focused documentation for FreqInOut.",
-      copyright: "FreqInOut is licensed under GNU GPL v3.",
+      message: "Operator-focused documentation for CommsPlan.",
+      copyright: "CommsPlan is licensed under GNU GPL v3.",
     },
     returnToTopLabel: "Return to top",
     sidebarMenuLabel: "Documentation menu",

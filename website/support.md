@@ -1,6 +1,6 @@
 ---
 title: Support and Diagnostics
-description: Collect useful FreqInOut support information without sharing unnecessary private station data.
+description: Collect useful CommsPlan support information without sharing unnecessary private station data.
 ---
 
 # Support and diagnostics
@@ -9,9 +9,9 @@ Start with the smallest useful set of evidence. Most questions do not require a 
 
 ## Include with a support request
 
-- FreqInOut version.
+- CommsPlan version and whether the station was previously FreqInOut.
 - Operating system and architecture.
-- Package installation or source installation.
+- Package installation or source installation, including the package basename when applicable.
 - The affected radio, software family, or mesh connection.
 - The exact navigation path where the behavior occurs.
 - What you did, what you expected, and what happened instead.
@@ -40,9 +40,9 @@ Unless `FREQINOUT_CONFIG_DIR` selects another profile, the normal profile roots 
 
 ## Where to ask
 
-- Review the [repository README](https://github.com/N1MAG/FreqInOut#readme).
-- Check the [latest release notes](https://github.com/N1MAG/FreqInOut/releases/latest).
-- Report a reproducible software defect through [GitHub Issues](https://github.com/N1MAG/FreqInOut/issues).
+- Review the [repository README](https://github.com/N1MAG/CommsPlan#readme).
+- Check the [latest release notes](https://github.com/N1MAG/CommsPlan/releases/latest).
+- Report a reproducible software defect through [GitHub Issues](https://github.com/N1MAG/CommsPlan/issues).
 - For existing support arrangements, email [bill@n1mag.com](mailto:bill@n1mag.com).
 
 When community Discussions are enabled, this page can direct setup and operating questions there while reserving Issues for confirmed defects.
