@@ -1,9 +1,16 @@
-CommsPlan, formerly FreqInOut — macOS replacement preview
+CommsPlan 2.0.5, formerly FreqInOut — macOS manual DMG replacement
 
-Native upgrades are not yet release-qualified. This document describes the
-manual replacement and recovery procedure to rehearse with a disposable station.
+This document describes a manual replacement and recovery procedure. Use a
+disposable or separately backed-up station when first exercising it, and retain
+the historical application and installer until station verification and rollback
+checks are complete. External hardware, companion applications, and keychain
+continuity still require operator checks on the selected Mac.
 The disk image does not discover, back up or remove an existing installation.
 Copying CommsPlan.app alone can leave two apps installed with the same bundle ID.
+The historical profile root remains `~/.freqinout` unless
+`FREQINOUT_CONFIG_DIR` selects another location. The databases remain
+`freqinout.db` and `freqinout_nets.db`, and the bundle identifier remains
+`org.n1mag.freqinout`; only the displayed app name and executable use CommsPlan.
 
 BEFORE REPLACEMENT
 
@@ -21,7 +28,7 @@ BEFORE REPLACEMENT
    mdfind 'kMDItemCFBundleIdentifier == "org.n1mag.freqinout"'
    Spotlight can omit unindexed disks/folders. Also review your Applications
    folders, custom installation locations and mounted volumes manually. Inspect
-   each candidate by full path. Stop until ambiguous active copies are resolved;
+   each installation by full path. Stop until ambiguous active copies are resolved;
    a backup copy outside Applications must never be selected as the active app.
 
 3. Quit FreqInOut, CommsPlan and companion applications normally. Confirm their
@@ -33,10 +40,11 @@ BEFORE REPLACEMENT
    Verify the backup can be restored into a NEW profile with the old version.
    Retain external companion data and the same macOS account/keychain. The
    profile backup does not include keychain secrets. Native 2.0.4 preparation is
-   available in the candidate via --migration-preparation; follow the companion
+   available in the CommsPlan source tree via --migration-preparation; follow the companion
    CommsPlan-migration.md guide with a retained, digest-matching historical DMG
-   and NEW JSON reports. Its profile/package verification is preparation only;
-   no native upgrade is qualified yet. Stop without a verified recovery copy.
+   and NEW JSON reports. Its profile/package verification prepares the recovery
+   handoff but does not replace the manual station checks below. Stop without a
+   verified recovery copy.
 
 5. Copy the complete old application to a separate recovery folder outside
    Applications. Check its bundle identity/version and verify the copied bundle
@@ -65,7 +73,9 @@ BEFORE REPLACEMENT
 
 REPLACE AND VERIFY
 
-6. Check the CommsPlan package checksum/architecture. Inspect the app in this
+6. Check the CommsPlan package checksum/architecture. For the release assets,
+   use `CommsPlan-2.0.5-macos-arm64-unsigned.dmg` on Apple Silicon or
+   `CommsPlan-2.0.5-macos-x86_64-unsigned.dmg` on Intel. Inspect the app in this
    mounted image: bundle ID org.n1mag.freqinout; executable and name CommsPlan;
    version matches the selected release. Use the release's signing instructions;
    an unsigned package remains unsigned after replacement.
@@ -82,7 +92,18 @@ REPLACE AND VERIFY
    to select between retained copies. For an explicit profile override, launch
    the installed Contents/MacOS/CommsPlan executable from an environment with
    FREQINOUT_CONFIG_DIR set to the confirmed profile ROOT. Review startup
-   automation and isolate radios/companions for the preview rehearsal.
+   automation and isolate radios/companions for the first replacement run.
+
+   A frozen package's startup guard is separate from the manual full-profile
+   backup above. Its receipt at
+   `<PROFILE_ROOT>/.commsplan-packaged-startup.json` records a verified raw
+   `config`-tree backup, including captured SQLite WAL/journal sidecars; it does
+   not cover the whole profile, credentials, logs, caches, or companion data. A
+   missing receipt is normal on first launch and starts the guarded capture. A
+   fully fresh profile is allowed and is recorded as `fresh-profile`; if its
+   databases appear later, the guard captures the first verified backup then.
+   A malformed, changed, or linked receipt, or a missing or changed recorded
+   manifest or backup, stops startup for recovery.
 
 9. A 1.2.8 station still requires the existing informed station-upgrade dialog.
    A completed 2.0.4 station must retain its multi-rig configuration. Verify
@@ -105,5 +126,6 @@ explicit restored profile. A newer database must not be opened in 1.2.8; restori
 only the old application does not roll back station conversion. Re-establish
 the original active app location only after the selected copies are verified.
 
-Native process refusal, replacement interruption, rollback, Dock/LaunchServices
-and keychain continuity still require qualification on Intel and Apple Silicon.
+Native process state, replacement interruption, rollback, Dock/LaunchServices,
+and keychain continuity require operator checks on Intel and Apple Silicon; this
+procedure does not claim every external hardware path is qualified.

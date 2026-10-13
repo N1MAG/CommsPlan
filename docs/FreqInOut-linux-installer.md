@@ -1,9 +1,8 @@
 # CommsPlan 2.0 Linux Installer Reference
 
-> CommsPlan 2.0.5 candidate qualification: the published 2.0.4 release is still named FreqInOut.
-> Historical download filenames below refer to that release. CommsPlan packages
-> and native upgrade behavior are not yet release-qualified. See
-> [migration preview](CommsPlan-migration.md) before testing an existing station.
+> CommsPlan 2.0.5 Linux installer documentation. Historical native replacement
+> remains bounded by the platform procedures in [CommsPlan-migration.md];
+> package installation does not by itself prove station continuity or rollback.
 
 `install-commsplan.sh` is the canonical Linux entry point. It accepts
 `setup` (the default), `update`, `repair`, `desktop`, `uninstall`, and `profile`, then
@@ -67,6 +66,20 @@ The installer prepares the application but does not silently finalize the
 single-radio-to-2.0 configuration migration. CommsPlan owns the informed backup,
 review, and confirmation flow on first launch.
 
+For a frozen package, first startup performs a separate profile guard before
+station schema or database writes. It records the actual verified cold-copy path
+in `<PROFILE_ROOT>/.commsplan-packaged-startup.json`. The copy includes the raw
+`config` tree and any pending SQLite WAL or journal sidecars; SQLite is checked
+on a disposable copy so the raw backup is not mutated. This package-startup
+backup covers the `config` tree only; it does not include credentials, logs,
+caches, or companion-application data. Repeated launches of the same package
+version reuse the receipt after manifest identity checks. A fresh profile is
+recorded without a backup until data appears; the first later startup with both
+station databases captures and records that backup. A missing receipt is normal
+on first launch. Once a receipt exists, a malformed, changed, or linked receipt,
+a missing or mismatched recorded manifest/backup, or unsafe station databases
+stops startup for recovery.
+
 ## Profile-directory transition
 
 For an explicit, backed-up move to `~/.commsplan`, use `profile plan` followed
@@ -74,6 +87,12 @@ by the reviewed `profile copy` procedure in the
 [Linux profile transition guide](CommsPlan-migration.md#guided-linux-profile-transition-to-commsplan).
 The copy does not switch the desktop profile. Verify it with a one-shot launch
 before running `setup --config-root` to remember the new root.
+
+Historical Linux 1.2.8 source installations retain the source installation path
+and informed station-upgrade flow. Identify the actual profile used by that
+checkout, preserve the old application and verified backup, and use the source
+procedure before accepting CommsPlan. A native Linux package install is not a
+substitute for that historical source path.
 
 ## Common commands
 
@@ -91,7 +110,7 @@ Bind the launcher to an intentionally separate profile:
   --config-root "$HOME/.freqinout-field"
 ```
 
-Preview without changing the system:
+Review without changing the system:
 
 ```bash
 ./install-commsplan.sh setup --dry-run
@@ -106,8 +125,8 @@ Use a supplied repository and branch explicitly:
   --branch "$BRANCH_FROM_SUPPORT"
 ```
 
-The `--repo` and `--branch` options are explicit overrides for the legacy
-installer. Keep them when support assigns a preview branch; ordinary updates
+The `--repo` and `--branch` options are explicit overrides for the compatibility
+installer. Keep them when support assigns a specific branch; ordinary updates
 should use the checkout's current branch and upstream.
 
 For the legacy path, use the same options after the script name:
@@ -118,11 +137,11 @@ bash install_FreqInOut_linux.sh --offline --dir "$HOME/FreqInOut"
 
 ## Update behavior
 
-Close CommsPlan and companion radio applications before updating, then rerun
+Close CommsPlan, FreqInOut and companion radio applications before updating, then rerun
 `./install-commsplan.sh update` with the same `--dir` and `--config-root`
 values used originally. The canonical update follows the current branch and
-its upstream; a missing upstream is an error. The legacy installer defaults to
-the public `https://github.com/N1MAG/FreqInOut.git` repository and `main` when
+its upstream; a missing upstream is an error. The compatibility installer defaults to
+the public `https://github.com/N1MAG/CommsPlan.git` repository and `main` when
 it is asked to clone or update without an explicit source.
 
 For unattended policy control:
@@ -154,6 +173,11 @@ root is persisted and honored by the canonical launcher on later starts. The
 compatibility storage name is intentional: there is no automatic move to
 `~/.commsplan`, and no database is renamed.
 
+Compatibility identities remain historical by design: profiles stay under
+`~/.freqinout` unless explicitly overridden; databases remain `freqinout.db`
+and `freqinout_nets.db`; the Debian package ID remains `freqinout`; and both
+`freqinout` and `commsplan` commands remain available as shared command routes.
+
 Historical 1.2.8 installations may have used an app-local `config` directory,
 a sibling runtime directory, or another explicit root. Identify the actual
 profile used by that installation and pass it with `--config-root` before the
@@ -166,6 +190,14 @@ files. The verified Python installer quarantines an unusable `.venv`; a healthy
 dependency environment is not guaranteed to have a rollback copy. Installer
 backups and CommsPlan migration backups are recovery points, not working
 directories.
+
+The source installer and the frozen-package startup guard are separate recovery
+records. For source installation, retain the exact `Verified pre-install station
+backup:` path and the `.freqinout-install-verified.json` receipt in the selected
+checkout. For a package, retain the `<PROFILE_ROOT>/.commsplan-packaged-startup.json`
+receipt and the backup directory it names. Always use the actual path reported by
+the tool; Windows may retain a verified temporary backup name when a rename is
+blocked.
 
 Before restoring:
 
@@ -206,7 +238,7 @@ Application logs are in the active CommsPlan profile root:
 
 ## Uninstall
 
-Preview uninstall actions:
+Review uninstall actions without changing the system:
 
 ```bash
 ./install-commsplan.sh uninstall --dir "$HOME/FreqInOut" --dry-run

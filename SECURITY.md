@@ -2,14 +2,16 @@
 
 ## Supported Versions
 
-Security fixes are provided for the latest stable release on `main`.
+Security fixes are provided for the latest stable CommsPlan release on `main`.
+The historical FreqInOut repository and product names remain relevant to older
+installations and recovery material.
 
 ## Reporting a Vulnerability
 
 If you discover a security issue, please report it privately:
 
 - Preferred: GitHub private vulnerability report (Security Advisories).
-- Include subject/title: `FreqInOut Security Report`.
+- Include subject/title: `CommsPlan Security Report`.
 
 Please include:
 - A clear description of the issue

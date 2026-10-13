@@ -6,7 +6,7 @@ MIN_PYTHON_MINOR=10
 MAX_PYTHON_MAJOR=3
 MAX_PYTHON_MINOR=13
 
-DEFAULT_REPO_URL="https://github.com/N1MAG/FreqInOut.git"
+DEFAULT_REPO_URL="https://github.com/N1MAG/CommsPlan.git"
 DEFAULT_BRANCH="main"
 REPO_EXPLICIT=0
 if [[ -n "${REPO_URL:-}" ]]; then

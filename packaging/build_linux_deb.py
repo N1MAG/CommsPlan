@@ -91,7 +91,7 @@ def assemble_package_root(
                 "Maintainer: N1MAG <noreply@github.com>",
                 "Depends: libc6 (>= 2.35), libdbus-1-3, libegl1, libgl1, libglib2.0-0, libxkbcommon-x11-0, libxcb-cursor0",
                 "Recommends: bluez, libsecret-1-0",
-                "Homepage: https://github.com/N1MAG/FreqInOut",
+                "Homepage: https://github.com/N1MAG/CommsPlan",
                 "Description: CommsPlan coordinated operations console for HF digital stations",
                 " CommsPlan provides multi-radio scheduling, messaging, mapping,",
                 " station readiness, and companion-application coordination.",

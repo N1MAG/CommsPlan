@@ -9,9 +9,9 @@ AppId=FreqInOut
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher=N1MAG
-AppPublisherURL=https://github.com/N1MAG/FreqInOut
-AppSupportURL=https://github.com/N1MAG/FreqInOut/issues
-AppUpdatesURL=https://github.com/N1MAG/FreqInOut/releases
+AppPublisherURL=https://github.com/N1MAG/CommsPlan
+AppSupportURL=https://github.com/N1MAG/CommsPlan/issues
+AppUpdatesURL=https://github.com/N1MAG/CommsPlan/releases
 DefaultDirName={autopf}\FreqInOut
 UsePreviousAppDir=yes
 ; Refuse active apps instead of silently closing/restarting station control.

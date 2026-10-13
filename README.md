@@ -2,12 +2,7 @@
   <img src="assets/CommsPlan_logo.png" alt="CommsPlan logo" width="150">
 </p>
 
-# CommsPlan 2.0.5 — Release Candidate
-
-> This is a non-publishing candidate for isolated qualification, not a production
-> release. Public production downloads remain FreqInOut 2.0.4. Candidate packages,
-> upgrades, uninstall and recovery are still under test. Keep your working station
-> and verified backups. See [migration preparation](docs/CommsPlan-migration.md).
+# CommsPlan 2.0.5
 
 ### A coordinated operations console for HF digital stations
 
@@ -161,52 +156,6 @@ decision support rather than a guarantee of current propagation or delivery.
 
 ![Offline operational map with station and regional context](docs/images/readme-2.0/operational-map.png)
 
-## Testing this candidate
-
-Use branch `release/public-2.0.5-candidate` and a separate profile. These commands
-create a new test station; they do not migrate your existing station. Do not
-select a working station profile until its backup and upgrade procedure have
-been reviewed. Candidate packages are available from successful **Build and
-Publish Release** candidate runs under GitHub Actions, not from a new GitHub
-Release. Despite its name, that workflow does not publish a release for candidate
-branches. Verify the exact commit and adjacent SHA-256 before using an artifact.
-
-Windows source test (PowerShell, Python 3.11):
-
-```powershell
-git clone --branch release/public-2.0.5-candidate https://github.com/N1MAG/FreqInOut.git "$HOME\CommsPlan-candidate"
-Set-Location "$HOME\CommsPlan-candidate"
-$env:FREQINOUT_CONFIG_DIR = "$env:LOCALAPPDATA\CommsPlan-Candidate-Test"
-py -3.11 install_freqinout.py
-.\start-commsplan.cmd
-```
-
-Linux/macOS source test (Python 3.11):
-
-```sh
-git clone --branch release/public-2.0.5-candidate https://github.com/N1MAG/FreqInOut.git "$HOME/CommsPlan-candidate"
-cd "$HOME/CommsPlan-candidate"
-export FREQINOUT_CONFIG_DIR="$HOME/.commsplan-candidate-test"
-python3.11 install_freqinout.py
-./start-commsplan.sh
-```
-
-The explicit profile override applies to this shell and child processes. Close
-this shell after testing. Do not run the candidate and production station
-concurrently against shared companion profiles or radio endpoints.
-
-Candidate package basenames:
-
-- Windows: `CommsPlan-2.0.5-windows-x86_64-setup-unsigned.exe`
-- Linux: `CommsPlan-2.0.5-linux-amd64.deb`
-- Apple Silicon: `CommsPlan-2.0.5-macos-arm64-unsigned.dmg`
-- Intel macOS: `CommsPlan-2.0.5-macos-x86_64-unsigned.dmg`
-
-Unsigned labeling describes operating-system trust, not qualification. The
-existing FreqInOut repository URL remains valid during pre-rename testing. The
-production-download and source-install sections below describe the existing
-2.0.4 release; do not use them to select this candidate accidentally.
-
 ## Supported systems
 
 | Platform | CommsPlan 2.0 support |
@@ -219,22 +168,41 @@ Python **3.10 through 3.13** is accepted by CommsPlan; Python 3.11 is the tested
 recommended release interpreter. Companion radio applications are installed
 separately and remain under the operator's control.
 
-## Download the current release
+## Compatibility identities retained from FreqInOut
 
-Use the [current FreqInOut release](https://github.com/N1MAG/FreqInOut/releases/latest)
+The product name changes while storage and compatibility identities remain stable:
+
+- Existing profile roots remain `%LOCALAPPDATA%\FreqInOut` or `%APPDATA%\FreqInOut`
+  on Windows and `~/.freqinout` on macOS and Linux, unless
+  `FREQINOUT_CONFIG_DIR` selects another root.
+- The two operational databases remain `freqinout.db` and `freqinout_nets.db`.
+- The Windows installer retains `AppId=FreqInOut` for historical discovery and
+  upgrade continuity.
+- The Linux Debian package ID remains `freqinout`; the `freqinout` command and
+  desktop identity remain compatibility routes alongside `commsplan`.
+- The macOS bundle identifier remains `org.n1mag.freqinout`, while the displayed
+  application name and executable are CommsPlan.
+
+Do not rename these profiles, databases, package IDs, or bundle identifiers as
+part of a source or package installation.
+
+## Download from the CommsPlan release page
+
+Use the [CommsPlan release page](https://github.com/N1MAG/CommsPlan/releases/latest)
 for the clearest installation path. Each release page contains the release
 notes, changelog highlights, source-code archives, package checksums, and the
 available native packages:
 
-- Windows: `FreqInOut-2.0.4-windows-x86_64-setup-unsigned.exe`
-- Debian/Ubuntu-family Linux: `FreqInOut-2.0.4-linux-amd64.deb`
-- Apple Silicon macOS: `FreqInOut-2.0.4-macos-arm64-unsigned.dmg`
-- Intel macOS: `FreqInOut-2.0.4-macos-x86_64-unsigned.dmg`
+- Windows: `CommsPlan-2.0.5-windows-x86_64-setup-unsigned.exe`
+- Debian/Ubuntu-family Linux: `CommsPlan-2.0.5-linux-amd64.deb`
+- Apple Silicon macOS: `CommsPlan-2.0.5-macos-arm64-unsigned.dmg`
+- Intel macOS: `CommsPlan-2.0.5-macos-x86_64-unsigned.dmg`
 
 Windows and macOS packages are currently unsigned. Windows may show an
 **Unknown publisher** or SmartScreen prompt; macOS may require **Open Anyway**
 under Privacy & Security. Verify the package against `SHA256SUMS.txt` on the
-release page. Those production 2.0.4 packages install **FreqInOut**. Candidate packages install **CommsPlan**.
+release page. The historical 2.0.4 packages install **FreqInOut**; the 2.0.5
+release packages install **CommsPlan**.
 
 ## Install or update manually from the public repository
 
@@ -261,8 +229,8 @@ check out its `v<version>` tag instead of following moving `main`.
 Install Git and 64-bit Python 3.11 first:
 
 ```powershell
-git clone https://github.com/N1MAG/FreqInOut.git "$HOME\FreqInOut"
-Set-Location "$HOME\FreqInOut"
+git clone https://github.com/N1MAG/CommsPlan.git "$HOME\CommsPlan"
+Set-Location "$HOME\CommsPlan"
 py -3.11 install_freqinout.py
 .\start-freqinout.cmd
 ```
@@ -272,8 +240,8 @@ py -3.11 install_freqinout.py
 Install Git and Python 3.11 from Python.org or Homebrew:
 
 ```bash
-git clone https://github.com/N1MAG/FreqInOut.git "$HOME/FreqInOut"
-cd "$HOME/FreqInOut"
+git clone https://github.com/N1MAG/CommsPlan.git "$HOME/CommsPlan"
+cd "$HOME/CommsPlan"
 python3.11 install_freqinout.py
 ./start-freqinout.sh
 ```
@@ -284,18 +252,20 @@ The guided installer installs required system packages where supported,
 creates CommsPlan's virtual environment, and prepares the desktop launcher:
 
 ```bash
-git clone https://github.com/N1MAG/FreqInOut.git "$HOME/FreqInOut"
-cd "$HOME/FreqInOut"
+git clone https://github.com/N1MAG/CommsPlan.git "$HOME/CommsPlan"
+cd "$HOME/CommsPlan"
 bash install_FreqInOut_linux.sh
 ```
 
 See the [installation guide](docs/Installation.md) for distribution details,
 custom paths, repair, update, and uninstall instructions.
 
-## Planned migration from an existing FreqInOut station
+## Migration from an existing FreqInOut station
 
-CommsPlan 2.0.5 is intended to carry an existing single-radio station forward
-and to update an existing 2.0 installation through the same verified installer.
+CommsPlan 2.0.5 carries an existing single-radio station forward and updates an
+existing 2.0 installation through the same verified installer. Native replacement
+and rollback remain bounded by the platform procedures and operator checks in the
+migration guide.
 Before upgrading:
 
 1. Close CommsPlan and affected companion applications.
@@ -303,14 +273,26 @@ Before upgrading:
 3. Update the application using the documented platform procedure.
 4. Review the proposed default-radio conversion before confirming it.
 5. Verify software paths, endpoints, schedules, and Launch Control after the
-first 2.0 start.
+   first 2.0 start.
+
+The first frozen-package start also records guarded backup evidence before
+station schema or database writes. Keep the actual backup path from
+`<PROFILE_ROOT>/.commsplan-packaged-startup.json`; repeated starts of the same
+version reuse that receipt after manifest checks. A fresh profile is recorded
+without a backup until its databases appear, then the first data-bearing start
+captures one. This evidence supports recovery preparation and does not by itself
+qualify historical native replacement or rollback. The package-startup copy
+covers the selected profile's `config` tree only; it does not include credentials,
+logs, caches, or companion-application data.
 
 The migration preserves the existing station as the default radio and brings
 its schedules, messages, software settings, and operating data forward. Adding
-a second radio is optional. The conversion path has automated rehearsal
-coverage, but operators should treat the verified backup as mandatory and be
-prepared to review or rebuild affected companion-application settings if an
-older station differs from the rehearsed profile. See the [historical FreqInOut 2.0.4
+a second radio is optional. The conversion path has automated rehearsal coverage,
+but operators should treat the verified backup as mandatory and be prepared to
+review or rebuild affected companion-application settings if an older station
+differs from the rehearsed profile. Windows stations on 1.2.8 must first use the
+historical FreqInOut 2.0.4 release; Linux 1.2.8 source checkouts retain the
+documented source-only path. See the [historical FreqInOut 2.0.4
 installation and upgrade guide](docs/FreqInOut%202.0.4%20Installation%20and%20Upgrade%20Guide.docx)
 for the Windows, macOS, and Linux workflows and rollback guidance.
 

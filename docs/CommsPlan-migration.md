@@ -5,14 +5,15 @@ profile locations, databases, credential-store identity and shared application
 lock. Existing `FREQINOUT_CONFIG_DIR` overrides still select the same profile.
 Do not rename your profile folder or databases to match the new product name.
 
-The maintainer has assigned **2.0.5** to the next release, the first CommsPlan
-release. The supported Windows transition is **FreqInOut 2.0.4 → CommsPlan 2.0.5**.
-Candidate metadata is 2.0.5. Historical 2.0.4 package references identify the
-source installation, not a completed 2.0.5 release. Qualification is still pending.
+CommsPlan 2.0.5 is the first release under the CommsPlan name. The supported
+Windows transition baseline is **FreqInOut 2.0.4 → CommsPlan 2.0.5**. Historical
+2.0.4 package references identify the prior installation and recovery material.
 
-This procedure accompanies the **non-publishing 2.0.5 candidate**. Native upgrades from the distributed
-1.2.8 and 2.0.4 installers have not yet been qualified. Keep the historical
-application and installer available until the station is verified.
+This guide describes source migration and native preparation procedures. It
+preserves explicit source-only steps; historical native replacement and rollback
+remain bounded by the platform procedures and operator checks below. Keep the
+historical application, package or installer, and a verified backup available
+until the station is verified.
 
 The supported Windows migration baseline is **2.0.4 → CommsPlan**. If you are
 running an older Windows release, first back up your station and upgrade using
@@ -22,17 +23,63 @@ schedules, messages and other station configuration before starting CommsPlan
 preparation. Keep the pre-upgrade backup and historical installer for recovery.
 The tool checks the selected installation; it refuses older native versions
 rather than treating them as 2.0.4. Direct older-Windows-to-CommsPlan migration
-is outside this procedure. The 1.2.8 source procedure remains available for source
-installations; preservation and rollback qualification remain required.
+is outside this procedure. Windows 1.2.8 stations must first use the historical
+FreqInOut 2.0.4 intermediate release. The 1.2.8 source procedure remains
+available for Linux and other source installations; preservation and rollback
+checks remain required.
+
+## Retained storage and compatibility identities
+
+The product rename does not rename station storage or platform identities. Existing
+profiles remain under their historical roots (`%LOCALAPPDATA%\FreqInOut` or
+`%APPDATA%\FreqInOut` on Windows and `~/.freqinout` on macOS and Linux) unless
+`FREQINOUT_CONFIG_DIR` selects another root. The databases remain
+`freqinout.db` and `freqinout_nets.db`; the Windows installer retains
+`AppId=FreqInOut`; the Linux package ID remains `freqinout`; and the macOS bundle
+identifier remains `org.n1mag.freqinout`. Preserve the `freqinout` package,
+desktop, and command compatibility routes during migration.
+
+## Frozen-package backup evidence
+
+The first startup of a frozen CommsPlan package performs a guarded backup before
+the package can write station schema or database changes. It must own the
+station lock, select a physical profile root, find both `freqinout.db` and
+`freqinout_nets.db`, and reject linked configuration or database files. The raw
+`config` tree is copied as a cold backup, including pending SQLite WAL or
+journal sidecars. SQLite checks run against a disposable validation copy so the
+raw backup is not opened or mutated; source and copied-file hashes are checked
+again before success.
+
+This package-startup backup covers only the selected profile's `config` tree.
+It does not include the rest of the profile, credentials, logs, caches, or
+companion-application data; the migration helper's persistent-profile backup
+has broader coverage.
+
+The profile receipt is
+`<PROFILE_ROOT>/.commsplan-packaged-startup.json` (for example,
+`~/.commsplan/.commsplan-packaged-startup.json` for that selected root). It
+records the actual backup
+directory under `<PROFILE_ROOT>/backups/` and the manifest digest. Repeated
+launches of the same package version reuse that receipt after checking the
+recorded path and manifest identity. Once a receipt exists, a malformed,
+changed, or linked receipt; a missing or mismatched recorded manifest or backup;
+or unsafe station databases in an existing or previously captured profile stops
+startup. A missing receipt is normal on first launch and starts a new verified
+capture. A new profile records `fresh-profile`; when its databases later appear,
+the guard captures and records a verified backup once. This startup evidence
+supports recovery preparation; it does not replace the platform procedures and
+operator checks for historical native replacement or rollback.
 
 ## Migration preparation tool
 
 The initial tool supports explicitly selected **source installations** whose
 version metadata says 1.2.8 or 2.0.4. That metadata is recorded and hashed; it
-does not prove the checkout is an unmodified historical release. Frozen/native legacy installations and automatic discovery are not yet supported
-by the guided source preview. Native 2.0.4 preparation is described below and
-does not use the source session commands. Native replacement/rollback remains a separate
-qualification gate. The helper never runs an installer or removes old software.
+does not prove the checkout is an unmodified historical release. Frozen/native
+legacy installations and automatic discovery are outside the guided source
+migration procedure. Native 2.0.4 preparation is described below and does not
+use the source session commands. Native replacement/rollback remains a separate
+platform procedure with operator checks. The helper never runs an installer or
+removes old software.
 
 Run it with the CommsPlan source installation's Python environment after its
 requirements are installed. Close FIO, CommsPlan and companion applications.
@@ -58,7 +105,7 @@ failed copy stop preparation. Incomplete backup folders are retained and marked
 
 ## Guided source migration with interruption handling
 
-The guided preview supports an explicitly selected historical source installation
+The guided source migration supports an explicitly selected historical source installation
 and a **separate installed CommsPlan source tree**, with a verified source-install
 receipt. Keep the historical source and its working environment intact for
 rollback. The session directory must be new and outside both installation and
@@ -74,31 +121,31 @@ then creates and verifies a backup inside the session directory. It does not
 execute the historical code. These fingerprints bind the selected local files;
 they do not prove they match an official historical release.
 
-Next, manually install the candidate in a separate directory using its supported
+Next, manually install CommsPlan 2.0.5 in a separate directory using its supported
 source installer, explicitly selecting the same `FREQINOUT_CONFIG_DIR`. The
 installer must produce a valid `.freqinout-install-verified.json` receipt.
-Native installer actions are not substituted for this source-only preview.
+Native installer actions are not substituted for this source-only procedure.
 
 ```sh
 python start-commsplan-migration.py installed --session "SESSION_DIRECTORY" --target "INSTALLED_COMMSPLAN_SOURCE"
 python start-commsplan-migration.py launch-instructions --session "SESSION_DIRECTORY"
 ```
 
-`installed` verifies candidate metadata, source fingerprints, interpreter and
+`installed` verifies CommsPlan metadata, source fingerprints, interpreter and
 requirements receipt, and receipt profile selection. It records the handoff;
-it does not claim the station upgrade succeeded. The candidate cannot overlap
-the historical source, profile or session directory. A newer profile migration
-state cannot be opened by an older candidate.
+it does not claim the station upgrade succeeded. The CommsPlan source tree cannot
+overlap the historical source, profile or session directory. A newer profile
+migration state cannot be opened by an older application.
 
 `launch-instructions` prints the selected launcher, explicit profile environment
 and arguments as separate JSON fields. Apply that environment and launch the
 printed application with `--migration-session SESSION_DIRECTORY`. The helper
-never launches it automatically. The candidate keeps the existing informed
+never launches it automatically. CommsPlan keeps the existing informed
 station-upgrade dialog and existing station automation policy. Review startup
-application/scheduler behavior and isolate radios/companions for preview tests.
+application/scheduler behavior and isolate radios/companions for controlled tests.
 No unattended hardware test is authorized by this procedure.
 
-The application validates session/profile/candidate binding **before database
+The application validates session/profile/source binding **before database
 initialization**. A profile edited after the launch request is refused. It writes
 startup evidence only after the existing upgrade gate succeeds and the usable
 application shell opens. The local `launch_id` correlates this attempt; it is
@@ -107,7 +154,7 @@ record/evidence. Close the application and all companion writers before the next
 step so databases have no pending WAL/journal data.
 
 Review station identity, radios/bindings, companion paths, schedules/groups,
-messages/attachments and credentials in the candidate. Only after those checks:
+messages/attachments and credentials in CommsPlan. Only after those checks:
 
 ```sh
 python start-commsplan-migration.py verify-station --session "SESSION_DIRECTORY" --confirm station-identity --confirm radios-and-bindings --confirm companion-paths --confirm schedules-and-groups --confirm messages-and-attachments --confirm credentials
@@ -134,16 +181,16 @@ python start-commsplan-migration.py resume --session "SESSION_DIRECTORY"
 `finish` revalidates the evidence/data/backup and requires the retirement
 acknowledgement. It deletes nothing. `finished` means this local source workflow
 and operator checklist completed; it is **not** native-platform release
-qualification or proof of every external software/hardware setting.
+operator checks or proof of every external software/hardware setting.
 
-After interruption, `resume` rechecks physical paths, source/candidate/receipt,
+After interruption, `resume` rechecks physical paths, source/receipt,
 backup identity and the relevant profile state. It never runs installation,
 conversion or cleanup. Retry the last incomplete command. A verified backup
 completed just before a checkpoint interruption is revalidated and adopted;
-multiple candidates stop for review. Partial backups remain marked incomplete.
-A completed candidate launch can be requested again with a fresh `launch_id`
+multiple source trees stop for review. Partial backups remain marked incomplete.
+A completed CommsPlan launch can be requested again with a fresh `launch_id`
 after its existing evidence and protected contents validate. If startup changed
-the station but failed before producing evidence, the preview stops for recovery
+the station but failed before producing evidence, the workflow stops for recovery
 rather than blindly repeating conversion. Keep the failed profile and restore a
 verified copy into a new directory with the matching historical version.
 
@@ -155,24 +202,25 @@ The helper reads the profile migration marker without creating schema and
 reports whether the informed upgrade is still required. A 2.0.4 executable alone
 does not prove that a particular profile has completed the upgrade.
 
-Use the same explicit profile for the candidate launch. Verify callsign, radios,
+Use the same explicit profile for the CommsPlan launch. Verify callsign, radios,
 software paths, bindings, schedules, groups, messages and attachments before
-accepting the station. Do not run the historical and candidate apps together.
+accepting the station. Do not run the historical and CommsPlan apps together.
 A database converted by the newer application must not be opened in 1.2.8.
 
 Windows retains the historical installer identity and install directory. Linux
 retains the `freqinout` package and desktop-entry identity, with both `freqinout`
 and `commsplan` commands. macOS retains the bundle identity but uses
-`CommsPlan.app`; replacement of an existing `FreqInOut.app` still needs native
-qualification. These compatibility measures are implemented in source and are
-not yet evidence that every historical upgrade succeeds.
+`CommsPlan.app`; replacement of an existing `FreqInOut.app` still needs the
+platform procedure and operator checks. These compatibility measures are
+implemented in source and do not prove that every historical native upgrade
+succeeds.
 
-## Native replacement preview
+## Native replacement preparation
 
 ### Native 2.0.4 backup handoff
 
-The candidate provides explicit native preparation for the four distributed
-2.0.4 packages. It requires the original rollback package matching its pinned
+The CommsPlan source tree provides explicit native preparation for the four
+distributed 2.0.4 packages. It requires the original rollback package matching its pinned
 public release size and SHA-256, the actual installation directory (or macOS
 `.app`), and the confirmed existing profile root. Keep the rollback package
 outside both installation and profile directories. The tool never downloads,
@@ -181,10 +229,11 @@ installs, executes the old app, converts a station or removes software.
 Release selections are `windows-2.0.4`, `linux-amd64-2.0.4`,
 `macos-arm64-2.0.4` and `macos-x86_64-2.0.4`. Native 1.2.8 preparation is refused:
 the release has a Windows installer, but the tagged installer script reports
-`1.2.5.6`. Its actual installed identity requires qualification before this tool
-can use it. This does not change the source-only 1.2.8 procedure above.
+`1.2.5.6`. Its actual installed identity requires a separately verified
+installation before this tool can use it. This does not change the source-only
+1.2.8 procedure above.
 
-Close the app and all companion writers. Use the candidate executable's full
+Close the app and all companion writers. Use the CommsPlan executable's full
 path, with a NEW report file outside the app/profile/backup and an existing
 report parent directory. On Windows, wait for the process to exit before reading
 the report; a windowed executable has no terminal output. Replace placeholders:
@@ -227,7 +276,8 @@ A package digest does not prove the installed payload matches that package.
 Reports explicitly retain `installed_payload_matches_package: false` and
 `native_upgrade_qualified: false`. Signature/keychain continuity, external
 companion-path inventory, native session/resume/station verification and actual
-historical replacement/rollback still require qualification. Do not treat this
+historical replacement/rollback still require platform procedures and operator
+checks. Do not treat this
 preparation report as permission to migrate a live station or as a finished
 migration.
 
@@ -272,7 +322,15 @@ it into a new directory, without replacing an existing station. Verify the copy
 with the matching historical application version, explicitly selecting it with
 `FREQINOUT_CONFIG_DIR`. Preserve an interrupted recovery directory for review
 and retry into a different new directory. Do not remove the original profile,
-backup, or historical installer as part of this preview.
+backup, or historical installer as part of this recovery procedure.
+
+For a frozen-package backup, use the actual directory recorded in
+`<PROFILE_ROOT>/.commsplan-packaged-startup.json` and confirm its
+`manifest.json` before recovery. The startup guard's raw backup includes the
+database sidecars present at the cold-copy point; recovery must still verify the
+restored databases before opening them. Do not substitute the package startup
+receipt for the broader migration helper backup: they have different coverage
+and verification records.
 
 ## Linux source support: one maintenance command
 
@@ -288,7 +346,7 @@ the plan without writing locks/logs or changing files. See the
 If you choose to rename a verified Linux checkout from `~/Radio/FreqInOut` to
 `~/Radio/CommsPlan`, first close CommsPlan and all companion applications. Keep
 the selected profile (`~/.commsplan`) and its backups untouched. Pull the
-relocation-capable private build while the checkout still has its old name,
+relocation-capable CommsPlan release build while the checkout still has its old name,
 then run, from outside the checkout:
 
 ```sh
@@ -339,7 +397,7 @@ include companion data outside that folder or credentials.
 
 ### Guided Linux profile transition to `~/.commsplan`
 
-The private source preview now includes an explicit profile-copy tool. Complete
+The CommsPlan source installation includes an explicit profile-copy tool. Complete
 and verify the existing station upgrade first; this tool requires a multi-rig
 migration marker of at least 1. It does not combine the single-rig conversion
 with a directory move. Native packages and other platforms are not qualified by
@@ -348,11 +406,11 @@ this procedure. Database filenames remain `freqinout.db` and `freqinout_nets.db`
 Use the **actual profile root containing `config/`**. The supplied Linux startup
 log confirmed `/home/bill/.freqinout`; the commands below use that selection.
 Other users must substitute their confirmed root. Close FIO/CommsPlan and every
-companion writer before preview/copy. The shared app lock cannot stop companion
+companion writer before planning or copying. The shared app lock cannot stop companion
 software, and old/new profiles have separate locks: never run both stations at
 once. Keep the original profile, original working application and recovery files.
 
-From the updated application checkout, prepare a migration preview:
+From the updated application checkout, prepare a migration plan:
 
 ```bash
 cd "$HOME/Radio/FreqInOut"
@@ -364,7 +422,7 @@ bash install-commsplan.sh profile plan \
   --destination "$HOME/.commsplan"
 ```
 
-The preview only inspects the selected profile; it does not copy or switch it.
+The plan only inspects the selected profile; it does not copy or switch it.
 The terminal prints a compact JSON summary with counts, up to eight blocker
 samples, `ready_to_copy`, `digest`, and `report_file`. The full evidence is saved
 in that report under a new private `CommsPlan-profile-report-*` directory outside
@@ -444,7 +502,7 @@ shutdown lifecycle/checkpoint policy is separate work requiring native testing.
 
 Recovery inventories and preserves included directories, including empty trees,
 as well as files. Directory inventories bind raw capture, recovered provenance,
-preview, backup and restore; directory-only changes also stop preparation. Older
+planning, backup and restore; directory-only changes also stop preparation. Older
 file-only backups remain restorable, but a journal recovery created before this
 fix cannot support migration: repeat `profile recover` from the original to
 obtain a new workspace. Keep the old workspace for evidence; do not add missing
@@ -469,7 +527,7 @@ Interrupted work stays guarded and retained for review. Do not launch, edit or
 relocate the staging profile, because its provenance hashes bind it to the raw
 capture.
 
-Use the exact returned `profile` path for preview:
+Use the exact returned `profile` path for the next review step:
 
 ```bash
 PROFILE_SOURCE="PASTE_PROFILE_PATH_FROM_RECOVERY_OUTPUT"
@@ -478,27 +536,27 @@ bash install-commsplan.sh profile plan \
   --destination "$HOME/.commsplan"
 ```
 
-Review that preview and use **the same recovered source** for the subsequent
+Review that plan and use **the same recovered source** for the subsequent
 `profile copy` command below. The verified recovery record supplies the original
 `.freqinout` path as `path_origin`, so profile-owned paths are remapped from the
 original root rather than being left pointing back at it. No manual DB edits or
 `--path-origin` override is needed. The original `.freqinout` still remains the
 active/recovery station until you explicitly verify and activate `.commsplan`.
 
-If the preview blocks, stop and use its locations and `blocked_instances`
+If the plan blocks, stop and use its locations and `blocked_instances`
 context (instance identity, family, verification/recipe state and missing
 targets) to investigate while continuing
 to use the original station. Do not edit the original databases or delete scanner
 history merely to bypass a blocker. If the original profile changes, including a
-new launch, generate and review a fresh preview. There is no force option.
+new launch, generate and review a fresh plan. There is no force option.
 
 An unassigned Fast Light draft manifest may refer to a managed directory that
 was never created, even though the radio now uses a different, working
-identity and external FLRig/FLDigi profiles. The preview may list that exact
+identity and external FLRig/FLDigi profiles. The plan may list that exact
 row under `retired_manifests` and become ready only when no radio assignment,
 canonical identity, or launch item still refers to it, and every blocked path
 is inside the same missing draft. The old application configuration may itself
-be absent; in that case the preview also refuses any dangling radio assignment.
+be absent; in that case the plan also refuses any dangling radio assignment.
 The prepared copy saves the complete manifest row in
 `.commsplan-retired-manifests.json` before removing it from its active database.
 If an unused Fast Light configuration row exists, it remains in the copied
@@ -506,7 +564,7 @@ database for preservation. The
 original and verified backup retain all rows. Other missing paths remain
 blockers; the tool does not create placeholder companion profiles.
 
-Copy using the exact `digest` from the reviewed preview:
+Copy using the exact `digest` from the reviewed plan:
 
 ```bash
 bash install-commsplan.sh profile copy \
@@ -553,9 +611,10 @@ To return to the unchanged original station, close both application/companion
 sets and run the same setup command with the original `--config-root` instead.
 Edits made after moving to the new profile are not merged back automatically;
 keep both copies and investigate before choosing which station to continue.
-Do not delete the old profile or migration backup during this preview.
+Do not delete the old profile or migration backup during this procedure.
 
-Actual Linux terminal/desktop/operator acceptance remains required. This source
-implementation does not qualify a final 2.0.5 artifact or all Linux distributions.
+Actual Linux terminal/desktop/operator acceptance remains required. These source
+procedures do not by themselves qualify historical native replacement, every
+Linux distribution, or every final release artifact.
 Database renaming remains a separate coordinated migration across initialization,
 upgrades, backup/restore, diagnostics and old-version recovery.

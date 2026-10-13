@@ -1,9 +1,13 @@
 # Changelog
 
 ## [2.0.5]
-- Release candidate: CommsPlan branding, signal-routes application icons, and compatibility launchers for existing FreqInOut installations. Package upgrade, uninstall and recovery qualification is pending; this section does not announce a production release.
-- Added: Profile migration planning, verified copy and journal recovery tools, with explicit activation after verification.
-- Fixed: Linux source installation and repair support relocation from a FreqInOut source folder to a CommsPlan source folder and refresh desktop launchers.
+- Release note: This entry covers the CommsPlan 2.0.5 scope. Native package upgrade, uninstall, recovery, and hardware behavior remain subject to their platform procedures and operator checks; the complete Plan Builder input catalog remains deferred beyond 2.0.5.
+- Changed: The CommsPlan brand retains FreqInOut profile roots, `freqinout.db` and `freqinout_nets.db`, compatibility commands, the Windows `AppId=FreqInOut`, the Linux package identity, and the historical macOS bundle identifier. Migration, profile-copy/recovery, and Linux source-checkout relocation workflows preserve explicit paths and rollback artifacts.
+- Added: Frozen-package startup now guards pre-schema database writes with a station-lock check and a verified cold copy of the selected profile `config` tree, including raw WAL/journal sidecars. It records the actual receipt and manifest paths, validates SQLite on a disposable copy, reuses valid same-version evidence, and captures a fresh profile when data first appears.
+- Changed: Multi-radio hardware, BBS routing, and Launch Control now keep software, endpoints, rig-control instances, readback evidence, and retries tied to the selected radio. Ambiguous or failed states remain visible and stop unsafe actions; schedule changes preserve per-radio ownership and source/offset explanations while background refreshes stay bounded. Scheduler caches reuse unchanged plan, assignment, and schedule inputs and reload after saved source revisions change.
+- Added: Ops Center now uses a tabbed dashboard with shared roster, readiness, and status inputs. SOP work adds bounded attention/evidence search and summary authoring, while radio controls clarify active/default-radio ownership and operator actions.
+- Changed: Map presentation uses bounded worker snapshots and preserves visible scenes across focus changes while retaining offline vector operation; linked station context, layers, route updates, and MeshCore map projection are handled through the same guarded refresh path.
+- Fixed: Messages and navigation now keep stable source-aware status/action state and avoid unnecessary refresh work. Compose handles default and disconnected Mesh states more clearly, with improved Spotter comment layout and saved-form field decoding.
 
 ## [2.0.4]
 - Added: A consistent first-run welcome guides new stations into Guided Add Radio, while **Set Up Later** leaves a persistent **Set Up First Radio** action in Ops Center. Existing single-radio upgrades continue through the separate **Upgrade Existing Station** flow.
