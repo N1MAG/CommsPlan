@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from contextlib import closing
 import hashlib
 import json
 import os
@@ -173,7 +174,9 @@ def _active_fio_lock(profile_root: Path) -> bool:
 def _sqlite_quick_check(path: Path) -> None:
     uri = f"file:{path.resolve().as_posix()}?mode=ro"
     try:
-        with sqlite3.connect(uri, uri=True, timeout=5.0) as conn:
+        # Connection.__exit__ handles transactions, but does not close the file.
+        # Close deterministically before Windows removes the validation copy.
+        with closing(sqlite3.connect(uri, uri=True, timeout=5.0)) as conn:
             rows = [str(row[0]) for row in conn.execute("PRAGMA quick_check")]
     except sqlite3.Error as exc:
         raise InstallationError(
