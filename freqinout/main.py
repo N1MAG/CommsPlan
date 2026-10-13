@@ -228,12 +228,6 @@ def main():
     )
     _emit_startup_stage("qt_app_created", stage_started, app_start=startup_started)
 
-    stage_started = time.perf_counter()
-    if surface_trace is not None:
-        surface_trace.set_stage("apply_startup_theme")
-    _apply_startup_theme(app)
-    _emit_startup_stage("apply_startup_theme", stage_started, app_start=startup_started)
-
     app_icon = _load_app_icon()
     if not app_icon.isNull():
         app.setWindowIcon(app_icon)
@@ -261,6 +255,31 @@ def main():
     except Exception as e:
         splash = None
         log.warning("Startup splash could not be shown: %s", e)
+
+    # Frozen packages bypass the source installer. Capture the existing station
+    # under our shared lock before schema initialization can change a database.
+    if getattr(sys, "frozen", False):
+        try:
+            from freqinout.core.packaged_profile_guard import prepare_packaged_profile
+            if splash is not None:
+                splash.update_status("Verifying station upgrade backup...")
+            backup_record = prepare_packaged_profile(get_config_dir(), __version__, held_lock_pid=os.getpid())
+            log.info("Packaged startup preparation: %s; backup=%s", backup_record["state"], backup_record["backup"])
+        except Exception as exc:
+            log.exception("Packaged startup backup refused; station databases were not initialized")
+            _write_fatal_startup_log(exc)
+            if splash is not None:
+                splash.close()
+            lockfile.unlock()
+            if not args.smoke_test:
+                QMessageBox.critical(None, DISPLAY_NAME, f"CommsPlan stopped before opening the station.\n\n{exc}")
+            raise SystemExit(2)
+
+    stage_started = time.perf_counter()
+    if surface_trace is not None:
+        surface_trace.set_stage("apply_startup_theme")
+    _apply_startup_theme(app)
+    _emit_startup_stage("apply_startup_theme", stage_started, app_start=startup_started)
 
     # Ensure SQLite schema is present while the operator can see startup progress.
     stage_started = time.perf_counter()

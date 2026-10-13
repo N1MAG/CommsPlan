@@ -206,7 +206,10 @@ def _file_hashes(root: Path) -> dict[str, str]:
 
 def _existing_station_database(profile_root: Path) -> Path | None:
     path = profile_root / "config" / "freqinout.db"
-    return path if path.is_file() and path.stat().st_size > 0 else None
+    databases = list((profile_root / "config").glob("*.db"))
+    if databases and (not path.is_file() or any(database.stat().st_size == 0 for database in databases)):
+        raise InstallationError("The station contains a missing or empty database. Keep the profile and contact CommsPlan support before upgrading.")
+    return path if path.is_file() else None
 
 
 def _finalize_verified_profile_backup(temporary_dir: Path, final_dir: Path) -> Path:
@@ -247,14 +250,22 @@ def _finalize_verified_profile_backup(temporary_dir: Path, final_dir: Path) -> P
     return temporary_dir
 
 
-def _create_verified_profile_backup(profile_root: Path) -> Path | None:
+def _create_verified_profile_backup(profile_root: Path, *, held_lock_pid: int | None = None) -> Path | None:
     if (profile_root / ".commsplan-copy-incomplete").exists():
         raise InstallationError("Profile copy is incomplete; use the original profile. Installation selection was not changed.")
     station_db = _existing_station_database(profile_root)
     if station_db is None:
         print(f"New installation detected. No existing FIO/CommsPlan station profile was found at {profile_root}.")
         return None
-    if _active_fio_lock(profile_root):
+    active_lock = _active_fio_lock(profile_root)
+    if held_lock_pid is not None:
+        try:
+            lock_pid = int((profile_root / "freqinout.lock").read_text(encoding="utf-8").splitlines()[0])
+        except (OSError, ValueError, IndexError) as exc:
+            raise InstallationError("The startup lock could not be verified before backup.") from exc
+        if held_lock_pid != os.getpid() or lock_pid != held_lock_pid or not active_lock:
+            raise InstallationError("The startup backup does not own the station lock.")
+    elif active_lock:
         raise InstallationError(
             "FIO/CommsPlan is still running. Close FIO/CommsPlan and its companion radio applications, then rerun this installer."
         )
@@ -264,13 +275,10 @@ def _create_verified_profile_backup(profile_root: Path) -> Path | None:
     if not database_paths:
         raise InstallationError(f"An existing station was detected, but no databases were found in {config_dir}.")
     print(f"Existing station detected at: {profile_root}")
-    print("Checking station databases before backup...")
-    for path in database_paths:
-        _sqlite_quick_check(path)
-
+    print("Capturing station databases for isolated backup validation...")
     config_bytes = sum(path.stat().st_size for path in config_dir.rglob("*") if path.is_file())
     backup_free_bytes = shutil.disk_usage(profile_root).free
-    backup_required_bytes = config_bytes + (64 * 1024 * 1024)
+    backup_required_bytes = 2 * config_bytes + (64 * 1024 * 1024)
     if backup_free_bytes < backup_required_bytes:
         raise InstallationError(
             "There is not enough free space to create and verify the station backup. "
@@ -279,6 +287,9 @@ def _create_verified_profile_backup(profile_root: Path) -> Path | None:
         )
 
     backup_root = profile_root / "backups"
+    if backup_root.is_symlink():
+        raise InstallationError("Station backup directory is a symbolic link; use a reviewed backup procedure before upgrading.")
+    created_backup_root = not backup_root.exists()
     backup_root.mkdir(parents=True, exist_ok=True)
     stamp = _timestamp()
     final_dir = backup_root / f"pre-install-{stamp}"
@@ -288,14 +299,24 @@ def _create_verified_profile_backup(profile_root: Path) -> Path | None:
         index += 1
     temporary_dir = Path(tempfile.mkdtemp(prefix=".pre-install-", dir=backup_root))
     try:
+        if config_dir.is_symlink() or any(path.is_symlink() for path in config_dir.rglob("*")):
+            raise InstallationError("Station configuration contains symbolic links; use a reviewed backup procedure before upgrading.")
+        source_hashes = _file_hashes(config_dir)
         copied_config = temporary_dir / "config"
         shutil.copytree(config_dir, copied_config)
-        source_hashes = _file_hashes(config_dir)
         backup_hashes = _file_hashes(copied_config)
-        if source_hashes != backup_hashes:
-            raise InstallationError("The station backup did not match the original files.")
-        for path in sorted(copied_config.glob("*.db")):
-            _sqlite_quick_check(path)
+        if source_hashes != backup_hashes or source_hashes != _file_hashes(config_dir):
+            raise InstallationError("The station changed during backup or the copied files did not match. Close all writers and retry.")
+        # SQLite mode=ro may still interact with WAL/SHM. Validate a second
+        # disposable copy, keeping both the source and the raw verified backup
+        # byte-for-byte unchanged, including any pending journal data.
+        with tempfile.TemporaryDirectory(prefix=".backup-validation-", dir=backup_root) as validation:
+            validation_config = Path(validation) / "config"
+            shutil.copytree(copied_config, validation_config)
+            for path in sorted(validation_config.glob("*.db")):
+                _sqlite_quick_check(path)
+        if source_hashes != _file_hashes(config_dir) or backup_hashes != _file_hashes(copied_config):
+            raise InstallationError("The station changed during backup validation. Close all writers and retry.")
         manifest = {
             "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             "verification_status": "verified",
@@ -310,6 +331,11 @@ def _create_verified_profile_backup(profile_root: Path) -> Path | None:
         final_dir = _finalize_verified_profile_backup(temporary_dir, final_dir)
     except Exception:
         shutil.rmtree(temporary_dir, ignore_errors=True)
+        if created_backup_root:
+            try:
+                backup_root.rmdir()  # Remove only our empty directory, never prior backups.
+            except OSError:
+                pass
         raise
     print(f"Verified pre-install station backup: {final_dir}")
     return final_dir

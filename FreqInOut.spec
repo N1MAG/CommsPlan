@@ -92,6 +92,7 @@ a = Analysis(
         ('third_party/js8net/js8net-main/LICENSE', 'third_party/js8net/js8net-main'),
     ] + qt_qml_datas,
     hiddenimports=[
+        "install_freqinout",  # Shared verified backup primitives used by frozen startup.
         "PySide6.QtLocation",
         "PySide6.QtPositioning",
         "PySide6.QtQml",
