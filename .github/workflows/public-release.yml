@@ -94,8 +94,8 @@ jobs:
       - name: Install pinned dependencies
         shell: pwsh
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt -r packaging/build-requirements.txt
+          python -m pip install --upgrade pip -c packaging/constraints/windows-x86_64.txt
+          python -m pip install -r requirements.txt -r packaging/build-requirements.txt -c packaging/constraints/windows-x86_64.txt
           python -m pip freeze --all | Set-Content windows-dependencies.txt -Encoding utf8
 
       - name: Build frozen application
@@ -186,6 +186,25 @@ jobs:
             throw "Windows uninstall removed operator profile data"
           }
 
+      - name: Qualify populated historical package upgrade and rollback
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python packaging/qualify_native_upgrade.py
+          --package "CommsPlan-${{ needs.verify.outputs.version }}-windows-x86_64-setup-unsigned.exe"
+          --workspace "${{ runner.temp }}/commsplan-native-upgrade"
+
+      - name: Retain native upgrade qualification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: CommsPlan-${{ needs.verify.outputs.version }}-windows-x86_64-upgrade-evidence
+          path: |
+            ${{ runner.temp }}/commsplan-native-upgrade/*.json
+            ${{ runner.temp }}/commsplan-native-upgrade/*.log
+          if-no-files-found: warn
+          retention-days: 3
+
       - name: Generate checksum
         shell: pwsh
         run: |
@@ -259,8 +278,8 @@ jobs:
       - name: Install pinned dependencies
         shell: pwsh
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt -r packaging/build-requirements.txt
+          python -m pip install --upgrade pip -c packaging/constraints/windows-x86_64.txt
+          python -m pip install -r requirements.txt -r packaging/build-requirements.txt -c packaging/constraints/windows-x86_64.txt
           python -m pip freeze --all | Set-Content windows-dependencies.txt -Encoding utf8
 
       - name: Build and smoke-test frozen application
@@ -384,6 +403,25 @@ jobs:
             throw "Windows uninstall removed operator profile data"
           }
 
+      - name: Qualify populated historical package upgrade and rollback
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python packaging/qualify_native_upgrade.py
+          --package "CommsPlan-${{ needs.verify.outputs.version }}-windows-x86_64-setup.exe"
+          --workspace "${{ runner.temp }}/commsplan-native-upgrade"
+
+      - name: Retain native upgrade qualification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: CommsPlan-${{ needs.verify.outputs.version }}-windows-x86_64-upgrade-evidence
+          path: |
+            ${{ runner.temp }}/commsplan-native-upgrade/*.json
+            ${{ runner.temp }}/commsplan-native-upgrade/*.log
+          if-no-files-found: warn
+          retention-days: 3
+
       - name: Generate checksum
         shell: pwsh
         run: |
@@ -447,8 +485,8 @@ jobs:
 
       - name: Install pinned dependencies
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt -r packaging/build-requirements.txt
+          python -m pip install --upgrade pip -c packaging/constraints/linux-amd64.txt
+          python -m pip install -r requirements.txt -r packaging/build-requirements.txt -c packaging/constraints/linux-amd64.txt
           python -m pip freeze --all > linux-dependencies.txt
 
       - name: Build and smoke-test frozen application
@@ -483,6 +521,25 @@ jobs:
           test -f "$profile/retain-after-uninstall.txt"
           test ! -e /usr/bin/freqinout
           test ! -e /usr/bin/commsplan
+
+      - name: Qualify populated historical package upgrade and rollback
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python packaging/qualify_native_upgrade.py
+          --package "Output/CommsPlan-${{ needs.verify.outputs.version }}-linux-amd64.deb"
+          --workspace "${{ runner.temp }}/commsplan-native-upgrade"
+
+      - name: Retain native upgrade qualification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: CommsPlan-${{ needs.verify.outputs.version }}-linux-amd64-upgrade-evidence
+          path: |
+            ${{ runner.temp }}/commsplan-native-upgrade/*.json
+            ${{ runner.temp }}/commsplan-native-upgrade/*.log
+          if-no-files-found: warn
+          retention-days: 3
 
       - name: Generate checksum
         run: |
@@ -549,8 +606,8 @@ jobs:
 
       - name: Install pinned dependencies
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt -r packaging/build-requirements.txt
+          python -m pip install --upgrade pip -c packaging/constraints/macos-${{ matrix.arch }}.txt
+          python -m pip install -r requirements.txt -r packaging/build-requirements.txt -c packaging/constraints/macos-${{ matrix.arch }}.txt
           python -m pip freeze --all > "macos-${{ matrix.arch }}-dependencies.txt"
 
       - name: Verify approved native application icon
@@ -597,6 +654,25 @@ jobs:
           test -f "$FREQINOUT_CONFIG_DIR/retain-after-uninstall.txt"
           hdiutil detach -quiet "$mount"
           trap - EXIT
+
+      - name: Qualify populated historical package upgrade and rollback
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python packaging/qualify_native_upgrade.py
+          --package "Output/CommsPlan-${{ needs.verify.outputs.version }}-macos-${{ matrix.arch }}-unsigned.dmg"
+          --workspace "${{ runner.temp }}/commsplan-native-upgrade"
+
+      - name: Retain native upgrade qualification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: CommsPlan-${{ needs.verify.outputs.version }}-macos-${{ matrix.arch }}-upgrade-evidence
+          path: |
+            ${{ runner.temp }}/commsplan-native-upgrade/*.json
+            ${{ runner.temp }}/commsplan-native-upgrade/*.log
+          if-no-files-found: warn
+          retention-days: 3
 
       - name: Generate checksum
         run: |
@@ -677,8 +753,8 @@ jobs:
 
       - name: Install pinned dependencies
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt -r packaging/build-requirements.txt
+          python -m pip install --upgrade pip -c packaging/constraints/macos-${{ matrix.arch }}.txt
+          python -m pip install -r requirements.txt -r packaging/build-requirements.txt -c packaging/constraints/macos-${{ matrix.arch }}.txt
           python -m pip freeze --all > "macos-${{ matrix.arch }}-dependencies.txt"
 
       - name: Import Developer ID certificate
@@ -767,6 +843,25 @@ jobs:
           test -f "$FREQINOUT_CONFIG_DIR/retain-after-uninstall.txt"
           hdiutil detach -quiet "$mount"
           trap - EXIT
+
+      - name: Qualify populated historical package upgrade and rollback
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python packaging/qualify_native_upgrade.py
+          --package "Output/CommsPlan-${{ needs.verify.outputs.version }}-macos-${{ matrix.arch }}.dmg"
+          --workspace "${{ runner.temp }}/commsplan-native-upgrade"
+
+      - name: Retain native upgrade qualification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: CommsPlan-${{ needs.verify.outputs.version }}-macos-${{ matrix.arch }}-upgrade-evidence
+          path: |
+            ${{ runner.temp }}/commsplan-native-upgrade/*.json
+            ${{ runner.temp }}/commsplan-native-upgrade/*.log
+          if-no-files-found: warn
+          retention-days: 3
 
       - name: Generate checksum
         run: |

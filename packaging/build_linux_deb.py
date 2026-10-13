@@ -73,6 +73,11 @@ def assemble_package_root(
 
     control = target / "DEBIAN" / "control"
     control.parent.mkdir(parents=True, exist_ok=True)
+    # dpkg executes these hooks before replacing/removing package-owned files.
+    for hook in ("preinst", "prerm"):
+        destination = control.parent / hook
+        shutil.copy2(source / "packaging/linux/refuse-active-station.sh", destination)
+        destination.chmod(0o755)
     installed_kib = max(1, sum(path.stat().st_size for path in target.rglob("*") if path.is_file()) // 1024)
     control.write_text(
         "\n".join(
