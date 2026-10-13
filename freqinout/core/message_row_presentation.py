@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import datetime
+import json
 from functools import lru_cache
 import re
 from typing import Callable, Mapping
@@ -388,7 +389,14 @@ def _cached_commstat_message_row_presentation(fields: tuple[object, ...]) -> Mes
         source_family_label,
         event_ts_utc,
         event_ts,
+        payload_json,
     ) = fields
+    try:
+        payload = json.loads(payload_json or "{}")
+    except (TypeError, ValueError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
     status = str(status_label or "INFO").strip().upper() or "INFO"
     intelligence = analyze_commstat_fields(
         artifact_kind=artifact_kind,
@@ -404,6 +412,7 @@ def _cached_commstat_message_row_presentation(fields: tuple[object, ...]) -> Mes
         alert_color=alert_color,
         subtype=subtype,
         remarks=remarks_text,
+        brevity_models=payload.get("brevity_models", ()),
         transport=transport_label,
         reach=reach_label,
         source_family=source_family_label,
@@ -468,6 +477,7 @@ def commstat_message_row_presentation(msg: object) -> MessageRowPresentation:
         str(getattr(msg, "source_family_label", "") or ""),
         str(getattr(msg, "event_ts_utc", "") or ""),
         float(getattr(msg, "event_ts", 0.0) or 0.0),
+        str(getattr(msg, "payload_json", "") or ""),
     )
     return _cached_commstat_message_row_presentation(fields)
 

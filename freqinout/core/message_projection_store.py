@@ -841,7 +841,7 @@ def upsert_message_projection(conn: sqlite3.Connection, message: MessageProjecti
             severity=excluded.severity,
             read_state=CASE
                 WHEN LOWER(COALESCE(message_projection.read_state, ''))='read'
-                     AND LOWER(COALESCE(excluded.read_state, '')) IN ('new', 'unread', '')
+                     AND LOWER(COALESCE(excluded.read_state, '')) IN ('new', 'unread', 'info', '')
                 THEN message_projection.read_state
                 ELSE excluded.read_state
             END,
@@ -1368,6 +1368,7 @@ def get_message_projection_generation(db_path: str | Path) -> int:
 def query_projected_message_page(
     db_path: str | Path,
     *,
+    message_ids: Sequence[str] | None = None,
     source_family: str = "",
     source_families: Sequence[str] | None = None,
     group_name: str = "",
@@ -1413,6 +1414,16 @@ def query_projected_message_page(
         include_deleted=include_deleted,
         include_suppressed=include_suppressed,
     )
+    if message_ids is not None:
+        # Explicit Ops scope: no empty-list fallback to the ordinary Inbox.
+        ids = tuple(dict.fromkeys(str(value).strip() for value in message_ids if str(value).strip()))
+        if len(ids) > MAX_PROJECTED_MESSAGE_PAGE_SIZE:
+            raise ValueError("Explicit message scope exceeds the 200-message bound")
+        if ids:
+            base_clauses.append("message_id IN (" + ",".join("?" for _ in ids) + ")")
+            base_params.extend(ids)
+        else:
+            base_clauses.append("0")
     clauses = list(base_clauses)
     params = list(base_params)
     if cursor is not None:
@@ -1821,15 +1832,21 @@ def list_projected_attention_messages(
     *,
     limit: int = 250,
 ) -> list[sqlite3.Row]:
+    # Use the Inbox's canonical visibility/duplicate authority before counting.
+    clauses, params = _projected_message_filter_sql(
+        source_family="", source_families=None, group_name="", group_names=None,
+        status="", statuses=None, severity="", from_call="", to_call="",
+        message_type="", search_text="", received_after_ts=0, received_before_ts=0,
+        include_archived=False, include_deleted=False, include_suppressed=False,
+    )
+    clauses.append("(operator_attention=1 OR actionable=1 OR severity IN ('critical', 'warning'))")
+    where = " AND ".join(clauses)
     return _read_projected_rows(
         db_path,
-        """
+        f"""
         SELECT *
           FROM message_projection
-         WHERE deleted=0
-           AND archived=0
-           AND inbox_visible=1
-           AND (operator_attention=1 OR actionable=1 OR severity IN ('critical', 'warning'))
+         WHERE {where}
          ORDER BY
            CASE severity
                WHEN 'critical' THEN 0
@@ -1842,7 +1859,7 @@ def list_projected_attention_messages(
            message_id DESC
          LIMIT ?
         """,
-        (_bounded_int(limit, default=250, maximum=1_000),),
+        tuple(params) + (_bounded_int(limit, default=250, maximum=1_000),),
     )
 
 

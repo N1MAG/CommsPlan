@@ -56,14 +56,20 @@ def connect_sqlite_readonly(
     """
     path = Path(db_path).expanduser().resolve()
     uri = f"{path.as_uri()}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True, timeout=max(0.05, float(timeout)))
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=max(0.05, float(timeout)))
+    except sqlite3.Error as exc:
+        from freqinout.core.map_read_budget import record_map_read_error
+        record_map_read_error(exc)
+        raise
     if row_factory is not None:
         conn.row_factory = row_factory
     busy_ms = int(busy_timeout_ms if busy_timeout_ms is not None else max(50, float(timeout) * 1000.0))
     conn.execute(f"PRAGMA busy_timeout={busy_ms}")
     conn.execute("PRAGMA query_only=ON")
     conn.execute("PRAGMA temp_store=MEMORY")
-    return conn
+    from freqinout.core.map_read_budget import bound_map_connection
+    return bound_map_connection(conn)
 
 
 def connect_sqlite_runtime_write(

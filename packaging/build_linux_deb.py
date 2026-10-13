@@ -1,4 +1,4 @@
-"""Assemble and build FreqInOut's direct-download Debian package."""
+"""Assemble and build CommsPlan's direct-download Debian package."""
 
 from __future__ import annotations
 
@@ -43,30 +43,33 @@ def assemble_package_root(
 ) -> tuple[str, str]:
     source = Path(source_root).resolve()
     target = Path(package_root).resolve()
-    frozen_app = source / "dist" / "FreqInOut"
-    if not (frozen_app / "FreqInOut").is_file():
-        raise FileNotFoundError(f"PyInstaller output is missing: {frozen_app / 'FreqInOut'}")
+    frozen_app = source / "dist" / "CommsPlan"
+    if not (frozen_app / "CommsPlan").is_file():
+        raise FileNotFoundError(f"PyInstaller output is missing: {frozen_app / 'CommsPlan'}")
     version = validated_version(source)
     arch = architecture or deb_architecture()
 
+    # Preserve the package-owned installation directory across the brand upgrade.
     app_dir = target / "opt" / "freqinout" / "FreqInOut"
     shutil.copytree(frozen_app, app_dir)
 
-    launcher = target / "usr" / "bin" / "freqinout"
-    launcher.parent.mkdir(parents=True, exist_ok=True)
-    launcher.write_text(
-        "#!/bin/sh\nexec /opt/freqinout/FreqInOut/FreqInOut \"$@\"\n",
-        encoding="utf-8",
-    )
-    launcher.chmod(launcher.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    # Both commands execute the same frozen application and use its legacy profile lock.
+    for command in ("commsplan", "freqinout"):
+        launcher = target / "usr" / "bin" / command
+        launcher.parent.mkdir(parents=True, exist_ok=True)
+        launcher.write_text(
+            '#!/bin/sh\nexec /opt/freqinout/FreqInOut/CommsPlan "$@"\n',
+            encoding="utf-8",
+        )
+        launcher.chmod(launcher.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
     desktop = target / "usr" / "share" / "applications" / "freqinout.desktop"
     desktop.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source / "packaging" / "linux" / "freqinout.desktop", desktop)
 
-    icon = target / "usr" / "share" / "icons" / "hicolor" / "256x256" / "apps" / "freqinout.png"
+    icon = target / "usr" / "share" / "icons" / "hicolor" / "256x256" / "apps" / "commsplan.png"
     icon.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source / "assets" / "FreqInOut-desktop.png", icon)
+    shutil.copy2(source / "assets" / "CommsPlan-desktop.png", icon)
 
     control = target / "DEBIAN" / "control"
     control.parent.mkdir(parents=True, exist_ok=True)
@@ -84,8 +87,8 @@ def assemble_package_root(
                 "Depends: libc6 (>= 2.35), libdbus-1-3, libegl1, libgl1, libglib2.0-0, libxkbcommon-x11-0, libxcb-cursor0",
                 "Recommends: bluez, libsecret-1-0",
                 "Homepage: https://github.com/N1MAG/FreqInOut",
-                "Description: Coordinated operations console for HF digital stations",
-                " FreqInOut provides multi-radio scheduling, messaging, mapping,",
+                "Description: CommsPlan coordinated operations console for HF digital stations",
+                " CommsPlan provides multi-radio scheduling, messaging, mapping,",
                 " station readiness, and companion-application coordination.",
                 "",
             )
@@ -101,7 +104,7 @@ def build_deb(output_dir: Path, *, source_root: Path = ROOT) -> Path:
     with tempfile.TemporaryDirectory(prefix="freqinout-deb-") as temporary:
         package_root = Path(temporary) / "root"
         version, arch = assemble_package_root(package_root, source_root=source_root)
-        destination = output / f"FreqInOut-{version}-linux-{arch}.deb"
+        destination = output / f"CommsPlan-{version}-linux-{arch}.deb"
         if destination.exists():
             destination.unlink()
         subprocess.run(

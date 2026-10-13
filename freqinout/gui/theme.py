@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Dict, Tuple
+from functools import lru_cache
 
 from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QColor, QFont, QPalette
@@ -258,6 +259,25 @@ def _dual_button_rules(
     return _rules_for("QPushButton") + _rules_for("QToolButton")
 
 
+def icon_button_metrics(widget: QWidget) -> tuple[int, int, int, int]:
+    """Icon, padding, hit target and split-menu width from the active font/style."""
+    from PySide6.QtWidgets import QStyle
+    line = widget.fontMetrics().lineSpacing()
+    icon = max(20, (line * 7 + 4) // 5)
+    padding = max(3, (line + 4) // 5)
+    extent = max(font_derived_widget_height(widget), icon + 2 * padding + 2)
+    menu = max(line, widget.style().pixelMetric(QStyle.PM_MenuButtonIndicator, None, widget))
+    return icon, padding, extent, menu
+
+
+def icon_button_style(role: str, theme: Dict[str, str], widget: QWidget) -> str:
+    """Shared button roles with icon-sized padding and separate menu clearance."""
+    _, padding, _, menu = icon_button_metrics(widget)
+    return (button_style(role, theme)
+            + f" QPushButton, QToolButton {{ padding:{padding}px; }}"
+            + f" QToolButton::menu-button {{ width:{menu}px; }}")
+
+
 def font_css(font: QFont) -> str:
     parts: list[str] = []
     try:
@@ -281,6 +301,24 @@ def font_css(font: QFont) -> str:
         if pixel_size > 0:
             parts.append(f"font-size: {pixel_size}px;")
     return " ".join(parts)
+
+
+def status_chip_style(theme: Dict[str, str], font_metrics) -> str:
+    """Noninteractive status chips using the shared palette and font spacing."""
+    padding = max(2, int(font_metrics.lineSpacing()) // 5)
+    radius = max(3, padding)
+    return (
+        "QFrame#statusChip {"
+        f"background:{theme['surface_alt']}; border:1px solid {theme['border']}; "
+        f"border-radius:{radius}px; padding:{padding}px;"
+        "} QFrame#statusChip QLabel { background:transparent; "
+        f"color:{theme['text']}; border:none; padding:0;"
+        "} QFrame#statusChip QToolButton { background:transparent; "
+        f"color:{theme['text']}; border:none; padding:0;"
+        "} QFrame#statusChip QToolButton:hover {"
+        f"color:{theme['accent']}; text-decoration:underline;"
+        "}"
+    )
 
 
 def button_style(role: str, theme: Dict[str, str]) -> str:
@@ -364,6 +402,63 @@ def button_style(role: str, theme: Dict[str, str]) -> str:
         disabled_bg=disabled_bg,
         disabled_fg=disabled_fg,
         disabled_border=border,
+    )
+
+
+def station_control_card_style(theme: Dict[str, str], *, selected: bool = False) -> str:
+    """Shared semantic frame treatment for cache-only station radio cards.
+
+    Cards use the same station-control surface tokens as the legacy command
+    bar, while selection is communicated through the shared accent border.
+    Keeping this in the theme layer prevents the full shell and Dock from
+    developing separate light/dark treatments.
+    """
+
+    palette = dict(theme or {})
+    surface_key = "station_control_tile_selected_surface" if selected else "station_control_tile_surface"
+    border_key = "station_control_tile_selected_border" if selected else "station_control_tile_border"
+    surface = palette.get(surface_key, palette.get("surface", "#FFFFFF"))
+    border = palette.get(border_key, palette.get("border", "#C7CED6"))
+    text = palette.get("text", "#202124")
+    muted = palette.get("text_muted", "#5B6570")
+    return (
+        "QFrame#radioControlCard {"
+        f" background:{surface}; border:1px solid {border}; border-radius:6px;"
+        "}"
+        "QFrame#radioControlCard QWidget#radioCardIdentity, "
+        "QFrame#radioControlCard QWidget#radioCardStatusRow, "
+        "QFrame#radioControlCard QWidget#radioCardFields, "
+        "QFrame#radioControlCard QWidget#radioCardActions, "
+        "QFrame#radioControlCard QFrame#radioCardAppEvidence, "
+        "QFrame#radioControlCard QWidget#radioCardAppRow, "
+        "QFrame#radioControlCard QWidget#radioCardNextRow, "
+        "QFrame#radioControlCard QLabel { background:transparent; }"
+        "QFrame#radioControlCard QLabel, QFrame#radioControlCard QComboBox {"
+        f" color:{text};"
+        "}"
+        "QFrame#radioControlCard QComboBox {"
+        f" background:{palette.get('surface_alt', surface)}; border:1px solid {border}; padding:3px 6px;"
+        "}"
+        "QFrame#radioControlCard QComboBox:disabled {"
+        f" color:{muted}; background:{palette.get('surface_alt', surface)};"
+        "}"
+        "QPushButton#radioCardName {"
+        f" color:{text}; font-weight:700;"
+        "}"
+        "QLabel#radioCardGroup, QLabel#radioCardObservedCaption, "
+        "QLabel#radioCardDestinationCaption, QLabel#radioCardFrequencyCaption, "
+        "QLabel#radioCardDurationCaption {"
+        f" color:{muted};"
+        "}"
+        "QLabel#radioCardAuthority {"
+        f" color:{muted}; font-weight:600;"
+        "}"
+        "QLabel#radioCardAuthority[radioCardAuthorityRole=warning] {"
+        f" color:{palette.get('warning', muted)};"
+        "}"
+        "QLabel#radioCardAuthority[radioCardAuthorityRole=danger] {"
+        f" color:{palette.get('danger', muted)};"
+        "}"
     )
 
 
@@ -1165,3 +1260,84 @@ def apply_app_theme(app, theme: Dict[str, str], *, ui_text_scale: float = 1.00) 
     app.setStyleSheet(app_stylesheet(theme))
     fit_existing_combo_boxes(app)
     apply_text_size_accessibility_guards(app, include_widths=False)
+
+
+# Shared compact operational controls: theme-owned, cache-only and DPI-aware.
+def quiet_control_style(theme: Dict[str, str], role: str = "muted") -> str:
+    color = theme.get(role, theme["text_muted"])
+    return ("QAbstractButton { background:transparent; border:none; padding:2px; text-align:left;"
+            f"color:{color};" "} QAbstractButton:hover {"
+            f"background:{theme['surface_alt']};" "}")
+
+
+def control_icon(name: str, theme: Dict[str, str], size: int, dpr: float = 1.0, role: str = "text"):
+    """Shared normalized 24px, 1.8-stroke canvas matching navigation icons."""
+    color = (_best_contrast_text(theme[{"on_accent": "accent", "on_warning": "warning", "on_danger": "danger"}[role]], ("#111111", "#FFFFFF"))
+             if role in {"on_accent", "on_warning", "on_danger"} else theme.get(role, theme["text"]))
+    return _cached_control_icon(name, color, int(size), round(float(dpr), 2))
+
+
+@lru_cache(maxsize=192)
+def _cached_control_icon(name: str, color: str, size: int, dpr: float):
+    from PySide6.QtCore import QPointF, QRectF
+    from PySide6.QtGui import QIcon, QPainter, QPen, QPixmap
+    pixmap = QPixmap(max(1, round(size * dpr)), max(1, round(size * dpr)))
+    pixmap.setDevicePixelRatio(dpr)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing)
+    painter.scale(size / 24, size / 24)
+    painter.setPen(QPen(QColor(color), 1.8, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+    def line(x1, y1, x2, y2):
+        painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+    if name in {"pause", "play"}:
+        if name == "play":
+            line(7, 4, 19, 12); line(19, 12, 7, 20); line(7, 20, 7, 4)
+        else:
+            painter.drawRoundedRect(QRectF(6, 4, 3, 16), 1, 1)
+            painter.drawRoundedRect(QRectF(15, 4, 3, 16), 1, 1)
+    elif name == "resume":
+        painter.drawArc(QRectF(5, 5, 15, 15), 35 * 16, 290 * 16)
+        line(4, 4, 4, 10); line(4, 10, 10, 10)
+    elif name in {"qsy", "arrow-right"}:
+        line(3, 12, 21, 12); line(15, 6, 21, 12); line(15, 18, 21, 12)
+    elif name in {"sop", "list-checks", "checklist", "list-x"}:
+        for y in (6, 12, 18):
+            if name == "list-x":
+                line(3, y - 2, 8, y + 3); line(8, y - 2, 3, y + 3)
+            else:
+                line(3, y, 5, y + 2); line(5, y + 2, 8, y - 2)
+            line(12, y, 21, y)
+    elif name == "schedule":
+        painter.drawRoundedRect(QRectF(3, 5, 18, 16), 2, 2)
+        line(7, 3, 7, 7); line(17, 3, 17, 7); line(3, 9, 21, 9)
+        line(8, 15, 11, 18); line(11, 18, 17, 12)
+    elif name == "clock":
+        painter.drawEllipse(QRectF(3, 3, 18, 18)); line(12, 7, 12, 12); line(12, 12, 16, 14)
+    elif name in {"calendar-days", "calendar", "sources"}:
+        painter.drawRoundedRect(QRectF(3, 5, 18, 16), 2, 2)
+        line(7, 3, 7, 7); line(17, 3, 17, 7); line(3, 9, 21, 9)
+        for x in (7, 12, 17):
+            painter.drawEllipse(QRectF(x - 1, 13, 2, 2))
+    elif name in {"sliders-horizontal", "sliders", "policy"}:
+        line(4, 7, 20, 7); line(4, 12, 20, 12); line(4, 17, 20, 17)
+        painter.drawEllipse(QRectF(8, 5, 4, 4)); painter.drawEllipse(QRectF(14, 10, 4, 4)); painter.drawEllipse(QRectF(6, 15, 4, 4))
+    elif name in {"headset", "headphones", "net"}:
+        painter.drawArc(QRectF(4, 3, 16, 16), 0, 180 * 16)
+        line(4, 12, 4, 17); line(20, 12, 20, 17)
+        painter.drawRoundedRect(QRectF(2, 14, 5, 5), 1, 1); painter.drawRoundedRect(QRectF(17, 14, 5, 5), 1, 1)
+    elif name == "FLDigi":
+        for x, top in ((4, 9), (8, 5), (12, 2), (16, 5), (20, 9)):
+            line(x, top, x, 24 - top)
+    elif name == "JS8":
+        painter.drawRoundedRect(QRectF(5, 9, 14, 11), 2, 2)
+        line(5, 9, 17, 3); line(8, 13, 12, 13); line(8, 16, 12, 16)
+        painter.drawEllipse(QRectF(15, 14, 2, 2))
+    elif name == "VarAC":
+        for x, y in ((3, 15), (15, 15), (9, 3)):
+            painter.drawRoundedRect(QRectF(x, y, 6, 6), 1, 1)
+        line(12, 9, 12, 12); line(6, 12, 18, 12); line(6, 12, 6, 15); line(18, 12, 18, 15)
+    else:
+        painter.drawEllipse(QRectF(3, 3, 18, 18)); line(12, 7, 12, 13); line(12, 17, 12, 17)
+    painter.end()
+    return QIcon(pixmap)

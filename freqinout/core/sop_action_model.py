@@ -18,6 +18,7 @@ class SopActionDraft:
     condition_levels: str = "ALL"
     band: str = ""
     frequency: str = ""
+    operating_group_frequency_key: str = ""
     software: str = ""
     mode: str = ""
     action_key: str = ""

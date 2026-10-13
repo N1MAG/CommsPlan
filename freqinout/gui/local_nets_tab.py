@@ -9,17 +9,19 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, Signal, QEvent
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
     QLineEdit, QMessageBox, QPushButton, QScrollArea, QSpinBox,
-    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget, QSizePolicy, QAbstractButton,
 )
 
 from freqinout.core.known_operating_groups import net_resources_db_path
 from freqinout.core.local_net_models import LocalNetSchedule
+from freqinout.core.system_timezone import normalize_supported_timezone_name
 from freqinout.core.navigation_intent import NavigationIntent
 from freqinout.core.local_net_recurrence import project_occurrences
 from freqinout.core.local_net_service import (
@@ -32,10 +34,13 @@ from freqinout.core.resource_catalog_models import FrequencyResource
 from freqinout.core.resource_catalog_store import ResourceCatalogStore, STATION_MANUAL_SOURCE_KEY
 from freqinout.gui.resource_picker import choose_frequency_resource, frequency_where_text, session_when_text
 from freqinout.gui.help_registry import resolve_help_host
-from freqinout.gui.theme import label_style, resolve_theme
+from freqinout.gui.theme import (
+    label_style, resolve_theme, button_style, font_derived_widget_height,
+    fit_combo_box_to_contents,
+)
 
 
-REMINDER_COPY = "Reminder only — FIO will not tune a radio"
+REMINDER_COPY = "Reminder only — CommsPlan will not tune a radio"
 
 
 def _groups(settings: object) -> tuple[tuple[str, str], ...]:
@@ -76,81 +81,300 @@ class LocalNetEditorDialog(QDialog):
         self.schedule = schedule
         self._selected_frequency: FrequencyResource | None = None
         self.setWindowTitle("Edit Local Net" if schedule else "Add Local Net")
-        # The body owns vertical scrolling; keep the editor launch geometry
-        # usable on compact/large-text screens without imposing a hard floor.
-        self.resize(760, 560)
+        # Resolve local entry once; timing and geometry consume the loaded draft.
+        configured_timezone = settings.get("timezone", "UTC") if settings is not None else "UTC"
+        self._local_timezone = normalize_supported_timezone_name(configured_timezone) or "UTC"
+        try:
+            ZoneInfo(self._local_timezone)
+        except (ValueError, KeyError):
+            self._local_timezone = "UTC"
+        self._timezone_cache = {name: ZoneInfo(name) for name in ("UTC", self._local_timezone)}
+        self._confirmed_timezones = set(self._timezone_cache)
+        self._geometry_timer = QTimer(self)
+        self._geometry_timer.setSingleShot(True)
+        self._geometry_timer.timeout.connect(self._fit_editor_geometry)
+        self.resize(760, 680)
         root = QVBoxLayout(self)
-        scroll = QScrollArea(self); scroll.setWidgetResizable(True); scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        body = QWidget(scroll); layout = QVBoxLayout(body); layout.setContentsMargins(10, 10, 10, 10); layout.setSpacing(10)
-        warning = QLabel(REMINDER_COPY); warning.setObjectName("localNetsReminderOnly"); warning.setWordWrap(True); warning.setStyleSheet(label_style("warning", resolve_theme(settings or {}), weight=700))
-        layout.addWidget(warning)
+        self.scroll = QScrollArea(self)
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QScrollArea.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        body = QWidget(self.scroll)
+        self._editor_body = body
+        self.scroll.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        layout = QVBoxLayout(body)
+        layout.setAlignment(Qt.AlignTop)
+        gap = max(1, self.fontMetrics().horizontalAdvance(" "))
+        layout.setContentsMargins(gap * 2, gap * 2, gap * 2, gap * 2)
+        layout.setSpacing(gap * 2)
+        self.warning = QLabel(REMINDER_COPY, self)
+        self.warning.setObjectName("localNetsReminderOnly")
+        self.warning.setWordWrap(True)
+        root.addWidget(self.warning)
 
-        net_box = QGroupBox("1. Net", body); net_form = QFormLayout(net_box)
-        self.session_combo = QComboBox(net_box); self.session_combo.addItem("Custom local reminder", None)
+        def form_for(title):
+            box = QGroupBox(title, body)
+            form = QFormLayout(box)
+            form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+            form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+            layout.addWidget(box)
+            return box, form
+
+        def action_row(*controls):
+            holder = QWidget(body)
+            row = QHBoxLayout(holder)
+            row.setContentsMargins(0, 0, 0, 0)
+            for control in controls:
+                row.addWidget(control)
+            row.addStretch()
+            return holder
+
+        net_box, net_form = form_for("Net and group")
+        self.name_edit = QLineEdit(net_box)
+        self.name_edit.setPlaceholderText("Net name")
+        self.service_combo = QComboBox(net_box)
+        self.service_combo.addItems(["AMATEUR", "GMRS"])
+        self.service_combo.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        self.group_combo = QComboBox(net_box)
+        self.group_combo.addItem("Community / Unassigned", (None, None))
+        for key, name in _groups(settings):
+            self.group_combo.addItem(name, (key, name))
+        self.group_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.group_combo.setProperty("fio_no_auto_fit", True)
+        self.group_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.group_combo.setMinimumContentsLength(18)
+        self.manage_groups_btn = QPushButton("Manage groups…", net_box)
+        self.manage_groups_btn.setToolTip("Manage Operating Groups and return to this draft.")
+        net_form.addRow("Name", self.name_edit)
+        net_form.addRow("Service", self.service_combo)
+        net_form.addRow("Operating group", self.group_combo)
+        self.frequency_label = QLabel("No frequency resource selected", net_box)
+        self.frequency_label.setWordWrap(True)
+        net_form.addRow("Frequency", self.frequency_label)
+        self.choose_frequency_btn = QPushButton("Choose frequency…", net_box)
+        self.manage_frequency_btn = QPushButton("Frequency catalog…", net_box)
+        self.manage_frequency_btn.setToolTip("Manage Frequency Catalog and return to this draft.")
+        net_form.addRow("", action_row(self.choose_frequency_btn, self.manage_frequency_btn, self.manage_groups_btn))
+
+        self.directory_toggle = QCheckBox("Use a known net meeting", body)
+        layout.addWidget(self.directory_toggle)
+        self.directory_panel = QWidget(body)
+        directory_form = QFormLayout(self.directory_panel)
+        directory_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        self.session_combo = QComboBox(self.directory_panel)
+        self.session_combo.setProperty("fio_no_auto_fit", True)
+        self.session_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.session_combo.setMinimumContentsLength(18)
+        self.session_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.session_combo.addItem("Custom local reminder", None)
         sessions = self.catalog.list_sessions(active=True, limit=200)
         entries = self.catalog.net_entries_by_keys(session.net_entry_key for session in sessions)
         for session in sessions:
             entry = entries.get(session.net_entry_key)
             name = entry.name if entry is not None else session.net_entry_key
             self.session_combo.addItem(f"{name} · {session_when_text(session)}", session.net_session_key)
-        self.use_session_btn = QPushButton("Use selected net meeting", net_box)
-        self.name_edit = QLineEdit(net_box); self.service_combo = QComboBox(net_box); self.service_combo.addItems(["AMATEUR", "GMRS"])
-        net_form.addRow("Known net meeting", self.session_combo); net_form.addRow("", self.use_session_btn)
-        net_form.addRow("Name", self.name_edit); net_form.addRow("Service", self.service_combo); layout.addWidget(net_box)
+        self.use_session_btn = QPushButton("Use selected meeting", self.directory_panel)
+        directory_form.addRow("Known net meeting", self.session_combo)
+        directory_form.addRow("", action_row(self.use_session_btn))
+        layout.addWidget(self.directory_panel)
+        self.directory_toggle.toggled.connect(self.directory_panel.setVisible)
+        self.directory_panel.hide()
 
-        group_box = QGroupBox("2. Group / Where", body); group_form = QFormLayout(group_box)
-        self.group_combo = QComboBox(group_box); self.group_combo.addItem("Community / Unassigned", (None, None))
-        for key, name in _groups(settings): self.group_combo.addItem(name, (key, name))
-        self.frequency_label = QLabel("No frequency resource selected", group_box); self.frequency_label.setWordWrap(True)
-        self.choose_frequency_btn = QPushButton("Choose frequency resource…", group_box)
-        self.manage_frequency_btn = QPushButton("Manage Frequency Catalog…", group_box)
-        self.manage_groups_btn = QPushButton("Manage Operating Groups…", group_box)
-        self.custom_kind = QComboBox(group_box); self.custom_kind.addItems(["simplex", "repeater"])
-        self.custom_receive_hz = QLineEdit(group_box); self.custom_receive_hz.setPlaceholderText("Hz, e.g. 146520000")
-        self.custom_transmit_hz = QLineEdit(group_box); self.custom_transmit_hz.setPlaceholderText("Required for repeater; simplex defaults to receive")
-        self.create_frequency_btn = QPushButton("Create station-private resource", group_box)
-        group_form.addRow("Operating group", self.group_combo); group_form.addRow("", self.manage_groups_btn)
-        group_form.addRow("Frequency", self.frequency_label); group_form.addRow("", self.choose_frequency_btn); group_form.addRow("", self.manage_frequency_btn)
-        group_form.addRow("New resource type", self.custom_kind); group_form.addRow("New receive Hz", self.custom_receive_hz); group_form.addRow("New transmit Hz", self.custom_transmit_hz); group_form.addRow("", self.create_frequency_btn); layout.addWidget(group_box)
+        self.frequency_toggle = QCheckBox("Create a frequency resource", body)
+        layout.addWidget(self.frequency_toggle)
+        self.frequency_panel = QWidget(body)
+        frequency_form = QFormLayout(self.frequency_panel)
+        frequency_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        self.custom_kind = QComboBox(self.frequency_panel)
+        self.custom_kind.addItems(["simplex", "repeater"])
+        self.custom_receive_hz = QLineEdit(self.frequency_panel)
+        self.custom_receive_hz.setPlaceholderText("Receive frequency in Hz")
+        self.custom_transmit_hz = QLineEdit(self.frequency_panel)
+        self.custom_transmit_hz.setPlaceholderText("Repeater transmit Hz; simplex uses receive")
+        self.create_frequency_btn = QPushButton("Create station-private resource", self.frequency_panel)
+        frequency_form.addRow("New resource type", self.custom_kind)
+        frequency_form.addRow("New receive Hz", self.custom_receive_hz)
+        frequency_form.addRow("New transmit Hz", self.custom_transmit_hz)
+        frequency_form.addRow("", action_row(self.create_frequency_btn))
+        layout.addWidget(self.frequency_panel)
+        self.frequency_toggle.toggled.connect(self.frequency_panel.setVisible)
+        self.frequency_panel.hide()
 
-        when_box = QGroupBox("3. When", body); when_form = QFormLayout(when_box)
-        self.recurrence = QComboBox(when_box); self.recurrence.addItems(["weekly", "daily", "periodic", "biweekly", "one_time"])
-        self.weekday_checks = [QCheckBox(name, when_box) for name in ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")]
-        weekdays_widget = QWidget(when_box); weekdays_layout = QGridLayout(weekdays_widget); weekdays_layout.setContentsMargins(0, 0, 0, 0)
-        for index, checkbox in enumerate(self.weekday_checks): weekdays_layout.addWidget(checkbox, index // 4, index % 4)
+        when_box, self.when_form = form_for("When and reminder")
+        self.recurrence = QComboBox(when_box)
+        self.recurrence.addItems(["weekly", "daily", "periodic", "biweekly", "one_time"])
+        self.recurrence.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        self.weekday_checks = [QCheckBox(name, when_box) for name in
+                               ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")]
+        self.weekdays_widget = QWidget(when_box)
+        self.weekdays_widget.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        weekdays_layout = QGridLayout(self.weekdays_widget)
+        weekdays_layout.setContentsMargins(0, 0, 0, 0)
+        for index, checkbox in enumerate(self.weekday_checks):
+            weekdays_layout.addWidget(checkbox, index // 4, index % 4)
         self.month_week_checks = [QCheckBox(str(number), when_box) for number in range(1, 6)]
-        month_widget = QWidget(when_box); month_layout = QHBoxLayout(month_widget); month_layout.setContentsMargins(0, 0, 0, 0)
-        for checkbox in self.month_week_checks: month_layout.addWidget(checkbox)
-        self.time_edit = QLineEdit(when_box); self.time_edit.setPlaceholderText("HH:MM")
-        self.timezone_edit = QLineEdit(when_box); self.timezone_edit.setText("UTC")
-        self.date_edit = QLineEdit(when_box); self.date_edit.setPlaceholderText("YYYY-MM-DD (one-time / biweekly anchor)")
-        self.effective_start_edit = QLineEdit(when_box); self.effective_start_edit.setPlaceholderText("YYYY-MM-DD (optional)")
-        self.effective_end_edit = QLineEdit(when_box); self.effective_end_edit.setPlaceholderText("YYYY-MM-DD (optional)")
-        self.exceptions_edit = QLineEdit(when_box); self.exceptions_edit.setPlaceholderText("YYYY-MM-DD, YYYY-MM-DD")
-        self.duration = QSpinBox(when_box); self.duration.setRange(1, 1440); self.duration.setValue(60)
-        when_form.addRow("Recurrence", self.recurrence); when_form.addRow("Weekdays", weekdays_widget); when_form.addRow("Month weeks", month_widget); when_form.addRow("Start time", self.time_edit); when_form.addRow("Timezone", self.timezone_edit); when_form.addRow("Date / anchor", self.date_edit); when_form.addRow("Effective start", self.effective_start_edit); when_form.addRow("Effective end", self.effective_end_edit); when_form.addRow("Exception dates", self.exceptions_edit); when_form.addRow("Duration (minutes)", self.duration); layout.addWidget(when_box)
+        self.month_widget = QWidget(when_box)
+        self.month_widget.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        month_layout = QHBoxLayout(self.month_widget)
+        month_layout.setContentsMargins(0, 0, 0, 0)
+        for checkbox in self.month_week_checks:
+            month_layout.addWidget(checkbox)
+        month_layout.addStretch()
+        self.time_edit = QLineEdit(when_box)
+        self.time_edit.setPlaceholderText("HH:MM")
+        self.time_edit.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        self.time_basis_combo = QComboBox(when_box)
+        self.time_basis_combo.addItem(f"Local ({self._local_timezone})", self._local_timezone)
+        self.time_basis_combo.addItem("UTC", "UTC")
+        self.time_basis_combo.addItem("Other time zone…", None)
+        self.time_basis_combo.setProperty("fio_no_auto_fit", True)
+        self.time_basis_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.timezone_edit = QLineEdit(when_box)
+        self.timezone_edit.setText(self._local_timezone)
+        self.timezone_edit.setPlaceholderText("IANA time zone")
+        self.time_basis_hint = QLabel("Times and dates use the selected zone. Changing it keeps the clock time.", when_box)
+        self.time_basis_hint.setWordWrap(True)
+        self.date_edit = QLineEdit(when_box)
+        self.date_edit.setPlaceholderText("YYYY-MM-DD")
+        self.duration = QSpinBox(when_box)
+        self.duration.setRange(1, 1440)
+        self.duration.setValue(60)
+        self.duration.setSuffix(" min")
+        self.duration.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        self.reminder = QSpinBox(when_box)
+        self.reminder.setRange(0, 1440)
+        self.reminder.setValue(15)
+        self.reminder.setSuffix(" min before")
+        self.reminder.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        self.when_form.addRow("Recurrence", self.recurrence)
+        self.when_form.addRow("Weekdays", self.weekdays_widget)
+        self.when_form.addRow("Month weeks", self.month_widget)
+        self.when_form.addRow("Start time", action_row(self.time_edit, self.time_basis_combo))
+        self.when_form.addRow("Time zone", self.timezone_edit)
+        self.when_form.addRow("", self.time_basis_hint)
+        self.when_form.addRow("Date / anchor", self.date_edit)
+        self.when_form.addRow("Duration", action_row(self.duration, QLabel("Reminder", when_box), self.reminder))
 
-        reminder_box = QGroupBox("4. Reminder & SOP", body); reminder_form = QFormLayout(reminder_box)
-        self.reminder = QSpinBox(reminder_box); self.reminder.setRange(0, 1440); self.reminder.setValue(15)
-        self.sop_edit = QLineEdit(reminder_box); self.sop_edit.setPlaceholderText("Optional SOP ID; never activated here")
-        self.notes_edit = QLineEdit(reminder_box); reminder_form.addRow("Reminder lead (minutes)", self.reminder); reminder_form.addRow("SOP context", self.sop_edit); reminder_form.addRow("Participation notes", self.notes_edit)
-        layout.addWidget(reminder_box)
-        review_box = QGroupBox("5. Review", body); review_layout = QVBoxLayout(review_box)
-        self.preview = QLabel("Complete the timing fields to preview the next occurrence.", review_box); self.preview.setWordWrap(True); review_layout.addWidget(self.preview)
-        layout.addWidget(review_box); layout.addStretch(1); scroll.setWidget(body); root.addWidget(scroll, 1)
-        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel, self); buttons.accepted.connect(self._save); buttons.rejected.connect(self.reject); root.addWidget(buttons)
-        self.use_session_btn.clicked.connect(self._use_directory_session); self.choose_frequency_btn.clicked.connect(self._choose_frequency); self.create_frequency_btn.clicked.connect(self._create_frequency)
+        self.details_toggle = QCheckBox("Date limits, SOP context and notes", body)
+        layout.addWidget(self.details_toggle)
+        self.details_panel = QWidget(body)
+        details_form = QFormLayout(self.details_panel)
+        details_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        self.effective_start_edit = QLineEdit(self.details_panel)
+        self.effective_start_edit.setPlaceholderText("YYYY-MM-DD (optional)")
+        self.effective_end_edit = QLineEdit(self.details_panel)
+        self.effective_end_edit.setPlaceholderText("YYYY-MM-DD (optional)")
+        self.exceptions_edit = QLineEdit(self.details_panel)
+        self.exceptions_edit.setPlaceholderText("YYYY-MM-DD, YYYY-MM-DD")
+        self.sop_edit = QLineEdit(self.details_panel)
+        self.sop_edit.setPlaceholderText("Optional SOP ID; never activated here")
+        self.notes_edit = QLineEdit(self.details_panel)
+        details_form.addRow("Effective start", self.effective_start_edit)
+        details_form.addRow("Effective end", self.effective_end_edit)
+        details_form.addRow("Exception dates", self.exceptions_edit)
+        details_form.addRow("SOP context", self.sop_edit)
+        details_form.addRow("Participation notes", self.notes_edit)
+        layout.addWidget(self.details_panel)
+        self.details_toggle.toggled.connect(self.details_panel.setVisible)
+        self.details_panel.hide()
+        layout.addStretch()
+        self.scroll.setWidget(body)
+        root.addWidget(self.scroll, 1)
+        self.preview = QLabel("Complete the timing fields to preview the next occurrence.", self)
+        self.preview.setWordWrap(True)
+        root.addWidget(self.preview)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel, self)
+        self.buttons.accepted.connect(self._save)
+        self.buttons.rejected.connect(self.reject)
+        root.addWidget(self.buttons)
+        self.use_session_btn.clicked.connect(self._use_directory_session)
+        self.choose_frequency_btn.clicked.connect(self._choose_frequency)
+        self.create_frequency_btn.clicked.connect(self._create_frequency)
         self.manage_frequency_btn.clicked.connect(lambda: self._request_handoff("resources.frequency_catalog"))
         self.manage_groups_btn.clicked.connect(lambda: self._request_handoff("settings.operating_groups"))
-        for widget in (self.name_edit, self.time_edit, self.timezone_edit, self.date_edit, self.effective_start_edit, self.effective_end_edit, self.exceptions_edit, self.sop_edit, self.notes_edit): widget.textChanged.connect(self._preview)
-        for widget in (self.service_combo, self.group_combo, self.recurrence): widget.currentIndexChanged.connect(self._preview)
-        for widget in (self.duration, self.reminder): widget.valueChanged.connect(self._preview)
-        for checkbox in (*self.weekday_checks, *self.month_week_checks): checkbox.toggled.connect(self._preview)
-        if schedule: self._load(schedule)
-        else: self.time_edit.setText("19:00")
+        self.time_basis_combo.currentIndexChanged.connect(self._on_time_basis_changed)
+        self.timezone_edit.textChanged.connect(self._sync_time_basis)
+        self.timezone_edit.editingFinished.connect(self._confirm_timezone)
+        self.recurrence.currentIndexChanged.connect(self._update_recurrence_fields)
+        for widget in (self.name_edit, self.time_edit, self.timezone_edit, self.date_edit,
+                       self.effective_start_edit, self.effective_end_edit, self.exceptions_edit,
+                       self.sop_edit, self.notes_edit):
+            widget.textChanged.connect(self._preview)
+        for widget in (self.service_combo, self.group_combo, self.recurrence):
+            widget.currentIndexChanged.connect(self._preview)
+        for widget in (self.duration, self.reminder):
+            widget.valueChanged.connect(self._preview)
+        for checkbox in (*self.weekday_checks, *self.month_week_checks):
+            checkbox.toggled.connect(self._preview)
+        if schedule:
+            self._load(schedule)
+        else:
+            self.time_edit.setText("19:00")
         if draft_snapshot:
             self._restore_draft_snapshot(draft_snapshot)
+        self._sync_time_basis()
+        self._update_recurrence_fields()
         self._preview()
+        self.apply_theme()
+
+    def _on_time_basis_changed(self, *_args) -> None:
+        zone = self.time_basis_combo.currentData()
+        if zone is not None:
+            self.timezone_edit.setText(str(zone))
+        self.when_form.setRowVisible(self.timezone_edit, zone is None)
+        self._preview()
+
+    def _sync_time_basis(self, *_args) -> None:
+        zone = self.timezone_edit.text().strip()
+        index = 0 if zone == self._local_timezone else 1 if zone == "UTC" else 2
+        self.time_basis_combo.blockSignals(True)
+        self.time_basis_combo.setCurrentIndex(index)
+        self.time_basis_combo.blockSignals(False)
+        self.when_form.setRowVisible(self.timezone_edit, index == 2)
+
+    def _confirm_timezone(self) -> bool:
+        zone = self.timezone_edit.text().strip()
+        try:
+            self._timezone_cache[zone] = ZoneInfo(zone)
+        except (ValueError, KeyError) as exc:
+            self.preview.setText(f"Review time zone: {exc}")
+            return False
+        self._confirmed_timezones.add(zone)
+        self._preview()
+        return True
+
+    def _update_recurrence_fields(self, *_args) -> None:
+        recurrence = self.recurrence.currentText()
+        self.when_form.setRowVisible(self.weekdays_widget, recurrence in {"weekly", "periodic", "biweekly"})
+        self.when_form.setRowVisible(self.month_widget, recurrence == "periodic")
+        self.when_form.setRowVisible(self.date_edit, recurrence in {"biweekly", "one_time"})
+        label = self.when_form.labelForField(self.date_edit)
+        if label is not None:
+            label.setText("Date" if recurrence == "one_time" else "Anchor date")
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() in (QEvent.FontChange, QEvent.ApplicationFontChange, QEvent.StyleChange):
+            if hasattr(self, "_geometry_timer"):
+                self._geometry_timer.start(0)
+
+    def _fit_editor_geometry(self) -> None:
+        self._editor_body.setMaximumWidth(self.fontMetrics().horizontalAdvance("M" * 76))
+        self.preview.setMaximumWidth(self.fontMetrics().horizontalAdvance("M" * 76))
+        for widget in self.findChildren(QWidget):
+            if isinstance(widget, (QLineEdit, QComboBox, QSpinBox, QAbstractButton)):
+                widget.setMinimumHeight(font_derived_widget_height(widget))
+                if isinstance(widget, QComboBox):
+                    fit_combo_box_to_contents(widget)
+
+    def apply_theme(self) -> None:
+        theme = resolve_theme(self.settings or {})
+        self.warning.setStyleSheet(label_style("warning", theme, weight=700))
+        for button in self.findChildren(QPushButton):
+            button.setStyleSheet(button_style("muted", theme))
+            button.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        self.buttons.button(QDialogButtonBox.Save).setStyleSheet(button_style("eligible_success", theme))
+        self._geometry_timer.start(0)
 
     def _draft_snapshot(self) -> dict[str, object]:
         """Capture incomplete form state without requiring schedule validation."""
@@ -178,6 +402,10 @@ class LocalNetEditorDialog(QDialog):
             "custom_kind": self.custom_kind.currentText(),
             "custom_receive_hz": self.custom_receive_hz.text(),
             "custom_transmit_hz": self.custom_transmit_hz.text(),
+            "time_basis": self.time_basis_combo.currentIndex(),
+            "directory_open": self.directory_toggle.isChecked(),
+            "frequency_open": self.frequency_toggle.isChecked(),
+            "details_open": self.details_toggle.isChecked(),
         }
 
     def _restore_draft_snapshot(self, snapshot: dict[str, object]) -> None:
@@ -205,6 +433,11 @@ class LocalNetEditorDialog(QDialog):
         text(self.sop_edit, "sop_id"); text(self.notes_edit, "notes")
         self.custom_kind.setCurrentText(str(snapshot.get("custom_kind") or "simplex"))
         text(self.custom_receive_hz, "custom_receive_hz"); text(self.custom_transmit_hz, "custom_transmit_hz")
+        self.directory_toggle.setChecked(bool(snapshot.get("directory_open") or snapshot.get("session_key")))
+        self.frequency_toggle.setChecked(bool(snapshot.get("frequency_open") or snapshot.get("custom_receive_hz") or snapshot.get("custom_transmit_hz")))
+        self.details_toggle.setChecked(bool(snapshot.get("details_open") or any(snapshot.get(key) for key in ("effective_start", "effective_end", "exceptions", "sop_id", "notes"))))
+        self.time_basis_combo.setCurrentIndex(int(snapshot.get("time_basis", self.time_basis_combo.currentIndex())))
+        self._confirm_timezone()
 
     def _request_handoff(self, destination_route: str) -> None:
         snapshot = self._draft_snapshot()
@@ -223,6 +456,11 @@ class LocalNetEditorDialog(QDialog):
         self.done(self.HANDOFF_RESULT)
 
     def _load(self, row: LocalNetSchedule) -> None:
+        try:
+            self._timezone_cache[row.timezone_name] = ZoneInfo(row.timezone_name)
+            self._confirmed_timezones.add(row.timezone_name)
+        except (ValueError, KeyError):
+            pass
         self.name_edit.setText(row.name); self.service_combo.setCurrentText(row.service); self.recurrence.setCurrentText(row.recurrence); self.time_edit.setText(row.local_start_time); self.timezone_edit.setText(row.timezone_name); self.duration.setValue(row.duration_minutes); self.reminder.setValue(row.reminder_minutes); self.sop_edit.setText(str(row.sop_id or "")); self.notes_edit.setText(row.participation_notes or "")
         for index, checkbox in enumerate(self.weekday_checks): checkbox.setChecked(index in row.weekdays)
         for index, checkbox in enumerate(self.month_week_checks, start=1): checkbox.setChecked(index in row.month_weeks)
@@ -233,6 +471,8 @@ class LocalNetEditorDialog(QDialog):
             if self.group_combo.itemData(index)[0] == row.operating_group_key: self.group_combo.setCurrentIndex(index); break
         if row.frequency_resource_key:
             self._selected_frequency = self.catalog.get_frequency(row.frequency_resource_key); self._set_frequency_label()
+        self.details_toggle.setChecked(bool(row.effective_start_date or row.effective_end_date or row.exception_dates or row.sop_id or row.participation_notes))
+        self.directory_toggle.setChecked(bool(row.net_session_key))
         if row.net_session_key:
             index = self.session_combo.findData(row.net_session_key)
             if index >= 0: self.session_combo.setCurrentIndex(index)
@@ -280,20 +520,25 @@ class LocalNetEditorDialog(QDialog):
 
     def _preview(self, *_args: object) -> None:
         try:
-            rows = project_occurrences(self._draft(), datetime.now(timezone.utc), limit=3)
+            if self.timezone_edit.text().strip() not in self._confirmed_timezones:
+                self.preview.setText("Confirm the IANA time zone to preview this reminder.")
+                return
+            rows = project_occurrences(self._draft(), datetime.now(timezone.utc), limit=1)
             if rows:
-                lines = ["Next exact occurrences:"]
+                lines = ["Next occurrence:"]
                 for item in rows:
                     local = _when(item)
                     utc = item.start_utc.strftime("%Y-%m-%d %H:%M UTC")
                     lines.append(f"• {local}  |  {utc}")
-                lines.append(REMINDER_COPY)
                 self.preview.setText("\n".join(lines))
             else:
                 self.preview.setText("No occurrence appears in the next 90 days.")
         except Exception as exc: self.preview.setText(f"Review timing: {exc}")
 
     def _save(self) -> None:
+        if not self._confirm_timezone():
+            self.timezone_edit.setFocus()
+            return
         try: self.result_schedule = self.local_store.save_schedule(self._draft()); self.accept()
         except Exception as exc: QMessageBox.warning(self, "Save Local Net", str(exc))
 

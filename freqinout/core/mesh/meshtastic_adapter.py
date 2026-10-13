@@ -118,7 +118,7 @@ class MeshtasticLocalAdapter:
         if not text.strip():
             raise MeshConnectionError("Enter a mesh message before sending.")
         if len(text.encode("utf-8")) > 220:
-            raise MeshConnectionError("Meshtastic message is longer than FIO's qualified 220-byte text limit.")
+            raise MeshConnectionError("Meshtastic message is longer than CommsPlan's qualified 220-byte text limit.")
         try:
             channel_index = int(str(request.channel_id or "0").strip() or "0")
         except ValueError as exc:

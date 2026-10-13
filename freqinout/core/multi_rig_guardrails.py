@@ -147,7 +147,7 @@ def _js8_endpoint_guidance(rows: Iterable[Mapping[str, Any]]) -> list[MultiRigGu
             affected_radio_names=names,
             severity="info",
             message=(
-                "Multiple active JS8Call TCP endpoints are configured. Native FIO JS8 control is endpoint-scoped, "
+                "Multiple active JS8Call TCP endpoints are configured. Native CommsPlan JS8 control is endpoint-scoped, "
                 "but the legacy js8net fallback can attach to only one endpoint at a time."
             ),
         )

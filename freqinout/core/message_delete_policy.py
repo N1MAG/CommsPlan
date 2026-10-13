@@ -34,7 +34,7 @@ def _source_label_for_origin(origin: object, msg_type: object = "") -> str:
     key = str(origin or "").strip().lower()
     labels = {
         "js8": "JS8Call",
-        "spotter": "JS8Spotter",
+        "spotter": "CommsPlan Spotter",
         "varac": "VarAC",
         "commstat": "CommStat",
         "sitrep": "SitRep",
@@ -63,14 +63,14 @@ def message_delete_capability(payload: Any, *, origin: object = "", msg_type: ob
     if cls == "CommStatArtifact":
         return MessageDeleteCapability(
             source_label="CommStat",
-            effect_label="Delete source row when safe; otherwise hide from FIO Messages",
-            audit_action="CommStat source delete or FIO hide",
+            effect_label="Delete source row when safe; otherwise hide from CommsPlan Messages",
+            audit_action="CommStat source delete or CommsPlan hide",
         )
     if cls == "ProjectedMessagePayload":
         return MessageDeleteCapability(
             source_label=source_label,
-            effect_label="Hide from FIO projection",
-            audit_action="Hide from FIO projection",
+            effect_label="Hide from CommsPlan projection",
+            audit_action="Hide from CommsPlan projection",
             requires_source_identity=False,
         )
     if cls == "VarACMessage":
@@ -83,11 +83,11 @@ def message_delete_capability(payload: Any, *, origin: object = "", msg_type: ob
         return MessageDeleteCapability(
             source_label={
                 "JS8Message": "JS8Call",
-                "SpotterMessage": "JS8Spotter",
+                "SpotterMessage": "CommsPlan Spotter",
                 "SitrepMessage": "SitRep",
             }.get(cls, source_label),
-            effect_label="Delete from FIO message store",
-            audit_action="Delete from FIO message store",
+            effect_label="Delete from CommsPlan message store",
+            audit_action="Delete from CommsPlan message store",
         )
     return MessageDeleteCapability(
         source_label=source_label,
@@ -103,17 +103,17 @@ def message_delete_result_detail(payload: Any, result: str) -> str:
     result_key = str(result or "").strip().lower()
     if cls == "CommStatArtifact":
         if result_key == "deleted_source":
-            return "CommStat source row deleted and FIO projection removed"
+            return "CommStat source row deleted and CommsPlan projection removed"
         if result_key == "deleted_projection":
-            return "CommStat source row was already absent; stale FIO projection removed"
+            return "CommStat source row was already absent; stale CommsPlan projection removed"
         if result_key == "hidden":
-            return "CommStat artifact hidden from FIO Messages; source row was not safely identifiable"
+            return "CommStat artifact hidden from CommsPlan Messages; source row was not safely identifiable"
         if result_key == "skipped":
             return "CommStat artifact has no stable identity"
         return "CommStat item not deleted"
     if cls == "ProjectedMessagePayload":
         if result_key == "hidden":
-            return "projected message hidden from FIO views"
+            return "projected message hidden from CommsPlan views"
         if result_key == "skipped":
             return "missing projected message id"
         return "projected message not hidden"
@@ -137,13 +137,13 @@ def message_delete_result_detail(payload: Any, result: str) -> str:
         return "VarAC source row not marked deleted"
     if cls == "SpotterMessage":
         if result_key == "deleted":
-            return "Spotter row deleted from FIO store"
+            return "Spotter row deleted from CommsPlan store"
         if result_key == "skipped":
             return "missing Spotter id"
         return "Spotter row not deleted"
     if cls == "SitrepMessage":
         if result_key == "deleted":
-            return "SitRep row deleted from FIO store"
+            return "SitRep row deleted from CommsPlan store"
         return "SitRep row not deleted"
     if result_key == "skipped":
         return "unsupported message payload"
@@ -172,7 +172,7 @@ def failed_source_delete_result(
             warning = f"Failed to delete Message {msg_id}." if msg_id > 0 else "Failed to delete message."
         elif cls == "CommStatArtifact":
             warning = (
-                "FIO could not delete this CommStat item. The message database was busy or unavailable. "
+                "CommsPlan could not delete this CommStat item. The message database was busy or unavailable. "
                 "Try Refresh Now and delete it again."
             )
         elif isinstance(payload, FileRecord):
@@ -185,14 +185,14 @@ def commstat_delete_execution_result(result: object) -> MessageDeleteExecutionRe
     if key == "skipped":
         return missing_identity_delete_result(
             "skipped",
-            warning="FIO could not hide this CommStat item because it does not have a stable message identity.",
+            warning="CommsPlan could not hide this CommStat item because it does not have a stable message identity.",
         )
     if key not in {"deleted_source", "deleted_projection", "hidden"}:
         return MessageDeleteExecutionResult(
             "failed",
             "failed",
             warning=(
-                "FIO could not delete this CommStat item. The message database was busy or unavailable. "
+                "CommsPlan could not delete this CommStat item. The message database was busy or unavailable. "
                 "Try Refresh Now and delete it again."
             ),
         )
@@ -319,7 +319,7 @@ def bulk_delete_confirmation_text(rows: Sequence[object], prompt: str = "Delete 
     lines.extend(
         [
             "",
-            "This action updates the source store where FIO can safely do so and removes the rows from the current view.",
+            "This action updates the source store where CommsPlan can safely do so and removes the rows from the current view.",
         ]
     )
     return "\n".join(line for line in lines if line is not None).strip()
@@ -335,8 +335,8 @@ def bulk_delete_completion_text(
 ) -> str:
     result_labels = {
         "deleted_source": "Deleted from source",
-        "deleted_projection": "Cleaned stale FIO rows",
-        "hidden": "Hidden in FIO",
+        "deleted_projection": "Cleaned stale CommsPlan rows",
+        "hidden": "Hidden in CommsPlan",
         "deleted": "Deleted",
     }
     lines = [f"Completed delete for {int(deleted)} message(s)."]
@@ -367,7 +367,7 @@ def single_delete_confirmation_text(row: object, prompt: str = "Delete this mess
         "",
         message_row_summary_line(row),
         "",
-        "This action updates the source store where FIO can safely do so and removes the row from the current view.",
+        "This action updates the source store where CommsPlan can safely do so and removes the row from the current view.",
     ]
     return "\n".join(line for line in lines if line is not None).strip()
 
@@ -379,7 +379,7 @@ def single_delete_success_text(row: object, *, hidden: bool = False) -> str:
         msg_type=getattr(row, "msg_type", ""),
     )
     if hidden:
-        return f"{capability.source_label} message hidden from FIO Messages."
+        return f"{capability.source_label} message hidden from CommsPlan Messages."
     return f"{capability.source_label} message deleted."
 
 

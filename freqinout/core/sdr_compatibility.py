@@ -173,7 +173,7 @@ SDR_COMPATIBILITY_REGISTRY = SdrCompatibilityRegistry(
             fio_status="Experimental",
             platforms=("Linux", "macOS", "Windows"),
             capabilities=("frequency", "readback", "optional mode", "manual fallback"),
-            notes="FIO's receive-only adapter is implemented. Enable SDR++ RigCTL tuning and select the intended VFO; each exact hardware/application/OS combination remains unverified until its live gate passes.",
+            notes="CommsPlan's receive-only adapter is implemented. Enable SDR++ RigCTL tuning and select the intended VFO; each exact hardware/application/OS combination remains unverified until its live gate passes.",
             source="SDR++ upstream source/module matrix",
             source_version="8c9f5ee8fe405775bfcd62c8c8f8c0fc928a64af",
         ),
@@ -210,7 +210,7 @@ SDR_COMPATIBILITY_REGISTRY = SdrCompatibilityRegistry(
             fio_status="Planned",
             platforms=("Linux", "macOS", "Windows"),
             capabilities=("frequency", "mode", "bandwidth", "readback"),
-            notes="Exact RSP model and application version require separate FIO acceptance.",
+            notes="Exact RSP model and application version require separate CommsPlan acceptance.",
             source="SDRplay SDRconnect platform and WebSocket documentation",
         ),
         SdrCompatibilityEntry(
@@ -222,8 +222,8 @@ SDR_COMPATIBILITY_REGISTRY = SdrCompatibilityRegistry(
             fio_status="Manual",
             platforms=("Linux", "macOS", "Windows"),
             capabilities=("copy frequency", "manual mode", "manual bandwidth"),
-            notes="Always selectable. FIO provides frequency details and optional safe application launch without claiming control.",
-            source="FIO operator contract",
+            notes="Always selectable. CommsPlan provides frequency details and optional safe application launch without claiming control.",
+            source="CommsPlan operator contract",
         ),
     )
 )

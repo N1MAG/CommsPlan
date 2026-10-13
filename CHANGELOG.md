@@ -1,5 +1,10 @@
 # Changelog
 
+## [2.0.5]
+- Release candidate: CommsPlan branding, signal-routes application icons, and compatibility launchers for existing FreqInOut installations. Package upgrade, uninstall and recovery qualification is pending; this section does not announce a production release.
+- Added: Profile migration planning, verified copy and journal recovery tools, with explicit activation after verification.
+- Fixed: Linux source installation and repair support relocation from a FreqInOut source folder to a CommsPlan source folder and refresh desktop launchers.
+
 ## [2.0.4]
 - Added: A consistent first-run welcome guides new stations into Guided Add Radio, while **Set Up Later** leaves a persistent **Set Up First Radio** action in Ops Center. Existing single-radio upgrades continue through the separate **Upgrade Existing Station** flow.
 - Fixed: Windows startup no longer flashes internal command windows or transient unpainted FIO windows while the splash screen is active.

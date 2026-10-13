@@ -284,6 +284,13 @@ class DeviceSettingsProxy:
             merged["message_paths"] = combined_message_paths
         return merged
 
+    def update_js8_offset(self, offset_hz: int) -> None:
+        """Refresh one operational default without rebuilding endpoint clients."""
+
+        value = int(offset_hz)
+        self.profile["js8_offset_hz"] = value
+        self._data["js8_offset_hz"] = value
+
 
 @dataclass
 class DeviceRuntimeSnapshot:
@@ -398,6 +405,14 @@ def apply_endpoint_operational_summary(
 ) -> DeviceRuntimeSnapshot:
     """Overlay detached cache evidence onto a detached runtime snapshot."""
 
+    if isinstance(summary, Mapping) and "observed_frequency_hz" in summary:
+        # Detached scheduler readback, never the desired schedule frequency.
+        value = summary.get("observed_frequency_hz")
+        snapshot.current_frequency_hz = int(value) if value is not None else None
+        snapshot.current_frequency_label = _format_frequency_label(snapshot.current_frequency_hz)
+        snapshot.current_band = _hz_to_band(snapshot.current_frequency_hz)
+        if value is not None and summary.get("observed_frequency_current") is False:
+            snapshot.current_frequency_label += " · last confirmed"
     projection = endpoint_operational_health(summary)
     snapshot.operational_state = projection.state_code
     snapshot.operational_detail = projection.detail
@@ -568,7 +583,11 @@ class DeviceRuntime:
             except Exception as exc:
                 log.debug("DeviceRuntime: failed building rig client for %s: %s", self.profile.get("name", ""), exc)
                 self.rig_client = None
-        if device_class != "observer" and (self.is_primary or backend == "js8call"):
+        js8_companion_configured = bool(
+            self.profile.get("js8_instance_id") or self.profile.get("js8_install_path")
+            or self.profile.get("js8_profile_path")
+        )
+        if device_class != "observer" and (self.is_primary or backend == "js8call" or js8_companion_configured):
             try:
                 host = str(self.settings_proxy.get("js8_host", "127.0.0.1") or "127.0.0.1").strip() or "127.0.0.1"
                 port = int(self.settings_proxy.get("js8_port", 2442) or 2442)
@@ -576,7 +595,9 @@ class DeviceRuntime:
             except Exception as exc:
                 log.debug("DeviceRuntime: failed building JS8 client for %s: %s", self.profile.get("name", ""), exc)
                 self.js8_control_client = None
-        if self.is_primary:
+        if device_class != "observer" and (self.is_primary or any(
+            self.settings_proxy.get(key, "") for key in ("varac_path", "varac_db_path", "varac_ini_path", "varac_launch_cmd")
+        )):
             try:
                 self.varac_status_client = VarACStatusClient(settings=self.settings_proxy)
             except Exception as exc:
@@ -590,6 +611,7 @@ class DeviceRuntime:
                 self.receiver_client.close()
             except Exception:
                 pass
+
         if self.js8_control_client is not None:
             try:
                 self.js8_control_client.stop()
@@ -611,6 +633,21 @@ class DeviceRuntime:
             self.status_poll_coordinator.invalidate(self._status_poll_key("frequency"))
         except Exception:
             pass
+
+    def update_js8_offset(self, offset_hz: int) -> None:
+        """Refresh the cached per-radio default without reconnecting CAT/audio."""
+
+        value = int(offset_hz)
+        self.profile["js8_offset_hz"] = value
+        if self.settings_proxy is not None:
+            self.settings_proxy.update_js8_offset(value)
+        # Keep the runtime's comparison baseline aligned with this deliberately
+        # in-place update.  Otherwise the next store sync would see a changed
+        # profile signature and unnecessarily rebuild the radio-control clients.
+        self._config_signature = self._signature_for(
+            self.profile,
+            is_primary=bool(getattr(self, "is_primary", False)),
+        )
 
     def _status_poll_key(self, kind: str) -> str:
         device_id = int(self.profile.get("id", 0) or 0)
@@ -741,7 +778,7 @@ class DeviceRuntime:
             else:
                 observer_info = {
                     "state": "idle",
-                    "tooltip": "Manual tuning. FIO will show the scheduled receive frequency without controlling the receiver.",
+                    "tooltip": "Manual tuning. CommsPlan will show the scheduled receive frequency without controlling the receiver.",
                     "running": False,
                     "reachable": False,
                     "endpoint": _device_endpoint_summary(self.profile),
@@ -945,8 +982,6 @@ class DeviceRuntime:
                 "Observer / SDR devices are monitored and receive follow guidance only; "
                 "they never own the primary compatibility shell in this slice."
             )
-        elif not self.is_primary:
-            warnings.append("Current control tabs remain bound to the primary compatibility device.")
         if str(service_states.get("VarAC", {}).get("state", "idle") or "idle").strip().lower() == "warn":
             tooltip = str(service_states.get("VarAC", {}).get("tooltip", "") or "").strip()
             if tooltip:
@@ -1042,6 +1077,22 @@ class StationRuntimeManager:
             time_fn=time.monotonic,
         )
         self._receiver_client_factory = receiver_client_factory
+        self._hardware_lifecycle_snapshot: object | None = None
+
+    def set_hardware_lifecycle_snapshot(self, snapshot: object) -> None:
+        """Publish one immutable background hardware snapshot to runtime readers."""
+
+        generation = int(getattr(snapshot, "generation", 0) or 0)
+        current_generation = int(
+            getattr(getattr(self, "_hardware_lifecycle_snapshot", None), "generation", 0) or 0
+        )
+        if generation >= current_generation:
+            self._hardware_lifecycle_snapshot = snapshot
+
+    def hardware_health_for_device(self, device_profile_id: int) -> object | None:
+        snapshot = self._hardware_lifecycle_snapshot
+        radios = getattr(snapshot, "radios", {}) if snapshot is not None else {}
+        return radios.get(int(device_profile_id)) if isinstance(radios, Mapping) else None
 
     def invalidate_runtime_status(self) -> None:
         self._runtime_status = None
@@ -1589,6 +1640,15 @@ class StationRuntimeManager:
             return None
         return self._runtimes.get(ident)
 
+    def update_runtime_js8_offset(self, device_profile_id: int, offset_hz: int) -> bool:
+        """Refresh one runtime default without reconnecting any control client."""
+
+        runtime = self.get_runtime_for_device(device_profile_id)
+        if runtime is None:
+            return False
+        runtime.update_js8_offset(int(offset_hz))
+        return True
+
     def get_active_profile_swap(self) -> Optional[Dict[str, Any]]:
         return dict(self._active_profile_swap) if isinstance(self._active_profile_swap, dict) else None
 
@@ -1877,7 +1937,7 @@ class StationRuntimeManager:
         if peer_status_unknown:
             detail = (
                 f"Target {target_tuning or normalized_band or 'frequency change'} cannot be compared with "
-                f"{primary_candidate['peer_name']} because FIO cannot verify that radio's current frequency."
+                f"{primary_candidate['peer_name']} because CommsPlan cannot verify that radio's current frequency."
             )
         else:
             peer_tuning = " ".join(
@@ -1905,6 +1965,12 @@ class StationRuntimeManager:
                 normalized_band,
                 str(normalized_target_hz or 0),
                 ",".join(str(peer_id) for peer_id in peer_ids),
+                # Approval belongs to the tuning evidence that was reviewed,
+                # including every conflicting peer, even within one band.
+                ",".join(
+                    f"{item['peer_id']}:{item.get('peer_frequency_hz') or 0}:{item.get('peer_band') or ''}"
+                    for item in sorted(candidates, key=lambda item: int(item['peer_id']))
+                ),
                 ",".join(antenna_groups),
                 ",".join(amplifier_groups),
                 ",".join(frontend_groups),

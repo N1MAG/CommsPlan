@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-import json
 import re
 import string
 import datetime as _dt
-from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 from freqinout.core.group_utils import normalize_group_name
+from freqinout.core.commstat_brevity import (code_candidates, cached_catalogs, analyze_brevity_codes, brevity_metadata)
 
 
 COMMSTAT_SCOPE_MAP = {
@@ -139,7 +138,6 @@ STATE_NAME_TO_CODE = {
     "WYOMING": "WY",
 }
 
-_BREVITY_RE = re.compile(r"\b([1-5][A-Z]{5})\b")
 _STANDARD_MARKERS = (
     ("{&%3}", "{&%}"),
     ("{F%3}", "{F%}"),
@@ -305,14 +303,19 @@ def build_commstat_brevity_rf_text(
     destination: object,
     brevity_code: object,
     comment: object = "",
+    catalog: Optional[Dict] = None,
 ) -> str:
     """Build a short CommStat brevity RF message for JS8Call."""
     target = str(destination or "").strip().upper().lstrip("@")
     code = str(brevity_code or "").strip().upper().lstrip("#")
     if not target:
         raise ValueError("destination is required")
-    if not re.fullmatch(r"[1-5][A-Z]{5}", code):
-        raise ValueError("brevity_code must be a six-character CommStat brevity code")
+    if catalog is not None:
+        records = analyze_brevity_codes(code, {code[:1]: catalog})
+        if len(records) != 1 or records[0]["code"] != code or records[0]["status"] != "decoded":
+            raise ValueError("brevity_code requires a complete defined model")
+    elif not re.fullmatch(r"[1-5][A-Z]{5}", code):
+        raise ValueError("extended brevity_code requires its catalog definition")
     comment_text = sanitize_commstat_comment(comment, max_len=48)
     payload = f"#{code}"
     if comment_text:
@@ -404,11 +407,8 @@ def expand_plus_shorthand(status_code: object) -> str:
 
 
 def extract_brevity_code(remarks: object) -> str:
-    text = str(remarks or "").upper()
-    matches = _BREVITY_RE.findall(text)
-    if not matches:
-        return ""
-    return str(matches[-1] or "").strip().upper()
+    matches = code_candidates(remarks)
+    return matches[-1] if matches else ""
 
 
 def infer_state_and_geo(grid: object, remarks: object) -> Tuple[str, str, str]:
@@ -453,26 +453,9 @@ def resolve_commstat_reported_for_state(
 
 
 def decode_brevity_summary(code: object, asset_dir: Optional[Path]) -> str:
-    brevity_code = str(code or "").strip().upper()
-    if not re.fullmatch(r"[1-5][A-Z]{5}", brevity_code):
-        return ""
-    if asset_dir is None:
-        return ""
-    list_id = brevity_code[0]
-    assets = _load_brevity_assets(str(asset_dir))
-    positions = assets.get(list_id)
-    if not isinstance(positions, dict):
-        return ""
-
-    emergency_name = _lookup_named_code(positions.get("emergency_type"), brevity_code[1])
-    status_name = _lookup_named_code(positions.get("status_codes"), brevity_code[2])
-    impact_name = _lookup_named_code(positions.get("shared_impacts"), brevity_code[3])
-    response_name = _lookup_named_code(positions.get("public_reaction"), brevity_code[4])
-    station_name = _lookup_named_code(positions.get("station_response"), brevity_code[5])
-    parts = [p for p in (emergency_name, status_name, impact_name, response_name, station_name) if p]
-    if not parts:
-        return ""
-    return f"{brevity_code}: " + " | ".join(parts)
+    # Worker-only compatibility entry point; GUI consumes published metadata.
+    records = analyze_brevity_codes(code, cached_catalogs(asset_dir))
+    return "\n".join(row["summary"] for row in records)
 
 
 def parse_commstat_message(
@@ -538,7 +521,8 @@ def _parse_standard_statrep_message(
     report_group = report_group_for_target(target_hint)
     state_code, state_confidence, geo_confidence = infer_state_and_geo(grid, remarks_text)
     brevity_code = extract_brevity_code(remarks_text)
-    brevity_summary = decode_brevity_summary(brevity_code, asset_dir)
+    brevity = brevity_metadata(remarks_text, asset_dir)
+    brevity_summary = brevity["brevity_summary"]
 
     return {
         "subtype": "COMMSTAT_FWD" if is_forwarded else "COMMSTAT_12",
@@ -556,6 +540,8 @@ def _parse_standard_statrep_message(
             "remarks_text": remarks_text,
             "brevity_code": brevity_code,
             "brevity_summary": brevity_summary,
+            "brevity_models": brevity["brevity_models"],
+            "brevity_asset_dir": brevity["brevity_asset_dir"],
             "state_code": state_code,
             "state_confidence": state_confidence,
             "geo_confidence": geo_confidence,
@@ -591,7 +577,8 @@ def _parse_fcode_message(
     report_group = report_group_for_target(target_hint)
     state_code, state_confidence, geo_confidence = infer_state_and_geo("", remarks_text)
     brevity_code = extract_brevity_code(remarks_text)
-    brevity_summary = decode_brevity_summary(brevity_code, asset_dir)
+    brevity = brevity_metadata(remarks_text, asset_dir)
+    brevity_summary = brevity["brevity_summary"]
     scope = COMMSTAT_SCOPE_MAP.get(responses[:1], "") if form_id == "F!301" and responses else ""
 
     return {
@@ -609,6 +596,8 @@ def _parse_fcode_message(
             "remarks_text": remarks_text,
             "brevity_code": brevity_code,
             "brevity_summary": brevity_summary,
+            "brevity_models": brevity["brevity_models"],
+            "brevity_asset_dir": brevity["brevity_asset_dir"],
             "state_code": state_code,
             "state_confidence": state_confidence,
             "geo_confidence": geo_confidence,
@@ -685,48 +674,5 @@ def _state_abbr_context_is_location(text: str, match: re.Match[str]) -> bool:
     words = re.findall(r"[A-Z]+", prefix)
     prev = words[-1] if words else ""
     if prev in _NON_LOCATION_PRECEDERS:
-        return False
-    return True
-
-
-def _lookup_named_code(section: object, code: str) -> str:
-    if not isinstance(section, dict):
-        return ""
-    entry = section.get(code)
-    if isinstance(entry, dict):
-        return str(entry.get("name") or "").strip()
-    return ""
-
-
-@lru_cache(maxsize=16)
-def _load_brevity_assets(asset_dir: str) -> Dict[str, Dict]:
-    out: Dict[str, Dict] = {}
-    base = Path(asset_dir)
-    if not base.exists():
-        return out
-    for path in sorted(base.glob("[0-9]-*.json")):
-        try:
-            with path.open("r", encoding="utf-8") as fh:
-                data = json.load(fh)
-        except Exception:
-            continue
-        if not _valid_brevity_data(data):
-            continue
-        list_id = path.name[:1]
-        out[list_id] = data
-    return out
-
-
-def _valid_brevity_data(data: object) -> bool:
-    if not isinstance(data, dict):
-        return False
-    required = {
-        "emergency_type",
-        "status_codes",
-        "public_reaction",
-        "station_response",
-        "shared_impacts",
-    }
-    if not required.issubset(set(data.keys())):
         return False
     return True

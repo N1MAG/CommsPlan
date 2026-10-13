@@ -703,7 +703,7 @@ class ShortwaveListeningView(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(8)
-        intro = QLabel("Saved Shortwave reminders are manual listening cues. FIO never tunes, launches, schedules, or transmits from this page.")
+        intro = QLabel("Saved Shortwave reminders are manual listening cues. CommsPlan never tunes, launches, schedules, or transmits from this page.")
         intro.setWordWrap(True)
         layout.addWidget(intro)
         self.status = QLabel("Open Listening to load saved reminders.")
@@ -756,7 +756,7 @@ class ShortwaveListeningView(QWidget):
         self.receiver_combo = QComboBox(editor)
         self.receiver_combo.addItem("No receiver selected", None)
         self.receiver_combo.setAccessibleName("Optional configured receiver identity")
-        self.receiver_combo.setToolTip("An informational station reference only. FIO will not tune or control it from a Shortwave reminder.")
+        self.receiver_combo.setToolTip("An informational station reference only. CommsPlan will not tune or control it from a Shortwave reminder.")
         form.addRow("Label", self.label_edit)
         form.addRow("Note", self.notes_edit)
         form.addRow("Remind", self.lead_combo)
@@ -773,7 +773,7 @@ class ShortwaveListeningView(QWidget):
         actions.addWidget(self.save_btn, 0, 0)
         self.remove_btn = QPushButton("Remove", editor)
         self.remove_btn.setEnabled(False)
-        self.remove_btn.setToolTip("Remove this FIO reminder only. The source dataset and listing remain unchanged.")
+        self.remove_btn.setToolTip("Remove this CommsPlan reminder only. The source dataset and listing remain unchanged.")
         self.remove_btn.clicked.connect(self.remove_selected)
         actions.addWidget(self.remove_btn, 0, 1)
         self.apply_btn = QPushButton("Apply listing update", editor)
@@ -1008,7 +1008,7 @@ class ShortwaveListeningView(QWidget):
         if key and QMessageBox.question(
             self,
             "Remove listening reminder",
-            "Remove this FIO listening reminder? The source listing is not deleted.",
+            "Remove this CommsPlan listening reminder? The source listing is not deleted.",
             QMessageBox.Remove | QMessageBox.Cancel,
             QMessageBox.Cancel,
         ) == QMessageBox.Remove:

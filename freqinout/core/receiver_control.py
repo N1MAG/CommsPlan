@@ -360,7 +360,7 @@ class ManualReceiverControl:
             detail=(
                 "Manual receiver tune cancelled."
                 if cancelled
-                else "FIO did not tune this manual receiver; tune it manually and confirm the frequency."
+                else "CommsPlan did not tune this manual receiver; tune it manually and confirm the frequency."
             ),
         )
 
@@ -383,7 +383,7 @@ class ManualReceiverControl:
             detail=(
                 "Manual receiver mode change cancelled."
                 if cancelled
-                else "FIO did not change this manual receiver; set mode and bandwidth manually."
+                else "CommsPlan did not change this manual receiver; set mode and bandwidth manually."
             ),
         )
 
@@ -408,7 +408,7 @@ class ManualReceiverControl:
             detail=(
                 "Manual receiver verification cancelled."
                 if cancelled
-                else "Manual receiver state cannot be verified by FIO; confirm it at the receiver."
+                else "Manual receiver state cannot be verified by CommsPlan; confirm it at the receiver."
             ),
         )
 

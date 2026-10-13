@@ -176,7 +176,7 @@ class FldigiMacroMappingDialog(QDialog):
         self.add_manual_btn.setStyleSheet(button_style("eligible_info", theme))
         self.browse_btn.setStyleSheet(button_style("eligible_success", theme))
         self.update_macro_path_btn.setStyleSheet(button_style("warning", theme))
-        self.update_macro_path_btn.setToolTip("Back up and update the selected macro's <FILE:...> path when it should use FIO's configured check-in folder.")
+        self.update_macro_path_btn.setToolTip("Back up and update the selected macro's <FILE:...> path when it should use CommsPlan's configured check-in folder.")
         self.remove_btn.setStyleSheet(button_style("danger", theme))
         self.save_btn.setStyleSheet(button_style("success", theme))
         self.close_btn.setStyleSheet(button_style("muted", theme))
@@ -365,8 +365,8 @@ class FldigiMacroMappingDialog(QDialog):
         if self._path_compare_key(macro_text) == self._path_compare_key(configured_text):
             return ""
         return (
-            f"Macro text points to {macro_text}. FIO is using the configured file "
-            f"{configured_text}. Update the FLDigi macro if it should read FIO's live file."
+            f"Macro text points to {macro_text}. CommsPlan is using the configured file "
+            f"{configured_text}. Update the FLDigi macro if it should read CommsPlan's live file."
         )
 
     @staticmethod
@@ -542,21 +542,21 @@ class FldigiMacroMappingDialog(QDialog):
             QMessageBox.information(
                 self,
                 "Macro Discovery & Mapping",
-                "Only FIO-managed check-in files are repaired here. Custom macro files are left exactly where the operator placed them.",
+                "Only CommsPlan-managed check-in files are repaired here. Custom macro files are left exactly where the operator placed them.",
             )
             return
         if not macro_source:
             QMessageBox.information(self, "Macro Discovery & Mapping", "No scanned macro file path is available for this row. Rescan the macro profile first.")
             return
         if self._path_compare_key(macro_source) == self._path_compare_key(configured_source):
-            QMessageBox.information(self, "Macro Discovery & Mapping", "This macro already points to the configured FIO file path.")
+            QMessageBox.information(self, "Macro Discovery & Mapping", "This macro already points to the configured CommsPlan file path.")
             return
 
         prompt = (
-            f"FIO will back up the macro file, then update {macro_id}"
+            f"CommsPlan will back up the macro file, then update {macro_id}"
             f"{f' ({macro_label})' if macro_label else ''}.\n\n"
             f"Current macro path:\n{macro_source}\n\n"
-            f"Configured FIO path:\n{configured_source}\n\n"
+            f"Configured CommsPlan path:\n{configured_source}\n\n"
             "After this, refresh or reload macros in FLDigi if FLDigi already has this profile open."
         )
         if QMessageBox.question(self, "Update FLDigi Macro Path", prompt) != QMessageBox.Yes:
@@ -572,7 +572,7 @@ class FldigiMacroMappingDialog(QDialog):
             QMessageBox.warning(
                 self,
                 "Macro Discovery & Mapping",
-                "FIO could not find the selected <FILE:...> reference in that macro slot. Rescan the profile and try again.",
+                "CommsPlan could not find the selected <FILE:...> reference in that macro slot. Rescan the profile and try again.",
             )
             return
 

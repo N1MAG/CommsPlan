@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from freqinout.core.group_utils import normalize_group_name
+from freqinout.core.commstat_brevity import intelligence_values
 from freqinout.core.commstat_sitrep import parse_commstat_message
 from freqinout.core.js8_message_policy import (
     JS8_MESSAGE_POLICY_VERSION,
@@ -59,6 +60,8 @@ def native_projector_version(source_family: object) -> int:
     """Return the bounded replay version for one native source family."""
 
     family = _text(source_family).lower()
+    if family in {"sitrep", "commstat"}:
+        return 5
     if family in {"js8", "spotter", "varac", "sitrep", "commstat", "mesh"}:
         return PROJECTOR_VERSION
     return PROJECTOR_VERSION
@@ -806,6 +809,7 @@ def _analyze_local_js8_commstat(
         remarks=remarks,
         brevity_code=metadata.get("brevity_code", ""),
         brevity_summary=metadata.get("brevity_summary", ""),
+        brevity_models=metadata.get("brevity_models", ()),
         transport="js8",
         reach=metadata.get("reach_mode", ""),
         source_family="JS8Call RF",
@@ -1472,6 +1476,7 @@ def _project_sitrep_events(conn: sqlite3.Connection, limit: int, force: bool, *,
     fingerprint = ""
     if not targeted:
         fingerprint = _table_fingerprint(conn, "sitrep_events", "COUNT(*)", "MAX(COALESCE(id, 0))", "MAX(COALESCE(event_ts, 0))", "MAX(COALESCE(updated_ts, 0))")
+        fingerprint = content_hash(5, fingerprint)
         if _checkpoint_matches(conn, checkpoint_id, fingerprint, force=force):
             return 0
     query = """
@@ -1501,6 +1506,10 @@ def _project_sitrep_events(conn: sqlite3.Connection, limit: int, force: bool, *,
             external_key = _text(row["report_key"]) or _text(row["id"])
             status = _status_from_condition(row["overall_status"])
             body = _sitrep_body(row)
+            records = _brevity_payload(row["raw_payload_json"]).get("brevity_models", [])
+            if not isinstance(records, list):
+                records = []
+            topic_body = _sitrep_body(row, include_brevity=False)
             event_ts = _float(row["event_ts"])
             message_id = canonical_station_message_id(
                 "sitrep",
@@ -1511,6 +1520,12 @@ def _project_sitrep_events(conn: sqlite3.Connection, limit: int, force: bool, *,
                 message_type=row["subtype"],
                 durable_id=external_key if event_ts <= 0 else "",
             )
+            existing_ref = conn.execute(
+                "SELECT message_id FROM message_external_refs WHERE source_id=? AND external_kind=? AND external_key=?",
+                (source_id, "sitrep_event", external_key),
+            ).fetchone()
+            if existing_ref:
+                message_id = existing_ref[0]
             source = MessageSourceRecord(
                 source_id=source_id,
                 source_family="sitrep",
@@ -1545,8 +1560,8 @@ def _project_sitrep_events(conn: sqlite3.Connection, limit: int, force: bool, *,
                 subject=_sitrep_subject(row),
                 summary=body[:240],
                 body_preview=body[:1200],
-                topics=_topics(body, row["overall_status"], row["power"], row["water"], row["medical"], row["communications"], row["fuel"]),
-                entities=_row_entities(row, ("overall_status", "power", "water", "medical", "communications", "internet", "travel", "food", "fuel", "crime", "civil_unrest", "political")),
+                topics=_topics(topic_body, row["overall_status"], row["power"], row["water"], row["medical"], row["communications"], row["fuel"], *intelligence_values(records)),
+                entities={**_row_entities(row, ("overall_status", "power", "water", "medical", "communications", "internet", "travel", "food", "fuel", "crime", "civil_unrest", "political")), "brevity_models": records},
                 actionable=status in {"YELLOW", "RED", "ALERT"},
                 operator_attention=status in {"YELLOW", "RED", "ALERT"},
                 confidence=0.9,
@@ -1576,6 +1591,14 @@ def _project_sitrep_events(conn: sqlite3.Connection, limit: int, force: bool, *,
     return projected
 
 
+def _brevity_payload(raw):
+    try:
+        payload = json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 def _project_commstat_artifacts(conn: sqlite3.Connection, limit: int, force: bool, *, external_keys: Sequence[str] | None = None, source_ids: Sequence[str] | None = None, bundle_sink: ProjectionBundleSink | None = None) -> int:
     if not table_exists(conn, "commstat_artifacts"):
         return 0
@@ -1584,6 +1607,7 @@ def _project_commstat_artifacts(conn: sqlite3.Connection, limit: int, force: boo
     fingerprint = ""
     if not targeted:
         fingerprint = _table_fingerprint(conn, "commstat_artifacts", "COUNT(*)", "MAX(COALESCE(id, 0))", "MAX(COALESCE(event_ts, 0))", "MAX(COALESCE(updated_ts, 0))")
+        fingerprint = content_hash(5, fingerprint)
         if table_exists(conn, "commstat_artifact_deletions"):
             fingerprint = content_hash(fingerprint, _table_fingerprint(conn, "commstat_artifact_deletions", "COUNT(*)", "MAX(COALESCE(deleted_ts, 0))"))
         if _checkpoint_matches(conn, checkpoint_id, fingerprint, force=force):
@@ -1624,6 +1648,12 @@ def _project_commstat_artifacts(conn: sqlite3.Connection, limit: int, force: boo
             external_key = _text(row["artifact_key"]) or _text(row["id"])
             status = _upper(row["status_label"]) or _upper(row["alert_color"]) or "INFO"
             body = _text(row["body_text"]) or _text(row["remarks_text"]) or _text(row["title"])
+            brevity = _brevity_payload(row["payload_json"])
+            records = brevity.get("brevity_models", [])
+            if not isinstance(records, list):
+                records = []
+            interpretation = _text(brevity.get("brevity_summary"))
+            display_body = "\n".join(part for part in (body, interpretation) if part)
             event_ts = _float(row["event_ts"])
             message_id = canonical_station_message_id(
                 "commstat",
@@ -1649,7 +1679,7 @@ def _project_commstat_artifacts(conn: sqlite3.Connection, limit: int, force: boo
             projection = MessageProjectionRecord(
                 message_id=message_id,
                 canonical_key=canonical_message_key("commstat", message_id),
-                content_hash=content_hash(native_projector_version("commstat"), "commstat", external_key, row["updated_ts"], status, body),
+                content_hash=content_hash(native_projector_version("commstat"), "commstat", external_key, row["updated_ts"], status, body, records),
                 primary_source_id=source_id,
                 source_family="commstat",
                 source_label=source.source_label,
@@ -1669,16 +1699,16 @@ def _project_commstat_artifacts(conn: sqlite3.Connection, limit: int, force: boo
                 event_utc=_text(row["event_ts_utc"]) or _utc_from_ts(event_ts),
                 received_utc=_text(row["event_ts_utc"]) or _utc_from_ts(event_ts),
                 subject=_text(row["title"]) or _subject(body),
-                summary=body[:240],
-                body_preview=body[:1200],
-                topics=_topics(body, row["status_label"], row["alert_color"], row["reach_mode"], row["transport_mode"]),
-                entities=_row_entities(row, ("artifact_kind", "subtype", "reach_mode", "transport_mode", "source_count")),
+                summary=display_body[:240],
+                body_preview=display_body[:1200],
+                topics=_topics(body, row["status_label"], row["alert_color"], row["reach_mode"], row["transport_mode"], *intelligence_values(records)),
+                entities={**_row_entities(row, ("artifact_kind", "subtype", "reach_mode", "transport_mode", "source_count")), "brevity_models": records},
                 actionable=status in {"YELLOW", "RED", "ALERT", "WARNING"},
                 operator_attention=status in {"YELLOW", "RED", "ALERT", "WARNING"},
                 confidence=0.9,
                 recommended_action="review" if status in {"YELLOW", "RED", "ALERT", "WARNING"} else "",
                 retention_class="operational",
-                search_text=_search_text(row["from_call"], row["target"], row["report_group"], row["title"], body),
+                search_text=_search_text(row["from_call"], row["target"], row["report_group"], row["title"], display_body),
                 projection_version=native_projector_version("commstat"),
             )
             _emit_projection_bundle(
@@ -2041,7 +2071,7 @@ def _sitrep_subject(row: sqlite3.Row) -> str:
     return " ".join(part for part in parts if part)[:120]
 
 
-def _sitrep_body(row: sqlite3.Row) -> str:
+def _sitrep_body(row: sqlite3.Row, *, include_brevity: bool = True) -> str:
     fields = (
         ("Overall", row["overall_status"]),
         ("Power", row["power"]),
@@ -2059,7 +2089,7 @@ def _sitrep_body(row: sqlite3.Row) -> str:
     parts = [f"{label}: {_text(value)}" for label, value in fields if _text(value)]
     remarks = _text(row["remarks_text"])
     brevity = _text(row["brevity_summary"])
-    if brevity:
+    if brevity and include_brevity:
         parts.append(f"Brevity: {brevity}")
     if remarks:
         parts.append(f"Remarks: {remarks}")

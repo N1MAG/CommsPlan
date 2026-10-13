@@ -179,7 +179,7 @@ def run_reversible_receiver_tune_test(
             restored=None,
             restore_verified=None,
             operator_state="Manual tuning",
-            detail="This receiver does not report the frequency write and readback capabilities required for FIO tuning.",
+            detail="This receiver does not report the frequency write and readback capabilities required for CommsPlan tuning.",
         )
     before = probe.state
     if before is None or before.frequency_hz is None:
@@ -194,7 +194,7 @@ def run_reversible_receiver_tune_test(
             restored=None,
             restore_verified=None,
             operator_state="Connected; verify tuning",
-            detail="FIO could not read the current frequency, so a reversible tuning test was not attempted.",
+            detail="CommsPlan could not read the current frequency, so a reversible tuning test was not attempted.",
         )
 
     tolerance = capabilities.readback_tolerance_hz if tolerance_hz is None else int(tolerance_hz)
@@ -264,7 +264,7 @@ def run_reversible_receiver_tune_test(
     )
     success = tune_ok and restored_ok
     if not restored_ok:
-        restore_warning = "FIO could not verify restoration of the original receiver frequency. Check the receiver before continuing."
+        restore_warning = "CommsPlan could not verify restoration of the original receiver frequency. Check the receiver before continuing."
         failure_detail = f"{failure_detail} {restore_warning}".strip()
     return ReceiverTuneQualification(
         success=success,

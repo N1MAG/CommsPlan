@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import platform
+import re
 import shlex
 import shutil
 import subprocess
@@ -14,6 +15,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from PySide6.QtCore import QObject, QTimer, Signal
 
 from freqinout.core.logger import log
+from freqinout.core.custom_rigctld import parse_custom_rigctld
 from freqinout.core.settings_manager import SettingsManager
 from freqinout.core.software_status_service import SoftwareStatusService
 from freqinout.core.dependency_status_service import (
@@ -32,6 +34,14 @@ from freqinout.core.managed_directory_contract import (
 from freqinout.core.process_window_title import set_process_window_title
 from freqinout.core.station_launch_planner import LaunchPlan, StationLaunchPlanner
 from freqinout.core.varac_launch_recipe import legacy_varac_structured_launch
+from freqinout.core.hardware_lifecycle import (
+    existing_hardware_lifecycle_service,
+    shared_hardware_lifecycle_service,
+)
+from freqinout.core.hardware_projection import (
+    apply_flrig_fltk_serial_projection,
+    build_hardware_launch_projection,
+)
 
 
 LAUNCH_APP_ORDER: List[str] = [
@@ -64,7 +74,9 @@ LAUNCH_ENDPOINT_PREFLIGHT_TIMEOUT_SEC = 15.0
 LAUNCH_ENDPOINT_PREFLIGHT_POLL_MS = 250
 LAUNCH_RADIO_CONTROL_READY_TIMEOUT_SEC = 30.0
 LAUNCH_RADIO_CONTROL_PROBE_INTERVAL_SEC = 1.0
+LAUNCH_SCHEDULE_HANDOFF_TIMEOUT_SEC = 30.0
 LAUNCH_PROCESS_REAPER_INTERVAL_MS = 1000
+HARDWARE_SNAPSHOT_MAX_AGE_SEC = 315.0
 
 
 LAUNCH_APP_META: Dict[str, Dict[str, Any]] = {
@@ -145,6 +157,36 @@ class LaunchOrchestrator(QObject):
     sequence_progress = Signal(object)
     sequence_finished = Signal(object)
 
+    @staticmethod
+    def read_status_recipe_items(db_path, settings_data, radio_id, items, hardware_lifecycle=None):
+        """Worker-only read preview, with no GUI-owned QObject or DB connection.
+
+        Initialize only preview dependencies, not the launch sequencer's timers,
+        shared dependency probes or lifecycle subscriptions. The independent
+        QObject is created and released on this reader's thread. Existing stores
+        open their own read connections; schema assurance belongs to startup.
+        """
+        class CachedSettings:
+            def get(self, key, default=None):
+                return settings_data.get(key, default)
+
+            def all(self):
+                return dict(settings_data)
+
+        preview = LaunchOrchestrator.__new__(LaunchOrchestrator)
+        QObject.__init__(preview)
+        preview.settings = CachedSettings()
+        preview.multi_radio_store = MultiRadioStore(db_path)
+        preview.bundle_store = LaunchBundleStore.__new__(LaunchBundleStore)
+        preview.bundle_store.db_path = db_path
+        preview.planner = StationLaunchPlanner()
+        preview.hardware_lifecycle = hardware_lifecycle
+        preview._last_projection_warnings = {}
+        plan = preview.preview_radio_recipe_plan(
+            radio_id, bundle_override={"launch_enabled": True, "items": items},
+        )
+        return [instance.as_queue_item() for instance in plan.instances]
+
     def __init__(
         self,
         settings: SettingsManager,
@@ -160,6 +202,7 @@ class LaunchOrchestrator(QObject):
         self.bundle_store = bundle_store or LaunchBundleStore(settings.db_path)
         self.multi_radio_store = multi_radio_store or MultiRadioStore(settings.db_path)
         self.planner = StationLaunchPlanner()
+        self.hardware_lifecycle = existing_hardware_lifecycle_service(self.multi_radio_store)
         self._runtime_launch_enabled_override: Optional[bool] = None
         self._runtime_launch_block_reason: str = ""
         self._last_projection_warnings: Dict[int, str] = {}
@@ -177,10 +220,13 @@ class LaunchOrchestrator(QObject):
         self._current_launch_description = ""
         self._current_started_monotonic = 0.0
         self._current_phase = ""
+        self._hardware_preflight_requested: Dict[str, int] = {}
+        self._hardware_preflight_verified: set[str] = set()
         self._endpoint_preflight_verified: set[str] = set()
         self._endpoint_preflight_requested: set[str] = set()
         self._endpoint_preflight_clear: set[str] = set()
         self._sequence_claimed_identities: set[str] = set()
+        self._radio_control_last_evidence: Dict[int, Dict[str, Any]] = {}
         self._radio_control_gate_states: Dict[int, str] = {}
         self._radio_control_probe_due_monotonic: Dict[int, float] = {}
         self._sequence_attribution_candidates: tuple[Mapping[str, Any], ...] = ()
@@ -254,6 +300,38 @@ class LaunchOrchestrator(QObject):
 
     def get_custom_tools(self) -> List[Dict[str, str]]:
         return self.normalize_custom_tools(self.settings.get("custom_tool_items", []))
+
+    @staticmethod
+    def format_script_launch_command(path: str) -> str:
+        """Return a shell-safe command string for a picker-selected script.
+
+        Custom tools retain their historical command-string storage format, but
+        picker-created entries must survive spaces and quoting in paths.  Batch
+        files also need ``cmd.exe`` on Windows because Launch Control uses
+        ``shell=False`` for every process spawn.
+        """
+        script = Path(os.path.expanduser(os.path.expandvars(str(path or "").strip())))
+        script_text = str(script)
+        suffix = script.suffix.casefold()
+        if suffix == ".py":
+            executable = "python" if platform.system() == "Windows" else "python3"
+            parts = [executable, script_text]
+        elif suffix == ".bash":
+            parts = ["bash", script_text]
+        elif suffix == ".sh":
+            parts = [script_text] if script.is_file() and os.access(script, os.X_OK) else ["bash", script_text]
+        elif suffix == ".ps1":
+            if platform.system() == "Windows":
+                parts = ["powershell.exe", "-NoProfile", "-File", script_text]
+            else:
+                parts = ["pwsh", "-NoProfile", "-File", script_text]
+        elif platform.system() == "Windows" and suffix in {".bat", ".cmd"}:
+            parts = ["cmd.exe", "/d", "/c", f'"{script_text}"']
+        else:
+            parts = [script_text]
+        if platform.system() == "Windows":
+            return subprocess.list2cmdline(parts)
+        return shlex.join(parts)
 
     def launch_catalog_order(self, custom_tools: Optional[List[Dict[str, Any]]] = None) -> List[str]:
         names = list(LAUNCH_APP_ORDER)
@@ -917,10 +995,74 @@ class LaunchOrchestrator(QObject):
         for macOS application bundles.
         """
         instances = []
+        hardware_lifecycle = getattr(self, "hardware_lifecycle", None)
+        lifecycle = hardware_lifecycle.latest() if hardware_lifecycle is not None else None
+        hardware_store = getattr(self, "multi_radio_store", None)
         for instance in plan.instances:
             queue_item = instance.as_queue_item()
             command, _description = (None, "operator start") if instance.operator_starts else self._resolve_launch_command(queue_item)
-            instances.append(replace(instance, effective_command=tuple(command or ())))
+            projected = instance
+            radio_id = int(instance.radio_ids[0]) if len(instance.radio_ids) == 1 else 0
+            bundle = (
+                hardware_store.get_radio_hardware_bundle(radio_id)
+                if radio_id > 0
+                and hardware_store is not None
+                and hasattr(hardware_store, "get_radio_hardware_bundle")
+                else None
+            )
+            if bundle:
+                readiness = dict(instance.readiness_policy)
+                projection_key = str(readiness.get("hardware_projection_key", "") or "").strip()
+                if not projection_key:
+                    instances.append(replace(projected, effective_command=tuple(command or ())))
+                    continue
+                if hardware_lifecycle is None and hardware_store is not None:
+                    hardware_lifecycle = shared_hardware_lifecycle_service(hardware_store)
+                    self.hardware_lifecycle = hardware_lifecycle
+                    lifecycle = hardware_lifecycle.latest()
+                snapshot = lifecycle.radios.get(radio_id) if lifecycle is not None else None
+                snapshot_age = (
+                    time.monotonic() - float(lifecycle.captured_monotonic)
+                    if lifecycle is not None
+                    else float("inf")
+                )
+                snapshot_current = bool(
+                    snapshot is not None
+                    and snapshot_age <= HARDWARE_SNAPSHOT_MAX_AGE_SEC
+                    and int(snapshot.bundle_generation) == int(bundle.get("generation", 0) or 0)
+                )
+                if not snapshot_current:
+                    if hardware_lifecycle is not None:
+                        hardware_lifecycle.request_refresh()
+                    readiness["hardware_launch_block"] = (
+                        "Radio hardware evidence is refreshing or stale. Wait a moment and retry."
+                    )
+                else:
+                    projection = build_hardware_launch_projection(
+                        instance.name,
+                        snapshot,
+                        projection_key=projection_key,
+                        receive_only=(
+                            str(instance.execution_scope or "").strip().lower()
+                            == "receive_only"
+                        ),
+                    )
+                    if projection.blocked:
+                        readiness["hardware_launch_block"] = projection.reason
+                    elif projection.environment:
+                        merged_environment = dict(instance.environment)
+                        merged_environment.update(dict(projection.environment))
+                        projected = replace(
+                            projected,
+                            environment=tuple(sorted(merged_environment.items())),
+                        )
+                    readiness["hardware_projection_key"] = projection_key
+                    # Projection proves only that FIO supplied the reviewed
+                    # target. Native post-launch observation is a separate
+                    # qualification and must not be implied here.
+                    readiness["hardware_projected_roles"] = projection.verified_roles
+                projected = replace(projected, readiness_policy=tuple(sorted(readiness.items())))
+            instances.append(replace(projected, effective_command=tuple(command or ())))
         return LaunchPlan(trigger=plan.trigger, scope_radio_id=plan.scope_radio_id, instances=tuple(instances))
 
     def _station_process_attribution_candidates(
@@ -1184,6 +1326,13 @@ class LaunchOrchestrator(QObject):
             ) == "ready"
         launched_here = self._current_launch_process_for_item(item) is not None
         policy = item.get("readiness_policy", {}) if isinstance(item, Mapping) else {}
+        if self._custom_rigctld_identity(item) is not None:
+            info = self._cached_status_for_item(item, force=launched_here)
+            return bool(
+                not info.get("stale", True)
+                and info.get("endpoint_occupied", False)
+                and (self._current_launch_process_is_stable(item) if launched_here else info.get("running", False))
+            )
         if name == "JS8Call":
             if isinstance(policy, Mapping) and not bool(policy.get("require_api", True)):
                 return (
@@ -1284,6 +1433,17 @@ class LaunchOrchestrator(QObject):
             return DEFAULT_LAUNCH_READINESS_TIMEOUT_SEC
         return timeout if timeout > 0 else DEFAULT_LAUNCH_READINESS_TIMEOUT_SEC
 
+    def _custom_rigctld_identity(self, item):
+        name = self._queue_item_name(item)
+        if name in LAUNCH_APP_META:
+            return None
+        raw = str(item.get("launch_command_override", "") or "") if isinstance(item, Mapping) else ""
+        command = raw or self._custom_tool_command(name)
+        arguments = item.get("launch_arguments", ()) if isinstance(item, Mapping) else ()
+        if isinstance(arguments, (list, tuple)) and arguments:
+            command += " " + shlex.join(tuple(str(value) for value in arguments))
+        return parse_custom_rigctld(command)
+
     @staticmethod
     def _has_persisted_endpoint_identity(item: Any) -> bool:
         """Return whether one launch item owns a concrete service endpoint.
@@ -1294,6 +1454,8 @@ class LaunchOrchestrator(QObject):
         authoritative discriminator for the service-bearing applications.
         """
 
+        if isinstance(item, Mapping) and parse_custom_rigctld(str(item.get("launch_command_override") or "")) is not None:
+            return True
         if not isinstance(item, Mapping) or not str(item.get("instance_identity", "") or "").strip():
             return False
         name = LaunchOrchestrator._queue_item_name(item)
@@ -1342,6 +1504,9 @@ class LaunchOrchestrator(QObject):
                 kwargs["fldigi_port_override"] = int(policy.get("port")) if policy.get("port") is not None else None
             except Exception:
                 kwargs["fldigi_port_override"] = None
+        daemon = self._custom_rigctld_identity(item)
+        if daemon is not None:
+            kwargs["instance_identities"] = {name: {"target": shlex.join((daemon.executable, *daemon.arguments))}}
         try:
             snapshot = self.dependency_status.status_snapshot(**kwargs)
         except Exception:
@@ -1436,6 +1601,9 @@ class LaunchOrchestrator(QObject):
 
     def _radio_control_evidence_state(self, item: Any, *, force: bool = False) -> str:
         info = self._cached_radio_control_status(item, force=force)
+        evidence = getattr(self, "_radio_control_last_evidence", {})
+        evidence[self._radio_id_for_item(item)] = dict(info)
+        self._radio_control_last_evidence = evidence
         try:
             checked_at = float(info.get("checked_at", 0.0) or 0.0)
         except (TypeError, ValueError):
@@ -1447,6 +1615,18 @@ class LaunchOrchestrator(QObject):
         if not fresh_for_sequence:
             return "pending"
         return "ready" if bool(info.get("radio_readback_ready", False)) else "unavailable"
+
+    def _log_radio_control_readback_failure(self, item: Any) -> None:
+        radio_id = self._radio_id_for_item(item)
+        info = getattr(self, "_radio_control_last_evidence", {}).get(radio_id, {})
+        log.warning(
+            "LaunchOrchestrator: radio %s last control evidence: source=%s checked_at=%s "
+            "reachable=%s readback_ready=%s online=%s frequency_hz=%s detail=%s",
+            radio_id, info.get("source"), info.get("checked_at"),
+            info.get("reachable"), info.get("radio_readback_ready"),
+            info.get("radio_online"), info.get("frequency_hz"),
+            str(info.get("tooltip") or "")[:300],
+        )
 
     def _radio_control_probe_is_due(self, item: Any, *, immediate: bool = False) -> bool:
         radio_id = self._radio_id_for_item(item)
@@ -1461,6 +1641,29 @@ class LaunchOrchestrator(QObject):
         self._radio_control_probe_due_monotonic = due_by_radio
         return True
 
+    def set_schedule_handoff_provider(self, provider) -> None:
+        """Install the scheduler's cache-only launch acknowledgement reader."""
+        self._schedule_handoff_provider = provider
+
+    def _begin_schedule_handoff(self, item: Any) -> None:
+        radio_id = self._radio_id_for_item(item)
+        self._radio_control_gate_states[radio_id] = "ready"
+        self.sequence_progress.emit({
+            "name": f"{self._radio_name_for_item(item)} control",
+            "status": "ready",
+            "detail": "fresh transceiver and frequency readback received",
+            "counts_toward_total": False,
+            "radio_ids": [radio_id],
+        })
+        self._current_name = f"{self._radio_name_for_item(item)} schedule"
+        self._current_item = item
+        self._current_cmd = None
+        self._current_phase = "radio_schedule_apply"
+        self._current_started_monotonic = time.monotonic()
+        self._poll_timer.setInterval(LAUNCH_ENDPOINT_PREFLIGHT_POLL_MS)
+        self._poll_timer.start()
+        log.info("LaunchOrchestrator: radio %s waiting for current schedule frequency verification", radio_id)
+
     def _begin_radio_control_gate(self, item: Any) -> None:
         radio_id = self._radio_id_for_item(item)
         if radio_id <= 0:
@@ -1473,12 +1676,7 @@ class LaunchOrchestrator(QObject):
             force=self._radio_control_probe_is_due(item, immediate=True),
         )
         if state == "ready":
-            states[radio_id] = "ready"
-            log.info(
-                "LaunchOrchestrator: %s control ready; continuing radio startup stage",
-                self._radio_name_for_item(item),
-            )
-            self._schedule_advance_queue(0)
+            self._begin_schedule_handoff(item)
             return
         self._current_name = f"{self._radio_name_for_item(item)} control"
         self._current_item = item
@@ -1538,6 +1736,54 @@ class LaunchOrchestrator(QObject):
                 return True
         return False
 
+    def _prepare_hardware_native_projection(self, item: Any) -> None:
+        """Apply only an explicitly qualified, exact FLRig native projection."""
+
+        if not isinstance(item, Mapping) or self._queue_item_name(item) != "FLRig":
+            return
+        readiness = item.get("readiness_policy", {})
+        if not isinstance(readiness, Mapping):
+            return
+        projection_key = str(readiness.get("hardware_projection_key", "") or "").strip()
+        if projection_key.casefold() != "flrig:fltk-prefs:v1":
+            return
+        radio_ids = item.get("radio_ids", ())
+        if not isinstance(radio_ids, (list, tuple)) or len(radio_ids) != 1:
+            raise RuntimeError("FLRig hardware projection requires one exact radio owner.")
+        radio_id = int(radio_ids[0])
+        lifecycle = self.hardware_lifecycle.latest()
+        if (
+            lifecycle is None
+            or time.monotonic() - float(lifecycle.captured_monotonic)
+            > HARDWARE_SNAPSHOT_MAX_AGE_SEC
+        ):
+            self.hardware_lifecycle.request_refresh()
+            raise RuntimeError("FLRig hardware evidence is stale; wait for refresh and retry.")
+        snapshot = lifecycle.radios.get(radio_id) if lifecycle is not None else None
+        if snapshot is None:
+            raise RuntimeError("FLRig hardware verification is not available yet.")
+        current_bundle = self.multi_radio_store.get_radio_hardware_bundle(radio_id)
+        if current_bundle is None or int(snapshot.bundle_generation) != int(
+            current_bundle.get("generation", 0) or 0
+        ):
+            self.hardware_lifecycle.request_refresh()
+            raise RuntimeError("FLRig hardware assignment changed; wait for refresh and retry.")
+        cat = next((role for role in snapshot.roles if role.role == "cat"), None)
+        observed = cat.observed_locator if cat is not None else {}
+        locator = str(observed.get("by_id", "") or observed.get("path", "") or "").strip()
+        if cat is None or cat.state not in {"exact", "port_bound", "unstable_confirmed"} or not locator:
+            raise RuntimeError(cat.reason if cat is not None else "FLRig CAT hardware is not assigned.")
+        target_value = str(readiness.get("flrig_preferences_target", "") or "").strip()
+        if not target_value:
+            raise RuntimeError(
+                "FLRig connection is application-managed because no exact qualified preference target was reviewed."
+            )
+        apply_flrig_fltk_serial_projection(
+            Path(target_value),
+            locator,
+            projection_key=projection_key,
+        )
+
     def _post_ready_settle_delay_seconds(self, name: str) -> float:
         if self._index >= len(self._queue):
             return 0.0
@@ -1563,10 +1809,13 @@ class LaunchOrchestrator(QObject):
         self._current_launch_description = ""
         self._current_started_monotonic = 0.0
         self._current_phase = ""
+        self._hardware_preflight_requested = {}
+        self._hardware_preflight_verified = set()
         self._endpoint_preflight_verified = set()
         self._endpoint_preflight_requested = set()
         self._endpoint_preflight_clear = set()
         self._sequence_claimed_identities = set()
+        self._radio_control_last_evidence = {}
         self._radio_control_gate_states = {}
         self._radio_control_probe_due_monotonic = {}
         self._sequence_attribution_candidates = self._station_process_attribution_candidates(
@@ -1701,9 +1950,72 @@ class LaunchOrchestrator(QObject):
         return f"instance:{identity}" if identity else ""
 
     @staticmethod
+    def _hardware_preflight_key(item: Any) -> str:
+        if not isinstance(item, Mapping):
+            return ""
+        readiness = item.get("readiness_policy", {})
+        if not isinstance(readiness, Mapping):
+            return ""
+        projection_key = str(readiness.get("hardware_projection_key", "") or "").strip()
+        radio_ids = item.get("radio_ids", ())
+        if not projection_key or not isinstance(radio_ids, (list, tuple)) or len(radio_ids) != 1:
+            return ""
+        return f"{int(radio_ids[0])}|{projection_key.casefold()}"
+
+    def _fresh_hardware_projection_state(
+        self,
+        item: Any,
+        *,
+        requested_generation: int,
+    ) -> str:
+        """Refresh one queue item's projection from a launch-time generation."""
+
+        if not isinstance(item, dict):
+            return "blocked"
+        lifecycle = self.hardware_lifecycle.latest() if self.hardware_lifecycle is not None else None
+        if lifecycle is None or int(lifecycle.generation) < int(requested_generation):
+            return "pending"
+        readiness = dict(item.get("readiness_policy", {}) or {})
+        readiness.pop("hardware_launch_block", None)
+        projection_key = str(readiness.get("hardware_projection_key", "") or "").strip()
+        radio_ids = item.get("radio_ids", ())
+        radio_id = int(radio_ids[0]) if isinstance(radio_ids, (list, tuple)) and len(radio_ids) == 1 else 0
+        bundle = self.multi_radio_store.get_radio_hardware_bundle(radio_id) if radio_id > 0 else None
+        snapshot = lifecycle.radios.get(radio_id) if bundle is not None else None
+        if bundle is None or snapshot is None:
+            readiness["hardware_launch_block"] = "Fresh radio hardware evidence is unavailable."
+            item["readiness_policy"] = readiness
+            return "blocked"
+        if int(snapshot.bundle_generation) != int(bundle.get("generation", 0) or 0):
+            readiness["hardware_launch_block"] = "The radio hardware assignment changed before launch."
+            item["readiness_policy"] = readiness
+            return "blocked"
+        projection = build_hardware_launch_projection(
+            self._queue_item_name(item),
+            snapshot,
+            projection_key=projection_key,
+            receive_only=str(item.get("execution_scope", "") or "").strip().lower()
+            == "receive_only",
+        )
+        if projection.blocked:
+            readiness["hardware_launch_block"] = projection.reason
+            item["readiness_policy"] = readiness
+            return "blocked"
+        environment = dict(item.get("environment", {}) or {})
+        environment.update(dict(projection.environment))
+        item["environment"] = environment
+        readiness["hardware_projected_roles"] = projection.verified_roles
+        readiness["hardware_inventory_generation"] = int(lifecycle.generation)
+        item["readiness_policy"] = readiness
+        return "ready"
+
+    @staticmethod
     def _endpoint_preflight_key(item: Any) -> str:
         if not LaunchOrchestrator._has_persisted_endpoint_identity(item):
             return ""
+        daemon = parse_custom_rigctld(str(item.get("launch_command_override") or ""))
+        if daemon is not None:
+            return "custom-rigctld:" + shlex.join((daemon.executable, *daemon.arguments))
         policy = item.get("readiness_policy", {})
         identity = str(item.get("instance_identity", "") or "").strip()
         name = LaunchOrchestrator._queue_item_name(item)
@@ -1743,6 +2055,8 @@ class LaunchOrchestrator(QObject):
         )
         if not evidence_complete:
             return "pending"
+        if self._custom_rigctld_identity(item) is not None:
+            return "occupied" if bool(info.get("endpoint_occupied", False)) else "clear"
         return "occupied" if bool(info.get("reachable", False)) else "clear"
 
     def _advance_queue(self) -> None:
@@ -1773,6 +2087,53 @@ class LaunchOrchestrator(QObject):
         name = self._queue_item_name(queue_item)
         if not name:
             self._index += 1
+            self._schedule_advance_queue(0)
+            return
+        hardware_preflight_key = self._hardware_preflight_key(queue_item)
+        if (
+            hardware_preflight_key
+            and hardware_preflight_key not in self._hardware_preflight_verified
+        ):
+            requested_generation = self._hardware_preflight_requested.get(
+                hardware_preflight_key,
+                0,
+            )
+            if requested_generation <= 0:
+                if self.hardware_lifecycle is None:
+                    self.hardware_lifecycle = shared_hardware_lifecycle_service(
+                        self.multi_radio_store
+                    )
+                requested_generation = self.hardware_lifecycle.request_refresh()
+                self._hardware_preflight_requested[hardware_preflight_key] = requested_generation
+            hardware_state = self._fresh_hardware_projection_state(
+                queue_item,
+                requested_generation=requested_generation,
+            )
+            if hardware_state == "pending":
+                self._current_name = name
+                self._current_item = queue_item
+                self._current_cmd = None
+                self._current_phase = "hardware_preflight"
+                self._current_started_monotonic = time.monotonic()
+                self._poll_timer.setInterval(LAUNCH_ENDPOINT_PREFLIGHT_POLL_MS)
+                self._poll_timer.start()
+                return
+            self._hardware_preflight_verified.add(hardware_preflight_key)
+        readiness = queue_item.get("readiness_policy", {}) if isinstance(queue_item, Mapping) else {}
+        hardware_block = (
+            str(readiness.get("hardware_launch_block", "") or "").strip()
+            if isinstance(readiness, Mapping)
+            else ""
+        )
+        if hardware_block:
+            self._index += 1
+            result = self._result_for(
+                queue_item,
+                status="failed",
+                detail=f"hardware launch blocked: {hardware_block}",
+            )
+            self._results.append(result)
+            self.sequence_progress.emit(result)
             self._schedule_advance_queue(0)
             return
         if isinstance(queue_item, Mapping) and bool(
@@ -1853,7 +2214,7 @@ class LaunchOrchestrator(QObject):
         legacy_js8_profile = self._legacy_default_js8_profile_conflict(queue_item)
         if legacy_js8_profile:
             detail = (
-                "an older FIO-generated JS8Call profile is still running "
+                "an older CommsPlan-generated JS8Call profile is still running "
                 f"({legacy_js8_profile}); close that JS8Call window or process, "
                 "then choose Launch again to start the configured default profile"
             )
@@ -1916,10 +2277,13 @@ class LaunchOrchestrator(QObject):
                             "LaunchOrchestrator: JS8 endpoint persistence failed: %s",
                             storage_exc,
                         )
+                daemon = self._custom_rigctld_identity(queue_item)
+                owned = daemon is None or self._program_ready_for_sequence(queue_item)
                 result = self._result_for(
                     queue_item,
-                    status="already_running",
-                    detail="configured endpoint is already active",
+                    status="already_running" if owned else "failed",
+                    detail=("configured endpoint is already active" if owned else
+                            "rigctld endpoint is occupied by an unverified process; duplicate launch skipped"),
                 )
                 self._results.append(result)
                 if sequence_identity:
@@ -1984,10 +2348,13 @@ class LaunchOrchestrator(QObject):
                 "LaunchOrchestrator: skipped %s launch because its exact configured process is active",
                 name,
             )
+            daemon = self._custom_rigctld_identity(queue_item)
+            verified = daemon is None or self._program_ready_for_sequence(queue_item)
             result = self._result_for(
                 queue_item,
-                status="already_running",
-                detail="exact configured process is already active",
+                status="already_running" if verified else "failed",
+                detail=("exact configured process is already active" if verified else
+                        "configured rigctld is running; readback unverified, duplicate launch skipped"),
             )
             self._results.append(result)
             if sequence_identity:
@@ -2098,6 +2465,7 @@ class LaunchOrchestrator(QObject):
             self._schedule_advance_queue(0)
             return
         try:
+            self._prepare_hardware_native_projection(queue_item)
             self._materialize_item_managed_directories(queue_item)
             creationflags = 0
             if platform.system() == "Windows":
@@ -2231,7 +2599,10 @@ class LaunchOrchestrator(QObject):
         if not isinstance(radio_names, (list, tuple)) or len(radio_names) != 1:
             return ""
         if name == "JS8Call":
-            if str(item.get("rig_name_source", "") or "").strip() != "legacy_default":
+            if str(item.get("rig_name_source", "") or "").strip() not in {
+                "legacy_default",
+                "settings_default",
+            }:
                 return ""
             # The legacy/default JS8 namespace must launch without
             # --rig-name so it continues to read the operator's configured
@@ -2493,6 +2864,35 @@ class LaunchOrchestrator(QObject):
             self._schedule_advance_queue(0)
             return
         elapsed = max(0.0, time.monotonic() - self._current_started_monotonic)
+        if self._current_phase == "radio_schedule_apply":
+            radio_id = self._radio_id_for_item(self._current_item)
+            try:
+                provider = getattr(self, "_schedule_handoff_provider", None)
+                status = provider(radio_id) if callable(provider) else "blocked"
+            except Exception:
+                log.exception("LaunchOrchestrator: radio %s schedule acknowledgement failed", radio_id)
+                status = "blocked"
+            if status in {"ready", "not_required"} or status == "blocked" or elapsed >= LAUNCH_SCHEDULE_HANDOFF_TIMEOUT_SEC:
+                self._poll_timer.stop()
+                passed = status in {"ready", "not_required"}
+                if not passed:
+                    self._radio_control_gate_states[radio_id] = "blocked"
+                (log.info if passed else log.warning)(
+                        "LaunchOrchestrator: radio %s schedule handoff %s", radio_id,
+                        status if passed else "unavailable; dependent apps blocked")
+                self.sequence_progress.emit({
+                    "name": name, "status": "schedule_ready" if passed else "schedule_unavailable",
+                    "detail": ("current frequency verified" if status == "ready" else
+                               "automatic frequency change not required" if passed else
+                               "current schedule frequency could not be verified"),
+                    "counts_toward_total": False, "radio_ids": [radio_id],
+                })
+                self._current_name = None
+                self._current_item = None
+                self._current_cmd = None
+                self._current_phase = ""
+                self._schedule_advance_queue(0)
+            return
         if self._current_phase == "radio_control_gate":
             item = self._current_item or {}
             radio_id = self._radio_id_for_item(item)
@@ -2502,28 +2902,10 @@ class LaunchOrchestrator(QObject):
             )
             if state == "ready":
                 self._poll_timer.stop()
-                self._radio_control_gate_states[radio_id] = "ready"
-                radio_name = self._radio_name_for_item(item)
-                log.info(
-                    "LaunchOrchestrator: %s control ready; continuing radio startup stage",
-                    radio_name,
-                )
-                self.sequence_progress.emit(
-                    {
-                        "name": f"{radio_name} control",
-                        "status": "ready",
-                        "detail": "fresh radio frequency readback received",
-                        "counts_toward_total": False,
-                        "radio_ids": [radio_id],
-                    }
-                )
-                self._current_name = None
-                self._current_item = None
-                self._current_cmd = None
-                self._current_phase = ""
-                self._schedule_advance_queue(0)
+                self._begin_schedule_handoff(item)
                 return
             if elapsed >= LAUNCH_ENDPOINT_PREFLIGHT_TIMEOUT_SEC:
+                self._log_radio_control_readback_failure(item)
                 self._poll_timer.stop()
                 self._radio_control_gate_states[radio_id] = "blocked"
                 radio_name = self._radio_name_for_item(item)
@@ -2537,7 +2919,7 @@ class LaunchOrchestrator(QObject):
                         and str(result.get("status", "") or "") == "already_running"
                     ):
                         result["status"] = "timeout"
-                        result["detail"] = "application is running, but radio frequency readback is unavailable"
+                        result["detail"] = "application is running, but radio-control readback is unavailable"
                 log.warning(
                     "LaunchOrchestrator: %s control unavailable; remaining radio apps will be skipped",
                     radio_name,
@@ -2546,7 +2928,7 @@ class LaunchOrchestrator(QObject):
                     {
                         "name": f"{radio_name} control",
                         "status": "unavailable",
-                        "detail": "fresh radio frequency readback was not available",
+                        "detail": "fresh transceiver and frequency readback was not available",
                         "counts_toward_total": False,
                         "radio_ids": [radio_id],
                     }
@@ -2557,6 +2939,32 @@ class LaunchOrchestrator(QObject):
                 self._current_phase = ""
                 self._schedule_advance_queue(0)
                 return
+            return
+        if self._current_phase == "hardware_preflight":
+            item = self._current_item or {}
+            hardware_key = self._hardware_preflight_key(item)
+            requested_generation = self._hardware_preflight_requested.get(hardware_key, 0)
+            state = self._fresh_hardware_projection_state(
+                item,
+                requested_generation=requested_generation,
+            )
+            if state == "pending" and elapsed < LAUNCH_ENDPOINT_PREFLIGHT_TIMEOUT_SEC:
+                return
+            if state == "pending":
+                readiness = dict(item.get("readiness_policy", {}) or {})
+                readiness["hardware_launch_block"] = (
+                    "Fresh radio hardware evidence was not available before the launch deadline."
+                )
+                if isinstance(item, dict):
+                    item["readiness_policy"] = readiness
+            self._poll_timer.stop()
+            if hardware_key:
+                self._hardware_preflight_verified.add(hardware_key)
+            self._current_name = None
+            self._current_item = None
+            self._current_cmd = None
+            self._current_phase = ""
+            self._schedule_advance_queue(0)
             return
         if self._current_phase == "endpoint_preflight":
             item = self._current_item or name
@@ -2742,14 +3150,7 @@ class LaunchOrchestrator(QObject):
             result = self._result_for(self._current_item or name, status="launched", detail=detail)
             self._results.append(result)
             ready_item = self._current_item
-            if (
-                isinstance(ready_item, Mapping)
-                and bool(ready_item.get("radio_control_gate_required", False))
-                and name == str(ready_item.get("radio_control_app", "") or "").strip()
-            ):
-                radio_id = self._radio_id_for_item(ready_item)
-                if radio_id > 0:
-                    self._radio_control_gate_states[radio_id] = "ready"
+            control_ready = self._is_gated_radio_control_app(ready_item)
             self.sequence_progress.emit(result)
             self._current_name = None
             self._current_item = None
@@ -2757,7 +3158,10 @@ class LaunchOrchestrator(QObject):
             self._current_process = None
             self._current_launch_description = ""
             self._current_phase = ""
-            self._schedule_advance_queue(int(delay_sec * 1000.0))
+            if control_ready:
+                self._begin_schedule_handoff(ready_item)
+            else:
+                self._schedule_advance_queue(int(delay_sec * 1000.0))
             return
         readiness_timeout = float(self._wait_timeout_sec)
         if (
@@ -2767,6 +3171,8 @@ class LaunchOrchestrator(QObject):
         ):
             readiness_timeout = min(readiness_timeout, LAUNCH_RADIO_CONTROL_READY_TIMEOUT_SEC)
         if elapsed >= readiness_timeout:
+            if self._is_gated_radio_control_app(self._current_item):
+                self._log_radio_control_readback_failure(self._current_item)
             self._poll_timer.stop()
             result = self._result_for(
                 self._current_item or name,
@@ -2862,6 +3268,13 @@ class LaunchOrchestrator(QObject):
         """Return exact process state, or ``None`` when it cannot be proven."""
 
         name = self._queue_item_name(item)
+        daemon = self._custom_rigctld_identity(item)
+        if daemon is not None:
+            records = self._launch_process_records()
+            inventory = {} if records is None else {"process_records": records}
+            return bool(self.status.cached_program_instance_running(
+                "RigCtlD", daemon.executable, daemon.arguments, **inventory,
+            ))
         if isinstance(item, Mapping) and item.get("instance_identity"):
             target = str(
                 item.get("launch_command_override", "")
@@ -3219,6 +3632,21 @@ class LaunchOrchestrator(QObject):
         return None
 
     def _command_from_freeform(self, raw: str) -> Optional[List[str]]:
+        if platform.system() == "Windows":
+            # Picker-created batch commands carry a literal quoted /c target.
+            # shlex(posix=False) treats the escaped quotes and spaces as
+            # separate tokens, so recover this narrow command shape directly.
+            match = re.match(r"^\s*cmd(?:\.exe)?\s+/d\s+/c\s+(.+?)\s*$", raw, re.IGNORECASE)
+            if match:
+                target = match.group(1).strip()
+                if target.startswith('"') and target.endswith('"'):
+                    target = target[1:-1].replace('\\"', '"')
+                elif target.startswith('\\"') and target.endswith('\\"'):
+                    target = target[2:-2]
+                if target:
+                    if not (target.startswith('"') and target.endswith('"')):
+                        target = f'"{target}"'
+                    return ["cmd.exe", "/d", "/c", target]
         try:
             parts = shlex.split(raw, posix=platform.system() != "Windows")
             if not parts:
@@ -3249,6 +3677,17 @@ class LaunchOrchestrator(QObject):
         txt = str(token or "")
         if not txt:
             return ""
+        # ``shlex.split(..., posix=False)`` intentionally preserves the
+        # surrounding quotes that protect Windows paths with spaces.  Popen
+        # receives argv tokens, so remove only those outer balancing quotes;
+        # embedded quotes remain part of the token.
+        if (
+            platform.system() == "Windows"
+            and len(txt) >= 2
+            and txt[0] == txt[-1]
+            and txt[0] in {"\"", "'"}
+        ):
+            txt = txt[1:-1]
         # Expand user/env paths for shell=False launches so copied desktop-style
         # command values behave consistently in Launch Control.
         if "=" in txt and not txt.startswith("-"):
@@ -3266,6 +3705,18 @@ class LaunchOrchestrator(QObject):
         if suffix == ".py":
             py_cmd = "python" if platform.system() == "Windows" else "python3"
             return [py_cmd, str(path)]
+        if suffix == ".bash":
+            return ["bash", str(path)]
+        if suffix == ".sh":
+            return [str(path)] if os.access(path, os.X_OK) else ["bash", str(path)]
+        if suffix == ".ps1":
+            if platform.system() == "Windows":
+                return ["powershell.exe", "-NoProfile", "-File", str(path)]
+            return ["pwsh", "-NoProfile", "-File", str(path)]
+        if platform.system() == "Windows" and suffix in {".bat", ".cmd"}:
+            # ``shell=False`` cannot execute cmd scripts directly through
+            # CreateProcess; keep the launch safe and explicit instead.
+            return ["cmd.exe", "/d", "/c", f'"{path}"']
         return [str(path)]
 
     @staticmethod
@@ -3439,10 +3890,13 @@ class LaunchOrchestrator(QObject):
         self._current_launch_description = ""
         self._current_started_monotonic = 0.0
         self._current_phase = ""
+        self._hardware_preflight_requested = {}
+        self._hardware_preflight_verified = set()
         self._endpoint_preflight_verified = set()
         self._endpoint_preflight_requested = set()
         self._endpoint_preflight_clear = set()
         self._sequence_claimed_identities = set()
+        self._radio_control_last_evidence = {}
         self._radio_control_gate_states = {}
         self._radio_control_probe_due_monotonic = {}
         self._sequence_attribution_candidates = ()

@@ -17,12 +17,17 @@ REQUIRED_INPUTS = (
     "packaging/pyinstaller_runtime_qt.py",
     "packaging/linux/freqinout.desktop",
     "packaging/build_macos_dmg.py",
+    "docs/CommsPlan-macos-upgrade.txt",
+    "docs/CommsPlan-migration.md",
     "packaging/build_release_notes.py",
     "packaging/prepare_release_assets.py",
     "packaging/macos/entitlements.plist",
-    "assets/FreqInOut.ico",
-    "assets/FreqInOut-desktop.png",
-    "assets/FreqInOut_logo.png",
+    "assets/CommsPlan.ico",
+    "assets/CommsPlan.icns",
+    "assets/CommsPlan-desktop.png",
+    "assets/CommsPlan_logo.png",
+    "start-commsplan.sh",
+    "start-commsplan.cmd",
 )
 
 
@@ -59,7 +64,7 @@ def validated_version(root: Path = ROOT, *, expected_tag: str = "") -> str:
         ),
         "guide": _match(
             root / "docs/guide.html",
-            r"Current version</strong>:\s*([^<\s]+)",
+            r"(?:Current version|Latest public release)</strong>:\s*(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z][0-9A-Za-z.-]*)?)",
             "guide version",
         ),
     }

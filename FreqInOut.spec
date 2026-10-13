@@ -2,7 +2,8 @@
 
 from pathlib import Path
 import os
-import re
+import json
+import runpy
 import sys
 
 import PySide6
@@ -10,18 +11,24 @@ import PySide6
 
 ROOT = Path(SPECPATH)
 QT_ROOT = Path(PySide6.__file__).resolve().parent / "Qt"
-APP_VERSION = re.search(
-    r'^__version__\s*=\s*["\']([^"\']+)["\']',
-    (ROOT / "freqinout" / "version.py").read_text(encoding="utf-8"),
-    re.MULTILINE,
-).group(1)
+# Validate the same release inputs used by workflow/package builders before freezing.
+APP_VERSION = runpy.run_path(str(ROOT / "packaging" / "verify_release_inputs.py"))[
+    "validated_version"
+](ROOT)
+# PyInstaller injects the build directory as lowercase `workpath`.
+PRODUCT_METADATA = Path(workpath) / "commsplan-product.json"
+PRODUCT_METADATA.parent.mkdir(parents=True, exist_ok=True)
+PRODUCT_METADATA.write_text(
+    json.dumps({"product": "CommsPlan", "version": APP_VERSION, "legacy_product": "FreqInOut"}) + "\n",
+    encoding="utf-8",
+)
 MACOS_CODESIGN_IDENTITY = os.environ.get("FIO_CODESIGN_IDENTITY") or None
 MACOS_ENTITLEMENTS = (
     str(ROOT / "packaging" / "macos" / "entitlements.plist")
     if MACOS_CODESIGN_IDENTITY
     else None
 )
-MACOS_ICON = ROOT / "assets" / "FreqInOut.icns"
+MACOS_ICON = ROOT / "assets" / "CommsPlan.icns"
 
 
 def qml_module_files(module_name):
@@ -69,6 +76,7 @@ a = Analysis(
     pathex=['.'],
     binaries=qt_plugin_binaries,
     datas=[
+        (str(PRODUCT_METADATA), "."),
         ('freqinout/gui/qml', 'freqinout/gui/qml'),
         ('freqinout/resources/spotter_forms', 'freqinout/resources/spotter_forms'),
         ('config/leaflet', 'config/leaflet'),
@@ -79,6 +87,7 @@ a = Analysis(
         ('config/shortwave/eibi', 'config/shortwave/eibi'),
         ('assets', 'assets'),
         ('docs/guide.html', 'docs'),
+        ('docs/CommsPlan-migration.md', 'docs'),
         ('third_party/js8net/js8net-main/js8net.py', 'third_party/js8net/js8net-main'),
         ('third_party/js8net/js8net-main/LICENSE', 'third_party/js8net/js8net-main'),
     ] + qt_qml_datas,
@@ -96,6 +105,7 @@ a = Analysis(
         "keyring.backends.macOS",
         "keyring.backends.SecretService",
         "keyring.backends.Windows",
+        "freqinout.core.mesh.linux_ble_supervisor",
     ],
     hookspath=[],
     hooksconfig={},
@@ -111,7 +121,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='FreqInOut',
+    name='CommsPlan',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -123,7 +133,7 @@ exe = EXE(
     codesign_identity=MACOS_CODESIGN_IDENTITY,
     entitlements_file=MACOS_ENTITLEMENTS,
     icon=(
-        'assets/FreqInOut.ico'
+        'assets/CommsPlan.ico'
         if sys.platform == 'win32'
         else str(MACOS_ICON) if sys.platform == 'darwin' and MACOS_ICON.is_file() else None
     ),
@@ -135,21 +145,21 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name='FreqInOut',
+    name='CommsPlan',
 )
 
 if sys.platform == 'darwin':
     app = BUNDLE(
         coll,
-        name='FreqInOut.app',
+        name='CommsPlan.app',
         icon=str(MACOS_ICON) if MACOS_ICON.is_file() else None,
         bundle_identifier='org.n1mag.freqinout',
         version=APP_VERSION,
         codesign_identity=MACOS_CODESIGN_IDENTITY,
         entitlements_file=MACOS_ENTITLEMENTS,
         info_plist={
-            'CFBundleDisplayName': 'FreqInOut',
-            'CFBundleName': 'FreqInOut',
+            'CFBundleDisplayName': 'CommsPlan',
+            'CFBundleName': 'CommsPlan',
             'CFBundleShortVersionString': APP_VERSION,
             'CFBundleVersion': APP_VERSION,
             'LSApplicationCategoryType': 'public.app-category.utilities',

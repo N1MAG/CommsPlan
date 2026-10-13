@@ -13,6 +13,7 @@ import psutil
 
 from freqinout.core.dependency_health import get_dependency_health_registry
 from freqinout.core.logger import log
+from freqinout.core.custom_rigctld import parse_custom_rigctld
 from freqinout.radio_interface.js8_api_client import JS8ApiClient, JS8ApiEndpoint
 
 
@@ -93,6 +94,7 @@ STATUS_KEYS: Sequence[str] = (
 
 JS8_DEFAULT_HOST = "127.0.0.1"
 JS8_DEFAULT_PORT = 2442
+JS8_HEALTH_SLOW_MS = 2500.0
 FLRIG_DEFAULT_HOST = "127.0.0.1"
 FLRIG_DEFAULT_PORT = 12345
 RIGCTLD_DEFAULT_HOST = "127.0.0.1"
@@ -651,6 +653,61 @@ class SoftwareStatusService:
             return True
         return False
 
+    def cached_instance_process_state(
+        self, program_name: str, configured_target: str,
+        expected_arguments: Sequence[object] = (), *, max_age_s: float = 30.0,
+        default_ini: str = "",
+    ) -> Dict[str, object]:
+        """Bounded attribution from the existing inventory; never walk processes.
+
+        Unknown/ambiguous identity is distinct from a fresh observed absence.
+        The original inventory timestamp must survive downstream publications.
+        """
+        cls = type(self)
+        with cls._shared_proc_lock:
+            stamp = float(cls._shared_proc_snapshot_ts or 0.0)
+            records = tuple(cls._shared_proc_records)
+        result: Dict[str, object] = {"running": None, "checked_monotonic": stamp}
+        age = time.monotonic() - stamp
+        if not configured_target or stamp <= 0 or not 0 <= age <= max_age_s:
+            return result
+        # This API takes a literal executable path, not a launch command.
+        target = self._normalized_process_argument(configured_target)
+        family = set(self._target_tokens(program_name))
+        matches = []
+        for record in records:
+            if (expected_arguments or default_ini) and not record.get("cmdline"):
+                continue
+            ini_tokens = [str(value) for value in record.get("cmdline", ())
+                          if str(value).lower().endswith(".ini")]
+            if default_ini and ini_tokens and not self._process_arguments_match(ini_tokens, (default_ini,)):
+                continue
+            tokens = (record.get("name", ""), record.get("exe", ""), *record.get("cmd_tokens", ()))
+            paths = (record.get("exe_path", ""), *record.get("cmd_paths", ()))
+            if (self._process_record_is_active(record)
+                    and any(self._matches_target_process_name(str(token), family) for token in tokens)
+                    and any(self._normalized_process_argument(path) == target for path in paths if path)
+                    and self._process_arguments_match(record.get("cmdline", ()), expected_arguments)):
+                matches.append(record)
+        pids = {record.get("pid") for record in matches}
+        if len(pids) == 1 and None not in pids and 0 not in pids:
+            result["running"] = True
+        elif not matches:
+            # A family process with unreadable attribution is not proof that
+            # this radio's instance is stopped.
+            family = self._target_tokens(program_name)
+            unknown = any(
+                self._process_record_is_active(record)
+                and any(self._matches_target_process_name(str(token), set(family))
+                    for token in (record.get("name", ""), record.get("exe", ""), *record.get("cmd_tokens", ())))
+                and (not (record.get("exe_path") or record.get("cmd_paths"))
+                     or ((expected_arguments or default_ini) and not record.get("cmdline")))
+                for record in records
+            )
+            if not unknown:
+                result["running"] = False
+        return result
+
     def program_instance_running(
         self,
         program_name: str,
@@ -741,7 +798,8 @@ class SoftwareStatusService:
         cls._shared_js8_api_cache[cache_key] = (self._js8_api_cache_ts, self._js8_api_cache_ok)
         elapsed_ms = (time.monotonic() - started) * 1000.0
         if reachable:
-            self._health.record_success(health_key, owner="SoftwareStatusService", duration_ms=elapsed_ms)
+            self._health.record_success(health_key, owner="SoftwareStatusService", duration_ms=elapsed_ms,
+                                        slow_ms=JS8_HEALTH_SLOW_MS)
         else:
             self._health.record_failure(
                 health_key,
@@ -800,6 +858,7 @@ class SoftwareStatusService:
                 health_key,
                 owner="SoftwareStatusService",
                 duration_ms=elapsed_ms,
+                slow_ms=JS8_HEALTH_SLOW_MS,
                 metadata=metadata,
             )
         elif running:
@@ -966,6 +1025,7 @@ class SoftwareStatusService:
                         health_key,
                         owner="SoftwareStatusService",
                         duration_ms=capability_elapsed_ms,
+                        slow_ms=JS8_HEALTH_SLOW_MS,
                         metadata=metadata,
                     )
                 else:
@@ -1189,13 +1249,13 @@ class SoftwareStatusService:
         mode = str(status.get("mode", "offline") or "offline").strip()
         version_part = f" Version: {version}." if version else ""
         if mode == "api_full":
-            return f"JS8Call API is ready for native FIO diagnostics at {endpoint}.{version_part}"
+            return f"JS8Call API is ready for native CommsPlan diagnostics at {endpoint}.{version_part}"
         if mode == "api_basic":
-            return f"JS8Call API is reachable at {endpoint}; FIO will use basic API features and keep fallbacks available.{version_part}"
+            return f"JS8Call API is reachable at {endpoint}; CommsPlan will use basic API features and keep fallbacks available.{version_part}"
         if mode == "file_fallback":
-            return f"JS8Call is reachable at {endpoint}, but native API support is limited; FIO will keep using log/database fallbacks.{version_part}"
+            return f"JS8Call is reachable at {endpoint}, but native API support is limited; CommsPlan will keep using log/database fallbacks.{version_part}"
         if running:
-            return f"JS8Call appears to be running, but FIO could not verify the TCP API at {endpoint}."
+            return f"JS8Call appears to be running, but CommsPlan could not verify the TCP API at {endpoint}."
         return "JS8Call is not running; no JS8 API check is needed right now."
 
     def flrig_api_reachable(
@@ -1311,7 +1371,7 @@ class SoftwareStatusService:
         reason = str((health or {}).get("last_error") or "").strip()
         suffix = ""
         if degraded and cooldown > 0:
-            suffix = f" FIO is backing off for {cooldown:.0f}s to keep the UI responsive."
+            suffix = f" CommsPlan is backing off for {cooldown:.0f}s to keep the UI responsive."
         elif degraded and reason:
             suffix = f" Last issue: {reason}."
         if reachable:
@@ -1594,6 +1654,41 @@ class SoftwareStatusService:
                 "running": bool(running),
             }
 
+        # Custom daemon names are labels, not executable names. Native
+        # rigctld commands provide explicit per-radio process and endpoint
+        # identity without interpreting arbitrary launcher scripts.
+        for name, identity in identities.items():
+            if name in out or not isinstance(identity, Mapping):
+                continue
+            command = str(identity.get("target") or "")
+            extra_arguments = identity.get("arguments", ())
+            if isinstance(extra_arguments, (list, tuple)) and extra_arguments:
+                command += " " + shlex.join(tuple(str(value) for value in extra_arguments))
+            daemon = parse_custom_rigctld(command)
+            if daemon is None:
+                continue
+            from freqinout.radio_interface.rigctl_client import RigctldClient
+            running = self.program_instance_running(
+                "RigCtlD", daemon.executable, daemon.arguments,
+            )
+            frequency = RigctldClient(
+                host=daemon.host, port=daemon.port, timeout=0.8,
+            ).get_vfo_frequency()
+            ready = isinstance(frequency, (int, float)) and frequency > 0
+            out[name] = {
+                "running": running,
+                "reachable": bool(running and ready),
+                "radio_readback_ready": bool(running and ready),
+                "endpoint_occupied": bool(ready),
+                "state": "ok" if running and ready else "warning" if running else "idle",
+                "frequency_hz": frequency if ready else None,
+                "tooltip": f"rigctld {daemon.host}:{daemon.port}: " + (
+                    "radio frequency verified" if running and ready else
+                    "process running, radio readback unavailable" if running else
+                    "configured daemon not running"
+                ),
+            }
+
         if verify_control_readback:
             readback_key = {
                 "FLRIG": "FLRig",
@@ -1610,11 +1705,9 @@ class SoftwareStatusService:
                     flrig_client = FLRigClient(
                         host=flrig_host,
                         port=flrig_port,
-                        timeout=0.8,
+                        timeout=1.5,
                     )
-                    transceiver_name = flrig_client.get_live_transceiver_name()
-                    if transceiver_name:
-                        frequency_hz = flrig_client.get_vfo_frequency()
+                    transceiver_name, frequency_hz = flrig_client.get_launch_readback()
                 elif readback_key == "RigCtlD" and rigctld_api_ok:
                     from freqinout.radio_interface.rigctl_client import RigctldClient
 
@@ -1659,9 +1752,13 @@ class SoftwareStatusService:
                     row["transceiver_name"] = transceiver_name or ""
                 if bool(row.get("reachable")) and not ready:
                     reason = (
-                        "FLRig reports that its transceiver is offline."
+                        "FLRig XML-RPC is ready, but no online transceiver is reported."
                         if readback_key == "FLRig" and not transceiver_name
-                        else "Radio frequency readback is unavailable."
+                        else (
+                            f"FLRig reports {transceiver_name}, but radio frequency readback is unavailable."
+                            if readback_key == "FLRig"
+                            else "Radio frequency readback is unavailable."
+                        )
                     )
                     row["tooltip"] = (
                         str(row.get("tooltip", "") or "").rstrip(". ")

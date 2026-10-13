@@ -14,7 +14,7 @@ PIXMAP_ICON="$HOME/.local/share/pixmaps/freqinout.png"
 
 usage() {
   cat <<'EOF'
-FreqInOut Linux Uninstaller
+CommsPlan Linux Uninstaller (legacy filename)
 
 Usage:
   bash uninstall_FreqInOut_linux.sh
@@ -30,9 +30,9 @@ Options:
 EOF
 }
 
-log() { echo "[FreqInOut] $*"; }
-warn() { echo "[FreqInOut] WARNING: $*" >&2; }
-die() { echo "[FreqInOut] ERROR: $*" >&2; exit 1; }
+log() { echo "[CommsPlan] $*"; }
+warn() { echo "[CommsPlan] WARNING: $*" >&2; }
+die() { echo "[CommsPlan] ERROR: $*" >&2; exit 1; }
 expand_path() { local raw="$1"; echo "${raw/#\~/$HOME}"; }
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
@@ -100,6 +100,17 @@ setup_logging() {
   fi
   log "Logging to $LOG_FILE"
   [[ $DRY_RUN -eq 1 ]] && log "Dry-run mode enabled; nothing will be deleted."
+  return 0
+}
+
+integration_belongs_to_install() {
+  local target="$1"
+  if [[ "$target" == *.desktop ]]; then
+    grep -Fxq -- "Path=$INSTALL_DIR" "$target"
+  else
+    grep -Fxq -- "# CommsPlan installation: $INSTALL_DIR" "$target" ||
+      grep -Fxq -- "cd $(printf '%q' "$INSTALL_DIR")" "$target"
+  fi
 }
 
 remove_desktop_items() {
@@ -110,15 +121,25 @@ remove_desktop_items() {
     [[ -n "$candidate" ]] && desktop_dir="$candidate"
   fi
 
-  [[ -f "$DESKTOP_ENTRY_PATH" ]] && run_cmd rm -f "$DESKTOP_ENTRY_PATH"
-  [[ -f "$LAUNCHER_PATH" ]] && run_cmd rm -f "$LAUNCHER_PATH"
+  local owns_icons=0
+  if [[ -f "$DESKTOP_ENTRY_PATH" ]] && integration_belongs_to_install "$DESKTOP_ENTRY_PATH"; then
+    owns_icons=1
+    run_cmd rm -f "$DESKTOP_ENTRY_PATH"
+  fi
+  for command_path in "$LAUNCHER_PATH" "$HOME/.local/bin/commsplan"; do
+    if [[ -f "$command_path" ]] && integration_belongs_to_install "$command_path"; then
+      run_cmd rm -f "$command_path"
+    fi
+  done
   local size
   for size in 64 128 256 512 1024; do
     local icon_path="$ICON_THEME_ROOT/${size}x${size}/apps/freqinout.png"
-    [[ -f "$icon_path" ]] && run_cmd rm -f "$icon_path"
+    [[ $owns_icons -eq 1 && -f "$icon_path" ]] && run_cmd rm -f "$icon_path"
   done
-  [[ -f "$PIXMAP_ICON" ]] && run_cmd rm -f "$PIXMAP_ICON"
-  [[ -f "$desktop_dir/$DESKTOP_FILE_NAME" ]] && run_cmd rm -f "$desktop_dir/$DESKTOP_FILE_NAME"
+  [[ $owns_icons -eq 1 && -f "$PIXMAP_ICON" ]] && run_cmd rm -f "$PIXMAP_ICON"
+  if [[ -f "$desktop_dir/$DESKTOP_FILE_NAME" ]] && integration_belongs_to_install "$desktop_dir/$DESKTOP_FILE_NAME"; then
+    run_cmd rm -f "$desktop_dir/$DESKTOP_FILE_NAME"
+  fi
 
   if command_exists update-desktop-database; then
     run_cmd update-desktop-database "$HOME/.local/share/applications"
@@ -128,9 +149,49 @@ remove_desktop_items() {
 main() {
   parse_args "$@"
   INSTALL_DIR="$(expand_path "$INSTALL_DIR")"
+  if [[ $DRY_RUN -eq 1 ]]; then
+    log "DRY RUN: would check running processes and ownership, then offer desktop/app removal at $INSTALL_DIR; profile data is retained."
+    return
+  fi
   setup_logging
 
-  log "Preparing to uninstall FreqInOut."
+  # Fail closed rather than remove a running source/packaged application.
+  command_exists python3 || die "Python is required for the running-process check."
+  if ! python3 - <<'PROCESS'
+import os
+from pathlib import Path
+proc = Path('/proc')
+if not proc.is_dir():
+    raise SystemExit('Cannot inspect Linux processes; uninstall stopped.')
+for entry in proc.iterdir():
+    if not entry.name.isdigit() or int(entry.name) in {os.getpid(), os.getppid()}:
+        continue
+    try:
+        args = [v.decode(errors='replace') for v in (entry / 'cmdline').read_bytes().split(b'\0') if v]
+    except FileNotFoundError:
+        continue
+    except PermissionError:
+        raise SystemExit('Cannot inspect all processes; close apps and resolve permissions before uninstall.')
+    if not args:
+        continue
+    name = Path(args[0]).name.lower()
+    module = any(a == '-m' and i + 1 < len(args) and args[i+1] == 'freqinout.main' for i,a in enumerate(args))
+    if module or name in {'freqinout','commsplan','freqinout.exe','commsplan.exe','freqinout.appimage','commsplan.appimage'}:
+        raise SystemExit('Close FIO/CommsPlan before uninstalling.')
+PROCESS
+  then
+    die "Running-process safety check did not pass."
+  fi
+  for owned_path in "$LAUNCHER_PATH" "$HOME/.local/bin/commsplan" "$DESKTOP_ENTRY_PATH"; do
+    if [[ -f "$owned_path" ]] && ! integration_belongs_to_install "$owned_path"; then
+      die "Desktop integration belongs to another installation; no files removed."
+    fi
+  done
+  INSTALL_DIR="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).expanduser().resolve())' "$INSTALL_DIR")"
+  case "$INSTALL_DIR" in
+    /|"$HOME"|"$HOME/Radio") die "Refusing to remove a home/root/container directory." ;;
+  esac
+  log "Preparing to uninstall CommsPlan."
   log "Install folder: $INSTALL_DIR"
 
   if ! prompt_yes_no "Remove launcher, desktop icon, and menu entry?"; then
@@ -141,7 +202,13 @@ main() {
 
   if [[ -d "$INSTALL_DIR" ]]; then
     if prompt_yes_no "Remove application folder at '$INSTALL_DIR'?"; then
-      run_cmd rm -rf "$INSTALL_DIR"
+      # A source tree can contain operator data (including historical config).
+      # Retain it for manual archival rather than claim the profile was preserved.
+      if [[ -e "$INSTALL_DIR/config" || -e "$INSTALL_DIR/runtime" || -e "$INSTALL_DIR/VarAC.ini" ]]; then
+        warn "Retained application folder because it contains config/runtime or VarAC.ini. Archive operator data before manual removal."
+      else
+        run_cmd rm -rf "$INSTALL_DIR"
+      fi
     else
       warn "Kept application folder."
     fi

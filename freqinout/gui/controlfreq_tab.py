@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+from copy import deepcopy
 import math
 import re
 import sqlite3
 import time
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, Signal, QSize, QRectF, QModelIndex
 from PySide6.QtGui import (
@@ -60,6 +61,11 @@ from freqinout.core.config_paths import get_config_dir
 from freqinout.core.condition_sop_policy import evaluate_condition_sop_invocations
 from freqinout.core.group_utils import normalize_group_name
 from freqinout.core.logger import log
+from freqinout.core.operating_group_frequency import normalize_frequency_hz, resolve_operating_group_frequency
+from freqinout.core.latest_read_cache import LatestReadCache
+from freqinout.core.ops_intelligence import SearchRequest, read_search_brief, save_guidance_preference
+from freqinout.gui.ops_intelligence_panel import SopAttentionWidget, SearchBriefWidget
+from threading import Event
 from freqinout.core.multi_radio_store import MultiRadioStore, settings_db_path
 from freqinout.core.perf_metrics import span as perf_span
 from freqinout.core.observation_queries import (
@@ -154,6 +160,7 @@ from freqinout.gui.stations_map_tab import (
 from freqinout.gui.help_registry import resolve_help_host
 from freqinout.gui.plan_context_label import PlanContextLabel
 from freqinout.gui.traffic_action_summary_widget import TrafficActionSummaryWidget
+from freqinout.gui.ops_dashboard import OpsDashboard
 from freqinout.gui.theme import (
     apply_text_size_accessibility_guards,
     font_derived_widget_height,
@@ -363,6 +370,209 @@ class PeerRendezvousDelegate(QStyledItemDelegate):
         return QSize(base.width(), max(base.height(), option.fontMetrics.height() + 24))
 
 
+class _ActivityReadContext:
+    """Detached aggregation inputs; never contains widgets or SettingsManager."""
+    def __init__(self, db_path, group_freqs, group_bands, operator_groups=None, operating_groups=()):
+        self.db_path = db_path
+        self.group_freqs = {key: list(values) for key, values in group_freqs.items()}
+        self.group_bands = {key: set(values) for key, values in group_bands.items()}
+        self.operating_groups = [deepcopy(dict(row)) for row in operating_groups if isinstance(row, Mapping)]
+        self.operator_groups = (
+            {str(key): set(values) for key, values in operator_groups.items()}
+            if operator_groups is not None else None
+        )
+        self._operator_groups_cache = {}
+        self._operator_groups_cache_ts = 0.0
+        self._operator_groups_cache_ttl_sec = 0.0
+        self._operator_groups_cache_mtime = 0.0
+
+    def _db_path(self):
+        return self.db_path
+
+    def _group_freq_map(self):
+        return self.group_freqs
+
+    def _group_band_map(self):
+        return self.group_bands
+
+    def _load_operator_group_map(self):
+        if self.operator_groups is not None:
+            return {key: set(values) for key, values in self.operator_groups.items()}
+        return ControlFreqTab._load_operator_group_map(self)
+
+    @staticmethod
+    def _is_activity_callsign_token(value):
+        return ControlFreqTab._is_activity_callsign_token(value)
+
+
+@dataclass(frozen=True)
+class _OperatorRosterSnapshot:
+    group_map: Dict[str, Set[str]]
+    peer_meta: Dict[str, Dict[str, object]]
+    geo: Dict[str, Dict[str, str]]
+    peer_schedule_rows: List[Dict[str, Any]]
+    my_schedule_rows: List[Dict[str, Any]]
+
+
+class _OperatorRosterReadWorker:
+    """One detached, read-only publication for roster and peer schedule inputs."""
+
+    MAX_OPERATOR_ROWS = 25_000
+    MAX_SCHEDULE_ROWS = 50_000
+    MAX_PEER_SCHEDULE_ROWS = 50_000
+
+    def __init__(self, generation: int, settings_db_path: Path, nets_db_path: Path):
+        self.generation = int(generation)
+        self.settings_db_path = Path(settings_db_path)
+        self.nets_db_path = Path(nets_db_path)
+
+    @staticmethod
+    def _connect_readonly(path: Path):
+        if not path.is_file():
+            return None
+        # URI mode=ro prevents this background read from creating a missing DB.
+        from urllib.parse import quote
+
+        uri = f"file:{quote(str(path), safe='/')}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=1.5)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=1500")
+        return conn
+
+    @staticmethod
+    def _table_names(conn: sqlite3.Connection) -> Set[str]:
+        return {
+            str(row[0] or "")
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table','view')"
+            ).fetchall()
+        }
+
+    @staticmethod
+    def _rows(
+        conn: sqlite3.Connection,
+        table: str,
+        *,
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        if table not in _OperatorRosterReadWorker._table_names(conn):
+            return []
+        rows = conn.execute(
+            f'SELECT * FROM "{table}" LIMIT ?', (int(limit) + 1,)
+        ).fetchall()
+        if len(rows) > int(limit):
+            raise RuntimeError(f"{table} exceeds the {int(limit)} row publication bound")
+        return [dict(row) for row in rows]
+
+    def run(self) -> Dict[str, Any]:
+        settings_conn = nets_conn = None
+        try:
+            settings_conn = self._connect_readonly(self.settings_db_path)
+            nets_conn = self._connect_readonly(self.nets_db_path)
+            if nets_conn is None:
+                raise FileNotFoundError("operator roster database is unavailable")
+            # Each database is read from one stable read transaction. Settings
+            # and Nets are separate files, so this intentionally makes no
+            # cross-database atomicity claim.
+            nets_conn.execute("BEGIN")
+            if settings_conn is not None:
+                settings_conn.execute("BEGIN")
+
+            if "operator_checkins" not in self._table_names(nets_conn):
+                raise RuntimeError("operator roster table is unavailable")
+            checkins = self._rows(
+                nets_conn, "operator_checkins", limit=self.MAX_OPERATOR_ROWS
+            )
+            groups: Dict[str, Set[str]] = {}
+            peer_meta: Dict[str, Dict[str, object]] = {}
+            geo: Dict[str, Dict[str, str]] = {}
+            for row in checkins:
+                callsign = str(row.get("callsign") or "").strip().upper()
+                if not callsign:
+                    continue
+                operator_groups: Set[str] = set()
+                for key in ("group1", "group2", "group3"):
+                    value = normalize_group_name(row.get(key, ""))
+                    if value:
+                        operator_groups.add(value)
+                try:
+                    parsed = json.loads(row.get("groups_json") or "[]")
+                    for raw in parsed if isinstance(parsed, list) else ():
+                        value = normalize_group_name(raw)
+                        if value:
+                            operator_groups.add(value)
+                except Exception:
+                    pass
+                if operator_groups:
+                    groups[callsign] = operator_groups
+                peer_meta[callsign] = {
+                    "groups": operator_groups,
+                    "role": str(row.get("group_role") or "").strip().upper(),
+                    "region": str(row.get("roster_region") or row.get("state") or "").strip().upper(),
+                }
+                geo[callsign] = {
+                    "state": ControlFreqTab._normalize_state_abbr(str(row.get("state") or "")),
+                    "grid": str(row.get("grid") or "").strip().upper(),
+                }
+
+            peer_rows: List[Dict[str, Any]] = []
+            names = self._table_names(nets_conn)
+            peer_table = (
+                "peer_hf_schedule_effective"
+                if "peer_hf_schedule_effective" in names
+                else "peer_hf_schedule"
+            )
+            if peer_table not in names:
+                raise RuntimeError("peer schedule table is unavailable")
+            peer_rows = [
+                dict(row)
+                for row in nets_conn.execute(
+                    f"SELECT owner_callsign, day_utc, start_utc, end_utc, band, frequency "
+                    f"FROM \"{peer_table}\" LIMIT ?",
+                    (self.MAX_PEER_SCHEDULE_ROWS + 1,),
+                ).fetchall()
+            ]
+            if len(peer_rows) > self.MAX_PEER_SCHEDULE_ROWS:
+                raise RuntimeError(
+                    f"peer schedule exceeds the {self.MAX_PEER_SCHEDULE_ROWS} row publication bound"
+                )
+
+            my_schedule_rows: List[Dict[str, Any]] = []
+            for source_conn in (settings_conn, nets_conn):
+                if source_conn is None:
+                    continue
+                for table in ("daily_schedule_tab", "net_schedule_tab"):
+                    my_schedule_rows.extend(
+                        self._rows(
+                            source_conn,
+                            table,
+                            limit=self.MAX_SCHEDULE_ROWS,
+                        )
+                    )
+
+            return {
+                    "generation": self.generation,
+                    "ok": True,
+                    "snapshot": _OperatorRosterSnapshot(
+                        group_map=groups,
+                        peer_meta=peer_meta,
+                        geo=geo,
+                        peer_schedule_rows=peer_rows,
+                        my_schedule_rows=my_schedule_rows,
+                    ),
+                    "error": "",
+                }
+        except Exception as exc:
+            return {"generation": self.generation, "ok": False, "snapshot": None, "error": str(exc)}
+        finally:
+            for source_conn in (settings_conn, nets_conn):
+                try:
+                    if source_conn is not None:
+                        source_conn.close()
+                except Exception:
+                    pass
+
+
 class ControlFreqTab(QWidget):
     """
     ControlFreq: summary/console view for activity and operational status.
@@ -376,6 +586,7 @@ class ControlFreqTab(QWidget):
     _shortwave_listening_outlook_ready = Signal(int, object, object)
     _shortwave_listening_action_ready = Signal(object)
     _propagation_ready = Signal(int, object, object)
+    _operator_roster_ready = Signal(object)
     # Local Nets are reminder-only.  The host owns persistence and typed routing;
     # this presentation seam deliberately carries the immutable projection item
     # back to the host instead of interpreting it as a scheduler row.
@@ -402,6 +613,20 @@ class ControlFreqTab(QWidget):
         self._sop_manager = SOPManager()
         self._timer: Optional[QTimer] = None
         self._active = False
+        self._brief_cache = LatestReadCache("fio-ops-brief")
+        self._guidance_save_cache = LatestReadCache("fio-ops-guidance-save")
+        self._brief_request = None
+        self._brief_cancel = Event()
+        self._brief_generation = 0
+        self._brief_published = None
+        self._guidance_save_request = None
+        self._guidance_save_generation = 0
+        # Paths are already cached by SettingsManager; no file probing on UI.
+        self._brief_db_path = Path(self.settings.db_path).with_name("freqinout_nets.db")
+        self._guidance_db_path = Path(self.settings.db_path)
+        self._brief_poll = QTimer(self)
+        self._brief_poll.setInterval(100)
+        self._brief_poll.timeout.connect(self._poll_intelligence_publications)
         self._last_refresh_ts = 0.0
         self._theme_cache: Optional[Dict[str, Any]] = None
         self._settings_reload_mtime_ns = 0
@@ -453,6 +678,17 @@ class ControlFreqTab(QWidget):
         self._operator_peer_meta_cache: Dict[str, Dict[str, object]] = {}
         self._operator_peer_meta_cache_ts = 0.0
         self._operator_peer_meta_cache_mtime = 0.0
+        self._operator_roster_snapshot: Optional[_OperatorRosterSnapshot] = None
+        self._operator_roster_published_at = 0.0
+        self._operator_roster_ttl_sec = 60.0
+        self._operator_roster_generation = 0
+        self._operator_roster_inflight_generation: Optional[int] = None
+        self._operator_roster_pending = False
+        self._operator_roster_retry_after = 0.0
+        self._operator_roster_error = ""
+        self._operator_roster_executor: Optional[ThreadPoolExecutor] = None
+        self._operator_roster_future: Optional[Future] = None
+        self._operator_roster_ready.connect(self._on_operator_roster_ready)
         self._activity_cache_key: Tuple[Any, ...] = ()
         self._activity_cache_rows: List[List[str]] = []
         self._activity_cache_ts = 0.0
@@ -520,6 +756,16 @@ class ControlFreqTab(QWidget):
         self._prefs_timer = QTimer(self)
         self._prefs_timer.setSingleShot(True)
         self._prefs_timer.timeout.connect(self._persist_ui_state)
+        # One UI-only geometry owner coalesces the many dynamic Ops card
+        # mutations. It never performs settings, database, network, or radio
+        # work; it only republishes the current layout extent to the outer
+        # page scroll area.
+        self._ops_geometry_sync_running = False
+        self._ops_geometry_sync_count = 0
+        self._ops_geometry_timer = QTimer(self)
+        self._ops_geometry_timer.setSingleShot(True)
+        self._ops_geometry_timer.setInterval(0)
+        self._ops_geometry_timer.timeout.connect(self._run_ops_geometry_sync)
         self._filter_refresh_timer = QTimer(self)
         self._filter_refresh_timer.setSingleShot(True)
         self._filter_refresh_timer.timeout.connect(self._run_filter_refresh)
@@ -597,6 +843,7 @@ class ControlFreqTab(QWidget):
 
         self.controlfreq_content = QWidget(self.controlfreq_scroll)
         root = QVBoxLayout(self.controlfreq_content)
+        self.controlfreq_root_layout = root
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(8)
         self.controlfreq_scroll.setWidget(self.controlfreq_content)
@@ -640,6 +887,12 @@ class ControlFreqTab(QWidget):
         header.addStretch(1)
         root.addLayout(header)
 
+        self.sop_attention_widget = SopAttentionWidget(self)
+        self.sop_attention_widget.set_guidance_enabled(bool(self.settings.get("controlfreq_sop_guidance", True)))
+        self.sop_attention_widget.guidanceChanged.connect(self._set_sop_guidance)
+        self.sop_attention_widget.contextRequested.connect(self._activate_intelligence_context)
+        root.addWidget(self.sop_attention_widget)
+
         filter_row = QGridLayout()
         self.filter_row = filter_row
         filter_row.setSpacing(8)
@@ -650,6 +903,7 @@ class ControlFreqTab(QWidget):
         self.search_edit.setAccessibleDescription(
             "Type an operational entity. Suggestions do not refresh the dashboard until selected."
         )
+        self.search_edit.textChanged.connect(self._clear_intelligence_search)
         self.search_edit.textChanged.connect(self._on_focus_search_text_changed)
         self.search_edit.returnPressed.connect(self._apply_best_focus_suggestion)
         self.search_edit.setMinimumWidth(220)
@@ -672,6 +926,17 @@ class ControlFreqTab(QWidget):
         self.command_palette_btn.setAccessibleName("Open command search")
         self.command_palette_btn.clicked.connect(self._show_command_palette)
 
+        self.intelligence_search_btn = QToolButton()
+        self.intelligence_search_btn.setText("Search")
+        self.intelligence_search_btn.setAccessibleName("Search known information")
+        self.intelligence_search_btn.setToolTip("Search the entered exact callsign, topic, or SOP event. Results use the dashboard filters.")
+        self.intelligence_search_btn.setPopupMode(QToolButton.InstantPopup)
+        search_menu = QMenu(self.intelligence_search_btn)
+        for label, kind in (("Search callsign", "callsign"), ("Search topic", "topic"), ("Search SOP event", "event")):
+            action = search_menu.addAction(label)
+            action.triggered.connect(lambda _checked=False, k=kind: self._start_intelligence_search(k))
+        self.intelligence_search_btn.setMenu(search_menu)
+
         self.group_combo = QComboBox()
         self.group_combo.setMinimumWidth(130)
         self.group_combo.currentIndexChanged.connect(self._on_filters_changed)
@@ -681,7 +946,7 @@ class ControlFreqTab(QWidget):
         self.traffic_source_combo.addItem("Traffic Source: All", "")
         self.traffic_source_combo.addItem("FLMsg/FLAmp", "nbems")
         self.traffic_source_combo.addItem("JS8Call", "js8call")
-        self.traffic_source_combo.addItem("FIOSpotter", "spotter")
+        self.traffic_source_combo.addItem("CommsPlan Spotter", "spotter")
         self.traffic_source_combo.addItem("CommStat", "commstat")
         self.traffic_source_combo.addItem("Mesh", "meshcore")
         self.traffic_source_combo.addItem("VarAC", "varac")
@@ -691,7 +956,7 @@ class ControlFreqTab(QWidget):
 
         self.traffic_age_combo = QComboBox()
         self.traffic_age_combo.setToolTip(
-            "Bound traffic counts and action queues by when FIO received each message."
+            "Bound traffic counts and action queues by when CommsPlan received each message."
         )
         for label, seconds in (
             ("Traffic: 1h", 60 * 60),
@@ -784,6 +1049,10 @@ class ControlFreqTab(QWidget):
         self.applied_filters_label.setWordWrap(True)
         self.applied_filters_label.setStyleSheet(label_style("muted", self._theme(), weight=600))
         root.addWidget(self.applied_filters_label)
+        self.search_brief_widget = SearchBriefWidget(self)
+        self.search_brief_widget.contextRequested.connect(self._activate_intelligence_context)
+        self.search_brief_widget.closed.connect(self._clear_intelligence_search)
+        self.search_brief_widget.hide()
 
         controlfreq_context_text = (
             "Ops Center uses the current radio and Frequency Plan context when reviewing schedule control."
@@ -1116,6 +1385,7 @@ class ControlFreqTab(QWidget):
         self.traffic_action_summary.bucketActivated.connect(self._open_traffic_action_bucket)
         inbox_layout.addWidget(self.traffic_action_summary)
         traffic_group_header = QHBoxLayout()
+        self.traffic_group_header = traffic_group_header
         self.traffic_group_title = QToolButton()
         self.traffic_group_title.setText("Traffic by group")
         self.traffic_group_title.setCheckable(True)
@@ -1285,6 +1555,8 @@ class ControlFreqTab(QWidget):
             view_row.addWidget(btn)
         view_row.addStretch(1)
         root.addLayout(view_row)
+        # Keep intelligence and group-spike signals above the optional inspector.
+        root.addWidget(self.search_brief_widget)
 
         self.schedule_box = QGroupBox("Schedule Outlook")
         schedule_layout = QVBoxLayout(self.schedule_box)
@@ -1518,7 +1790,123 @@ class ControlFreqTab(QWidget):
         self.shortcut_resume_schedule.activated.connect(self._on_resume_schedule_clicked)
         self.refresh_btn.setToolTip("Refresh (Ctrl+R)")
         self.freq_action_btn.setToolTip("QSY now and pause schedule control for the selected duration (Ctrl+Enter)")
+        self._install_dashboard(root, header, view_row)
         QTimer.singleShot(0, self._update_responsive_layout)
+
+    def _install_dashboard(self, root, header, legacy_view_row) -> None:
+        """Rehouse existing panels; do not create another projection or command path."""
+        root.setSpacing(max(4, self.fontMetrics().lineSpacing() // 4))
+        self.dashboard = OpsDashboard(self, action_role=self._schedule_action_button_role,
+                                      action_tooltip=self._schedule_action_tooltip)
+        self._dashboard_traffic_volumes = None
+        self._dashboard_traffic_expanded = self.traffic_group_title.isChecked()
+        for widget in (self.sop_attention_widget, self.search_brief_widget,
+                       self.top_splitter, self.bottom_row):
+            root.removeWidget(widget)
+        self.top_splitter.hide()
+        self.bottom_row.hide()
+        root.removeItem(self.top_overview_row)
+        self.top_overview_row.removeWidget(self.inbox_box)
+        root.removeItem(legacy_view_row)
+        # Old preference controls remain owned (and keys retained), but the
+        # mutually exclusive tab selector now owns presentation selection.
+        self._legacy_view_controls = QWidget(self)
+        self._legacy_view_controls.setLayout(legacy_view_row)
+        self._legacy_view_controls.hide()
+        root.removeItem(self.filter_row)
+        self.dashboard_filters = QWidget()
+        self.dashboard_filters.setLayout(self.filter_row)
+        self.dashboard_filters.hide()
+        toolbar = QGridLayout()
+        self.dashboard_toolbar = toolbar
+        for widget in (self.search_edit, self.app_search_btn, self.command_palette_btn,
+                       self.intelligence_search_btn, self.refresh_btn):
+            self.filter_row.removeWidget(widget)
+        self.search_edit.setMinimumWidth(160)
+        self.dashboard_filters_btn = QPushButton("Filters")
+        self.dashboard_filters_btn.setCheckable(True)
+        self.dashboard_filters_btn.setToolTip("Show group, source, age and time filters. Applied scope remains visible.")
+        self.dashboard_filters_btn.toggled.connect(self.dashboard_filters.setVisible)
+        self._arrange_dashboard_toolbar()
+        # Rebuild only the disclosed secondary controls into one compact row.
+        self._arrange_filter_controls(compact=False)
+        header.addWidget(self.dashboard.attention_button)
+        root.insertLayout(2, toolbar)
+        root.insertWidget(3, self.dashboard_filters)
+        self.inbox_box.layout().removeWidget(self.traffic_action_summary)
+        root.insertWidget(4, self.traffic_action_summary)
+        self.dashboard.add_panel("overview", self.inbox_box)
+        self.traffic_group_header.removeWidget(self.traffic_group_hint)
+        self.inbox_box.layout().insertWidget(1, self.traffic_group_hint)
+        self.traffic_group_hint.setWordWrap(True)
+        self.traffic_group_table.setRowCount(1)
+        self.traffic_group_table.setItem(0, 0, QTableWidgetItem("Awaiting traffic update"))
+        self.traffic_group_table.setSpan(0, 0, 1, 3)
+        self.dashboard_traffic_all_btn = QPushButton("View all →")
+        self.dashboard_traffic_all_btn.clicked.connect(lambda: self.dashboard.select_page("traffic"))
+        self.traffic_group_title.clicked.connect(
+            lambda: self.dashboard.select_page("traffic") if self.dashboard.current_page == "overview" else None
+        )
+        self.traffic_group_header.addWidget(self.dashboard_traffic_all_btn)
+        self.dashboard.add_panel("traffic", self.activity_box)
+        self.dashboard.add_panel("sop", self.sop_attention_widget)
+        self.sop_attention_widget.builder_button.hide()
+        self.dashboard_manage_sop_btn = QPushButton("Open SOP Builder")
+        self.dashboard_manage_sop_btn.clicked.connect(lambda: self._activate_intelligence_context("sop", {}))
+        self.dashboard.page_layouts["sop"].addWidget(self.dashboard_manage_sop_btn, alignment=Qt.AlignLeft)
+        self.dashboard.add_panel("peers", self.intersection_box)
+        self.dashboard.add_panel("schedule", self.schedule_box)
+        self.dashboard.add_panel("propagation", self.prop_box)
+        self.dashboard.add_panel("search", self.search_brief_widget)
+        self.search_brief_widget.hide()
+        self.dashboard.pageChanged.connect(self._dashboard_page_changed)
+        self.dashboard.scheduleAction.connect(self._on_schedule_action_clicked)
+        self.dashboard.mapRequested.connect(self._open_operational_activity_map)
+        root.addWidget(self.dashboard, 1)
+        self._dashboard_page_changed("overview")
+
+    def _dashboard_page_changed(self, key: str) -> None:
+        """Presentation only: the same traffic table moves, never duplicates."""
+        if key in {"overview", "traffic"}:
+            self.dashboard.page_layouts[key].insertWidget(0, self.inbox_box)
+            self.inbox_box.show()
+            self.traffic_source_detail_btn.setVisible(key == "traffic")
+            self.dashboard_traffic_all_btn.setVisible(key == "overview")
+            self.inbox_table.setVisible(key == "traffic" and self.traffic_source_detail_btn.isChecked())
+            self.traffic_group_title.blockSignals(True)
+            self.traffic_group_title.setCheckable(key == "traffic")
+            self.traffic_group_title.setChecked(key == "traffic" and self._dashboard_traffic_expanded)
+            self.traffic_group_title.blockSignals(False)
+            self.traffic_group_table.setVisible(key == "overview" or self._dashboard_traffic_expanded)
+            if self._dashboard_traffic_volumes is not None:
+                self._render_traffic_group_volumes(self._dashboard_traffic_volumes)
+        self._request_ops_geometry_sync()
+
+    def _dashboard_card_enabled(self, key: str) -> bool:
+        return hasattr(self, "dashboard") or bool(self._view_cards.get(key, True))
+
+    def _arrange_dashboard_toolbar(self) -> None:
+        controls = (self.search_edit, self.app_search_btn, self.command_palette_btn,
+                    self.dashboard_filters_btn, self.intelligence_search_btn, self.refresh_btn)
+        layout = self.dashboard_toolbar
+        natural = sum(max(w.minimumWidth(), w.minimumSizeHint().width()) for w in controls)
+        compact = self.width() < natural + max(0, layout.spacing()) * 5 + 16
+        for widget in controls:
+            layout.removeWidget(widget)
+        for column in range(6):
+            layout.setColumnStretch(column, 0)
+        if compact:
+            layout.addWidget(self.search_edit, 0, 0, 1, 4)
+            layout.addWidget(self.app_search_btn, 0, 4)
+            layout.addWidget(self.command_palette_btn, 0, 5)
+            for column, widget in zip((0, 2, 4), controls[3:]):
+                layout.addWidget(widget, 1, column, 1, 2)
+            for column in range(4):
+                layout.setColumnStretch(column, 1)
+        else:
+            for column, widget in enumerate(controls):
+                layout.addWidget(widget, 0, column)
+            layout.setColumnStretch(0, 1)
 
     @staticmethod
     def _setup_table_defaults(table: QTableWidget) -> None:
@@ -1549,6 +1937,7 @@ class ControlFreqTab(QWidget):
         super().resizeEvent(event)
         self._apply_freq_meta_text()
         self._update_responsive_layout()
+        self._request_ops_geometry_sync()
 
     def _controlfreq_responsive_mode_for_width(self, width: int) -> str:
         try:
@@ -1557,6 +1946,16 @@ class ControlFreqTab(QWidget):
             return "wide"
 
     def _update_responsive_layout(self) -> None:
+        if hasattr(self, "dashboard"):
+            try:
+                compact = self.width() < self.fontMetrics().horizontalAdvance("M") * 85
+            except RuntimeError:
+                return
+            self._responsive_layout_mode = "compact" if compact else "wide"
+            self._arrange_dashboard_toolbar()
+            self._arrange_filter_controls(compact)
+            self._apply_ops_table_column_layout(compact)
+            return
         if not hasattr(self, "top_overview_row") or not hasattr(self, "top_splitter"):
             return
         # A zero-delay first-layout callback can remain queued while a short-
@@ -1606,6 +2005,24 @@ class ControlFreqTab(QWidget):
         layout = getattr(self, "filter_row", None)
         if layout is None:
             return
+        if hasattr(self, "dashboard"):
+            controls = (self.group_combo, self.traffic_source_combo, self.traffic_age_combo,
+                        self.clear_filters_btn, self.time_toggle_btn)
+            for control in controls:
+                layout.removeWidget(control)
+            for column in range(10):
+                layout.setColumnStretch(column, 0)
+            if compact:
+                for column, control in enumerate(controls[:3]):
+                    layout.addWidget(control, 0, column)
+                    layout.setColumnStretch(column, 1)
+                layout.addWidget(self.clear_filters_btn, 1, 0, 1, 2)
+                layout.addWidget(self.time_toggle_btn, 1, 2)
+            else:
+                for column, control in enumerate(controls):
+                    layout.addWidget(control, 0, column)
+                    layout.setColumnStretch(column, 1 if column < 3 else 0)
+            return
         controls = (
             self.search_edit,
             self.app_search_btn,
@@ -1616,10 +2033,11 @@ class ControlFreqTab(QWidget):
             self.refresh_btn,
             self.clear_filters_btn,
             self.time_toggle_btn,
+            self.intelligence_search_btn,
         )
         for control in controls:
             layout.removeWidget(control)
-        for column in range(9):
+        for column in range(10):
             layout.setColumnStretch(column, 0)
         if compact:
             layout.addWidget(self.search_edit, 0, 0, 1, 2)
@@ -1630,7 +2048,8 @@ class ControlFreqTab(QWidget):
             layout.addWidget(self.traffic_age_combo, 1, 2)
             layout.addWidget(self.refresh_btn, 1, 3)
             layout.addWidget(self.clear_filters_btn, 2, 0, 1, 2)
-            layout.addWidget(self.time_toggle_btn, 2, 2, 1, 2)
+            layout.addWidget(self.time_toggle_btn, 2, 2)
+            layout.addWidget(self.intelligence_search_btn, 2, 3)
             for column in range(4):
                 layout.setColumnStretch(column, 1)
         else:
@@ -1658,9 +2077,13 @@ class ControlFreqTab(QWidget):
                 header.setSectionResizeMode(column, mode)
         if hasattr(self, "traffic_group_hint"):
             expanded = bool(getattr(self, "traffic_group_title", None) and self.traffic_group_title.isChecked())
-            self.traffic_group_hint.setVisible(not compact and expanded)
+            self.traffic_group_hint.setVisible(
+                (self.dashboard.current_page == "overview" or expanded) if hasattr(self, "dashboard") else not compact and expanded
+            )
 
     def _lock_frequency_control_height(self) -> None:
+        if hasattr(self, "dashboard"):
+            return
         try:
             if not bool(getattr(self.freq_ctrl_box, "isVisible", lambda: True)()):
                 self.inbox_box.setMinimumHeight(
@@ -1680,6 +2103,8 @@ class ControlFreqTab(QWidget):
             pass
 
     def _sync_top_panel_heights(self) -> None:
+        if hasattr(self, "dashboard"):
+            return
         try:
             self._set_left_activity_content_height()
             if not bool(getattr(self.freq_ctrl_box, "isVisible", lambda: True)()):
@@ -1845,6 +2270,8 @@ class ControlFreqTab(QWidget):
         self._update_applied_filters_label()
 
     def _apply_saved_splitter_sizes(self) -> None:
+        if hasattr(self, "dashboard"):
+            return
         if getattr(self, "_responsive_layout_mode", "wide") != "wide":
             return
         try:
@@ -2005,6 +2432,8 @@ class ControlFreqTab(QWidget):
         anim.start()
 
     def _rebalance_main_card_layout(self) -> None:
+        if hasattr(self, "dashboard"):
+            return
         left_activity = bool(self._view_cards.get("activity"))
         left_intersections = bool(self._view_cards.get("intersections"))
         right_schedule = bool(self._view_cards.get("schedule"))
@@ -2058,11 +2487,17 @@ class ControlFreqTab(QWidget):
             except Exception:
                 total_h += 12
             self.right_splitter.setMinimumHeight(total_h)
-            self.right_splitter.setMaximumHeight(total_h)
+            # The outer page owns vertical scrolling. A content-derived
+            # maximum here can become stale after Local Nets, Shortwave, or
+            # Schedule changes and make the later Propagation card unreachable.
+            self.right_splitter.setMaximumHeight(16777215)
+            self._request_ops_geometry_sync()
         except Exception:
             pass
 
     def _set_left_activity_content_height(self) -> None:
+        if hasattr(self, "dashboard"):
+            return
         if not hasattr(self, "left_splitter") or not hasattr(self, "activity_box"):
             return
         try:
@@ -2082,7 +2517,8 @@ class ControlFreqTab(QWidget):
         try:
             height = self._content_fit_group_height(widget, floor=floor)
             self.right_splitter.setMinimumHeight(height)
-            self.right_splitter.setMaximumHeight(height)
+            self.right_splitter.setMaximumHeight(16777215)
+            self._request_ops_geometry_sync()
         except Exception:
             self._reset_right_splitter_height()
 
@@ -2097,6 +2533,10 @@ class ControlFreqTab(QWidget):
             pass
 
     def _apply_view_state(self, *, animated: bool) -> None:
+        if hasattr(self, "dashboard"):
+            # Keep persisted legacy presets without letting them hide pages or
+            # suppress the dashboard's normal snapshot producers.
+            return
         self._view_cards = self._normalized_view_cards(self._view_cards)
         if animated:
             left_target = bool(self._view_cards.get("activity"))
@@ -2115,6 +2555,7 @@ class ControlFreqTab(QWidget):
         if not animated:
             self._rebalance_main_card_layout()
             self._sync_top_panel_heights()
+            self._request_ops_geometry_sync()
 
     def _sync_view_controls_from_state(self) -> None:
         if not hasattr(self, "view_preset_combo") or not hasattr(self, "view_chip_buttons"):
@@ -2177,6 +2618,8 @@ class ControlFreqTab(QWidget):
         self._schedule_persist_ui_state()
 
     def _refresh_newly_visible_cards(self, previous_cards: Dict[str, bool]) -> None:
+        if hasattr(self, "dashboard"):
+            return
         try:
             if bool(self._view_cards.get("propagation", False)) and not bool(previous_cards.get("propagation", False)):
                 # Trigger immediate target + forecast refresh when propagation is first shown.
@@ -2276,7 +2719,15 @@ class ControlFreqTab(QWidget):
         self._invalidate_theme_cache()
         try:
             theme = self._theme()
+            if hasattr(self, "dashboard"):
+                self.dashboard.apply_theme(theme)
+                self.dashboard_filters_btn.setStyleSheet(button_style("muted", theme))
+                self.dashboard_traffic_all_btn.setStyleSheet(button_style("muted", theme))
+                self.dashboard_manage_sop_btn.setStyleSheet(button_style("secondary", theme))
             self.help_btn.setStyleSheet(button_style("secondary", theme))
+            self.intelligence_search_btn.setStyleSheet(button_style("secondary", theme))
+            self.sop_attention_widget.apply_theme(theme)
+            self.search_brief_widget.apply_theme(theme)
             self.app_search_btn.setStyleSheet(button_style("secondary", theme))
             self.command_palette_btn.setStyleSheet(button_style("muted", theme))
             focus_bg, focus_fg, focus_border = self._semantic_panel_colors("secondary")
@@ -2353,6 +2804,8 @@ class ControlFreqTab(QWidget):
         self._apply_frequency_display_style()
         self._set_message_summary_visible_rows(6)
         apply_text_size_accessibility_guards(self, include_widths=False)
+        if hasattr(self, "dashboard") and self._dashboard_traffic_volumes is not None:
+            self._render_traffic_group_volumes(self._dashboard_traffic_volumes)
         self._lock_frequency_control_height()
         self._update_time_toggle_text()
         self._refresh_clock_display()
@@ -2477,7 +2930,10 @@ class ControlFreqTab(QWidget):
 
     def set_tab_active(self, active: bool) -> None:
         self._active = bool(active)
+        if not self._active:
+            self._clear_intelligence_search()
         if self._active:
+            self._ensure_operator_roster_read()
             # Give the stack switch and its first paint a chance to complete
             # before its optional index maintenance begins.  The worker itself
             # is bounded, but beginning it during shell construction can still
@@ -2509,7 +2965,7 @@ class ControlFreqTab(QWidget):
             # Slightly delay status probing so first paint is not blocked.
             QTimer.singleShot(175, self._refresh_status_widgets)
             QTimer.singleShot(0, self._refresh_clock_display)
-            if self._sop_outlook_refresh_pending and bool(self._view_cards.get("schedule", True)):
+            if self._sop_outlook_refresh_pending and self._dashboard_card_enabled("schedule"):
                 self._sop_outlook_refresh_pending = False
                 QTimer.singleShot(0, self._refresh_schedule_outlook)
             return
@@ -2563,13 +3019,13 @@ class ControlFreqTab(QWidget):
         try:
             with perf_span("controlfreq.secondary_refresh", settings=self.settings, min_ms=10.0):
                 self._load_group_combo()
-                if bool(self._view_cards.get("activity", True)):
+                if self._dashboard_card_enabled("activity"):
                     self._refresh_activity()
-                if bool(self._view_cards.get("intersections", True)):
+                if self._dashboard_card_enabled("intersections"):
                     self._refresh_intersections()
-                if bool(self._view_cards.get("schedule", True)):
+                if self._dashboard_card_enabled("schedule"):
                     self._refresh_schedule_outlook()
-                if bool(self._view_cards.get("propagation", True)):
+                if self._dashboard_card_enabled("propagation"):
                     self._refresh_prop_target_controls()
                 self._last_secondary_refresh_ts = time.time()
                 self._schedule_deferred_heavy_refresh(force=True)
@@ -2589,7 +3045,7 @@ class ControlFreqTab(QWidget):
         try:
             with perf_span("controlfreq.heavy_refresh", settings=self.settings, min_ms=10.0):
                 self._refresh_message_summary()
-                if bool(self._view_cards.get("propagation", True)):
+                if self._dashboard_card_enabled("propagation"):
                     self._refresh_propagation_snapshot()
                 self._last_heavy_refresh_ts = time.time()
         finally:
@@ -2611,6 +3067,7 @@ class ControlFreqTab(QWidget):
         self._invalidate_sop_window_cache()
         self._invalidate_activity_cache()
         self._invalidate_schedule_row_caches()
+        self._invalidate_operator_roster_cache()
         self._sop_outlook_refresh_pending = True
         self._apply_theme()
         if self._active:
@@ -2626,6 +3083,7 @@ class ControlFreqTab(QWidget):
         self._peer_schedule_rows_cache = []
         self._peer_schedule_rows_cache_ts = 0.0
         self._peer_schedule_rows_cache_mtime = 0.0
+        self._invalidate_operator_roster_cache()
         self._last_secondary_refresh_ts = 0.0
         if self._active:
             QTimer.singleShot(0, self._refresh_intersections)
@@ -2645,19 +3103,54 @@ class ControlFreqTab(QWidget):
             if widget is not None:
                 widget.deleteLater()
 
-    def _current_visible_status_items(self) -> List[Tuple[str, str]]:
-        try:
-            self.settings.reload()
-        except Exception:
-            pass
-        try:
-            profiles = list(self._multi_radio_store.list_device_profiles())
-        except Exception:
-            profiles = []
-            self._readiness_has_device_profiles = None
+    def _readiness_snapshot(self):
+        """Read worker-published setup evidence; never reload SQLite on Qt."""
+        cache = getattr(self, "_readiness_read_cache", None)
+        if cache is None:
+            cache = self._readiness_read_cache = LatestReadCache("fio-ops-readiness")
+        path = self._multi_radio_store.db_path
+        def reader_factory():
+            data = deepcopy(self.settings.all())
+            def read():
+                from types import SimpleNamespace
+                profiles = list(MultiRadioStore(path).list_device_profiles())
+                groups = load_operating_groups(SimpleNamespace(all=lambda: data))
+                return {
+                    "report": build_station_readiness_report(data, device_profiles=profiles, operating_groups=groups),
+                    "visible": visible_status_programs(data, device_profiles=profiles),
+                    "has_profiles": bool(profiles),
+                }
+            return read
+        result = cache.read(str(path), reader_factory, refresh_after_s=10.0)
+        if result is not None:
+            self._readiness_snapshot_last = result
+            self._readiness_has_device_profiles = result["has_profiles"]
         else:
-            self._readiness_has_device_profiles = bool(profiles)
-        return visible_status_programs(self.settings.all(), device_profiles=profiles)
+            result = getattr(self, "_readiness_snapshot_last", None)
+            if result is None:
+                self._readiness_has_device_profiles = None
+        timer = getattr(self, "_readiness_read_poll", None)
+        if timer is None:
+            timer = self._readiness_read_poll = QTimer(self)
+            timer.setInterval(100)
+            timer.timeout.connect(self._on_readiness_read_ready)
+        if cache._future is not None and not timer.isActive():
+            timer.start()
+        elif cache._future is None:
+            timer.stop()
+        return result
+
+    def _on_readiness_read_ready(self) -> None:
+        previous = getattr(self, "_readiness_snapshot_last", None)
+        result = self._readiness_snapshot()
+        if result is not previous and getattr(self, "_active", False):
+            self._refresh_running_status()
+
+    def _current_visible_status_items(self) -> List[Tuple[str, str]]:
+        snapshot = self._readiness_snapshot()
+        if snapshot is not None:
+            return list(snapshot["visible"])
+        return visible_status_programs(self.settings.all(), device_profiles=[])
 
     def _rebuild_status_indicators(self) -> None:
         if not hasattr(self, "status_layout"):
@@ -2681,26 +3174,8 @@ class ControlFreqTab(QWidget):
         self.status_layout.addStretch(1)
 
     def _current_readiness_report(self):
-        try:
-            self.settings.reload()
-        except Exception:
-            pass
-        try:
-            profiles = list(self._multi_radio_store.list_device_profiles())
-        except Exception:
-            profiles = []
-            self._readiness_has_device_profiles = None
-        else:
-            self._readiness_has_device_profiles = bool(profiles)
-        try:
-            operating_groups = load_operating_groups(self.settings)
-        except Exception:
-            operating_groups = []
-        return build_station_readiness_report(
-            self.settings.all(),
-            device_profiles=profiles,
-            operating_groups=operating_groups,
-        )
+        snapshot = self._readiness_snapshot()
+        return snapshot["report"] if snapshot is not None else None
 
     def _dismiss_readiness_review(self) -> None:
         self._readiness_banner_dismissed = True
@@ -2722,6 +3197,8 @@ class ControlFreqTab(QWidget):
 
     def _review_readiness_now(self) -> None:
         report = self._current_readiness_report()
+        if report is None:
+            return
         window = self.window()
         if self._readiness_has_device_profiles is False and hasattr(window, "open_guided_add_radio"):
             try:
@@ -2740,8 +3217,11 @@ class ControlFreqTab(QWidget):
                 pass
 
     def _copy_readiness_review_summary(self) -> None:
+        report = self._current_readiness_report()
+        if report is None:
+            return
         QApplication.clipboard().setText(
-            readiness_report_detail_text(self._current_readiness_report(), title="FreqInOut Multi-Rig Setup Review")
+            readiness_report_detail_text(report, title="CommsPlan Multi-Rig Setup Review")
         )
         if hasattr(self, "readiness_review_copy_btn"):
             self.readiness_review_copy_btn.setText("Copied")
@@ -2751,6 +3231,9 @@ class ControlFreqTab(QWidget):
         if not hasattr(self, "readiness_review_widget"):
             return
         report = self._current_readiness_report()
+        if report is None:
+            self.readiness_review_widget.setVisible(False)
+            return
         requires_first_radio = self._readiness_has_device_profiles is False
         if report.digest != self._readiness_banner_digest:
             self._readiness_banner_digest = report.digest
@@ -2923,7 +3406,106 @@ class ControlFreqTab(QWidget):
         self._schedule_persist_ui_state()
         self._refresh_schedule_outlook()
 
+    def _activate_intelligence_context(self, kind: str, context: dict) -> None:
+        """Route the explicitly selected brief item, independent of dashboard selection."""
+        if kind in {"sop", "open_sop"}:
+            self._navigate_to_tab("SOP")
+            return
+        route = map_context_from_mapping(context)
+        host = self.window()
+        if kind == "map" and hasattr(host, "open_spotter_map"):
+            host.open_spotter_map(**route.as_map_kwargs())
+        elif kind == "compose" and hasattr(host, "open_messages_section"):
+            intent = compose_intent_from_map_context(route, mode=str(context.get("source_family") or "")).as_dict()
+            host.open_messages_section("compose", compose_intent=intent)
+        elif hasattr(host, "open_messages_section"):
+            host.open_messages_section("inbox", **route.as_messages_kwargs())
+
+    def set_sop_attention_snapshot(self, snapshot) -> None:
+        """Shell-published immutable data only; no queries or aggregation."""
+        if snapshot != getattr(self, "_last_sop_attention_snapshot", None):
+            self._last_sop_attention_snapshot = snapshot
+            self.sop_attention_widget.set_snapshot(snapshot)
+            if hasattr(self, "dashboard"):
+                self.dashboard.set_attention(snapshot)
+
+    def _set_sop_guidance(self, enabled: bool) -> None:
+        # In-memory preference update only. One worker writes the isolated key.
+        self.settings._data["controlfreq_sop_guidance"] = bool(enabled)
+        self._guidance_save_generation += 1
+        self._guidance_save_request = (self._guidance_save_generation, bool(enabled))
+        self.sop_attention_widget.set_preference_error("")
+        self._brief_poll.start()
+        self._poll_intelligence_publications()
+
+    def _start_intelligence_search(self, kind: str) -> None:
+        if not self._active:
+            return
+        query = self.search_edit.text().strip()[:120]
+        if not query:
+            self.search_brief_widget.set_error("Enter a callsign, topic, or SOP event first.")
+            self.search_brief_widget.show()
+            if hasattr(self, "dashboard"):
+                self.dashboard.select_page("search")
+            return
+        self._clear_intelligence_search()
+        age = max(0, int(self.traffic_age_combo.currentData() or 0))
+        group = str(self.group_combo.currentData() or "")
+        source = str(self.traffic_source_combo.currentData() or "")
+        label = " · ".join((self.group_combo.currentText(), self.traffic_source_combo.currentText(), self.traffic_age_combo.currentText()))
+        self._brief_request = SearchRequest(kind, query, group, source, time.time() - age if age else 0., label)
+        self._brief_sop_snapshot = getattr(self, "_last_sop_attention_snapshot", None)
+        self.search_brief_widget.set_loading(kind, query)
+        self.search_brief_widget.show()
+        if hasattr(self, "dashboard"):
+            self.dashboard.select_page("search")
+        self._brief_poll.start()
+        self._poll_intelligence_publications()
+
+    def _clear_intelligence_search(self, *_args) -> None:
+        self._brief_cancel.set()
+        self._brief_cancel = Event()
+        self._brief_generation += 1
+        self._brief_request = None
+        self._brief_published = None
+        self._brief_cache.invalidate()
+        widget = getattr(self, "search_brief_widget", None)
+        if widget is not None:
+            widget.hide()
+        if hasattr(self, "dashboard") and self.dashboard.current_page == "search":
+            self.dashboard.select_page("overview")
+        if self._guidance_save_request is None:
+            self._brief_poll.stop()
+
+    def _poll_intelligence_publications(self) -> None:
+        request = self._brief_request
+        if request is not None:
+            cancel = self._brief_cancel
+            path = self._brief_db_path
+            sop = getattr(self, "_brief_sop_snapshot", None)
+            result = self._brief_cache.read((self._brief_generation, request),
+                lambda: lambda path=path, request=request, cancel=cancel, sop=sop: read_search_brief(path, request, cancel, sop))
+            if result is not None and result is not self._brief_published:
+                self._brief_published = result
+                self.search_brief_widget.set_result(result)
+            elif self._brief_cache.failed and self._brief_published is None:
+                self.search_brief_widget.set_error("Search unavailable or exceeded its time budget. Narrow the filters and search again.")
+                self._brief_request = None
+        saving = self._guidance_save_request
+        if saving is not None:
+            enabled = saving[1]
+            path = self._guidance_db_path
+            saved = self._guidance_save_cache.read(saving,
+                lambda: lambda path=path, enabled=enabled: save_guidance_preference(path, enabled))
+            if saved is not None or self._guidance_save_cache.failed:
+                if self._guidance_save_cache.failed:
+                    self.sop_attention_widget.set_preference_error("Preference could not be saved; applies to this session only.")
+                self._guidance_save_request = None
+        if (self._brief_request is None or self._brief_published is not None) and self._guidance_save_request is None:
+            self._brief_poll.stop()
+
     def _on_filters_changed(self, *_args) -> None:
+        self._clear_intelligence_search()
         self._update_clear_filters_style()
         self._update_applied_filters_label()
         self._schedule_persist_ui_state()
@@ -2936,11 +3518,11 @@ class ControlFreqTab(QWidget):
 
     def _run_filter_refresh(self) -> None:
         try:
-            if bool(self._view_cards.get("activity", True)):
+            if self._dashboard_card_enabled("activity"):
                 self._refresh_activity()
-            if bool(self._view_cards.get("intersections", True)):
+            if self._dashboard_card_enabled("intersections"):
                 self._refresh_intersections()
-            if bool(self._view_cards.get("schedule", True)):
+            if self._dashboard_card_enabled("schedule"):
                 self._refresh_schedule_outlook()
             # Message summary is always visible in top row.
             self._refresh_message_summary()
@@ -2952,6 +3534,7 @@ class ControlFreqTab(QWidget):
             log.debug("ControlFreq: filter refresh failed: %s", e)
 
     def _clear_filters(self) -> None:
+        self._clear_intelligence_search()
         self._clear_ops_focus(clear_search=True, refresh=False)
         self.search_edit.clear()
         if self.group_combo.count() > 0:
@@ -3019,7 +3602,7 @@ class ControlFreqTab(QWidget):
         if not query:
             query, ok = QInputDialog.getText(
                 self,
-                "Find in FIO",
+                "Find in CommsPlan",
                 "Screen, setting, radio, schedule, action, or issue:",
             )
             if not ok:
@@ -3044,6 +3627,31 @@ class ControlFreqTab(QWidget):
         return self._focus_executor
 
     def _shutdown_background_executors(self) -> None:
+        self._closing = True
+        self._operator_roster_generation += 1
+        self._operator_roster_pending = False
+        roster_executor = self._operator_roster_executor
+        self._operator_roster_executor = None
+        self._operator_roster_future = None
+        if roster_executor is not None:
+            try:
+                roster_executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                roster_executor.shutdown(wait=False)
+            except Exception as exc:
+                log.debug("ControlFreq: operator roster executor shutdown failed: %s", exc)
+        self._brief_cancel.set()
+        self._brief_generation += 1
+        self._brief_request = None
+        self._guidance_save_request = None
+        for name in ("_brief_cache", "_guidance_save_cache", "_activity_read_cache", "_operational_read_cache", "_readiness_read_cache"):
+            cache = getattr(self, name, None)
+            if cache is not None:
+                cache.close()
+        for name in ("_brief_poll", "_activity_read_poll", "_readiness_read_poll"):
+            timer = getattr(self, name, None)
+            if timer is not None:
+                timer.stop()
         self._shutdown_message_summary_executor()
         propagation_executor = self._propagation_executor
         self._propagation_executor = None
@@ -3675,18 +4283,18 @@ class ControlFreqTab(QWidget):
                 self._refresh_status_widgets()
             if include_secondary:
                 self._load_group_combo()
-                if bool(self._view_cards.get("activity", True)):
+                if self._dashboard_card_enabled("activity"):
                     self._refresh_activity()
-                if bool(self._view_cards.get("intersections", True)):
+                if self._dashboard_card_enabled("intersections"):
                     self._refresh_intersections()
-                if bool(self._view_cards.get("schedule", True)):
+                if self._dashboard_card_enabled("schedule"):
                     self._refresh_schedule_outlook()
-                if bool(self._view_cards.get("propagation", True)):
+                if self._dashboard_card_enabled("propagation"):
                     self._refresh_prop_target_controls()
                 self._last_secondary_refresh_ts = time.time()
             if include_heavy:
                 self._refresh_message_summary()
-                if bool(self._view_cards.get("propagation", True)):
+                if self._dashboard_card_enabled("propagation"):
                     self._refresh_propagation_snapshot()
                 self._last_heavy_refresh_ts = time.time()
             self._last_refresh_ts = time.time()
@@ -3972,7 +4580,8 @@ class ControlFreqTab(QWidget):
         if theme:
             self.freq_action_btn.setStyleSheet(button_style("warning", theme))
 
-    def _normalize_state_abbr(self, value: str) -> str:
+    @staticmethod
+    def _normalize_state_abbr(value: str) -> str:
         state = (value or "").strip().upper()
         if not state:
             return ""
@@ -3981,6 +4590,13 @@ class ControlFreqTab(QWidget):
         return US_STATE_ABBR_FROM_NAME.get(state, "")
 
     def _load_prop_operator_geo(self) -> Dict[str, Dict[str, str]]:
+        snapshot = getattr(self, "_operator_roster_snapshot", None)
+        if snapshot is not None:
+            self._ensure_operator_roster_read()
+            return {key: dict(value) for key, value in snapshot.geo.items()}
+        if hasattr(self, "_operator_roster_generation"):
+            self._ensure_operator_roster_read()
+            return {}
         db_path = self._db_path()
         out: Dict[str, Dict[str, str]] = {}
         if not db_path.exists():
@@ -4051,7 +4667,19 @@ class ControlFreqTab(QWidget):
     def _refresh_prop_target_controls(self) -> None:
         self._prop_target_syncing = True
         try:
+            self._ensure_operator_roster_read()
             self._prop_operator_geo = self._load_prop_operator_geo()
+            roster = getattr(self, "_operator_roster_snapshot", None)
+            roster_status = (
+                "Operator location roster is unavailable; propagation will use the configured fallback region."
+                if roster is None and getattr(self, "_operator_roster_error", "")
+                else "Checking operator location roster; propagation will use the configured fallback region."
+                if roster is None
+                else "Using the last published operator location roster while it refreshes."
+                if time.monotonic() - float(self._operator_roster_published_at) >= self._operator_roster_ttl_sec
+                else "Operator location roster published."
+            )
+            self.prop_target_value_combo.setToolTip(roster_status)
             target_type = (self.settings.get("prop_target_type", "REGION") or "REGION").strip().upper()
             if target_type not in {"REGION", "STATE", "OPERATOR"}:
                 target_type = "REGION"
@@ -4259,6 +4887,13 @@ class ControlFreqTab(QWidget):
         return self._filter_schedule_rows_for_runtime_target(rows)
 
     def _peer_schedule_rows(self) -> List[Dict[str, Any]]:
+        snapshot = getattr(self, "_operator_roster_snapshot", None)
+        if snapshot is not None:
+            self._ensure_operator_roster_read()
+            return [dict(row) for row in snapshot.peer_schedule_rows]
+        if hasattr(self, "_operator_roster_generation"):
+            self._ensure_operator_roster_read()
+            return []
         db_path = self._db_path()
         now_ts = time.time()
         db_mtime = self._safe_db_mtime(db_path)
@@ -4351,7 +4986,124 @@ class ControlFreqTab(QWidget):
             out.setdefault(grp, set()).add(band)
         return out
 
+    def _ensure_operator_roster_executor(self) -> ThreadPoolExecutor:
+        if self._operator_roster_executor is None:
+            self._operator_roster_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="fio-ops-roster"
+            )
+        return self._operator_roster_executor
+
+    def _ensure_operator_roster_read(self, *, force: bool = False) -> None:
+        """Start one detached roster/schedule read when the active UI needs it."""
+        if getattr(self, "_closing", False):
+            return
+        now = time.monotonic()
+        snapshot = getattr(self, "_operator_roster_snapshot", None)
+        stale = snapshot is None or now - float(getattr(self, "_operator_roster_published_at", 0.0)) >= float(
+            getattr(self, "_operator_roster_ttl_sec", 60.0)
+        )
+        if not force and not stale:
+            return
+        if not bool(getattr(self, "_active", False)):
+            return
+        if getattr(self, "_operator_roster_future", None) is not None:
+            if force:
+                self._operator_roster_pending = True
+            return
+        if now < float(getattr(self, "_operator_roster_retry_after", 0.0)) and not force:
+            return
+        self._operator_roster_generation += 1
+        generation = self._operator_roster_generation
+        worker = _OperatorRosterReadWorker(
+            generation,
+            settings_db_path(),
+            self._db_path(),
+        )
+        self._operator_roster_pending = False
+        self._operator_roster_inflight_generation = generation
+        future = self._ensure_operator_roster_executor().submit(worker.run)
+        self._operator_roster_future = future
+
+        def _done(done: Future) -> None:
+            try:
+                result = done.result()
+            except Exception as exc:
+                result = {"generation": generation, "ok": False, "snapshot": None, "error": str(exc)}
+            try:
+                self._operator_roster_ready.emit(result)
+            except RuntimeError:
+                pass
+
+        future.add_done_callback(_done)
+
+    def _invalidate_operator_roster_cache(self) -> None:
+        self._operator_roster_generation += 1
+        self._operator_roster_published_at = 0.0
+        if self._operator_roster_future is not None:
+            self._operator_roster_pending = True
+        self._ensure_operator_roster_read(force=True)
+
+    def on_operator_roster_changed(self) -> None:
+        """Invalidate the published roster after a committed roster edit."""
+        self._invalidate_operator_roster_cache()
+
+    def _on_operator_roster_ready(self, result: object) -> None:
+        if getattr(self, "_closing", False):
+            return
+        payload = dict(result or {})
+        generation = int(payload.get("generation") or 0)
+        if generation != self._operator_roster_inflight_generation:
+            # A delayed duplicate cannot clear or schedule over a newer future.
+            return
+        self._operator_roster_future = None
+        self._operator_roster_inflight_generation = None
+        if generation != self._operator_roster_generation:
+            pending = bool(self._operator_roster_pending)
+            self._operator_roster_pending = False
+            if pending and self._active:
+                self._ensure_operator_roster_read(force=True)
+            return
+        if generation == self._operator_roster_generation and payload.get("ok"):
+            snapshot = payload.get("snapshot")
+            if isinstance(snapshot, _OperatorRosterSnapshot):
+                # Publish only complete detached values; pending/error never erases
+                # the last usable snapshot.
+                self._operator_roster_snapshot = snapshot
+                self._operator_roster_published_at = time.monotonic()
+                self._operator_roster_error = ""
+                self._operator_roster_retry_after = 0.0
+                self._operator_groups_cache = {key: set(value) for key, value in snapshot.group_map.items()}
+                self._operator_peer_meta_cache = {
+                    key: {**value, "groups": set(value.get("groups") or ())}
+                    for key, value in snapshot.peer_meta.items()
+                }
+                self._prop_operator_geo = {key: dict(value) for key, value in snapshot.geo.items()}
+                self._peer_schedule_rows_cache = [dict(row) for row in snapshot.peer_schedule_rows]
+                if self._active:
+                    if self._dashboard_card_enabled("intersections"):
+                        self._refresh_intersections()
+                    if self._dashboard_card_enabled("propagation"):
+                        self._refresh_prop_target_controls()
+                    self._refresh_activity()
+        elif generation == self._operator_roster_generation:
+            self._operator_roster_error = str(payload.get("error") or "roster data unavailable")
+            self._operator_roster_retry_after = time.monotonic() + 10.0
+            log.debug("ControlFreq: operator roster read failed: %s", self._operator_roster_error)
+            if self._active and self._dashboard_card_enabled("intersections"):
+                self._refresh_intersections()
+        pending = bool(self._operator_roster_pending)
+        self._operator_roster_pending = False
+        if pending and self._active and not getattr(self, "_closing", False):
+            self._ensure_operator_roster_read(force=True)
+
     def _load_operator_group_map(self) -> Dict[str, Set[str]]:
+        snapshot = getattr(self, "_operator_roster_snapshot", None)
+        if snapshot is not None:
+            self._ensure_operator_roster_read()
+            return {key: set(value) for key, value in snapshot.group_map.items()}
+        if hasattr(self, "_operator_roster_generation"):
+            self._ensure_operator_roster_read()
+            return {}
         db_path = self._db_path()
         now_ts = time.time()
         try:
@@ -4405,6 +5157,16 @@ class ControlFreqTab(QWidget):
 
     def _load_operator_peer_meta(self) -> Dict[str, Dict[str, object]]:
         """Load the compact roster fields used by peer filters and row labels."""
+        snapshot = getattr(self, "_operator_roster_snapshot", None)
+        if snapshot is not None:
+            self._ensure_operator_roster_read()
+            return {
+                key: {**value, "groups": set(value.get("groups") or ())}
+                for key, value in snapshot.peer_meta.items()
+            }
+        if hasattr(self, "_operator_roster_generation"):
+            self._ensure_operator_roster_read()
+            return {}
         db_path = self._db_path()
         now_ts = time.time()
         db_mtime = self._safe_db_mtime(db_path)
@@ -4473,10 +5235,14 @@ class ControlFreqTab(QWidget):
         finally:
             combo.blockSignals(False)
 
-    def _refresh_peer_filter_options(self, operator_meta: Dict[str, Dict[str, object]]) -> None:
+    def _refresh_peer_filter_options(
+        self,
+        operator_meta: Dict[str, Dict[str, object]],
+        peer_rows: Optional[Sequence[Dict[str, Any]]] = None,
+    ) -> None:
         scheduled_calls = {
             str(row.get("owner_callsign") or "").strip().upper()
-            for row in self._peer_schedule_rows()
+            for row in (peer_rows if peer_rows is not None else self._peer_schedule_rows())
             if str(row.get("owner_callsign") or "").strip()
         }
         scheduled_meta = [operator_meta.get(callsign, {}) for callsign in scheduled_calls]
@@ -4523,15 +5289,36 @@ class ControlFreqTab(QWidget):
         group_traffic: Dict[str, int] = {g: 0 for g in group_freqs}
 
         def _matching_groups_for_link(band: str, mhz: float) -> List[str]:
-            matched: List[str] = []
-            for grp, freqs in group_freqs.items():
-                if group_filter and grp != group_filter:
+            rows = getattr(self, "operating_groups", None)
+            if rows is None:
+                rows = self.settings.get("operating_groups", []) or []
+            wanted_hz = normalize_frequency_hz(mhz)
+            if wanted_hz is None:
+                return []
+            configured_groups = {
+                normalize_group_name(row.get("group", ""))
+                for row in rows if isinstance(row, Mapping)
+            }
+            matched: list[str] = []
+            for grp in configured_groups:
+                if not grp:
                     continue
-                allowed_bands = group_bands.get(grp, set())
-                if band and allowed_bands and band not in allowed_bands:
-                    continue
-                if any(abs(mhz - f) < 0.0005 for f in freqs):
+                resolution = resolve_operating_group_frequency(
+                    rows,
+                    group=grp,
+                    band=band,
+                    frequency=mhz,
+                )
+                exact = any(
+                    normalize_frequency_hz(row.get("frequency")) == wanted_hz
+                    for row in resolution.candidates
+                )
+                if resolution.resolved or exact:
                     matched.append(grp)
+            # Activity frequency alone cannot identify which logical group
+            # owns a shared frequency. Preserve that event as unattributed.
+            if len(matched) != 1 or (group_filter and matched[0] != group_filter):
+                return []
             return matched
 
         def _add_group_traffic(cs: str) -> None:
@@ -4622,29 +5409,73 @@ class ControlFreqTab(QWidget):
         search = (self.search_edit.text() or "").strip().upper()
         group_filter = self.group_combo.currentData() or ""
         self._refresh_operational_activity(window_minutes, search, str(group_filter).strip().upper())
-        cache_key = (
-            window_minutes,
-            search,
-            str(group_filter).strip().upper(),
-            str(getattr(self, "_source_family_filter", "") or "").strip().lower(),
-            self._activity_cache_token(),
-        )
-        now_ts = time.time()
-        if (
-            cache_key == self._activity_cache_key
-            and (now_ts - float(self._activity_cache_ts) <= self._activity_cache_ttl_sec)
-            and self._activity_cache_rows
-        ):
-            self._set_table_rows(self.activity_table, self._activity_cache_rows)
-            self._set_left_activity_content_height()
+        self._ensure_operator_roster_read()
+        roster = getattr(self, "_operator_roster_snapshot", None)
+        if roster is None and self._active:
+            status = (
+                "Operator roster unavailable" if getattr(self, "_operator_roster_error", "")
+                else "Checking operator roster…"
+            )
+            rows = [[status, "--", "--", "--"]]
+            self.activity_table.setToolTip(
+                "Activity grouping needs the operator roster. A result will appear when a detached snapshot is available."
+            )
+            if rows != getattr(self, "_activity_rendered_rows", None):
+                self._activity_rendered_rows = rows
+                self._set_table_rows(self.activity_table, rows)
+                self._set_left_activity_content_height()
             return
-        with perf_span("controlfreq.refresh_activity", settings=self.settings, min_ms=5.0):
-            rows_out = self._compute_activity_rows(window_minutes, search, str(group_filter).strip().upper())
-        self._activity_cache_key = cache_key
-        self._activity_cache_ts = time.time()
-        self._activity_cache_rows = [list(row) for row in rows_out]
-        self._set_table_rows(self.activity_table, rows_out)
-        self._set_left_activity_content_height()
+        roster_stale = (
+            roster is not None
+            and time.monotonic() - float(self._operator_roster_published_at) >= self._operator_roster_ttl_sec
+        )
+        self.activity_table.setToolTip(
+            "Using the last published operator roster while a refresh is pending or unavailable."
+            if roster_stale
+            else "Activity grouping uses the published operator roster."
+        )
+        # Eager/inactive helper callers (including legacy isolated fixtures)
+        # retain the pre-publication activity reader. Active UI rendering waits
+        # for the shared roster snapshot above.
+        group_filter = str(group_filter).strip().upper()
+        group_freqs, group_bands = self._group_freq_map(), self._group_band_map()
+        operating_groups = [dict(row) for row in self.settings.get("operating_groups", []) or [] if isinstance(row, Mapping)]
+        db_path = self._db_path()
+        signature = (str(db_path), window_minutes, search, group_filter,
+                     str(getattr(self, "_source_family_filter", "")),
+                     repr(group_freqs), repr(group_bands), repr(operating_groups),
+                     float(getattr(self, "_operator_roster_published_at", 0.0)))
+        cache = getattr(self, "_activity_read_cache", None)
+        if cache is None:
+            cache = self._activity_read_cache = LatestReadCache("fio-ops-activity")
+        def reader_factory():
+            context = _ActivityReadContext(
+                db_path, group_freqs, group_bands,
+                operator_groups=roster.group_map if roster is not None else None,
+                operating_groups=operating_groups,
+            )
+            return lambda: ControlFreqTab._compute_activity_rows(context, window_minutes, search, group_filter)
+        rows = cache.read(signature, reader_factory, refresh_after_s=self._activity_cache_ttl_sec)
+        rows = rows if rows is not None else [["Activity unavailable" if cache.failed else "Loading activity…", "--", "--", "--"]]
+        if rows != getattr(self, "_activity_rendered_rows", None):
+            self._activity_rendered_rows = rows
+            self._set_table_rows(self.activity_table, rows)
+            self._set_left_activity_content_height()
+        self._poll_activity_readers()
+
+    def _poll_activity_readers(self):
+        pending = any(getattr(getattr(self, name, None), "_future", None) is not None
+                      for name in ("_activity_read_cache", "_operational_read_cache"))
+        timer = getattr(self, "_activity_read_poll", None)
+        if pending and timer is None:
+            timer = self._activity_read_poll = QTimer(self)
+            timer.setInterval(100)
+            timer.timeout.connect(self._refresh_activity)
+        if timer is not None:
+            if pending and not timer.isActive():
+                timer.start()
+            elif not pending:
+                timer.stop()
 
     def _refresh_operational_activity(
         self,
@@ -4653,57 +5484,67 @@ class ControlFreqTab(QWidget):
         group_filter: str = "",
     ) -> None:
         db_path = self._db_path()
-        if not db_path.exists():
+        source_families = self._traffic_source_query_families(
+            str(getattr(self, "_source_family_filter", "") or "").strip())
+        callsign = str(self.settings.get("operator_callsign", "") or "").strip().upper()
+        pins = self._configured_awareness_pins()
+        profile_db_path = settings_db_path()
+        sop_db_path = getattr(self._sop_manager, "db_path", None)
+        signature = (str(db_path), window_minutes, search, group_filter,
+                     tuple(source_families), callsign, repr(pins), str(profile_db_path), str(sop_db_path))
+        cache = getattr(self, "_operational_read_cache", None)
+        if cache is None:
+            cache = self._operational_read_cache = LatestReadCache("fio-ops-awareness")
+        def reader_factory():
+            query = ObservationQuery(
+                source_families=source_families,
+                since_utc=(dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=max(1, int(window_minutes or 120)))).replace(microsecond=0).isoformat(),
+                operating_group=group_filter, search_text=search, limit=80,
+            )
+            def read():
+                observations = query_observations(db_path, query)
+                snapshot = activity_snapshot_from_observations(observations[:40])
+                awareness = build_awareness_snapshot(
+                    observations, local_callsign=callsign,
+                    active_groups=(group_filter,) if group_filter else (),
+                    pins=pins, visible_attention_limit=6,
+                )
+                sop_profiles = ControlFreqTab._read_condition_sop_profiles(sop_db_path)
+                try:
+                    profiles = MultiRadioStore(profile_db_path).list_runtime_active_device_profiles()
+                except Exception:
+                    profiles = []
+                return snapshot, awareness, sop_profiles, tuple(profiles)
+            return read
+        result = cache.read(signature, reader_factory, refresh_after_s=self._operational_snapshot_cache_ttl_sec)
+        if result is None:
             self._operational_activity_context = {}
             self._operational_awareness_context = {}
-            lanes = self._build_operational_source_lanes(())
-            self._set_operational_awareness_snapshot(None, source_lanes=lanes)
-            self._set_operational_activity_text("Recent Traffic: no traffic database yet", "")
+            self._operational_awareness_full_snapshot = None
+            self._awareness_row_contexts = []
+            table = getattr(self, "awareness_table", None)
+            pending_signature = (signature, cache.failed)
+            if table is not None and pending_signature != getattr(self, "_awareness_pending_signature", None):
+                self._awareness_pending_signature = pending_signature
+                table.setEnabled(False)
+                self._set_table_rows(table, [["Unavailable" if cache.failed else "Checking", "-", "Current traffic view pending", ""]])
+            self._set_operational_activity_text("Recent Traffic: unavailable" if cache.failed else "Recent Traffic: checking…", "")
             return
-        cache_key = (
-            int(window_minutes or 120),
-            str(search or "").strip().upper(),
-            str(group_filter or "").strip().upper(),
-            str(getattr(self, "_source_family_filter", "") or "").strip().lower(),
-            self._activity_cache_token(),
-        )
-        now_ts = time.time()
-        if (
-            cache_key == self._operational_snapshot_cache_key
-            and now_ts - float(self._operational_snapshot_cache_ts or 0.0) <= self._operational_snapshot_cache_ttl_sec
-        ):
+        if result is getattr(self, "_operational_rendered_result", None):
             return
-        self._operational_snapshot_cache_key = cache_key
-        self._operational_snapshot_cache_ts = now_ts
+        self._operational_rendered_result = result
+        self._awareness_pending_signature = None
+        table = getattr(self, "awareness_table", None)
+        if table is not None:
+            table.setEnabled(True)
         try:
-            since_utc = (
-                dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=max(1, int(window_minutes or 120)))
-            ).replace(microsecond=0).isoformat()
-            observations = query_observations(
-                db_path,
-                ObservationQuery(
-                    source_families=self._traffic_source_query_families(
-                        str(getattr(self, "_source_family_filter", "") or "").strip()
-                    ),
-                    since_utc=since_utc,
-                    operating_group=str(group_filter or ""),
-                    search_text=str(search or ""),
-                    limit=80,
-                ),
-            )
-            snapshot = activity_snapshot_from_observations(observations[:40])
+            snapshot, awareness_snapshot, sop_profiles, source_profiles = result
+            self._operational_source_profiles = source_profiles
             headline = self._format_operational_activity_headline(snapshot, search)
-            sop_decision = self._format_condition_sop_decision(snapshot)
+            sop_decision = self._format_condition_sop_decision(snapshot, profiles=sop_profiles)
             if sop_decision:
                 headline = f"{headline} | SOP: {sop_decision}"
             self._operational_activity_context = self._activity_context_from_snapshot(snapshot, group_filter)
-            awareness_snapshot = build_awareness_snapshot(
-                observations,
-                local_callsign=str(self.settings.get("operator_callsign", "") or "").strip().upper(),
-                active_groups=(str(group_filter or "").strip().upper(),) if str(group_filter or "").strip() else (),
-                pins=self._configured_awareness_pins(),
-                visible_attention_limit=6,
-            )
             self._operational_awareness_full_snapshot = awareness_snapshot
             self._set_operational_awareness_snapshot(awareness_snapshot)
             self._set_operational_activity_text(
@@ -4756,10 +5597,7 @@ class ControlFreqTab(QWidget):
 
     def _active_source_short_names(self) -> List[str]:
         names: List[str] = []
-        try:
-            profiles = list(self._multi_radio_store.list_runtime_active_device_profiles())
-        except Exception:
-            profiles = []
+        profiles = list(getattr(self, "_operational_source_profiles", ()))
         for profile in profiles:
             name = str((profile or {}).get("short_name") or (profile or {}).get("name") or "").strip()
             if name and name not in names:
@@ -4767,11 +5605,7 @@ class ControlFreqTab(QWidget):
         return names
 
     def _build_operational_source_lanes(self, attention_items: Sequence[object]) -> Tuple[object, ...]:
-        try:
-            profiles = list(self._multi_radio_store.list_runtime_active_device_profiles())
-        except Exception as e:
-            log.debug("ControlFreq: failed to load active source lanes: %s", e)
-            profiles = []
+        profiles = list(getattr(self, "_operational_source_profiles", ()))
         now_text = ""
         try:
             now_text = self._format_current_schedule_label()
@@ -5117,6 +5951,13 @@ class ControlFreqTab(QWidget):
             else:
                 headline = "No traffic needs attention."
         text = "Situation: " + headline
+        if hasattr(self, "dashboard"):
+            incidents = tuple(getattr(situation, "active_incidents", ()) or ()) if situation is not None else ()
+            needs = tuple(getattr(situation, "top_needs", ()) or ()) if situation is not None else ()
+            self.dashboard.situation_link.setText(
+                f"Situation · {len(incidents)} incidents / {len(needs)} needs" if snapshot is not None else "Situation · unavailable"
+            )
+            self.dashboard.situation_link.setToolTip(text + " · Open traffic evidence")
         label.setText(text)
         label.setToolTip(text)
         detail_parts: list[str] = []
@@ -6099,11 +6940,12 @@ class ControlFreqTab(QWidget):
             return f"{prefix} | {family}: {subject}" + (f" | {route}" if route else "")
         return f"{prefix} | {family}" + (f" | {route}" if route else "")
 
-    def _format_condition_sop_decision(self, snapshot: object) -> str:
+    def _format_condition_sop_decision(self, snapshot: object, *, profiles=None) -> str:
         alerts = tuple(getattr(snapshot, "condition_alerts", ()) or ())
         if not alerts:
             return ""
-        profiles = self._condition_sop_profiles()
+        if profiles is None:
+            profiles = self._condition_sop_profiles()
         decisions = evaluate_condition_sop_invocations(
             alerts[:3],
             sop_profiles=profiles,
@@ -6126,8 +6968,21 @@ class ControlFreqTab(QWidget):
         return f"Review {target}: {name}" if target else f"Review: {name}"
 
     def _condition_sop_profiles(self) -> List[Dict[str, Any]]:
+        return self._condition_sop_profiles_from_reader(self._sop_manager)
+
+    @staticmethod
+    def _read_condition_sop_profiles(db_path):
+        if db_path is None:
+            return []
+        # Read only: startup owns schema creation and profile normalization.
+        reader = SOPManager.__new__(SOPManager)
+        reader.db_path = db_path
+        return ControlFreqTab._condition_sop_profiles_from_reader(reader)
+
+    @staticmethod
+    def _condition_sop_profiles_from_reader(reader) -> List[Dict[str, Any]]:
         try:
-            summaries = self._sop_manager.list_profiles()
+            summaries = reader.list_profiles()
         except Exception as e:
             log.debug("ControlFreq: failed to list SOP profiles for condition alert: %s", e)
             return []
@@ -6140,7 +6995,7 @@ class ControlFreqTab(QWidget):
             if profile_id <= 0:
                 continue
             try:
-                full = self._sop_manager.get_profile(profile_id)
+                full = reader.get_profile(profile_id)
             except Exception as e:
                 log.debug("ControlFreq: failed to load SOP profile %s for condition alert: %s", profile_id, e)
                 continue
@@ -6337,14 +7192,36 @@ class ControlFreqTab(QWidget):
         self._update_clear_filters_style()
 
     def _refresh_intersections(self) -> None:
-        if not bool(self._view_cards.get("intersections", True)):
+        if not self._dashboard_card_enabled("intersections"):
+            return
+        self._ensure_operator_roster_read()
+        roster = getattr(self, "_operator_roster_snapshot", None)
+        if roster is None:
+            failure = bool(getattr(self, "_operator_roster_error", ""))
+            status = "Operator roster unavailable · retrying" if failure else "Checking operator roster…"
+            self.peer_summary_label.setText(status)
+            self.peer_summary_label.setToolTip(
+                "Peer overlap results need the operator roster and schedules. "
+                "No overlap conclusion is available until that snapshot is published."
+            )
+            if hasattr(self, "dashboard"):
+                self.dashboard.peer_link.setText("Operators · checking roster")
+                self.dashboard.peer_link.setToolTip(status)
+            self._refresh_peer_finder_rows([], empty_message=status)
+            self._fit_group_box_to_contents(self.intersection_box)
+            self._set_schedule_splitter_content_sizes()
             return
         group_filter = normalize_group_name(self.group_combo.currentData())
         search = (self.search_edit.text() or "").strip().upper()
         intersection_combo = getattr(self, "intersection_window_combo", self.activity_window_combo)
         horizon_minutes = int(intersection_combo.currentData() or 120)
-        operator_meta = self._load_operator_peer_meta()
-        self._refresh_peer_filter_options(operator_meta)
+        operator_meta = {
+            key: {**value, "groups": set(value.get("groups") or ())}
+            for key, value in roster.peer_meta.items()
+        }
+        peer_rows = [dict(row) for row in roster.peer_schedule_rows]
+        my_entries = self._load_my_schedule_entries(schedule_rows=roster.my_schedule_rows)
+        self._refresh_peer_filter_options(operator_meta, peer_rows)
         rows = self._compute_peer_finder_rows(
             group_filter,
             search,
@@ -6354,6 +7231,9 @@ class ControlFreqTab(QWidget):
             peer_region=str(self.peer_region_filter.currentData() or "").strip().upper(),
             peer_role=str(self.peer_role_filter.currentData() or "").strip().upper(),
             operator_meta=operator_meta,
+            operator_groups=roster.group_map,
+            peer_rows=peer_rows,
+            my_entries=my_entries,
         )
         now_count = sum(
             1
@@ -6365,13 +7245,23 @@ class ControlFreqTab(QWidget):
             for row in rows
             if any(int(window.get("start_offset_minutes") or 0) > 0 for window in tuple(row.get("windows") or ()))
         )
-        summary = f"Now {now_count} · Next {self._format_window_label(horizon_minutes)} {next_count}"
+        stale = time.monotonic() - float(self._operator_roster_published_at) >= self._operator_roster_ttl_sec
+        prefix = "Roster may be out of date · " if stale else ""
+        summary = f"{prefix}Now {now_count} · Next {self._format_window_label(horizon_minutes)} {next_count}"
         self.peer_summary_label.setText(summary)
+        if hasattr(self, "dashboard"):
+            self.dashboard.peer_link.setText(f"Operators · {now_count} now / {next_count} next")
+            self.dashboard.peer_link.setToolTip(summary + " · exact-frequency schedule overlaps, not verified contact")
         self.peer_summary_label.setToolTip(
             f"Distinct operators with an exact-frequency overlap: {summary}. "
             "One operator may have both a current and later window."
         )
-        self._refresh_peer_finder_rows(rows, horizon_minutes=horizon_minutes)
+        self._refresh_peer_finder_rows(
+            rows,
+            horizon_minutes=horizon_minutes,
+            empty_message=("No peer overlap in the next " + self._format_window_label(horizon_minutes)
+                          + (" · roster may be out of date" if stale else "")),
+        )
         self._fit_group_box_to_contents(self.intersection_box)
         self._set_schedule_splitter_content_sizes()
 
@@ -6380,6 +7270,7 @@ class ControlFreqTab(QWidget):
         rows: Sequence[Dict[str, object]],
         *,
         horizon_minutes: int = 120,
+        empty_message: Optional[str] = None,
     ) -> None:
         table = getattr(self, "peer_chart_table", None)
         if not isinstance(table, QTableWidget):
@@ -6394,7 +7285,7 @@ class ControlFreqTab(QWidget):
             if not rows:
                 table.insertRow(0)
                 empty = QTableWidgetItem(
-                    f"No peer overlap in the next {self._format_window_label(horizon_minutes)}"
+                    empty_message or f"No peer overlap in the next {self._format_window_label(horizon_minutes)}"
                 )
                 empty.setFlags(empty.flags() ^ Qt.ItemIsEditable)
                 table.setItem(0, 0, empty)
@@ -6524,18 +7415,21 @@ class ControlFreqTab(QWidget):
         peer_region: str = "",
         peer_role: str = "",
         operator_meta: Optional[Dict[str, Dict[str, object]]] = None,
+        operator_groups: Optional[Dict[str, Set[str]]] = None,
+        peer_rows: Optional[Sequence[Dict[str, Any]]] = None,
+        my_entries: Optional[Sequence[Dict[str, object]]] = None,
     ) -> List[Dict[str, object]]:
         now_utc = dt.datetime.now(dt.timezone.utc)
         now_min = now_utc.hour * 60 + now_utc.minute
         now_day_idx = (now_utc.weekday() + 1) % 7
         now_week_min = now_day_idx * 1440 + now_min
         horizon_minutes = max(1, int(horizon_minutes or 120))
-        my_entries = self._load_my_schedule_entries()
+        my_entries = list(my_entries) if my_entries is not None else self._load_my_schedule_entries()
         if not my_entries:
             return []
         operator_meta = operator_meta if operator_meta is not None else self._load_operator_peer_meta()
-        operator_groups = self._load_operator_group_map()
-        peer_rows = self._peer_schedule_rows()
+        operator_groups = operator_groups if operator_groups is not None else self._load_operator_group_map()
+        peer_rows = peer_rows if peer_rows is not None else self._peer_schedule_rows()
         if not peer_rows:
             return []
         peer_callsign = str(peer_callsign or "").strip().upper()
@@ -6695,34 +7589,45 @@ class ControlFreqTab(QWidget):
         if not group:
             return ""
         ops = self.settings.get("operating_groups", []) or []
-        for row in ops:
-            grp = (row.get("group") or "").strip().upper()
-            if grp != group:
-                continue
-            try:
-                f = float(row.get("frequency", 0))
-            except Exception:
-                continue
-            if abs(f - freq) < 0.0005:
-                return (row.get("band") or "").strip().upper()
-        return ""
+        resolution = resolve_operating_group_frequency(ops, group=group, frequency=freq)
+        wanted_hz = normalize_frequency_hz(freq)
+        bands = {
+            str(row.get("band") or "").strip().upper()
+            for row in resolution.candidates
+            if wanted_hz is not None and normalize_frequency_hz(row.get("frequency")) == wanted_hz
+        }
+        return next(iter(bands)) if len(bands) == 1 else ""
 
-    def _load_my_schedule_entries(self) -> List[Dict[str, object]]:
-        try:
-            settings_mtime = (
-                float(self._settings_db_path().stat().st_mtime)
-                if self._settings_db_path().exists()
-                else 0.0
-            )
-        except Exception:
-            settings_mtime = 0.0
-        try:
-            nets_mtime = float(self._db_path().stat().st_mtime) if self._db_path().exists() else 0.0
-        except Exception:
-            nets_mtime = 0.0
-        cache_key = (settings_mtime, nets_mtime)
+    def _load_my_schedule_entries(
+        self, schedule_rows: Optional[Sequence[Dict[str, Any]]] = None
+    ) -> List[Dict[str, object]]:
+        use_snapshot = schedule_rows is not None
+        if not use_snapshot:
+            snapshot = getattr(self, "_operator_roster_snapshot", None)
+            if snapshot is not None and hasattr(self, "_operator_roster_generation"):
+                schedule_rows = snapshot.my_schedule_rows
+                use_snapshot = True
+                self._ensure_operator_roster_read()
+            elif hasattr(self, "_operator_roster_generation"):
+                self._ensure_operator_roster_read()
+                return []
+        cache_key = (0.0, 0.0)
+        if not use_snapshot:
+            try:
+                settings_mtime = (
+                    float(self._settings_db_path().stat().st_mtime)
+                    if self._settings_db_path().exists()
+                    else 0.0
+                )
+            except Exception:
+                settings_mtime = 0.0
+            try:
+                nets_mtime = float(self._db_path().stat().st_mtime) if self._db_path().exists() else 0.0
+            except Exception:
+                nets_mtime = 0.0
+            cache_key = (settings_mtime, nets_mtime)
         now_ts = time.time()
-        if (
+        if not use_snapshot and (
             self._my_schedule_entries_cache
             and (now_ts - float(self._my_schedule_entries_cache_ts) < self._my_schedule_entries_cache_ttl_sec)
             and cache_key == self._my_schedule_entries_cache_key
@@ -6804,29 +7709,41 @@ class ControlFreqTab(QWidget):
             except Exception as e:
                 log.debug("ControlFreq: failed to load %s for overlaps: %s", table_name, e)
 
-        _read_rows(
-            self._settings_db_path(),
-            "daily_schedule_tab",
-            "day_utc, start_utc, end_utc, band, frequency, group_name",
-        )
-        _read_rows(
-            self._db_path(),
-            "daily_schedule_tab",
-            "day_utc, start_utc, end_utc, band, frequency, group_name",
-        )
-        _read_rows(
-            self._db_path(),
-            "net_schedule_tab",
-            "day_utc, start_utc, end_utc, band, frequency, group_name, net_name",
-        )
-        _read_rows(
-            self._settings_db_path(),
-            "net_schedule_tab",
-            "day_utc, start_utc, end_utc, band, frequency, group_name, net_name",
-        )
-        self._my_schedule_entries_cache = entries
-        self._my_schedule_entries_cache_ts = now_ts
-        self._my_schedule_entries_cache_key = cache_key
+        if use_snapshot:
+            for row in schedule_rows or ():
+                group_val = str(row.get("group_name") or row.get("net_name") or "")
+                add_entry(
+                    str(row.get("day_utc") or ""),
+                    str(row.get("start_utc") or ""),
+                    str(row.get("end_utc") or ""),
+                    str(row.get("band") or ""),
+                    row.get("frequency"),
+                    group_val,
+                )
+        else:
+            _read_rows(
+                self._settings_db_path(),
+                "daily_schedule_tab",
+                "day_utc, start_utc, end_utc, band, frequency, group_name",
+            )
+            _read_rows(
+                self._db_path(),
+                "daily_schedule_tab",
+                "day_utc, start_utc, end_utc, band, frequency, group_name",
+            )
+            _read_rows(
+                self._db_path(),
+                "net_schedule_tab",
+                "day_utc, start_utc, end_utc, band, frequency, group_name, net_name",
+            )
+            _read_rows(
+                self._settings_db_path(),
+                "net_schedule_tab",
+                "day_utc, start_utc, end_utc, band, frequency, group_name, net_name",
+            )
+            self._my_schedule_entries_cache = entries
+            self._my_schedule_entries_cache_ts = now_ts
+            self._my_schedule_entries_cache_key = cache_key
         return entries
 
     @staticmethod
@@ -7509,7 +8426,7 @@ class ControlFreqTab(QWidget):
         if self.local_nets_later_btn.isChecked():
             rows.extend(("later", item) for item in later)
         if not rows:
-            empty = QLabel("No active Local Net reminders. Reminder only — FIO will not tune a radio.")
+            empty = QLabel("No active Local Net reminders. Reminder only — CommsPlan will not tune a radio.")
             empty.setWordWrap(True)
             empty.setObjectName("controlfreqLocalNetsOutlookEmpty")
             layout.addWidget(empty)
@@ -7736,7 +8653,7 @@ class ControlFreqTab(QWidget):
         now = now_utc or dt.datetime.now(dt.timezone.utc)
         rows = sorted(self._shortwave_listening_outlook_items, key=lambda row: self._shortwave_item_start(row) or now)[:52]
         if not rows:
-            empty = QLabel("No saved Shortwave Listening reminders. Manual tuning only — FIO will not control a receiver.")
+            empty = QLabel("No saved Shortwave Listening reminders. Manual tuning only — CommsPlan will not control a receiver.")
             empty.setWordWrap(True)
             layout.addWidget(empty)
         else:
@@ -7806,7 +8723,7 @@ class ControlFreqTab(QWidget):
         return frame
 
     def _refresh_schedule_outlook(self) -> None:
-        if not bool(self._view_cards.get("schedule", True)):
+        if not self._dashboard_card_enabled("schedule"):
             return
         self._reload_sop_manager_settings()
         now_utc = dt.datetime.now(dt.timezone.utc)
@@ -7880,6 +8797,8 @@ class ControlFreqTab(QWidget):
             or (tomorrow_start <= r.get("when_utc") <= tomorrow_end)
         ]
         self._next_schedule_outlook_preview = self._next_schedule_outlook_entry(now_utc, today_rows + week_rows)
+        if hasattr(self, "dashboard"):
+            self.dashboard.set_upcoming(today_rows + week_rows)
         self._set_awareness_sop_summary(today_rows, week_rows)
         self._render_schedule_timeline(today_rows, week_rows, now_utc=now_utc)
         # Local Nets has an independent bounded projection and never enters the
@@ -8805,6 +9724,8 @@ class ControlFreqTab(QWidget):
 
     def _toggle_traffic_group_detail(self, visible: bool, *, persist: bool = True) -> None:
         expanded = bool(visible)
+        if hasattr(self, "dashboard"):
+            self._dashboard_traffic_expanded = expanded
         if hasattr(self, "traffic_group_table"):
             self.traffic_group_table.setVisible(expanded)
         if hasattr(self, "traffic_group_hint"):
@@ -8823,11 +9744,14 @@ class ControlFreqTab(QWidget):
     def _open_traffic_action_bucket(self, bucket: str) -> None:
         if not bucket:
             return
+        message_ids, count = self.traffic_action_summary.navigation_snapshot(bucket)
         host = self.window()
         if hasattr(host, "open_messages_section"):
             host.open_messages_section(
                 "inbox",
                 action_filter=bucket,
+                traffic_message_ids=message_ids,
+                traffic_count_at_click=count,
                 age_filter_seconds=self._traffic_age_seconds(),
                 group_filter=str(self.group_combo.currentData() or ""),
                 source_family=str(self.traffic_source_combo.currentData() or ""),
@@ -9014,7 +9938,11 @@ class ControlFreqTab(QWidget):
         table = getattr(self, "traffic_group_table", None)
         if table is None:
             return
-        visible_volumes = volumes[:8]
+        if hasattr(self, "dashboard"):
+            self._dashboard_traffic_volumes = volumes
+        overview = hasattr(self, "dashboard") and self.dashboard.current_page == "overview"
+        visible_volumes = volumes[:4 if overview else 8]
+        selected = table.currentItem().data(Qt.UserRole) if table.currentItem() is not None else None
         table.setUpdatesEnabled(False)
         table.clearSpans()
         table.setRowCount(0)
@@ -9060,13 +9988,18 @@ class ControlFreqTab(QWidget):
                     if volume.trend == "All time"
                     else f"{volume.current_count} current · {volume.previous_count} prior"
                 )
+                if overview:
+                    comparison_label = f"{volume.current_count} total" if volume.trend == "All time" else f"{volume.current_count} / {volume.previous_count}"
+                    detail_item_text = f"{volume.trend} · {volume.unread_count} new"
+                else:
+                    detail_item_text = trend_detail
                 bar_item = QTableWidgetItem(comparison_label)
                 bar_item.setData(TRAFFIC_CHART_CURRENT_ROLE, volume.current_count)
                 bar_item.setData(TRAFFIC_CHART_PREVIOUS_ROLE, volume.previous_count)
                 bar_item.setData(TRAFFIC_CHART_SCALE_ROLE, scale)
                 bar_item.setData(TRAFFIC_CHART_TREND_ROLE, volume.trend)
 
-                detail_item = QTableWidgetItem(trend_detail)
+                detail_item = QTableWidgetItem(detail_item_text)
                 for chart_item in (group_item, bar_item, detail_item):
                     chart_item.setFlags(chart_item.flags() & ~Qt.ItemIsEditable)
                     chart_item.setData(Qt.UserRole, volume.group)
@@ -9079,15 +10012,22 @@ class ControlFreqTab(QWidget):
         table.setUpdatesEnabled(True)
         table.clearSelection()
         table.setCurrentCell(-1, -1)
+        if selected is not None:
+            for row_index, volume in enumerate(visible_volumes):
+                if volume.group == selected:
+                    table.setCurrentCell(row_index, 0)
+                    break
         total = sum(volume.current_count for volume in volumes)
         unread = sum(volume.unread_count for volume in volumes)
         increasing = sum(
             1 for volume in volumes if volume.trend.startswith(("Spike", "Rising"))
         )
-        self.traffic_group_title.setText(
-            f"Traffic by group · {total} total / {unread} new · {increasing} increasing"
-        )
-        self._fit_table_height_to_rows(table, min_rows=1, max_rows=5, empty_rows=1)
+        aggregate = f"Traffic by group · {total} total / {unread} new · {increasing} increasing"
+        self.traffic_group_title.setText(f"Traffic by group · {increasing} increasing" if hasattr(self, "dashboard") else aggregate)
+        self.traffic_group_title.setToolTip(aggregate + " · Show or hide group detail")
+        if hasattr(self, "dashboard"):
+            self.inbox_box.setTitle(f"Traffic · {total} total / {unread} new")
+        self._fit_table_height_to_rows(table, min_rows=1, max_rows=4 if overview else 5, empty_rows=1)
         self._sync_top_panel_heights()
         self._apply_ops_table_column_layout(
             getattr(self, "_responsive_layout_mode", "wide") == "compact"
@@ -9609,7 +10549,7 @@ class ControlFreqTab(QWidget):
         )
 
     def _refresh_propagation_snapshot(self) -> None:
-        if not bool(self._view_cards.get("propagation", True)):
+        if not self._dashboard_card_enabled("propagation"):
             return
         try:
             tz_name = self.settings.get("timezone", "UTC") or "UTC"
@@ -9824,6 +10764,9 @@ class ControlFreqTab(QWidget):
             return
         label.setText(str(text or "").strip() or "RF Readiness: unavailable")
         label.setToolTip(label.text())
+        if hasattr(self, "dashboard"):
+            self.dashboard.prop_link.setToolTip(label.text())
+            self.dashboard.prop_link.setText("RF · details")
 
     def _render_prop_band_ladder(
         self,
@@ -9835,6 +10778,9 @@ class ControlFreqTab(QWidget):
         layout = getattr(self, "prop_band_ladder_layout", None)
         if layout is None:
             return
+        if hasattr(self, "dashboard"):
+            preview = " / ".join(f"{band} {int(round(score))}" for band, score in tuple(scores)[:2])
+            self.dashboard.prop_link.setText("RF · " + (preview or "unavailable"))
         self._clear_widget_layout(layout)
         self.prop_band_ladder_container.setMinimumHeight(0)
         if not scores:
@@ -10140,6 +11086,8 @@ class ControlFreqTab(QWidget):
         self._fit_table_height_to_rows(self.prop_table, min_rows=0, max_rows=6, empty_rows=0)
 
     def _sync_propagation_box_height(self) -> None:
+        if hasattr(self, "dashboard"):
+            return
         box = getattr(self, "prop_box", None)
         if box is None:
             return
@@ -10157,9 +11105,73 @@ class ControlFreqTab(QWidget):
             bottom_row = getattr(self, "bottom_row", None)
             if bottom_row is not None:
                 bottom_row.updateGeometry()
+            self._request_ops_geometry_sync()
         except Exception:
             box.setMinimumHeight(0)
             box.setMaximumHeight(16777215)
+
+    def _request_ops_geometry_sync(self) -> None:
+        """Coalesce dynamic card changes into one page-extent publication."""
+
+        if self._ops_geometry_sync_running:
+            return
+        if not self._ops_geometry_timer.isActive():
+            self._ops_geometry_timer.start()
+
+    def _run_ops_geometry_sync(self) -> None:
+        """Publish the current content extent to the sole page scroll owner."""
+
+        if self._ops_geometry_sync_running:
+            return
+        if hasattr(self, "dashboard"):
+            # Hidden detail-page hints never enlarge the dashboard. Each
+            # selected page owns local overflow; outer scroll is only fallback.
+            self.controlfreq_content.setMinimumHeight(0)
+            self.controlfreq_root_layout.invalidate()
+            self.controlfreq_root_layout.activate()
+            self._ops_geometry_sync_count += 1
+            return
+        scroll = getattr(self, "controlfreq_scroll", None)
+        content = getattr(self, "controlfreq_content", None)
+        root = getattr(self, "controlfreq_root_layout", None)
+        if scroll is None or content is None or root is None:
+            return
+        self._ops_geometry_sync_running = True
+        try:
+            bar = scroll.verticalScrollBar()
+            old_value = int(bar.value())
+            old_maximum = int(bar.maximum())
+            anchored_to_bottom = old_maximum > 0 and old_value >= old_maximum - 2
+
+            # Clear only the page-level minimum before measuring so the page
+            # can shrink as well as grow. Child table/list bounds remain the
+            # responsibility of their existing fit helpers.
+            content.setMinimumHeight(0)
+            self._sync_top_panel_heights()
+            root.invalidate()
+            root.activate()
+            target_height = max(
+                int(scroll.viewport().height()),
+                int(root.minimumSize().height()),
+                int(root.sizeHint().height()),
+            )
+            content.setMinimumHeight(target_height)
+            content.updateGeometry()
+            scroll.updateGeometry()
+            self._ops_geometry_sync_count += 1
+
+            def restore_scroll_position() -> None:
+                try:
+                    if anchored_to_bottom:
+                        bar.setValue(bar.maximum())
+                    else:
+                        bar.setValue(min(old_value, bar.maximum()))
+                except RuntimeError:
+                    pass
+
+            QTimer.singleShot(0, restore_scroll_position)
+        finally:
+            self._ops_geometry_sync_running = False
 
     def _append_section_row(self, text: str) -> None:
         row = self.prop_table.rowCount()
@@ -10308,13 +11320,18 @@ class ControlFreqTab(QWidget):
         except Exception:
             pass
 
-    @staticmethod
-    def _fit_group_box_to_contents(group_box: QGroupBox) -> None:
+    def _fit_group_box_to_contents(self, group_box: QGroupBox) -> None:
+        if hasattr(self, "dashboard"):
+            group_box.setMinimumHeight(0)
+            group_box.setMaximumHeight(16777215)
+            group_box.updateGeometry()
+            return
         try:
             height = ControlFreqTab._content_fit_group_height(group_box, floor=96)
             group_box.setMinimumHeight(height)
             group_box.setMaximumHeight(height)
             group_box.updateGeometry()
+            self._request_ops_geometry_sync()
         except Exception:
             pass
 

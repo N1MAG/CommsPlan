@@ -180,7 +180,7 @@ def with_canonical_managed_directory_actions(
                     action_type="create_directory",
                     target=target,
                     summary=(
-                        f"Create the reviewed FIO-managed {APP_DISPLAY_NAMES.get(component_key, component_key)} "
+                        f"Create the reviewed CommsPlan-managed {APP_DISPLAY_NAMES.get(component_key, component_key)} "
                         f"folder for {instance_name}."
                     ),
                     requires_backup=False,
@@ -279,7 +279,7 @@ def build_guided_external_app_config_plan(
     if not allow_external_writes:
         selected_apps = sorted({app for proposal in proposals for app in proposal.enabled_apps})
         app_text = ", ".join(APP_DISPLAY_NAMES.get(app, app) for app in selected_apps) if selected_apps else "selected apps"
-        read_only_review = [f"Read-only setup will remember {app_text} references in FIO without changing external app configuration."]
+        read_only_review = [f"Read-only setup will remember {app_text} references in CommsPlan without changing external app configuration."]
         if selected_varac:
             read_only_review.extend(_varac_review_items())
         return GuidedAppConfigPlan(
@@ -477,7 +477,7 @@ def apply_guided_external_app_config_plan(
                     action_type=action_type,
                     target=target,
                     status="remembered",
-                    detail="FIO-side integration reference only.",
+                    detail="CommsPlan-side integration reference only.",
                 )
             )
             continue
@@ -503,7 +503,7 @@ def apply_guided_external_app_config_plan(
                     status="operator_action_required",
                     detail=(
                         "No exact supported native writer matches this application variant, version, platform, and operation. "
-                        "FIO configuration was not written; complete the native profile in the application and verify it in Health."
+                        "CommsPlan configuration was not written; complete the native profile in the application and verify it in Health."
                     ),
                 )
             )
@@ -682,7 +682,7 @@ def _int_text(value: object, default: int) -> int:
 
 def _varac_review_items() -> Tuple[str, str]:
     return (
-        "VarAC guided setup is read/import only: FIO remembers paths and monitors VarAC data without rewriting VarAC.ini or VarAC DB.",
+        "VarAC guided setup is read/import only: CommsPlan remembers paths and monitors VarAC data without rewriting VarAC.ini or VarAC DB.",
         "Use the dedicated VarAC BBS settings workflow for explicit [BBS] section sync; cluster membership remains read-only in this release.",
     )
 
@@ -714,7 +714,7 @@ def _add_commstat_shared_binding_action(
     target = str(
         paths.get("commstat_launch_path")
         or paths.get("commstat")
-        or "FIO station-shared CommStat service"
+        or "CommsPlan station-shared CommStat service"
     )
     actions.append(
         GuidedAppConfigAction(
@@ -736,7 +736,7 @@ def _add_commstat_shared_binding_action(
                 "radio_keys": ", ".join(proposal.instance_name for proposal in bindings),
             },
             notes=(
-                "FIO launches or monitors one CommStat process for the station.",
+                "CommsPlan launches or monitors one CommStat process for the station.",
                 "Each radio keeps its own JS8Call API/profile binding; CommStat is not duplicated per radio.",
             ),
         )
@@ -778,7 +778,7 @@ def _add_varac_integration_action(
     found_labels = tuple(asset.label for asset in varac_assets if asset.exists)
     if found_labels:
         details["readable_assets"] = ", ".join(found_labels)
-    target = details["install_path"] or details["ini_path"] or details["db_path"] or "FIO VarAC integration settings"
+    target = details["install_path"] or details["ini_path"] or details["db_path"] or "CommsPlan VarAC integration settings"
     actions.append(
         GuidedAppConfigAction(
             action_id="varac:remember-integration",
@@ -786,13 +786,13 @@ def _add_varac_integration_action(
             instance_name=instance_names,
             action_type="remember_integration",
             target=target,
-            summary="Remember VarAC paths and enable read/import integration in FIO without changing VarAC configuration.",
+            summary="Remember VarAC paths and enable read/import integration in CommsPlan without changing VarAC configuration.",
             requires_backup=False,
             writes_external_config=False,
             manual_review_required=True,
             details=details,
             notes=(
-                "FIO may read VarAC.ini, the VarAC database, logs, and message/BBS folders for discovery and ingest.",
+                "CommsPlan may read VarAC.ini, the VarAC database, logs, and message/BBS folders for discovery and ingest.",
                 "Guided setup does not write VarAC.ini or the VarAC database.",
                 "VarAC owns scheduler/frequency control for VarAC-only radios.",
             ),
@@ -819,7 +819,7 @@ def _add_directory_action(
             instance_name=instance_name,
             action_type="create_directory",
             target=key,
-            summary=f"Create FIO-managed {APP_DISPLAY_NAMES.get(app_id, app_id)} folder for {instance_name}.",
+            summary=f"Create CommsPlan-managed {APP_DISPLAY_NAMES.get(app_id, app_id)} folder for {instance_name}.",
             requires_backup=False,
             writes_external_config=False,
         )

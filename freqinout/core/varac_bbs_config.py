@@ -138,8 +138,9 @@ def load_varac_bbs_config(ini_path: object) -> Mapping[str, object]:
         raise FileNotFoundError("VarAC.ini not found")
     parser = configparser.ConfigParser(interpolation=None)
     parser.optionxform = str
-    with Path(resolved).open("r", encoding="utf-8", errors="replace") as handle:
-        parser.read_file(handle)
+    from freqinout.core.config_varac_managed import read_varac_ini_source
+    source = read_varac_ini_source(Path(resolved))
+    parser.read_string(source.raw_bytes.decode(source.encoding))
     section_name = _resolve_section_name(parser, "BBS")
     if section_name is None:
         raise KeyError("VarAC.ini does not contain a [BBS] section")
@@ -247,6 +248,36 @@ def varac_ini_sync_state_matches(known: object, current: object) -> bool:
     )
 
 
+def render_varac_bbs_config_bytes(raw: bytes, *, enable_bbs: bool, bbs_directory: str,
+                                  limit_access: bool, allowed_callsigns: object, announce: bool) -> bytes:
+    """Preserve unrelated keys, comments, case, encoding, and line endings."""
+    from freqinout.core.config_varac_managed import (
+        parse_varac_ini_bytes, render_varac_ini, VarACWriterCapability,
+    )
+    directory = str(bbs_directory or "").strip()
+    if any(ch in directory for ch in "\r\n\x00"):
+        raise ValueError("BBS directory must be a single-line path")
+    calls = format_callsign_list(allowed_callsigns)
+    if not re.fullmatch(r"[A-Z0-9/]*(?:,[A-Z0-9/]+)*", calls):
+        raise ValueError("Allowed callsigns must be concrete callsigns, separated by commas")
+    if limit_access and not calls:
+        raise ValueError("Limited VarAC BBS access requires at least one allowed callsign")
+    changes = {"BBS": {
+        "EnableBBS": "ON" if enable_bbs else "OFF", "BBSDirectory": directory,
+        "LimitAccessToCallsigns": "ON" if limit_access else "OFF",
+        "LimitAccessToCallsignsList": calls, "Announce": "ON" if announce else "OFF",
+    }}
+    source = parse_varac_ini_bytes(Path("VarAC.ini"), raw)
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.read_string(raw.decode(source.encoding))  # reject ambiguous duplicate keys/sections
+    # The established five-key BBS adapter, not the versioned cluster writer.
+    capability = VarACWriterCapability("bbs-adapter-v1", "any", "bbs", "bbs-v1", creatable_sections=("BBS",))
+    sections = [name for name in source.values if name.casefold() == "bbs"]
+    if len(sections) > 1 or len(re.findall(rb"(?im)^\s*\[bbs\]\s*(?:[;#].*)?$", raw)) > 1:
+        raise ValueError("Duplicate BBS sections cannot be updated safely")
+    return render_varac_ini(source, changes, capability=capability)
+
+
 def write_varac_bbs_config(
     ini_path: object,
     *,
@@ -267,45 +298,30 @@ def write_varac_bbs_config(
     if known_state is not None and not varac_ini_sync_state_matches(known_state, current_state):
         raise RuntimeError("VarAC.ini changed since it was loaded")
 
-    raw_text = path.read_text(encoding="utf-8", errors="replace")
-    lines = raw_text.splitlines()
-    bbs_lines = [
-        "[BBS]",
-        f"EnableBBS={'ON' if bool(enable_bbs) else 'OFF'}",
-        f"BBSDirectory={str(bbs_directory or '').strip()}",
-        f"LimitAccessToCallsigns={'ON' if bool(limit_access) else 'OFF'}",
-        f"LimitAccessToCallsignsList={format_callsign_list(allowed_callsigns)}",
-        f"Announce={'ON' if bool(announce) else 'OFF'}",
-    ]
-    replacement = "\n".join(bbs_lines)
-    section_start = None
-    section_end = None
-    for idx, line in enumerate(lines):
-        if line.strip().lower() == "[bbs]":
-            section_start = idx
-            for j in range(idx + 1, len(lines)):
-                nxt = lines[j].strip()
-                if nxt.startswith("[") and nxt.endswith("]"):
-                    section_end = j
-                    break
-            if section_end is None:
-                section_end = len(lines)
-            break
-    if section_start is None:
-        if raw_text and not raw_text.endswith(("\n", "\r")):
-            raw_text += "\n"
-        if raw_text and not raw_text.endswith("\n\n"):
-            raw_text += "\n"
-        updated_text = raw_text + replacement + "\n"
-    else:
-        before = "\n".join(lines[:section_start]).rstrip()
-        after = "\n".join(lines[section_end:]).lstrip()
-        parts: List[str] = []
-        if before:
-            parts.append(before)
-        parts.append(replacement)
-        if after:
-            parts.append(after)
-        updated_text = "\n\n".join(parts).rstrip() + "\n"
-    path.write_text(updated_text, encoding="utf-8")
+    from freqinout.core.config_backup import create_config_backup, restore_config_backup
+    from freqinout.core.config_varac_managed import _stage_bytes
+    raw = path.read_bytes()
+    payload = render_varac_bbs_config_bytes(raw, enable_bbs=enable_bbs, bbs_directory=bbs_directory,
+                                          limit_access=limit_access, allowed_callsigns=allowed_callsigns, announce=announce)
+    if payload == raw:
+        return current_state
+    backup = create_config_backup((path,), reason="varac-bbs")
+    if any(item.status != "backed_up" for item in backup.items):
+        raise OSError("VarAC BBS backup failed; INI was not changed")
+    staged = _stage_bytes(path, payload)
+    os.chmod(staged, path.stat().st_mode & 0o777)
+    promoted = False
+    try:
+        if not varac_ini_sync_state_matches(current_state, get_varac_ini_sync_state(path)):
+            raise RuntimeError("VarAC.ini changed before update")
+        os.replace(staged, path)
+        promoted = True
+        if path.read_bytes() != payload:
+            raise OSError("VarAC BBS readback did not match")
+    except Exception:
+        if promoted and not restore_config_backup(backup).ok:
+            raise RuntimeError(f"VarAC BBS rollback failed; recover from {backup.backup_dir}")
+        raise
+    finally:
+        staged.unlink(missing_ok=True)
     return get_varac_ini_sync_state(path)

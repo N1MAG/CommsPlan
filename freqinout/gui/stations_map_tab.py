@@ -6,7 +6,7 @@ import json
 import sqlite3
 import re
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, List, Dict, Mapping, Optional, Set, Tuple
 import math
@@ -48,6 +48,8 @@ from PySide6.QtWidgets import (
     QTabWidget,
 )
 from freqinout.core.config_paths import get_config_dir
+from freqinout.core.sqlite_utils import connect_sqlite_readonly
+from freqinout.core.map_read_budget import note_map_read_cap
 from freqinout.core.view_contracts import compose_intent_from_mapping, map_context_from_mapping
 from freqinout.gui.native_map_renderer import NativeMapRenderer
 from freqinout.gui.native_map_projection import build_native_overlay_projection
@@ -97,6 +99,8 @@ from freqinout.radio_interface.js8_rx_hub import JS8RxHub
 from freqinout.gui.qsy_helper import current_scheduler_freq
 from freqinout.gui.help_registry import resolve_help_host
 from freqinout.gui.plan_context_label import PlanContextLabel
+from freqinout.gui.map_layer_controls import MapLayerControls
+from freqinout.gui.map_layer_state import toggle_map_layer
 from freqinout.gui.theme import (
     contrast_text_for_background,
     resolve_theme,
@@ -333,20 +337,20 @@ class _RfPinManagerDialog(QDialog):
             return
         pin = self._pins_by_ref.get(refs[0])
         if pin is None:
-            QMessageBox.warning(self, "Manage Planning Pins", "FIO could not find the selected planning pin.")
+            QMessageBox.warning(self, "Manage Planning Pins", "CommsPlan could not find the selected planning pin.")
             return
         dialog = _RfPinDialog(self, pin=pin)
         if dialog.exec() != QDialog.Accepted:
             return
         payload = dialog.pin_payload()
         if not payload.get("grid"):
-            QMessageBox.warning(self, "Edit Planning Pin", "Add a grid square so FIO can place the planning pin on the map.")
+            QMessageBox.warning(self, "Edit Planning Pin", "Add a grid square so CommsPlan can place the planning pin on the map.")
             return
         try:
             save_rf_pin(self._db_path, payload)
         except Exception as exc:
             log.warning("StationsMap: failed to update RF pin: %s", exc, exc_info=True)
-            QMessageBox.warning(self, "Edit Planning Pin", f"FIO could not update this planning pin.\n{exc}")
+            QMessageBox.warning(self, "Edit Planning Pin", f"CommsPlan could not update this planning pin.\n{exc}")
             return
         self._changed = True
         self._load_rows()
@@ -369,7 +373,7 @@ class _RfPinManagerDialog(QDialog):
             delete_rf_pins(self._db_path, refs)
         except Exception as exc:
             log.warning("StationsMap: failed to delete RF pins: %s", exc, exc_info=True)
-            QMessageBox.warning(self, "Delete Planning Pins", f"FIO could not delete the selected planning pin(s).\n{exc}")
+            QMessageBox.warning(self, "Delete Planning Pins", f"CommsPlan could not delete the selected planning pin(s).\n{exc}")
             return
         self._deleted = True
         self._load_rows()
@@ -639,8 +643,11 @@ MAP_NETWORK_PATH_DISPLAY_LIMIT = 250
 WEATHER_SEVERITY_RANK = {
     "unknown": 0,
     "routine": 1,
+    "green": 1,
     "caution": 2,
+    "yellow": 2,
     "severe": 3,
+    "red": 3,
 }
 
 
@@ -681,7 +688,7 @@ def maidenhead_grid4_bounds(grid: str) -> Optional[tuple[float, float, float, fl
 class StationsMapTab(QWidget):
     """
     Displays JS8Call-heard stations on an OSM-based map with a Maidenhead overlay.
-    Stations and operational overlays render on FIO's provider-free offline map.
+    Stations and operational overlays render on CommsPlan's provider-free offline map.
     """
 
     def __init__(
@@ -712,6 +719,7 @@ class StationsMapTab(QWidget):
         self.link_mode = "off"
         self.link_value = ""
         self._paths_focus_station = ""
+        self._saved_map_path_scope = None
         self._map_last_link_source_rows = 0
         self._map_last_link_missing_position_rows = 0
         self._map_last_link_all_time_count = 0
@@ -753,6 +761,7 @@ class StationsMapTab(QWidget):
         self._map_status_filter_combo: Optional[QComboBox] = None
         self._map_trust_filter_combo: Optional[QComboBox] = None
         self.selected_band = "All"
+        self._map_schedule_freqs = []
         self.recency_seconds: Optional[int] = None
         self.operator_rows: List[Dict] = []
         self.operator_index: Dict[str, Dict] = {}
@@ -803,6 +812,11 @@ class StationsMapTab(QWidget):
         self._map_initialized = False
         self._pending_map_payload: Optional[Dict[str, object]] = None
         self._last_map_payload_sig: Optional[str] = None
+        self._map_read_lane = None
+        self._map_read_inflight = False
+        self._map_inspector_lane = None
+        self._map_inspector_generation = 0
+        self._map_read_cache_revision = 0
         self._map_payload_generation: int = 0
         self._map_payload_executor: ThreadPoolExecutor | None = None
         self._map_payload_emitter = _MapProjectionSnapshotEmitter(self)
@@ -918,14 +932,12 @@ class StationsMapTab(QWidget):
         self._load_display_preferences()
         self._refresh_band_options()
         self.apply_theme()
-        QTimer.singleShot(0, self._prewarm_map_perf_caches)
 
     def _ensure_initial_data_loaded(self) -> None:
         if self._initial_data_loaded:
             return
-        with perf_span("map.initial_data_load", settings=self.settings, min_ms=10.0):
-            self._load_operator_history()
-        self._initial_data_loaded = True
+        # The first visible refresh loads the roster on the map read worker.
+        return
 
     def _bool_setting(self, key: str, default: bool = False) -> bool:
         if not self.settings:
@@ -971,6 +983,11 @@ class StationsMapTab(QWidget):
                 self.show_infrastructure_reports,
             )
         ):
+            self.show_station_markers = True
+            self.map_stations_chk.blockSignals(True)
+            self.map_stations_chk.setChecked(True)
+            self.map_stations_chk.blockSignals(False)
+        if self.show_link_paths:
             self.show_station_markers = True
             self.map_stations_chk.blockSignals(True)
             self.map_stations_chk.setChecked(True)
@@ -1071,17 +1088,9 @@ class StationsMapTab(QWidget):
         self._start_js8_rx_listener()
 
     def _prewarm_map_perf_caches(self) -> None:
-        if self._is_shutting_down or self._prop_prewarm_done:
-            return
-        try:
-            self._load_prop_db_cache()
-        except Exception:
-            pass
-        try:
-            self._load_recent_calls_by_band(self._prop_window_seconds())
-        except Exception:
-            pass
-        self._prop_prewarm_done = True
+        # Lazy worker construction owns propagation/profile input reads.
+        if self._map_visible and self._app_active:
+            self._request_map_refresh(level="light", reason="prewarm")
 
     def _start_js8_rx_listener(self):
         """
@@ -1244,12 +1253,26 @@ class StationsMapTab(QWidget):
                 return tuple()
         return (("value", str(band_filter or "")),)
 
-    def _nets_db_fingerprint(self) -> Tuple[str, int, int]:
+    def _nets_db_fingerprint(self) -> tuple:
         try:
             db_path = get_config_dir() / "config" / "freqinout_nets.db"
         except Exception:
             return ("", 0, 0)
-        return self._path_stat_fingerprint(db_path)
+        # WAL commits may leave the main file untouched for many refreshes.
+        return (self._path_stat_fingerprint(db_path), self._path_stat_fingerprint(str(db_path) + "-wal"))
+
+    def _station_points_for_map(self) -> List[StationPoint]:
+        points = list(self.stations)
+        call = str(self.settings.get("operator_callsign", "") or "").strip().upper()
+        grid = str(self.settings.get("operator_grid6", "") or self.settings.get("operator_grid", "") or "").strip().upper()
+        location = maidenhead_to_latlon(grid) if re.fullmatch(r"[A-R]{2}\d{2}(?:[A-X]{2})?", grid) else None
+        if call and location:
+            # Saved operator location is authoritative for my station.
+            existing = next((point for point in points if point.callsign.upper() == call), None)
+            points = [point for point in points if point.callsign.upper() != call]
+            own = replace(existing, grid=grid, lat=location[0], lon=location[1]) if existing else StationPoint(callsign=call, grid=grid, lat=location[0], lon=location[1])
+            points.insert(0, own)
+        return points
 
     def _set_station_points(self, points: List[StationPoint]) -> None:
         self.stations = list(points)
@@ -1274,7 +1297,7 @@ class StationsMapTab(QWidget):
         return self.window()
 
     def _bring_application_window_forward(self) -> None:
-        """Present the existing main FIO window without touching Map geometry."""
+        """Present the existing main CommsPlan window without touching Map geometry."""
         host_ref = getattr(self, "_application_host_ref", None)
         if not callable(host_ref):
             return
@@ -1297,7 +1320,7 @@ class StationsMapTab(QWidget):
                     if QMetaObject.invokeMethod(main_window, "present_main_window", Qt.QueuedConnection):
                         return
                 except Exception:
-                    log.debug("StationsMap: queued FIO presentation failed", exc_info=True)
+                    log.debug("StationsMap: queued CommsPlan presentation failed", exc_info=True)
             presenter()
             return
         # Compatibility for lightweight hosts and tests. Real MainWindow owns
@@ -1306,11 +1329,14 @@ class StationsMapTab(QWidget):
             main_window.raise_()
             main_window.activateWindow()
         except Exception as exc:
-            log.debug("StationsMap: failed bringing FIO workspace to front: %s", exc)
+            log.debug("StationsMap: failed bringing CommsPlan workspace to front: %s", exc)
 
     def _request_map_refresh(self, *, level: str = "medium", reason: str = "", preserve_view: object = True) -> None:
         if getattr(self, "_is_shutting_down", False):
             return
+        # Invalidate at input change, before the coalescing timer can fire.
+        self._map_payload_generation = getattr(self, "_map_payload_generation", 0) + 1
+        self._map_inspector_generation = getattr(self, "_map_inspector_generation", 0) + 1
         requested_rank = self._refresh_level_rank(level)
         if not getattr(self, "_app_active", True):
             self._map_dirty = True
@@ -1414,12 +1440,12 @@ class StationsMapTab(QWidget):
                 self._render_map(preserve_view=preserve_view)
         except Exception as exc:
             self._enter_map_degraded(
-                "Map refresh did not complete cleanly. You can retry without restarting FIO.",
+                "Map refresh did not complete cleanly. You can retry without restarting CommsPlan.",
                 reason=reason,
                 exc=exc,
             )
             return
-        if not self._map_page_loading and self._map_runtime_state != "degraded":
+        if not getattr(self, "_map_read_inflight", False) and not self._map_page_loading and self._map_runtime_state != "degraded":
             link_detail = str(getattr(self, "_map_link_status_detail", "") or "").strip()
             detail = self._map_ready_detail_text()
             if link_detail:
@@ -1428,7 +1454,7 @@ class StationsMapTab(QWidget):
                 "ready",
                 detail,
             )
-        self._emit_map_event("render_completed", level=level, reason=reason)
+        self._emit_map_event("render_queued", level=level, reason=reason)
 
     def _map_loading_detail_text(self, *, level: str = "", reason: str = "") -> str:
         mode = self._current_map_mode_key()
@@ -1485,7 +1511,7 @@ class StationsMapTab(QWidget):
                 ),
             ),
         ]
-        return build_support_summary("FreqInOut Multi-Rig Map Diagnostics", top_lines, sections=sections)
+        return build_support_summary("CommsPlan Multi-Rig Map Diagnostics", top_lines, sections=sections)
 
     def _copy_map_diagnostics(self) -> None:
         QApplication.clipboard().setText(self._map_support_summary())
@@ -1518,6 +1544,13 @@ class StationsMapTab(QWidget):
                 )
             else:
                 label.setText(f"Map Status: {self._map_runtime_state.title()}. {text}")
+            if ready and getattr(self, "_current_map_mode_key", lambda: "all")() == "mesh_nodes":
+                summary = getattr(self, "_mesh_map_summary", {})
+                label.setText(
+                    f"Ready: {summary.get('located_nodes', 0)}/{summary.get('known_nodes', 0)} nodes · "
+                    f"{int(getattr(self, '_map_link_count', 0) or 0)} paths · "
+                    f"{summary.get('unlocated_nodes', 0)} unlocated · {summary.get('excluded_nodes', 0)} excluded"
+                )
             label.setToolTip(self._map_support_summary())
         support_layout = getattr(self, "_map_support_layout", None)
         if support_layout is not None:
@@ -1617,7 +1650,9 @@ class StationsMapTab(QWidget):
         is_visible = bool(is_visible)
         renderer = getattr(self, "_native_map_renderer", None)
         if renderer is not None:
-            renderer.set_map_visible(is_visible and self._app_active)
+            # An unfocused but visible Map must retain its scene. Application
+            # activity gates refresh/ingest timers and publication separately.
+            renderer.set_map_visible(is_visible)
         if self._map_visible == is_visible:
             return
         self._map_visible = is_visible
@@ -1635,7 +1670,12 @@ class StationsMapTab(QWidget):
             self._maybe_start_map_ingest()
         elif self._map_visible and self._js8_timer is not None and self._ingest_started and not self._js8_timer.isActive():
             self._js8_timer.start()
-        if self._map_initialized and self._map_load_ok and not self._map_dirty and not self._pending_refresh_level:
+        if getattr(self, "_map_runtime_state", "") == "degraded":
+            self._request_map_refresh(level="medium", reason="reopen_retry")
+            return
+        if (self._map_initialized and self._map_load_ok and not self._map_dirty
+                and not self._pending_refresh_level and not getattr(self, "_pending_map_payload", None)
+                and not getattr(self, "_map_read_inflight", False)):
             self._set_map_runtime_state("ready", self._map_ready_detail_text())
             self._emit_map_event("activation_ready")
             return
@@ -1647,7 +1687,7 @@ class StationsMapTab(QWidget):
         self._app_active = bool(active)
         renderer = getattr(self, "_native_map_renderer", None)
         if renderer is not None:
-            renderer.set_map_visible(self._app_active and self._map_visible)
+            renderer.set_map_visible(self._map_visible)
         if not self._app_active:
             if self._js8_timer is not None:
                 self._js8_timer.stop()
@@ -1656,7 +1696,12 @@ class StationsMapTab(QWidget):
         if self._map_visible and not self._is_shutting_down:
             if self._js8_timer is not None and self._ingest_started and not self._js8_timer.isActive():
                 self._js8_timer.start()
-            if self._map_initialized and self._map_load_ok and not self._map_dirty and not self._pending_refresh_level:
+            if getattr(self, "_map_runtime_state", "") == "degraded":
+                self._request_map_refresh(level="medium", reason="resume_retry")
+                return
+            if (self._map_initialized and self._map_load_ok and not self._map_dirty
+                    and not self._pending_refresh_level and not getattr(self, "_pending_map_payload", None)
+                and not getattr(self, "_map_read_inflight", False)):
                 self._set_map_runtime_state("ready", self._map_ready_detail_text())
                 self._emit_map_event("ui_resumed_ready")
                 return
@@ -1865,7 +1910,7 @@ class StationsMapTab(QWidget):
 
     def _widen_recency_for_manual_link_refresh(self) -> None:
         """
-        Manual link refresh means "show what FIO just loaded." If imported or
+        Manual link refresh means "show what CommsPlan just loaded." If imported or
         migrated traffic is older than the current recency window, widen to Any
         so a successful reload does not look empty.
         """
@@ -1914,39 +1959,13 @@ class StationsMapTab(QWidget):
         ]
 
     def _current_recency_options(self) -> List[Tuple[str, Optional[int]]]:
-        if self._current_map_mode_key() == "paths" or (
-            bool(getattr(self, "show_link_paths", False))
-            and str(getattr(self, "link_mode", "") or "").strip().lower() != "off"
-        ):
-            return self._path_recency_options()
         return self._map_recency_options()
 
     def _clamp_path_recency_if_needed(self) -> bool:
-        if not (
-            self._current_map_mode_key() == "paths"
-            or (
-                bool(getattr(self, "show_link_paths", False))
-                and str(getattr(self, "link_mode", "") or "").strip().lower() != "off"
-            )
-        ):
-            return False
-        current = getattr(self, "recency_seconds", None)
-        if current is not None and int(current or 0) <= MAP_PATH_MAX_RECENCY_SECONDS:
-            return False
-        self.recency_seconds = MAP_PATH_MAX_RECENCY_SECONDS
-        self._map_recency_label = MAP_PATH_MAX_RECENCY_LABEL
-        combo = getattr(self, "recency_combo", None)
-        if combo is not None:
-            try:
-                idx = combo.findText(MAP_PATH_MAX_RECENCY_LABEL)
-                if idx >= 0:
-                    combo.blockSignals(True)
-                    combo.setCurrentIndex(idx)
-                    combo.blockSignals(False)
-            except Exception:
-                pass
-        self._update_map_since_button_text(MAP_PATH_MAX_RECENCY_LABEL)
-        return True
+        # Compatibility hook: the selected age is never rewritten by a layer.
+        # Path readers apply the separate 24h maximum on their copied inputs.
+        self._update_map_since_button_text()
+        return False
 
     def _map_recency_display_label(self, value: str) -> str:
         label = str(value or "").strip() or "Any"
@@ -1971,6 +1990,7 @@ class StationsMapTab(QWidget):
                 label = ""
         self._map_recency_label = label or "Any"
         button.setText(self._map_recency_display_label(label or "Any"))
+        button.setToolTip("Selected activity age. Observed paths use at most the last 24h; other layers retain this age.")
 
     def _build_map_since_menu(self) -> None:
         button = getattr(self, "_map_since_button", None)
@@ -2116,8 +2136,6 @@ class StationsMapTab(QWidget):
                 self._on_recency_changed(idx)
                 return
         mapping = dict(self._current_recency_options())
-        if label not in mapping and self._current_map_mode_key() == "paths":
-            label = MAP_PATH_MAX_RECENCY_LABEL
         self.recency_seconds = mapping.get(label)
         if self.recency_seconds is None and str(label or "").strip().lower().endswith("d"):
             try:
@@ -2135,6 +2153,12 @@ class StationsMapTab(QWidget):
 
     def shutdown(self) -> None:
         self._is_shutting_down = True
+        for lane in (self._map_read_lane, self._map_inspector_lane):
+            if lane is not None:
+                lane.shutdown()
+        mesh_timer = getattr(self, "_mesh_map_update_timer", None)
+        if mesh_timer is not None:
+            mesh_timer.stop()
         try:
             if self._js8_timer:
                 self._js8_timer.stop()
@@ -2206,6 +2230,8 @@ class StationsMapTab(QWidget):
         return resolve_theme(self.settings)
 
     def apply_theme(self, theme: Optional[Mapping[str, str]] = None) -> None:
+        if getattr(self, "_map_read_inflight", False):
+            self._request_map_refresh(level="light", reason="theme_snapshot_changed")
         if isinstance(theme, Mapping) and theme:
             self._active_theme_override = dict(theme)
         else:
@@ -2310,14 +2336,14 @@ class StationsMapTab(QWidget):
         top_row = QHBoxLayout()
         top_row.setContentsMargins(0, 0, 0, 0)
         top_row.setSpacing(6)
-        self._show_fio_button = QPushButton("Show FIO")
-        self._show_fio_button.setToolTip("Bring the main FIO window to the front without closing Map.")
-        self._show_fio_button.setAccessibleName("Show main FIO window")
+        self._show_fio_button = QPushButton("Show CommsPlan")
+        self._show_fio_button.setToolTip("Bring the main CommsPlan window to the front without closing Map.")
+        self._show_fio_button.setAccessibleName("Show main CommsPlan window")
         self._show_fio_button.setVisible(True)
         self._show_fio_button.clicked.connect(self._bring_application_window_forward)
         top_row.addWidget(self._show_fio_button, alignment=Qt.AlignLeft)
         self._controls_button = QPushButton("Advanced Map Tools")
-        self._controls_button.setToolTip("Show optional layer, path, propagation, city, and planning-pin controls.")
+        self._controls_button.setToolTip("Refine evidence, inspect paths, adjust basemap detail, and manage planning pins.")
         self._controls_button.setVisible(True)
         self._controls_button.clicked.connect(self._toggle_controls_drawer)
         top_row.addWidget(self._controls_button, alignment=Qt.AlignLeft)
@@ -2805,6 +2831,8 @@ class StationsMapTab(QWidget):
             mode_actions_layout.setColumnStretch(col, 1)
         views_layout = self._add_collapsible_group(controls_layout, "Operator Views", expanded=False)
         views_layout.addWidget(mode_actions_row)
+        # Layer choices have one visible owner: the compact checkbox strip.
+        views_layout.parentWidget().parentWidget().hide()
         path_tools_layout = self._add_collapsible_group(controls_layout, "Path Tools", expanded=False)
         path_tools_grid = QGridLayout()
         path_tools_grid.setContentsMargins(0, 0, 0, 0)
@@ -2814,8 +2842,7 @@ class StationsMapTab(QWidget):
         path_tools_grid.addWidget(self.region_filter_combo, 0, 1)
         path_tools_grid.addWidget(QLabel("Band"), 1, 0)
         path_tools_grid.addWidget(self.band_combo, 1, 1)
-        path_tools_grid.addWidget(QLabel("Paths"), 2, 0)
-        path_tools_grid.addWidget(self.link_mode_combo, 2, 1)
+        self.link_mode_combo.hide()  # Scope is owned by the visible Paths selector.
         path_tools_grid.addWidget(QLabel("Paths to"), 3, 0)
         path_tools_grid.addWidget(self.relay_target_combo, 3, 1)
         path_tools_layout.addLayout(path_tools_grid)
@@ -2823,20 +2850,20 @@ class StationsMapTab(QWidget):
         path_tools_layout.addWidget(self._paths_help_button)
 
         intelligence_layout = self._add_collapsible_group(controls_layout, "Intelligence Layers", expanded=False)
-        self._map_intelligence_layers_section = intelligence_layout.parentWidget()
+        self._map_intelligence_layers_section = intelligence_layout.parentWidget().parentWidget()
         intelligence_layout.addWidget(self.map_stations_chk)
         intelligence_layout.addWidget(self.map_links_chk)
         intelligence_layout.addWidget(self.map_weather_chk)
         intelligence_layout.addWidget(self.map_alerts_chk)
         intelligence_layout.addWidget(self.map_infrastructure_chk)
+        self._map_intelligence_layers_section.hide()
 
         advanced_layout = self._add_collapsible_group(controls_layout, "Advanced Filters", expanded=False)
         advanced_grid = QGridLayout()
         advanced_grid.setContentsMargins(0, 0, 0, 0)
         advanced_grid.setHorizontalSpacing(8)
         advanced_grid.setVerticalSpacing(6)
-        advanced_grid.addWidget(QLabel("Show"), 0, 0)
-        advanced_grid.addWidget(self._map_scope_filter_combo, 0, 1)
+        self._map_scope_filter_combo.hide()  # Stations/Traffic checkboxes own this choice.
         advanced_grid.addWidget(QLabel("State"), 1, 0)
         advanced_grid.addWidget(self._map_state_filter_combo, 1, 1)
         advanced_grid.addWidget(QLabel("Source"), 2, 0)
@@ -2864,7 +2891,6 @@ class StationsMapTab(QWidget):
         # controls follow them and are omitted entirely by the responsive
         # reflow while hidden, so they cannot reserve invisible grid cells.
         self._map_filter_fields = (
-            filter_field("View", self._map_mode_combo, 210, 280),
             filter_field("Topic", self._map_topic_filter_combo, 185, 260),
             filter_field("Group", self.group_filter_combo, 170, 230),
             filter_field("Age", self._map_since_button, 118, 150),
@@ -2874,6 +2900,15 @@ class StationsMapTab(QWidget):
         )
         self._map_search_field = filter_field("Search", self._map_search_edit)
         self._reflow_map_filter_bar()
+        self._map_mode_combo.setVisible(False)
+        self._map_layer_controls = MapLayerControls(map_container)
+        self._map_layer_controls.layer_toggled.connect(self._on_map_layer_toggled)
+        map_layout.addWidget(self._map_layer_controls)
+        self._mesh_recent_chk = QCheckBox("Recent (24h)", map_container)
+        self._mesh_recent_chk.setToolTip("Unchecked: all known contacts. Checked: contacts heard in the last 24 hours. Advertised positions may be old.")
+        self._mesh_recent_chk.setVisible(False)
+        self._mesh_recent_chk.toggled.connect(self._on_mesh_recent_changed)
+        map_layout.addWidget(self._mesh_recent_chk)
         map_layout.addWidget(filter_bar)
 
         self._map_canvas_splitter = QSplitter(Qt.Horizontal, map_container)
@@ -3057,6 +3092,7 @@ class StationsMapTab(QWidget):
 
     def _clear_map_selected_detail(self) -> None:
         self._map_selected_payload = {}
+        self._map_inspector_generation = getattr(self, "_map_inspector_generation", 0) + 1
         panel = getattr(self, "_map_selected_panel", None)
         if panel is not None:
             panel.setVisible(False)
@@ -3091,27 +3127,28 @@ class StationsMapTab(QWidget):
         panel = getattr(self, "_map_selected_panel", None)
         if panel is None:
             return
+        same_selection = getattr(self, "_map_selected_payload", {}) == dict(payload or {})
         self._map_selected_payload = dict(payload or {})
+        self._map_inspector_generation = getattr(self, "_map_inspector_generation", 0) + 1
         rows = self._map_payload_rows(payload)
         title = self._map_detail_clean_text(payload.get("title") or "Selection")
         route = self._map_detail_clean_text(payload.get("route") or "")
         summary = self._map_detail_clean_text(payload.get("summary") or "", multiline=True)
         display_title = self._map_selected_display_title(payload, title, rows)
-        body_html = self._map_selected_detail_html(payload, summary=summary)
+        body_html = "<p>Updating selection details…</p>"
+        self._queue_map_inspector_snapshot()
 
         if self._map_selected_title is not None:
             self._map_selected_title.setText(display_title)
         if self._map_selected_subtitle is not None:
             self._map_selected_subtitle.setText(route)
             self._map_selected_subtitle.setVisible(bool(route))
-        if self._map_selected_body is not None:
-            self._map_selected_body.setHtml(body_html)
-        if self._map_selected_status_body is not None:
-            self._map_selected_status_body.setHtml(self._map_selected_status_html(payload, summary=summary))
-        if self._map_selected_paths_body is not None:
-            self._map_selected_paths_body.setHtml(self._map_selected_paths_html(payload))
-        if self._map_selected_messages_body is not None:
-            self._map_selected_messages_body.setHtml(self._map_selected_messages_html(payload))
+        if not same_selection:
+            self._map_inspector_has_content = False
+            for body in (self._map_selected_body, self._map_selected_status_body,
+                         self._map_selected_paths_body, self._map_selected_messages_body):
+                if body is not None:
+                    body.setHtml(body_html)
 
         lat, lon = self._map_selected_latlon(payload)
         group = str(payload.get("group") or "").strip()
@@ -3125,6 +3162,7 @@ class StationsMapTab(QWidget):
         is_mesh_cluster = is_mesh_node and self._map_payload_is_mesh_cluster(payload, rows)
         is_mesh_infra = is_mesh_node and self._map_payload_is_mesh_infrastructure(payload, rows)
         can_show_paths = bool(action_callsign and not self._map_selected_station_is_self(action_callsign))
+        can_show_paths = is_mesh_node or can_show_paths
         if self._map_selected_tabs is not None:
             self._map_selected_tabs.setTabEnabled(1, True)
             self._map_selected_tabs.setTabEnabled(2, can_show_paths)
@@ -3168,7 +3206,7 @@ class StationsMapTab(QWidget):
                 f"Open mesh compose for {action_callsign}."
                 if is_mesh_node and can_message
                 else (
-                    "Mesh direct compose is available when this node has an address FIO can target."
+                    "Mesh direct compose is available when this node has an address CommsPlan can target."
                     if is_mesh_node
                     else (
                         f"Open Compose and prefill {action_callsign}."
@@ -3214,6 +3252,8 @@ class StationsMapTab(QWidget):
         mesh_family = source_family in {"mesh", "meshcore", "meshtastic", "mesh_client", "local_mesh"}
         if not mesh_family:
             return False
+        if payload.get("is_mesh_node"):
+            return True
         if source_ref.startswith("mesh-node:"):
             return True
         if isinstance(source_refs, (list, tuple, set)):
@@ -3240,6 +3280,7 @@ class StationsMapTab(QWidget):
     ) -> List[str]:
         rows = rows or cls._map_payload_rows(payload)
         candidates: List[object] = [
+            payload.get("label") if payload.get("is_mesh_node") else None,
             payload.get("callsigns"),
             payload.get("call_label"),
             payload.get("callsign"),
@@ -3292,7 +3333,7 @@ class StationsMapTab(QWidget):
             add_label(candidate)
             if len(labels) >= limit:
                 break
-        return labels[:limit]
+        return labels[:1] if payload.get("is_mesh_node") and payload.get("label") else labels[:limit]
 
     @classmethod
     def _map_payload_is_mesh_cluster(cls, payload: Dict[str, object], rows: Optional[Dict[str, str]] = None) -> bool:
@@ -3713,6 +3754,8 @@ class StationsMapTab(QWidget):
             location_source = dict(raw_location_source) if isinstance(raw_location_source, Mapping) else {}
         source_type = StationsMapTab._map_detail_clean_text(location_source.get("type")).lower().replace("-", "_")
         source_label = StationsMapTab._map_detail_clean_text(location_source.get("label"))
+        if source_type == "advertised" or payload.get("is_mesh_node"):
+            return "Advertised"
         if confidence in {"declared", "explicit-latlon", "gps"}:
             return "GPS"
         if confidence == "grid":
@@ -4016,7 +4059,7 @@ class StationsMapTab(QWidget):
                     ("Newest", self._map_detail_first_value(rows.get("newest"), rows.get("age"), payload.get("age"))),
                     ("Topics", self._map_detail_first_value(rows.get("topics"), payload.get("topic"))),
                 ],
-                note="Mesh locations use device GPS/grid when available, then route-derived approximation when only repeater path context is known.",
+                note="Advertised positions may be old. Cached outgoing routes do not prove packet delivery or current reachability.",
             )
         status = self._map_detail_first_value(
             rows.get("sitrep"),
@@ -4124,6 +4167,14 @@ class StationsMapTab(QWidget):
         ]
 
     def _map_selected_paths_html(self, payload: Dict[str, object]) -> str:
+        if payload.get("is_mesh_node"):
+            route = payload.get("outgoing_route") or {}
+            return self._map_detail_shell_html("Mesh Paths", [
+                ("Node", payload.get("label")),
+                ("Cached outgoing", f"{route.get('hop_count')} hops" if route.get("known") else "Unknown"),
+                ("Updated", route.get("updated_utc") or "Unknown"),
+                ("Layer", "Showing" if self.show_link_paths else "Hidden"),
+            ], note="↝ Cached outgoing route. → Observed flood hop order. Missing or ambiguous hops break the line; delivery is unverified.")
         rows = self._map_payload_rows(payload)
         callsign = self._map_selected_action_callsign(payload)
         mode = str(getattr(self, "link_mode", "") or "").strip().lower()
@@ -4161,7 +4212,7 @@ class StationsMapTab(QWidget):
                 ("Relay Detail", relay_detail),
                 ("Shared Contacts", shared_text),
                 ("Layer", "Showing" if bool(getattr(self, "show_link_paths", False)) else "Hidden"),
-                ("Window", self._map_message_context_age_label(int(getattr(self, "recency_seconds", 0) or 0))),
+                ("Window", self._map_message_context_age_label(self._effective_path_recency_seconds())),
                 ("Scope", active_scope if mode != "off" else "Off"),
                 *planning_rows,
                 ("Meaning", "Arrows show who reported hearing whom; color shows reported signal quality."),
@@ -4609,7 +4660,7 @@ class StationsMapTab(QWidget):
         source_mix: Dict[str, int] = {}
         conn = None
         try:
-            conn = sqlite3.connect(db_path)
+            conn = connect_sqlite_readonly(db_path)
             cur = conn.cursor()
             cur.execute("SELECT last_seen_ts FROM js8_callsign_stats WHERE UPPER(callsign)=?", (target,))
             row = cur.fetchone()
@@ -4696,7 +4747,7 @@ class StationsMapTab(QWidget):
         my_call = self._map_callsign_base(self._operator_callsign_for_map_actions())
         if not target or not my_call or target == my_call:
             return {}
-        age_seconds = int(getattr(self, "recency_seconds", 0) or 0)
+        age_seconds = self._effective_path_recency_seconds()
         cache_key = ("map_path_snapshot", my_call, target, age_seconds)
         cached = self._query_cache_get(cache_key, ttl_sec=5.0)
         if isinstance(cached, dict):
@@ -4708,7 +4759,7 @@ class StationsMapTab(QWidget):
             return {}
         conn = None
         try:
-            conn = sqlite3.connect(db_path)
+            conn = connect_sqlite_readonly(db_path)
             cur = conn.cursor()
             for table in ("js8_links", "varac_links"):
                 try:
@@ -4844,7 +4895,7 @@ class StationsMapTab(QWidget):
             return result
         conn = None
         try:
-            conn = sqlite3.connect(db_path)
+            conn = connect_sqlite_readonly(db_path)
             cur = conn.cursor()
             cur.execute(
                 "SELECT MAX(utc_ts), COUNT(*), SUM(CASE WHEN read_ts IS NULL OR read_ts <= 0 THEN 1 ELSE 0 END) "
@@ -4960,8 +5011,8 @@ class StationsMapTab(QWidget):
     def _refresh_selected_paths_panel(self) -> None:
         payload = dict(getattr(self, "_map_selected_payload", {}) or {})
         body = getattr(self, "_map_selected_paths_body", None)
-        if body is not None:
-            body.setHtml(self._map_selected_paths_html(payload))
+        if body is not None and payload:
+            self._queue_map_inspector_snapshot()
         self._update_selected_paths_button_visual()
 
     def _update_selected_paths_button_visual(self, theme: Optional[Dict[str, str]] = None) -> None:
@@ -4970,6 +5021,10 @@ class StationsMapTab(QWidget):
             return
         if theme is None:
             theme = self._theme_snapshot()
+        if self._map_payload_is_mesh_node(getattr(self, "_map_selected_payload", {}) or {}):
+            btn.setText("Hide Mesh Paths" if self.show_link_paths else "Mesh Paths")
+            btn.setStyleSheet(button_style("eligible_info" if self.show_link_paths else "muted", theme))
+            return
         active = self._selected_station_paths_active()
         btn.setText("Hide Paths" if active else "Show Paths To")
         btn.setStyleSheet(button_style("eligible_info" if active else "muted", theme))
@@ -5006,6 +5061,9 @@ class StationsMapTab(QWidget):
             callsign = str(value or self.relay_target or self._paths_focus_station or "").strip().upper()
             label = f"Paths To: {callsign}" if callsign else "Paths To Station"
             target_data = ("relay_target", callsign)
+        elif mode in {"group", "region"}:
+            label = f"{mode.title()}: {value}"
+            target_data = (mode, value)
         elif mode == "all":
             label = "Network"
             target_data = ("all", "")
@@ -5017,7 +5075,7 @@ class StationsMapTab(QWidget):
             target_data = ("off", "")
         try:
             combo.blockSignals(True)
-            if mode in {"station", "relay_target"}:
+            if mode in {"station", "relay_target", "group", "region"}:
                 existing = combo.findData(target_data)
                 if existing < 0:
                     # Keep station-specific path review visible without filling the main dropdown with every callsign.
@@ -5051,7 +5109,35 @@ class StationsMapTab(QWidget):
             self._observation_focus_mode = ""
         self._paths_previous_observation_focus = None
 
-    def _set_path_layer_off(self) -> None:
+    def _remember_map_path_scope(self) -> None:
+        mode = str(getattr(self, "link_mode", "off") or "off")
+        if mode != "off":
+            self._saved_map_path_scope = (mode, self.link_value,
+                                          self.relay_target, self._paths_focus_station)
+
+    def _restore_map_path_scope(self, default: str = "my_station") -> None:
+        if str(getattr(self, "link_mode", "off") or "off") == "off":
+            saved = getattr(self, "_saved_map_path_scope", None)
+            self.link_mode, self.link_value, self.relay_target, self._paths_focus_station = (
+                saved or (default, "", "", ""))
+        self._sync_path_scope_combo((self.link_mode, self.link_value))
+        combo = getattr(self, "link_mode_combo", None)
+        if combo is not None:
+            idx = combo.findData((self.link_mode, self.link_value))
+            if idx >= 0:
+                combo.blockSignals(True)
+                combo.setCurrentIndex(idx)
+                combo.blockSignals(False)
+
+    def _effective_path_recency_seconds(self) -> int:
+        selected = getattr(self, "recency_seconds", None)
+        return min(int(selected), MAP_PATH_MAX_RECENCY_SECONDS) if selected else MAP_PATH_MAX_RECENCY_SECONDS
+
+    def _set_path_layer_off(self, *, remember: bool = True) -> None:
+        if remember:
+            self._remember_map_path_scope()
+        else:
+            self._saved_map_path_scope = None
         self.show_link_paths = False
         self.link_mode = "off"
         self.link_value = ""
@@ -5080,6 +5166,10 @@ class StationsMapTab(QWidget):
                 pass
 
     def _show_paths_for_selected_station(self) -> None:
+        if self._map_payload_is_mesh_node(getattr(self, "_map_selected_payload", {}) or {}):
+            selected = {"mesh_nodes"} if self.show_link_paths else {"mesh_nodes", "paths"}
+            self._apply_map_layer_selection(selected)
+            return
         callsign = self._map_selected_action_callsign()
         if not callsign or self._map_selected_station_is_self(callsign):
             return
@@ -5805,6 +5895,7 @@ class StationsMapTab(QWidget):
 
     def _clear_report_query_caches(self) -> None:
         """Clear map/report caches after user-visible report inputs change."""
+        self._map_read_cache_revision = getattr(self, "_map_read_cache_revision", 0) + 1
         try:
             self._map_query_cache.clear()
         except Exception:
@@ -5828,7 +5919,7 @@ class StationsMapTab(QWidget):
             return {}
         conn = None
         try:
-            conn = sqlite3.connect(db_path)
+            conn = connect_sqlite_readonly(db_path)
             summary = load_operator_activity_summary(conn)
         except Exception as e:
             log.debug("StationsMap: failed to load operator activity summary: %s", e)
@@ -5859,7 +5950,7 @@ class StationsMapTab(QWidget):
             return {}
         conn = None
         try:
-            conn = sqlite3.connect(db_path)
+            conn = connect_sqlite_readonly(db_path)
             summary = load_js8_direct_contact_summary(conn, my_call)
         except Exception as e:
             log.debug("StationsMap: failed to load JS8 direct-contact summary: %s", e)
@@ -5906,7 +5997,7 @@ class StationsMapTab(QWidget):
             return
         raw_rows = []
         try:
-            conn = sqlite3.connect(db_path)
+            conn = connect_sqlite_readonly(db_path)
             cur = conn.cursor()
             cur.execute(
                 """
@@ -5928,7 +6019,6 @@ class StationsMapTab(QWidget):
             conn.close()
         except Exception as e:
             log.error("StationsMap: failed to load operator history: %s", e)
-            self._set_station_points(pts)
             emit_span(
                 "map.load_operator_history",
                 (time.perf_counter() - perf_start) * 1000.0,
@@ -5936,7 +6026,7 @@ class StationsMapTab(QWidget):
                 meta={"stations": 0, "status": "query_failed"},
                 min_ms=5.0,
             )
-            return
+            raise
 
         my_call = (self.settings.get("operator_callsign", "") or "").strip().upper()
         my_grid = (self.settings.get("operator_grid6", "") or "").strip().upper()
@@ -6094,7 +6184,7 @@ class StationsMapTab(QWidget):
         if not db_path.exists():
             return freqs
         try:
-            conn = sqlite3.connect(db_path)
+            conn = connect_sqlite_readonly(db_path)
             cur = conn.cursor()
             cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='daily_schedule_tab'")
             if not cur.fetchone():
@@ -6112,6 +6202,8 @@ class StationsMapTab(QWidget):
         return sorted({v for v in freqs if v})
 
     def _refresh_band_options(self):
+        current = self.band_combo.currentData()
+        current_text = self.band_combo.currentText()
         priority = ["20M", "40M", "80M"]
         remaining = ["160M", "60M", "30M", "17M", "15M", "12M", "10M", "6M", "2M"]
         bands = ["All"] + priority + remaining
@@ -6120,10 +6212,14 @@ class StationsMapTab(QWidget):
         self.band_combo.addItem("All", {"type": "all"})
         for b in bands[1:]:
             self.band_combo.addItem(b, {"type": "band", "value": b})
-        for freq in self._daily_schedule_freqs():
+        for freq in getattr(self, "_map_schedule_freqs", []):
             label = f"{freq:.3f} MHz"
             self.band_combo.addItem(label, {"type": "freq", "value": freq})
-        self.band_combo.setCurrentIndex(0)
+        idx = self.band_combo.findData(current) if current else 0
+        if idx < 0 and current:
+            self.band_combo.addItem(current_text, current)
+            idx = self.band_combo.count() - 1
+        self.band_combo.setCurrentIndex(max(0, idx))
         self.band_combo.blockSignals(False)
 
     def _rebuild_operator_index(self):
@@ -6197,6 +6293,8 @@ class StationsMapTab(QWidget):
         self.group_filter_combo.addItem("All", "")
         for g in group_values:
             self.group_filter_combo.addItem(g, g)
+        if current and self.group_filter_combo.findData(current) < 0:
+            self.group_filter_combo.addItem(str(current), current)
         if current and self.group_filter_combo.findData(current) >= 0:
             self.group_filter_combo.setCurrentIndex(self.group_filter_combo.findData(current))
         else:
@@ -6210,6 +6308,8 @@ class StationsMapTab(QWidget):
         self.region_filter_combo.addItem("All", "")
         for reg in self._operator_regions:
             self.region_filter_combo.addItem(f"Region {reg}", reg)
+        if current and self.region_filter_combo.findData(current) < 0:
+            self.region_filter_combo.addItem(str(current), current)
         if current and self.region_filter_combo.findData(current) >= 0:
             self.region_filter_combo.setCurrentIndex(self.region_filter_combo.findData(current))
         else:
@@ -6217,7 +6317,7 @@ class StationsMapTab(QWidget):
         self.region_filter_combo.blockSignals(False)
 
     def _refresh_link_mode_options(self):
-        current_data = self.link_mode_combo.currentData() if hasattr(self, "link_mode_combo") else None
+        current_data = (self.link_mode, self.link_value)
         self.link_mode_combo.blockSignals(True)
         self.link_mode_combo.clear()
         self.link_mode_combo.addItem("Off", ("off", ""))
@@ -6229,7 +6329,6 @@ class StationsMapTab(QWidget):
         else:
             self.link_mode_combo.setCurrentIndex(max(0, self.link_mode_combo.findData(("off", ""))))
         self.link_mode_combo.blockSignals(False)
-        self.link_mode, self.link_value = self._parse_link_selection(self.link_mode_combo.currentData())
         self._sync_path_scope_combo((self.link_mode, self.link_value))
 
     def _ensure_map_link_mode(self, preferred_mode: str = "my_station") -> None:
@@ -6240,7 +6339,7 @@ class StationsMapTab(QWidget):
             self.link_value = ""
             self._sync_path_scope_combo((self.link_mode, self.link_value))
             return
-        current_mode, current_value = self._parse_link_selection(combo.currentData())
+        current_mode, current_value = self.link_mode, self.link_value
         if current_mode and current_mode != "off":
             self.link_mode = current_mode
             self.link_value = current_value
@@ -6438,7 +6537,7 @@ class StationsMapTab(QWidget):
             if not db_path.exists():
                 return
             try:
-                conn = sqlite3.connect(db_path)
+                conn = connect_sqlite_readonly(db_path)
                 cur = conn.cursor()
                 cur.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
@@ -6480,11 +6579,15 @@ class StationsMapTab(QWidget):
             return out
         return out
 
+    def _current_scheduler_frequency_for_map(self):
+        # Cached scheduler entry only; capture on the owner thread before reads.
+        return current_scheduler_freq(self._application_window())
+
     def _compute_now_reachable_snapshot(self) -> Dict[str, Dict]:
         now_utc = datetime.datetime.now(datetime.timezone.utc)
         active_freqs = self._load_my_active_schedule_freqs(now_utc)
         try:
-            sched_freq = current_scheduler_freq(self._application_window())
+            sched_freq = self._current_scheduler_frequency_for_map()
             sched_freq_mhz = self._parse_frequency_mhz(sched_freq)
             if sched_freq_mhz is not None:
                 active_freqs.add(round(sched_freq_mhz, 6))
@@ -6619,6 +6722,93 @@ class StationsMapTab(QWidget):
             )
         )
 
+    def _map_layer_selection(self) -> frozenset[str]:
+        mode = self._current_map_mode_key()
+        if mode == "mesh_nodes":
+            return frozenset({mode, "paths"} if self.show_link_paths else {mode})
+        if mode in {"regional", "pins"}:
+            return frozenset({mode})
+        selected = set()
+        if mode in {"propagation", "peer"}:
+            selected.add(mode)
+        if self.show_station_markers or self._links_active():
+            selected.add("stations")
+        if self._links_active():
+            selected.add("paths")
+        if (mode in {"hf", "local", "reports"} or self._map_report_refinement_active()
+                or any(bool(getattr(self, name, False)) for name in (
+                    "show_weather_reports", "show_alert_reports", "show_infrastructure_reports"))):
+            selected.add("traffic")
+        return frozenset(selected)
+
+    def _on_map_layer_toggled(self, layer: str, checked: bool) -> None:
+        selected = toggle_map_layer(self._map_layer_selection(), layer, checked)
+        self._apply_map_layer_selection(selected)
+
+    def _apply_map_layer_selection(self, selected) -> None:
+        """Resolve a checkbox transaction before requesting one coherent refresh."""
+        self._remember_map_path_scope()
+        selected = set(selected)
+        old_peer = bool(self._now_reachable_enabled)
+        self._now_reachable_enabled = "peer" in selected
+        if not self._now_reachable_enabled:
+            self._now_reachable_meta = {}
+            self._now_reachable_callsigns = set()
+        traffic_mode = {"rf": "hf_reports", "local": "local_reports"}.get(
+            self._selected_map_traffic_subtype(), "all_reports"
+        )
+        mode = next((mode for key, mode in (
+            ("regional", "regional_intelligence"), ("pins", "rf_pins"),
+            ("mesh_nodes", "mesh_nodes"), ("propagation", "propagation"),
+            ("traffic", traffic_mode), ("paths", "paths"),
+        ) if key in selected), "")
+        self._sitrep_status_only_enabled = False
+        self._observation_focus_enabled = bool(mode)
+        self._observation_focus_mode = mode
+        self._paths_previous_observation_focus = None
+        self.show_station_markers = "stations" in selected
+        self.show_link_paths = "paths" in selected
+        self.show_weather_reports = False
+        self.show_alert_reports = "traffic" in selected
+        self.show_infrastructure_reports = bool({"traffic", "mesh_nodes"} & selected)
+        self.show_rf_pins = "pins" in selected
+        self.prop_overlay_enabled = False
+        if self.show_link_paths:
+            if self.link_mode in {"", "off"}:
+                self._restore_map_path_scope("all" if "propagation" in selected else "my_station")
+            self._clamp_path_recency_if_needed()
+            self._sync_path_scope_combo((self.link_mode, self.link_value))
+        else:
+            self.link_mode, self.link_value = "off", ""
+            self.relay_target = ""
+            self._paths_focus_station = ""
+            self._sync_link_mode_combo_to_off()
+        # The hidden legacy Show selector is a layer scope, not a data filter.
+        # Keep it consistent with the visible layer transaction.
+        scope = getattr(self, "_map_scope_filter_combo", None)
+        if scope is not None:
+            self._set_combo_by_text_or_data(scope, "")
+        # Preserve the operator's topic/search, band, age and path choices.
+        for name, value in (
+            ("map_stations_chk", self.show_station_markers),
+            ("map_links_chk", self.show_link_paths), ("map_weather_chk", False),
+            ("map_alerts_chk", self.show_alert_reports),
+            ("map_infrastructure_chk", self.show_infrastructure_reports),
+            ("prop_overlay_chk", False), ("_now_reachable_button", self._now_reachable_enabled),
+        ):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.blockSignals(True)
+                widget.setChecked(value)
+                widget.blockSignals(False)
+        if "regional" in selected:
+            self.show_states = True
+        self._clear_report_query_caches()
+        self._update_map_mode_buttons()
+        self._update_map_view_status_label()
+        self._update_now_reachable_summary()
+        self._request_map_refresh(level="medium", reason="visible_layers")
+
     def _update_map_mode_buttons(self, theme: Optional[Dict[str, str]] = None) -> None:
         if theme is None:
             theme = self._theme_snapshot()
@@ -6644,6 +6834,9 @@ class StationsMapTab(QWidget):
                     and str(getattr(self, "link_mode", "") or "").strip().lower() != "off"
                 )
             button.setStyleSheet(button_style("eligible_info" if active else "muted", theme))
+        layers = getattr(self, "_map_layer_controls", None)
+        if layers is not None:
+            layers.set_selection(self._map_layer_selection())
         self._sync_map_mode_combo(mode_key)
         self._update_map_compact_control_visibility(mode_key)
         self._update_selected_paths_button_visual(theme)
@@ -6651,24 +6844,33 @@ class StationsMapTab(QWidget):
 
     def _update_map_compact_control_visibility(self, mode_key: str = "") -> None:
         key = str(mode_key or self._current_map_mode_key() or "").strip().lower()
+        recent = getattr(self, "_mesh_recent_chk", None)
+        if recent is not None:
+            recent.setVisible(key == "mesh_nodes")
+        filter_bar = getattr(self, "_map_filter_bar", None)
+        if filter_bar is not None:
+            filter_bar.setVisible(key != "mesh_nodes")
+        for field in tuple(getattr(self, "_map_filter_fields", ()) or ())[:3] + (getattr(self, "_map_search_field", None),):
+            if field is not None:
+                field.setEnabled(key != "mesh_nodes")
         sensitivity_field = getattr(self, "_map_intel_sensitivity_field", None)
         if sensitivity_field is not None:
             sensitivity_field.setVisible(key == "regional")
         traffic_subtype_field = getattr(self, "_map_traffic_subtype_field", None)
         if traffic_subtype_field is not None:
-            traffic_subtype_field.setVisible(key in {"reports", "hf", "local"})
+            traffic_subtype_field.setVisible(key in {"reports", "hf", "local"} or "traffic" in self._map_layer_selection())
         path_scope_field = getattr(self, "_map_path_scope_field", None)
         if path_scope_field is not None:
             path_scope_field.setVisible(
                 key in {"paths", "propagation", "peer"}
-                or bool(
+                or bool(key != "mesh_nodes" and
                     getattr(self, "show_link_paths", False)
                     and str(getattr(self, "link_mode", "") or "").strip().lower() != "off"
                 )
             )
         intelligence_section = getattr(self, "_map_intelligence_layers_section", None)
         if intelligence_section is not None:
-            intelligence_section.setVisible(key not in {"regional"})
+            intelligence_section.setVisible(False)
         if getattr(self, "_map_filter_grid", None) is not None:
             self._schedule_map_geometry_reflow()
 
@@ -6805,9 +7007,6 @@ class StationsMapTab(QWidget):
             self._observation_focus_mode = ""
             self._update_map_mode_buttons()
         if self._now_reachable_enabled:
-            snapshot = self._compute_now_reachable_snapshot()
-            self._now_reachable_meta = snapshot
-            self._now_reachable_callsigns = set(snapshot.keys())
             # Ensure links are visible for the operator-centric view.
             try:
                 mode, _ = self._parse_link_selection(self.link_mode_combo.currentData())
@@ -6869,6 +7068,7 @@ class StationsMapTab(QWidget):
 
     def focus_all_stations(self) -> None:
         """Return to the normal station map view."""
+        self._remember_map_path_scope()
         self._sitrep_status_only_enabled = False
         self._observation_focus_enabled = False
         self._observation_focus_mode = ""
@@ -6986,18 +7186,7 @@ class StationsMapTab(QWidget):
             except Exception:
                 pass
         self._clamp_path_recency_if_needed()
-        try:
-            if hasattr(self, "link_mode_combo"):
-                idx = self.link_mode_combo.findText("My Station")
-                if idx >= 0:
-                    self.link_mode_combo.blockSignals(True)
-                    self.link_mode_combo.setCurrentIndex(idx)
-                    self.link_mode_combo.blockSignals(False)
-                    self.link_mode = "my_station"
-                    self.link_value = ""
-                    self._sync_path_scope_combo(("my_station", ""))
-        except Exception:
-            pass
+        self._restore_map_path_scope("my_station")
         self._update_now_reachable_button_visual(False)
         self._update_map_mode_buttons()
         self._update_map_view_status_label()
@@ -7040,20 +7229,7 @@ class StationsMapTab(QWidget):
                 widget.blockSignals(False)
             except Exception:
                 pass
-        try:
-            if hasattr(self, "link_mode_combo"):
-                idx = self.link_mode_combo.findText("All")
-                if idx >= 0:
-                    self.link_mode_combo.blockSignals(True)
-                    self.link_mode_combo.setCurrentIndex(idx)
-                    self.link_mode_combo.blockSignals(False)
-                    self.link_mode = "all"
-                    self.link_value = ""
-                    self._sync_path_scope_combo(("all", ""))
-            # RF Planning is a layer/action view. Preserve the operator's current
-            # time and topic filters so toggling the layer does not change the question.
-        except Exception:
-            pass
+        self._restore_map_path_scope("all")
         self._update_now_reachable_button_visual(False)
         self._update_map_mode_buttons()
         self._update_map_view_status_label()
@@ -7226,6 +7402,12 @@ class StationsMapTab(QWidget):
         )
 
     def _on_map_traffic_subtype_changed(self, _idx: int) -> None:
+        if getattr(self, "_map_layer_controls", None) is not None:
+            source = getattr(self, "_map_source_filter_combo", None)
+            if source is not None:
+                self._set_combo_by_text_or_data(source, {"commstat": "commstat", "mesh": "mesh"}.get(self._selected_map_traffic_subtype(), ""))
+            self._apply_map_layer_selection(set(self._map_layer_selection()) | {"traffic"})
+            return
         self._clear_report_query_caches()
         self._apply_map_traffic_subtype(reason="traffic_subtype")
 
@@ -7443,7 +7625,7 @@ class StationsMapTab(QWidget):
             QMessageBox.warning(
                 self,
                 "Add Planning Pin",
-                "Add a grid square or state/province so FIO can place the planning pin in context.",
+                "Add a grid square or state/province so CommsPlan can place the planning pin in context.",
             )
             return
         if not payload.get("grid"):
@@ -7458,7 +7640,7 @@ class StationsMapTab(QWidget):
             save_rf_pin(db_path, payload)
         except Exception as exc:
             log.warning("StationsMap: failed to save RF pin: %s", exc, exc_info=True)
-            QMessageBox.warning(self, "Add Planning Pin", f"FIO could not save this planning pin.\n{exc}")
+            QMessageBox.warning(self, "Add Planning Pin", f"CommsPlan could not save this planning pin.\n{exc}")
             return
         self._clear_report_query_caches()
         if not bool(getattr(self, "_observation_focus_enabled", False)):
@@ -7474,7 +7656,7 @@ class StationsMapTab(QWidget):
         try:
             db_path = get_config_dir() / "config" / "freqinout_nets.db"
         except Exception as exc:
-            QMessageBox.warning(self, "Manage Planning Pins", f"FIO could not open planning pin storage.\n{exc}")
+            QMessageBox.warning(self, "Manage Planning Pins", f"CommsPlan could not open planning pin storage.\n{exc}")
             return
         dialog = _RfPinManagerDialog(db_path, self)
         dialog.exec()
@@ -7527,6 +7709,20 @@ class StationsMapTab(QWidget):
                 return (row.get("callsign") or "").strip().upper()
         return first
 
+    @staticmethod
+    def _expand_observed_path_directions(selected_links, directional_best, positions):
+        """Keep route selection undirected, but retain each observed traffic direction."""
+        selected_pairs = {tuple(sorted((link["origin"], link["destination"]))) for link in selected_links}
+        links = []
+        for (origin, destination), record in directional_best.items():
+            if tuple(sorted((origin, destination))) not in selected_pairs:
+                continue
+            first, last = positions.get(origin), positions.get(destination)
+            if first is None or last is None:
+                continue
+            links.append({**record, "lat1": first[0], "lon1": first[1], "lat2": last[0], "lon2": last[1]})
+        return links
+
     def _load_js8_links(
         self,
         band_filter=None,
@@ -7544,11 +7740,6 @@ class StationsMapTab(QWidget):
           last_seen (ts), last_spotter (ts), avg_snr, max_snr
         """
         links: List[Dict] = []
-        # Build position map from current stations
-        pos_map: Dict[str, tuple[float, float]] = {}
-        for pt in self.stations:
-            pos_map[pt.callsign.upper()] = (pt.lat, pt.lon)
-
         if isinstance(link_selection, (list, tuple)) and len(link_selection) >= 2:
             mode, selection_value = link_selection[0], link_selection[1]
         else:
@@ -7580,6 +7771,7 @@ class StationsMapTab(QWidget):
             ",".join(sorted(reachable_calls)),
             int(max_age_sec or 0),
             len(self.stations),
+            self._get_user_latlon(),
             len(self.operator_index),
         )
         cached = self._query_cache_get(cache_key, ttl_sec=2.0)
@@ -7602,6 +7794,11 @@ class StationsMapTab(QWidget):
             self._map_last_link_missing_position_rows = 0
             return links, {}
 
+        # Build position map from current stations
+        pos_map: Dict[str, tuple[float, float]] = {}
+        for pt in self._station_points_for_map():
+            pos_map[pt.callsign.upper()] = (pt.lat, pt.lon)
+
         try:
             from freqinout.core.config_paths import get_config_dir
 
@@ -7617,13 +7814,14 @@ class StationsMapTab(QWidget):
             ts_cut = time.time() - max_age_sec
 
         try:
-            conn = sqlite3.connect(db_path)
+            conn = connect_sqlite_readonly(db_path)
             cur = conn.cursor()
             try:
                 cols = {str(row[1]) for row in cur.execute("PRAGMA table_info(js8_links)").fetchall()}
             except Exception:
                 cols = set()
             relay_select = ", is_relay, relay_via" if {"is_relay", "relay_via"}.issubset(cols) else ", 0, ''"
+            direction_select = ", direction_known" if "direction_known" in cols else ", 0"
             where_parts: List[str] = []
             params: List[object] = []
             if ts_cut:
@@ -7636,10 +7834,11 @@ class StationsMapTab(QWidget):
             where_sql = f" WHERE {' AND '.join(where_parts)}" if where_parts else ""
             cur.execute(
                 "SELECT ts, origin, destination, snr, band, freq_hz, is_spotter"
-                f"{relay_select} FROM js8_links{where_sql}",
+                f"{relay_select}{direction_select} FROM js8_links{where_sql} ORDER BY ts DESC LIMIT 20000",
                 tuple(params),
             )
             rows = cur.fetchall()
+            note_map_read_cap("js8_links", len(rows), 20000)
             conn.close()
         except Exception as e:
             log.error("StationsMap: failed to load js8_links: %s", e)
@@ -7656,6 +7855,7 @@ class StationsMapTab(QWidget):
 
         # keep best SNR per pair with filters
         best: Dict[tuple[str, str], Dict[str, object]] = {}
+        directional_best: Dict[tuple[str, str], Dict[str, object]] = {}
         stat: Dict[str, Dict] = {}
         relay_best: Dict[tuple[str, str], Dict[str, object]] = {}
         my_partners: Set[str] = set()
@@ -7830,6 +8030,19 @@ class StationsMapTab(QWidget):
             if not include:
                 continue
 
+            direction_key = (o, d)
+            direction_known = bool(row[9]) if len(row) > 9 else False
+            previous = directional_best.get(direction_key)
+            if previous is None or (direction_known and not previous.get("direction_known")) or (
+                direction_known == bool(previous.get("direction_known"))
+                and snr_val is not None and (previous.get("snr") is None or snr_val > previous["snr"])
+            ):
+                directional_best[direction_key] = {
+                    "origin": o, "destination": d, "snr": snr_val, "ts": ts,
+                    "is_relay": bool(is_relay), "relay_via": relay_via or "",
+                    "direction_known": direction_known,
+                }
+
             if relay_target:
                 prev = relay_best.get(key)
                 prev_snr = prev.get("snr") if isinstance(prev, dict) else None
@@ -7933,6 +8146,8 @@ class StationsMapTab(QWidget):
             for (o, d), _data in best.items():
                 _add_link(best, o, d)
 
+        links = self._expand_observed_path_directions(links, directional_best, pos_map)
+
         # finalize stats: avg/max
         stats_out: Dict[str, Dict] = {}
         for cs, data in stat.items():
@@ -8006,6 +8221,7 @@ class StationsMapTab(QWidget):
             ",".join(sorted({c.strip().upper() for c in (reachable_callsigns or set()) if c})),
             int(max_age_sec or 0),
             len(self.stations),
+            self._get_user_latlon(),
             len(self.operator_index),
         )
         cached = self._query_cache_get(cache_key, ttl_sec=2.0)
@@ -8013,7 +8229,7 @@ class StationsMapTab(QWidget):
             return [dict(x) for x in cached if isinstance(x, dict)]
         links: List[Dict] = []
         pos_map: Dict[str, tuple[float, float]] = {}
-        for pt in self.stations:
+        for pt in self._station_points_for_map():
             pos_map[pt.callsign.upper()] = (pt.lat, pt.lon)
 
         if isinstance(link_selection, (list, tuple)) and len(link_selection) >= 2:
@@ -8046,7 +8262,7 @@ class StationsMapTab(QWidget):
         if max_age_sec and max_age_sec > 0:
             ts_cut = time.time() - max_age_sec
         try:
-            conn = sqlite3.connect(db_path)
+            conn = connect_sqlite_readonly(db_path)
             cur = conn.cursor()
             where_parts: List[str] = []
             params: List[object] = []
@@ -8059,10 +8275,11 @@ class StationsMapTab(QWidget):
                 pass
             where_sql = f" WHERE {' AND '.join(where_parts)}" if where_parts else ""
             cur.execute(
-                f"SELECT ts, origin, destination, snr, band, freq_hz FROM varac_links{where_sql}",
+                f"SELECT ts, origin, destination, snr, band, freq_hz FROM varac_links{where_sql} ORDER BY ts DESC LIMIT 20000",
                 tuple(params),
             )
             rows = cur.fetchall()
+            note_map_read_cap("varac_links", len(rows), 20000)
             conn.close()
         except Exception:
             return links
@@ -8104,6 +8321,7 @@ class StationsMapTab(QWidget):
 
         relay_best: Dict[tuple[str, str], Dict[str, object]] = {}
         best: Dict[tuple[str, str], Dict[str, object]] = {}
+        directional_best: Dict[tuple[str, str], Dict[str, object]] = {}
         my_partners: Set[str] = set()
         target_partners: Set[str] = set()
 
@@ -8196,6 +8414,10 @@ class StationsMapTab(QWidget):
                 snr_val = float(snr)
             except Exception:
                 snr_val = None
+            direction_key = (o, d)
+            previous = directional_best.get(direction_key)
+            if previous is None or (snr_val is not None and (previous.get("snr") is None or snr_val > previous["snr"])):
+                directional_best[direction_key] = {"origin": o, "destination": d, "snr": snr_val, "ts": ts}
             if relay_target:
                 key = tuple(sorted((o, d)))
                 prev = relay_best.get(key)
@@ -8303,6 +8525,7 @@ class StationsMapTab(QWidget):
             for (o, d), data in best.items():
                 _add_link_from_best(data, o, d)
 
+        links = self._expand_observed_path_directions(links, directional_best, pos_map)
         self._query_cache_set(cache_key, [dict(x) for x in links])
         return links
 
@@ -8324,7 +8547,7 @@ class StationsMapTab(QWidget):
         if not db_path.exists():
             return stats
         try:
-            conn = sqlite3.connect(db_path)
+            conn = connect_sqlite_readonly(db_path)
             cur = conn.cursor()
             cur.execute(
                 """
@@ -8413,7 +8636,7 @@ class StationsMapTab(QWidget):
         if not db_path.exists():
             return calls
         try:
-            conn = sqlite3.connect(db_path)
+            conn = connect_sqlite_readonly(db_path)
             cur = conn.cursor()
             cur.execute("SELECT DISTINCT origin FROM js8_links")
             calls.update({str(r[0]).strip().upper() for r in cur.fetchall() if r and r[0]})
@@ -8449,7 +8672,7 @@ class StationsMapTab(QWidget):
                 return match.group(0)
             return cs_norm
         try:
-            conn = sqlite3.connect(db_path)
+            conn = connect_sqlite_readonly(db_path)
             cur = conn.cursor()
             cur.execute("SELECT callsign FROM fldigi_checkins")
             checkins = {
@@ -8484,7 +8707,7 @@ class StationsMapTab(QWidget):
             return out
         cutoff = time.time() - int(max_age_sec or 0) if int(max_age_sec or 0) > 0 else 0.0
         try:
-            with sqlite3.connect(db_path) as conn:
+            with connect_sqlite_readonly(db_path) as conn:
                 exists = conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' AND name='commstat_artifacts'"
                 ).fetchone()
@@ -8660,7 +8883,7 @@ class StationsMapTab(QWidget):
 
     def _load_spotter_station_status(self) -> Dict[str, Dict]:
         unified_enabled = self._settings_bool(self.settings, "sitrep_unified_map_enabled", True)
-        cache_key = ("spotter_station_status", unified_enabled)
+        cache_key = ("spotter_station_status", unified_enabled, self._nets_db_fingerprint())
         cached = self._query_cache_get(cache_key)
         if isinstance(cached, dict):
             return {
@@ -8677,7 +8900,7 @@ class StationsMapTab(QWidget):
         if not db_path.exists():
             return statuses
         try:
-            conn = sqlite3.connect(db_path)
+            conn = connect_sqlite_readonly(db_path)
             cur = conn.cursor()
             try:
                 cur.execute(
@@ -8687,15 +8910,20 @@ class StationsMapTab(QWidget):
                     FROM spotter_station_status
                     """
                 )
-            except Exception:
-                cur.execute(
-                    """
-                    SELECT from_call, status_key, status_label, updated_utc_ts, updated_utc_str, response_code,
-                           '' AS status_source, '' AS status_source_detail
-                    FROM spotter_station_status
-                    """
-                )
-            rows = cur.fetchall()
+            except sqlite3.OperationalError:
+                try:
+                    cur.execute(
+                        """
+                        SELECT from_call, status_key, status_label, updated_utc_ts, updated_utc_str, response_code,
+                               '' AS status_source, '' AS status_source_detail
+                        FROM spotter_station_status
+                        """
+                    )
+                    rows = cur.fetchall()
+                except sqlite3.OperationalError:
+                    rows = []
+            else:
+                rows = cur.fetchall()
             fused_rows = []
             if unified_enabled:
                 try:
@@ -8739,7 +8967,10 @@ class StationsMapTab(QWidget):
             source = (status_source or "").strip().upper()
             source_summary = {source: key} if source else {}
             source_chips = self._encode_source_chips(source_summary)
-            status_label_text = (status_label or "").strip() or self._sitrep_status_label(key)
+            status_label_text = (
+                self._sitrep_status_label(key) if key == "unknown"
+                else ((status_label or "").strip() or self._sitrep_status_label(key))
+            )
             source_detail = (status_source_detail or "").strip()
             if not source_detail and source_chips:
                 source_detail = source_chips
@@ -8865,7 +9096,7 @@ class StationsMapTab(QWidget):
         if not db_path.exists():
             return out
         try:
-            conn = sqlite3.connect(db_path)
+            conn = connect_sqlite_readonly(db_path)
             cur = conn.cursor()
             base_sql = """
                 SELECT from_call, form_id, utc_ts, utc_str, decoded_text
@@ -9034,7 +9265,7 @@ class StationsMapTab(QWidget):
             return out
         cutoff = time.time() - WEATHER_REPORT_MAX_AGE_SEC
         try:
-            conn = sqlite3.connect(db_path)
+            conn = connect_sqlite_readonly(db_path)
             cur = conn.cursor()
             form_ids = sorted(code[2:] for code in (weather_codes or set()) if str(code).startswith("F!"))
             if not form_ids:
@@ -9160,7 +9391,7 @@ class StationsMapTab(QWidget):
             return out
         cutoff = time.time() - max_age_sec if max_age_sec and max_age_sec > 0 else 0.0
         try:
-            conn = sqlite3.connect(db_path)
+            conn = connect_sqlite_readonly(db_path)
             cur = conn.cursor()
             form_ids = sorted(code[2:] for code in form_codes if str(code).startswith("F!"))
             if not form_ids:
@@ -9278,15 +9509,21 @@ class StationsMapTab(QWidget):
                     limit=1500,
                 ),
                 layer_enabled=True,
+                readonly=True,
                 allow_unconfirmed_local=False,
                 exercise_layer=False,
             )
         except Exception as e:
             log.debug("StationsMap: failed to load observation %s reports: %s", layer_name, e)
-            return out
+            raise
 
-        metadata_lookup = self._message_file_metadata_lookup(db_path)
-        commstat_lookup = self._commstat_artifact_metadata_lookup(db_path)
+        # Enrich only the bounded observation result, never the whole archive.
+        metadata_lookup = self._message_file_metadata_lookup(
+            db_path, paths=tuple(self._observation_file_path(row.observation) for row in view_rows)
+        )
+        commstat_lookup = self._commstat_artifact_metadata_lookup(
+            db_path, source_refs=tuple(str(row.observation.source_ref or "") for row in view_rows)
+        )
         for view_row in view_rows:
             obs = view_row.observation
             source_family = str(obs.source_family or "").strip().lower()
@@ -9393,6 +9630,11 @@ class StationsMapTab(QWidget):
                     include = bool(topics.intersection(INFRASTRUCTURE_MAP_TOPICS))
             if not include:
                 continue
+            # A reported condition owns its color. Text classification chooses
+            # the topic symbol and is only a fallback when no status was reported.
+            report_status = StationsMapTab._map_report_status_key(metadata)
+            if report_status:
+                severity = report_status
             topic_icon = self._map_icon_for_topics(sorted(topics), preferred_topic=topic_filter)
             if topic_icon and icon not in {"warning"}:
                 icon = topic_icon
@@ -9467,6 +9709,7 @@ class StationsMapTab(QWidget):
                     "title": str(meta_title or obs.subject or "").strip(),
                     "icon": icon,
                     "severity": severity,
+                    "status": report_status,
                     "lat": obs.lat if use_observation_coordinates else None,
                     "lon": obs.lon if use_observation_coordinates else None,
                     "grid": effective_grid,
@@ -9511,7 +9754,7 @@ class StationsMapTab(QWidget):
             return {str(path) for path in cached if str(path)}
         paths: Set[str] = set()
         try:
-            with sqlite3.connect(str(db_path)) as conn:
+            with connect_sqlite_readonly(str(db_path)) as conn:
                 exists = conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' AND name='observation_projection'"
                 ).fetchone()
@@ -10021,14 +10264,17 @@ class StationsMapTab(QWidget):
                     limit=2500,
                 ),
                 layer_enabled=True,
+                readonly=True,
                 allow_unconfirmed_local=False,
                 exercise_layer=False,
             )
         except Exception as exc:
             log.debug("StationsMap: failed to load observation station scope: %s", exc)
-            return set()
+            raise
         wanted_sources = self._observation_focus_sources(focus_mode)
-        metadata_lookup = self._message_file_metadata_lookup(db_path)
+        metadata_lookup = self._message_file_metadata_lookup(
+            db_path, paths=tuple(self._observation_file_path(row.observation) for row in view_rows)
+        )
         for view_row in view_rows:
             obs = view_row.observation
             source_family = str(obs.source_family or "").strip().lower()
@@ -10142,11 +10388,12 @@ class StationsMapTab(QWidget):
                 state=state_filter,
                 max_age_sec=max_age_sec,
                 limit=5000,
+                readonly=True,
                 station_index=getattr(self, "operator_index", {}) or {},
             )
         except Exception as exc:
             log.warning("StationsMap: failed to build regional intelligence: %s", exc, exc_info=True)
-            return {"enabled": False, "states": {}, "regions": {}, "summary": "Regional intelligence could not be built."}
+            raise
 
         def rollup_center(rollup: RegionalAreaRollup) -> Tuple[float, float]:
             if rollup.area_type == "fema_region":
@@ -10496,8 +10743,11 @@ class StationsMapTab(QWidget):
             return False
         return bool(re.fullmatch(r"[A-R]{2}\d{2}(?:[A-X]{2})?", grid))
 
-    def _message_file_metadata_lookup(self, db_path: Path) -> Dict[str, Dict[str, object]]:
-        cache_key = ("message_file_metadata_lookup", str(db_path), self._nets_db_fingerprint())
+    def _message_file_metadata_lookup(self, db_path: Path, *, paths=None) -> Dict[str, Dict[str, object]]:
+        selected_paths = tuple(sorted({str(path) for path in paths if path})) if paths is not None else None
+        if selected_paths == ():
+            return {}
+        cache_key = ("message_file_metadata_lookup", str(db_path), self._nets_db_fingerprint(), selected_paths)
         cached = self._query_cache_get(cache_key, ttl_sec=8.0)
         if isinstance(cached, dict):
             return {
@@ -10507,24 +10757,29 @@ class StationsMapTab(QWidget):
             }
         lookup: Dict[str, Dict[str, object]] = {}
         try:
-            with sqlite3.connect(str(db_path)) as conn:
+            with connect_sqlite_readonly(str(db_path)) as conn:
                 exists = conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' AND name='message_file_metadata'"
                 ).fetchone()
                 if not exists:
                     self._query_cache_set(cache_key, lookup)
                     return lookup
-                rows = conn.execute(
-                    """
+                query = """
                     SELECT path, source_family, msg_type, display_type, status, from_call,
                            to_call, title, topics_json, search_text, report_ts, source_label
                     FROM message_file_metadata
-                    """
-                ).fetchall()
+                """
+                rows = []
+                batches = (selected_paths[index:index + 500] for index in range(0, len(selected_paths), 500)) if selected_paths is not None else (None,)
+                for batch in batches:
+                    condition = " WHERE path IN (" + ",".join("?" for _ in batch) + ")" if batch is not None else " ORDER BY report_ts DESC, path LIMIT 1500"
+                    rows.extend(conn.execute(query + condition, batch or ()).fetchall())
         except Exception as exc:
             log.debug("StationsMap: failed to load message file metadata: %s", exc)
             self._query_cache_set(cache_key, lookup)
             return lookup
+        if selected_paths is None:
+            note_map_read_cap("message metadata", len(rows), 1500)
         for row in rows:
             path = str(row[0] or "").strip()
             if not path:
@@ -10558,14 +10813,20 @@ class StationsMapTab(QWidget):
         self._query_cache_set(cache_key, dict(lookup))
         return lookup
 
-    def _commstat_artifact_metadata_lookup(self, db_path: Path) -> Dict[str, Dict[str, object]]:
-        cache_key = ("commstat_artifact_metadata_lookup", str(db_path), self._nets_db_fingerprint())
+    def _commstat_artifact_metadata_lookup(self, db_path: Path, *, source_refs=None) -> Dict[str, Dict[str, object]]:
+        artifact_ids = None
+        if source_refs is not None:
+            artifact_ids = tuple(sorted({int(ref.split(":", 1)[1]) for ref in source_refs
+                                         if ref.startswith("commstat_artifacts:") and ref.split(":", 1)[1].isdigit()}))
+            if not artifact_ids:
+                return {}
+        cache_key = ("commstat_artifact_metadata_lookup", str(db_path), self._nets_db_fingerprint(), artifact_ids)
         cached = self._query_cache_get(cache_key, ttl_sec=8.0)
         if isinstance(cached, dict):
             return {str(ref): dict(meta) for ref, meta in cached.items() if isinstance(meta, dict)}
         lookup: Dict[str, Dict[str, object]] = {}
         try:
-            with sqlite3.connect(str(db_path)) as conn:
+            with connect_sqlite_readonly(str(db_path)) as conn:
                 exists = conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' AND name='commstat_artifacts'"
                 ).fetchone()
@@ -10578,14 +10839,17 @@ class StationsMapTab(QWidget):
                     if len(row) > 1 and str(row[1] or "").strip()
                 }
                 event_ts_expr = "event_ts_utc" if "event_ts_utc" in cols else "event_ts" if "event_ts" in cols else "''"
-                rows = conn.execute(
-                    f"""
+                query = f"""
                     SELECT id, from_call, target, report_group, grid, state_code, scope,
                            status_label, alert_color, title, body_text, remarks_text,
                            transport_mode, reach_mode, {event_ts_expr}
                     FROM commstat_artifacts
-                    """
-                ).fetchall()
+                """
+                rows = []
+                batches = (artifact_ids[index:index + 500] for index in range(0, len(artifact_ids), 500)) if artifact_ids is not None else (None,)
+                for batch in batches:
+                    condition = " WHERE id IN (" + ",".join("?" for _ in batch) + ")" if batch is not None else " ORDER BY id DESC LIMIT 1500"
+                    rows.extend(conn.execute(query + condition, batch or ()).fetchall())
         except Exception as exc:
             log.debug("StationsMap: failed to load CommStat artifact metadata: %s", exc)
             self._query_cache_set(cache_key, lookup)
@@ -10740,7 +11004,7 @@ class StationsMapTab(QWidget):
             return {}
         if metadata_lookup is None:
             try:
-                metadata_lookup = self._message_file_metadata_lookup(get_config_dir() / "config" / "freqinout_nets.db")
+                metadata_lookup = self._message_file_metadata_lookup(get_config_dir() / "config" / "freqinout_nets.db", paths=(path,))
             except Exception:
                 metadata_lookup = {}
         meta = metadata_lookup.get(path) if isinstance(metadata_lookup, dict) else None
@@ -10857,6 +11121,9 @@ class StationsMapTab(QWidget):
         return True
 
     def _map_filters_active(self) -> bool:
+        if getattr(self, "_current_map_mode_key", lambda: "all")() == "mesh_nodes":
+            recent = getattr(self, "_mesh_recent_chk", None)
+            return bool(recent and recent.isChecked())
         group = self._selected_map_group_filter()
         region = self._selected_map_region_filter()
         band_data = self.band_combo.currentData() if hasattr(self, "band_combo") else {"type": "all"}
@@ -10876,6 +11143,8 @@ class StationsMapTab(QWidget):
         )
 
     def _map_active_filter_summary(self) -> str:
+        if getattr(self, "_current_map_mode_key", lambda: "all")() == "mesh_nodes":
+            return "Recently heard (24h)" if self._map_filters_active() else "Known contacts"
         labels: List[str] = []
         group = self._selected_map_group_filter()
         if group:
@@ -10960,10 +11229,13 @@ class StationsMapTab(QWidget):
             controls.setToolTip(
                 f"Advanced Map Tools has active filters: {advanced_summary}. Use Clear Filters to reset them."
                 if advanced_summary
-                else "Show optional layer, path, propagation, city, and planning-pin controls."
+                else "Refine evidence, inspect paths, adjust basemap detail, and manage planning pins."
             )
 
     def _on_map_search_text_changed(self, _text: str) -> None:
+        # Fence a previous search before the debounce interval elapses.
+        self._map_payload_generation = getattr(self, "_map_payload_generation", 0) + 1
+        self._map_inspector_generation = getattr(self, "_map_inspector_generation", 0) + 1
         timer = getattr(self, "_map_search_timer", None)
         if timer is not None:
             timer.start()
@@ -10999,6 +11271,11 @@ class StationsMapTab(QWidget):
 
     def clear_map_filters(self) -> None:
         """Clear map filtering inputs without changing the active map layer/view."""
+        recent = getattr(self, "_mesh_recent_chk", None)
+        if recent is not None:
+            recent.blockSignals(True)
+            recent.setChecked(False)
+            recent.blockSignals(False)
         for combo_attr, value in (
             ("group_filter_combo", ""),
             ("region_filter_combo", ""),
@@ -11032,6 +11309,7 @@ class StationsMapTab(QWidget):
 
     def clear_map_layers(self, *, reason: str = "clear_map_layers") -> None:
         """Clear visual overlays while preserving report/data filters."""
+        self._remember_map_path_scope()
         current_focus_mode = str(getattr(self, "_observation_focus_mode", "") or "").strip().lower()
         preserve_report_focus = self._map_report_refinement_active()
         preserve_regional_focus = current_focus_mode == "regional_intelligence"
@@ -11354,6 +11632,16 @@ class StationsMapTab(QWidget):
         if source == "mixed":
             return "mixed"
         return "hf"
+
+    @staticmethod
+    def _map_report_status_key(report: Mapping[str, object]) -> str:
+        from freqinout.core.commstat_artifacts import normalize_status_label
+
+        for value in (report.get("alert_color"), report.get("status")):
+            key = normalize_status_label(value).lower()
+            if key in {"red", "yellow", "green", "unknown"}:
+                return key
+        return ""
 
     @staticmethod
     def _compact_report_status_line(report: Dict[str, object]) -> str:
@@ -12126,7 +12414,7 @@ class StationsMapTab(QWidget):
         if not db_path.exists():
             return []
         try:
-            conn = sqlite3.connect(db_path)
+            conn = connect_sqlite_readonly(db_path)
             cur = conn.cursor()
             cols = {
                 str(row[1] or "").strip()
@@ -12195,7 +12483,7 @@ class StationsMapTab(QWidget):
         ts_cut = time.time() - max_age_sec
         calls: Set[str] = set()
         try:
-            conn = sqlite3.connect(db_path)
+            conn = connect_sqlite_readonly(db_path)
             cur = conn.cursor()
             cur.execute(
                 "SELECT ts, origin, destination, band, freq_hz FROM js8_links WHERE ts >= ?",
@@ -12274,7 +12562,7 @@ class StationsMapTab(QWidget):
             return out
         ts_cut = time.time() - max_age_sec
         try:
-            conn = sqlite3.connect(db_path)
+            conn = connect_sqlite_readonly(db_path)
             cur = conn.cursor()
             cur.execute(
                 "SELECT origin, destination, band FROM js8_links WHERE ts >= ?",
@@ -12388,6 +12676,40 @@ class StationsMapTab(QWidget):
             return "No path links found for current filters."
         return "No path links found."
 
+    @staticmethod
+    def _path_endpoint_markers(markers, links, my_call, statuses):
+        """Keep every drawn path anchored to its station identities, without I/O."""
+        by_call = {str(marker.get("callsign") or "").strip().upper(): dict(marker) for marker in markers}
+        endpoints = set()
+        for link in links:
+            for call_key, lat_key, lon_key in (("origin", "lat1", "lon1"), ("destination", "lat2", "lon2")):
+                call = str(link.get(call_key) or "").strip().upper()
+                if not call:
+                    continue
+                try:
+                    lat, lon = float(link[lat_key]), float(link[lon_key])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if not math.isfinite(lat) or not math.isfinite(lon):
+                    continue
+                endpoints.add(call)
+                marker = by_call.setdefault(call, {"callsign": call, "label": call, "title": call})
+                marker.update(lat=lat, lon=lon, is_own_station=call == my_call)
+                status = statuses.get(call, {})
+                key = str(status.get("status_key") or marker.get("spotter_status_key") or "unknown")
+                marker["spotter_status_key"] = key
+                marker["spotter_status_label"] = status.get("status_label") or StationsMapTab._sitrep_status_label(key)
+                for target, source in (("spotter_status_source", "status_source"),
+                                       ("spotter_status_age", "status_age"),
+                                       ("spotter_status_source_detail", "status_source_detail")):
+                    if source in status:
+                        marker[target] = status[source]
+                if call == my_call:
+                    marker["tooltip"] = "My station · " + call
+        return sorted(by_call.values(), key=lambda marker: (
+            not bool(marker.get("is_own_station")), marker.get("callsign") not in endpoints
+        ))
+
     def _display_links_for_mode(self, links: List[Dict], sitrep_mode: bool) -> List[Dict]:
         self._map_link_display_limited_count = 0
         self._map_link_loaded_count = len(links or [])
@@ -12427,26 +12749,7 @@ class StationsMapTab(QWidget):
             out = []
         if out:
             return out
-        db_path = get_config_dir() / "config" / "freqinout_nets.db"
-        if not db_path.exists():
-            return out
-        try:
-            conn = sqlite3.connect(db_path)
-            cur = conn.cursor()
-            cur.execute(
-                """
-                SELECT IFNULL(callsign, '')
-                FROM operator_checkins
-                ORDER BY callsign COLLATE NOCASE
-                """
-            )
-            for (callsign,) in cur.fetchall():
-                cs = (callsign or "").strip().upper()
-                if cs and cs not in out:
-                    out.append(cs)
-            conn.close()
-        except Exception as e:
-            log.debug("StationsMap: failed to load propagation operator options: %s", e)
+        # Roster options are published by the map worker; display never falls back to SQL.
         return out
 
     def _prop_target_options(self, target_type: str) -> list[str]:
@@ -12482,12 +12785,12 @@ class StationsMapTab(QWidget):
         self.prop_target_value_combo.setEditable(target_type == "OPERATOR")
         self.prop_target_value_combo.blockSignals(False)
 
-    def _refresh_prop_target_controls(self) -> None:
+    def _refresh_prop_target_controls(self, *, cached_only: bool = True) -> None:
         if not self.settings or self.prop_target_type_combo is None or self.prop_target_value_combo is None:
             return
         self._prop_target_syncing = True
         try:
-            if hasattr(self.settings, "reload"):
+            if not cached_only and hasattr(self.settings, "reload"):
                 self.settings.reload()
             target_type = (self.settings.get("prop_target_type", "REGION") or "REGION").strip().upper()
             if target_type not in {"REGION", "STATE", "OPERATOR"}:
@@ -12503,7 +12806,7 @@ class StationsMapTab(QWidget):
             current_value = (self.prop_target_value_combo.currentText() or "").strip().upper()
             existing_type = (self.settings.get("prop_target_type", "") or "").strip().upper()
             existing_value = (self.settings.get("prop_target_value", "") or "").strip().upper()
-            if existing_type != target_type or existing_value != current_value:
+            if not cached_only and (existing_type != target_type or existing_value != current_value):
                 self.settings.set_many(
                     {
                         "prop_target_type": target_type,
@@ -13050,7 +13353,7 @@ class StationsMapTab(QWidget):
         if not db_path.exists():
             return rows
         try:
-            conn = sqlite3.connect(db_path)
+            conn = connect_sqlite_readonly(db_path)
             cur = conn.cursor()
             has_effective_view = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='view' AND name='peer_hf_schedule_effective'"
@@ -13369,9 +13672,7 @@ class StationsMapTab(QWidget):
                 if splitter is not None:
                     splitter.addWidget(renderer)
             self._native_map_renderer = renderer
-            renderer.set_map_visible(
-                bool(getattr(self, "_map_visible", False) and getattr(self, "_app_active", True))
-            )
+            renderer.set_map_visible(bool(getattr(self, "_map_visible", False)))
             available = getattr(renderer, "is_available", None)
             if callable(available) and not available():
                 status_text = getattr(renderer, "status_text", None)
@@ -13382,7 +13683,7 @@ class StationsMapTab(QWidget):
             enter_degraded = getattr(self, "_enter_map_degraded", None)
             if callable(enter_degraded):
                 enter_degraded(
-                    "Native Map is unavailable. Review the Qt Location installation and retry without restarting FIO.",
+                    "Native Map is unavailable. Review the Qt Location installation and retry without restarting CommsPlan.",
                     reason="native_renderer_create",
                     exc=exc,
                 )
@@ -13451,6 +13752,11 @@ class StationsMapTab(QWidget):
         if renderer is None or (callable(available) and not available()):
             self._pending_map_payload = projection
             return False
+        if bool(getattr(self, "_map_initialized", False)):
+            projection.pop("auto_fit", None)
+            current_view = getattr(renderer, "view_state", None)
+            if callable(current_view):
+                projection["view"] = current_view()
         renderer.apply_projection(projection)
         self._pending_map_payload = None
         self._map_initialized = True
@@ -13513,7 +13819,120 @@ class StationsMapTab(QWidget):
             self._request_map_refresh(level="medium", reason="selected_detail_topic")
 
     # ------------- Map rendering ------------- #
+    def _on_mesh_recent_changed(self, _checked: bool) -> None:
+        self._update_clear_filter_buttons_visual()
+        self._request_map_refresh(level="light", reason="mesh_recent_filter")
+
+    def on_mesh_data_changed(self, event) -> None:
+        if getattr(event, "node", None) is None and getattr(event, "message", None) is None:
+            return
+        self._map_dirty = True
+        if self._current_map_mode_key() != "mesh_nodes":
+            return
+        timer = getattr(self, "_mesh_map_update_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(500)
+            timer.timeout.connect(lambda: self._request_map_refresh(level="light", reason="mesh_data_changed"))
+            self._mesh_map_update_timer = timer
+        if not timer.isActive():
+            timer.start()
+
+    def _capture_map_read_request(self, *, kind: str, generation: int, preserve_view=True):
+        """Snapshot cached values on the GUI thread; never pass Qt/settings owners."""
+        from copy import deepcopy
+        from freqinout.gui.map_read_snapshot import MapReadRequest, INPUT_FIELDS, SELECTORS, COMBO_FIELDS
+        state = {name: deepcopy(getattr(self, name)) for name in INPUT_FIELDS if hasattr(self, name)}
+        settings = self.settings.all() if hasattr(self.settings, "all") else dict(self.settings or {})
+        selectors = {name: deepcopy(getattr(self, name)()) for name in SELECTORS}
+        combos = {name: deepcopy(self._map_filter_combo_signature(name)) for name in COMBO_FIELDS}
+        band = self.band_combo.currentData() if hasattr(self, "band_combo") else {"type": "all"}
+        recent = getattr(self, "_mesh_recent_chk", None)
+        return MapReadRequest(generation, kind, state, deepcopy(settings), selectors, combos,
+                              dict(self._theme_snapshot()), deepcopy(band), bool(recent and recent.isChecked()),
+                              deepcopy(preserve_view))
+
     def _render_map(self, preserve_view: bool = True):
+        """Queue the entire read/build pipeline; presentation performs no input I/O."""
+        if self._is_shutting_down:
+            return
+        if not self._map_visible or not self._app_active or self._map_page_loading:
+            self._map_dirty = True
+            return
+        from freqinout.gui.map_read_snapshot import MapReadLane
+        self._map_dirty = False
+        self._map_payload_generation += 1
+        generation = self._map_payload_generation
+        if self._map_read_lane is None:
+            self._map_read_lane = MapReadLane(self)
+            self._map_read_lane.ready.connect(self._on_map_read_ready)
+        self._map_read_inflight = True
+        self._map_read_lane.request(self._capture_map_read_request(
+            kind="map", generation=generation, preserve_view=preserve_view))
+
+    def _on_map_read_ready(self, result):
+        self._map_read_inflight = bool(self._map_read_lane and self._map_read_lane._running)
+        if self._is_shutting_down or result.generation != self._map_payload_generation:
+            self._emit_map_event("data_snapshot_stale", generation=result.generation)
+            return
+        emit_span("map.data_snapshot", result.elapsed_ms, settings=self.settings,
+                  meta={"status": "failed" if result.error else "ready"}, min_ms=5.0)
+        if result.error:
+            self._enter_map_degraded("Map data unavailable; showing the last valid map. Retry to update.",
+                                     reason="data_snapshot_failed", exc=RuntimeError(result.error))
+            return
+        initial = not self._initial_data_loaded
+        for name, value in result.state.items():
+            setattr(self, name, value)
+        self._initial_data_loaded = True
+        self._refresh_band_options()
+        self._update_now_reachable_summary()
+        if initial:
+            self._refresh_link_mode_options()
+            self._refresh_group_filter_options()
+            self._refresh_region_filter_options()
+            self._refresh_relay_targets()
+            self._refresh_prop_target_controls(cached_only=True)
+        if result.badge:
+            self._update_prop_badge(*result.badge)
+        self._on_map_payload_snapshot_ready(result.projection)
+        self._emit_map_event("render_completed", generation=result.generation)
+        if self._map_selected_payload:
+            self._queue_map_inspector_snapshot()
+
+    def _queue_map_inspector_snapshot(self):
+        if self._is_shutting_down or not self._map_visible or not self._app_active:
+            return
+        from freqinout.gui.map_read_snapshot import MapReadLane
+        self._map_inspector_generation += 1
+        if self._map_inspector_lane is None:
+            self._map_inspector_lane = MapReadLane(self)
+            self._map_inspector_lane.ready.connect(self._on_map_inspector_ready)
+        self._map_inspector_lane.request(self._capture_map_read_request(
+            kind="inspector", generation=self._map_inspector_generation))
+
+    def _on_map_inspector_ready(self, result):
+        if (self._is_shutting_down or result.generation != self._map_inspector_generation
+                or not self._map_visible or not self._app_active):
+            return
+        bodies = (self._map_selected_body, self._map_selected_status_body,
+                  self._map_selected_paths_body, self._map_selected_messages_body)
+        if result.error:
+            # Keep coherent prior detail for this selection and mark it stale.
+            for body in bodies:
+                if body is not None:
+                    body.setToolTip("Details unavailable; retained information may be stale. Retry the map refresh.")
+                    if not getattr(self, "_map_inspector_has_content", False):
+                        body.setHtml("<p>Selection details unavailable. Retry the map refresh to update.</p>")
+            return
+        self._map_inspector_has_content = True
+        for body, text in zip(bodies, result.inspector):
+            if body is not None:
+                body.setHtml(text)
+                body.setToolTip("")
+
+    def _build_map_payload(self, preserve_view: bool = True):
         if not self._map_visible or not self._app_active:
             self._map_dirty = True
             return
@@ -13551,6 +13970,31 @@ class StationsMapTab(QWidget):
         if view_state is None and self._last_map_view:
             view_state = self._last_map_view
 
+        if self._current_map_mode_key() == "mesh_nodes":
+            # Known contacts are a topology source, independent of traffic age,
+            # topic and group filters. Read their bounded snapshot on the worker.
+            own_call = str(self.settings.get("operator_callsign", "") or "").strip().upper()
+            own_grid = str(self.settings.get("operator_grid6", "") or self.settings.get("operator_grid", "") or "").strip().upper()
+            own_location = maidenhead_to_latlon(own_grid) if own_grid else None
+            own_marker = ({"id": "fio-own-station", "kind": "station", "callsign": own_call,
+                           "label": own_call, "is_own_station": True,
+                           "lat": own_location[0], "lon": own_location[1],
+                           "tooltip": "My station · Saved operator grid " + own_grid}
+                          if own_call and own_location else None)
+            self._queue_native_map_projection({
+                "_mesh_operator_marker": own_marker,
+                "map_mode": "mesh_nodes", "markers": [], "links": [],
+                "_mesh_db_path": str(get_config_dir() / "config" / "freqinout_nets.db"),
+                "_mesh_show_paths": bool(self.show_link_paths),
+                "_mesh_recent_only": bool(getattr(self, "_mesh_recent_chk", None) and self._mesh_recent_chk.isChecked()),
+                "link_direction_markers": bool(self.show_link_paths),
+                "show_states": bool(self.show_states), "show_regions": bool(self.show_regions),
+                "show_grids": bool(self.show_grids), "show_grid_labels": bool(self.show_grid_labels),
+                "show_cities": bool(self.show_city_labels),
+                "view": view_state or {"lat": 45, "lon": -97, "zoom": 3},
+            })
+            return
+
         report_view_without_roster = bool(
             self._effective_map_observation_focus_enabled()
             and self._effective_map_report_focus_mode() in {"hf_reports", "local_reports", "all_reports", "mesh_nodes"}
@@ -13561,7 +14005,7 @@ class StationsMapTab(QWidget):
         )
         propagation_view_without_roster = bool(self.prop_overlay_enabled)
         if (
-            not self.stations
+            not self._station_points_for_map()
             and not report_view_without_roster
             and not regional_view_without_roster
             and not propagation_view_without_roster
@@ -13706,6 +14150,7 @@ class StationsMapTab(QWidget):
             self._map_band_filter_signature(band_filter),
             int(self.recency_seconds or 0),
             str(my_call or "").strip().upper(),
+            self._get_user_latlon(),
             effective_relay_target,
             bool(self._now_reachable_enabled),
             bool(self.show_station_markers),
@@ -13763,7 +14208,7 @@ class StationsMapTab(QWidget):
                     group_filter=group_filter,
                     region_filter=region_filter,
                     reachable_callsigns=reachable_filter,
-                    max_age_sec=self.recency_seconds,
+                    max_age_sec=self._effective_path_recency_seconds(),
                 ),
                 meta={"sitrep_mode": sitrep_mode},
             )
@@ -13777,7 +14222,7 @@ class StationsMapTab(QWidget):
                         group_filter=group_filter,
                         region_filter=region_filter,
                         reachable_callsigns=reachable_filter,
-                        max_age_sec=self.recency_seconds,
+                        max_age_sec=self._effective_path_recency_seconds(),
                     ),
                     meta={"sitrep_mode": sitrep_mode},
                 )
@@ -13869,7 +14314,7 @@ class StationsMapTab(QWidget):
                 lambda: _timed_map_call("map.load_spotter_station_status", self._load_spotter_station_status),
                 ttl_sec=6.0,
             )
-            if sitrep_mode or station_enrichment_needed
+            if sitrep_mode or station_enrichment_needed or path_view_active
             else {}
         )
         sitrep_state_summary: List[Dict[str, object]] = []
@@ -13972,7 +14417,7 @@ class StationsMapTab(QWidget):
                 ),
                 ttl_sec=6.0,
             )
-        for pt in self.stations:
+        for pt in self._station_points_for_map():
             cs_upper = pt.callsign.upper()
             if self._marker_station_matches_filters(
                 cs_upper,
@@ -14171,6 +14616,8 @@ class StationsMapTab(QWidget):
             positions = offset_positions(base_lat, base_lon, items)
             for pt, (lat_off, lon_off) in zip(items, positions):
                 cs_upper = pt.callsign.upper()
+                if cs_upper == my_call:
+                    lat_off, lon_off = pt.lat, pt.lon
                 stats = stats_lookup.get(cs_upper, {})
                 vstats = varac_stats.get(cs_upper, {})
                 activity = activity_lookup.get(cs_upper, {})
@@ -14242,6 +14689,7 @@ class StationsMapTab(QWidget):
                         "lat": lat_off,
                         "lon": lon_off,
                         "callsign": pt.callsign,
+                        "is_own_station": cs_upper == my_call,
                         "name": pt.name,
                         "state": pt.state,
                         "grid": pt.grid,
@@ -14318,6 +14766,21 @@ class StationsMapTab(QWidget):
         else:
             display_markers = markers if self.show_station_markers and stations_allowed else []
             display_links = links if self.show_link_paths else []
+            if (self.show_station_markers and stations_allowed) or display_links:
+                own = next((point for point in self._station_points_for_map() if point.callsign.upper() == my_call), None)
+                if own is not None and not any(marker.get("callsign") == my_call for marker in display_markers):
+                    status = spotter_status_lookup.get(my_call, {})
+                    display_markers.append({
+                        "callsign": my_call, "label": my_call if self.show_callsigns else "",
+                        "lat": own.lat, "lon": own.lon, "grid": own.grid,
+                        "is_own_station": True, "title": "My station · " + my_call,
+                        "spotter_status_key": status.get("status_key", "unknown"),
+                        "spotter_status_label": status.get("status_label", "Unknown"),
+                    })
+            if display_links:
+                display_markers = self._path_endpoint_markers(
+                    display_markers, display_links, my_call, spotter_status_lookup
+                )
         link_direction_markers = bool(self._map_link_direction_markers_enabled())
         self._map_link_status_detail = self._map_link_status_text(
             links_active=bool(self._links_active() and not sitrep_mode),
@@ -14326,7 +14789,7 @@ class StationsMapTab(QWidget):
             display_link_count=len(display_links),
             link_selection=effective_link_selection,
             all_time_link_count=int(getattr(self, "_map_last_link_all_time_count", 0) or 0),
-            recency_seconds=int(self.recency_seconds or 0),
+            recency_seconds=self._effective_path_recency_seconds() if self.show_link_paths else int(self.recency_seconds or 0),
         )
         report_event_count = len(weather_events) + len(alert_events) + len(infrastructure_events)
         if planning_pins_mode:
@@ -14425,7 +14888,8 @@ class StationsMapTab(QWidget):
             self._request_map_refresh(level="full", reason="visible_init", preserve_view=True)
             return
         if self._pending_map_payload and not self._map_dirty and not self._pending_refresh_level:
-            self._apply_pending_native_map_projection()
+            if self._apply_pending_native_map_projection():
+                self._set_map_runtime_state("ready", self._map_ready_detail_text())
             return
         if self._map_dirty:
             # A completed in-flight payload predates source changes recorded
@@ -14433,6 +14897,9 @@ class StationsMapTab(QWidget):
             self._pending_map_payload = None
             self._map_dirty = False
             self._request_map_refresh(level="medium", reason="visible_dirty", preserve_view=True)
+            return
+        if getattr(self, "_map_read_inflight", False):
+            self._set_map_runtime_state("loading", "Updating map data; the last valid map remains available.")
             return
         self._set_map_runtime_state("ready", self._map_ready_detail_text())
 
@@ -14447,7 +14914,9 @@ class StationsMapTab(QWidget):
         alert_events: Optional[List[Dict[str, object]]] = None,
         infrastructure_events: Optional[List[Dict[str, object]]] = None,
     ) -> bool:
-        """Fit the viewport when a focused result set changes, without fighting manual map navigation."""
+        """Fit an initial focused view; retain navigation after first publication."""
+        if bool(getattr(self, "_map_initialized", False)):
+            return False
         mode = str(map_mode or "").strip().lower() or "all"
         point_count = (
             len(markers or [])
@@ -14542,11 +15011,15 @@ class StationsMapTab(QWidget):
             return
         self._map_payload_generation += 1
         payload_generation = int(self._map_payload_generation)
+        previous = getattr(self, "_map_projection_future", None)
+        if previous is not None:
+            previous.cancel()  # Drop queued obsolete work; one running + one newest snapshot.
         future = self._map_projection_worker().submit(
             self._serialize_map_projection_snapshot,
             payload_generation,
             pending_payload,
         )
+        self._map_projection_future = future
         future.add_done_callback(lambda done: self._on_map_payload_future_done(payload_generation, pending_payload, done))
 
     def _map_projection_worker(self) -> ThreadPoolExecutor:
@@ -14563,7 +15036,8 @@ class StationsMapTab(QWidget):
             # Contract boundary: retained markers, observations, nodes, and
             # routes are serialized away from the UI thread. Live connection
             # health should update labels/chips and not rebuild this payload.
-            enriched_payload = build_native_overlay_projection(pending_payload)
+            from freqinout.gui.mesh_map_snapshot import enrich_mesh_map_snapshot
+            enriched_payload = build_native_overlay_projection(enrich_mesh_map_snapshot(pending_payload))
             payload = json.dumps(enriched_payload)
             return _MapProjectionSnapshotResult(
                 generation=generation,
@@ -14590,6 +15064,8 @@ class StationsMapTab(QWidget):
         pending_payload: Dict[str, object],
         future: Future,
     ) -> None:
+        if future.cancelled():
+            return
         try:
             result = future.result()
         except Exception as exc:
@@ -14620,11 +15096,30 @@ class StationsMapTab(QWidget):
                 # discarded worker result remains observable.
                 self._emit_map_event("payload_update_stale", generation=payload_generation)
             return
+        if result.error:
+            self._enter_map_degraded("Map data unavailable; showing the last valid map. Retry to update.",
+                                     reason="snapshot_failed", exc=RuntimeError(result.error))
+            return
         payload = result.payload
         sig = result.signature or str(hash(payload))
         if sig == getattr(self, "_last_map_payload_sig", None):
+            if self._map_visible and self._app_active:
+                self._set_map_runtime_state("ready", self._map_ready_detail_text())
             return
         pending_payload = dict(result.pending_payload)
+        if pending_payload.get("map_mode") == "mesh_nodes":
+            self._map_marker_count = len(pending_payload.get("markers") or [])
+            self._map_link_count = len(pending_payload.get("links") or [])
+            summary = pending_payload.get("mesh_summary") or {}
+            self._mesh_map_summary = dict(summary)
+            self._map_link_status_detail = (
+                f"Known nodes: {summary.get('known_nodes', 0)} · Located: {summary.get('located_nodes', 0)}"
+                f" · No location: {summary.get('unlocated_nodes', 0)} · Excluded: {summary.get('excluded_nodes', 0)} · Capped: {summary.get('omitted_nodes', 0)}"
+                f" · Path segments: {self._map_link_count} ({summary.get('observed_links', 0)} observed)."
+                f" Unresolved hops: {summary.get('unresolved_hops', 0)} · Ambiguous: {summary.get('ambiguous_hops', 0)}"
+                f" · Omitted paths: {summary.get('omitted_links', 0) + summary.get('omitted_candidates', 0)}."
+                " Advertised position age may be unknown; cached routes do not prove current reachability."
+            )
         if not getattr(self, "_map_visible", False) or not getattr(self, "_app_active", True):
             # Keep only the newest completed projection. A later source update
             # marks the map dirty and wins over this snapshot on reopen.
@@ -14689,11 +15184,17 @@ class StationsMapTab(QWidget):
         self._request_map_refresh(level="light", reason="toggle_grids")
 
     def _on_map_stations_changed(self, state):
+        if getattr(self, "_map_layer_controls", None) is not None:
+            self._on_map_layer_toggled("stations", bool(state))
+            return
         self.show_station_markers = bool(state)
         self._save_display_preferences()
         self._request_map_refresh(level="medium", reason="toggle_station_markers")
 
     def _on_map_links_changed(self, state):
+        if getattr(self, "_map_layer_controls", None) is not None:
+            self._on_map_layer_toggled("paths", bool(state))
+            return
         self.show_link_paths = bool(state)
         if not self.show_link_paths:
             self._set_path_layer_off()
@@ -14792,7 +15293,7 @@ class StationsMapTab(QWidget):
         data = combo.itemData(idx) if combo is not None else ("off", "")
         mode, value = self._parse_link_selection(data)
         if (mode or "off").lower() == "off":
-            self._set_path_layer_off()
+            self._set_path_layer_off(remember=False)
             self._update_map_mode_buttons()
             self._update_map_view_status_label()
             self._update_clear_filter_buttons_visual()
@@ -14810,7 +15311,7 @@ class StationsMapTab(QWidget):
             except Exception:
                 pass
         self.link_mode = mode or "off"
-        self.link_value = value if self.link_mode in {"station", "relay_target"} else ""
+        self.link_value = value if self.link_mode in {"station", "relay_target", "group", "region"} else ""
         if self.link_mode == "relay_target":
             self.relay_target = value
             self._paths_focus_station = value
@@ -14830,6 +15331,9 @@ class StationsMapTab(QWidget):
             self._paths_focus_station = ""
             self.relay_target = ""
         self.show_link_paths = self.link_mode != "off"
+        if self.show_link_paths and getattr(self, "_map_layer_controls", None) is not None:
+            self._on_map_layer_toggled("paths", True)
+            return
         self._clamp_path_recency_if_needed()
         links_chk = getattr(self, "map_links_chk", None)
         if links_chk is not None:
@@ -14866,8 +15370,6 @@ class StationsMapTab(QWidget):
     def _on_recency_changed(self, idx: int):
         val = self.recency_combo.itemText(idx)
         mapping = dict(self._current_recency_options())
-        if val not in mapping and self._current_map_mode_key() == "paths":
-            val = MAP_PATH_MAX_RECENCY_LABEL
         self.recency_seconds = mapping.get(val, None)
         self._map_recency_label = val
         self._clamp_path_recency_if_needed()
@@ -14891,6 +15393,10 @@ class StationsMapTab(QWidget):
         self._request_map_refresh(level="full", reason="regional_intel_sensitivity")
 
     def _on_advanced_map_filter_changed(self, *_args):
+        if self._map_advanced_scope_filter() == "reports":
+            self.show_station_markers = False
+            self._set_path_layer_off()
+        self._update_map_mode_buttons()
         self._clear_report_query_caches()
         self._update_clear_filter_buttons_visual()
         self._request_map_refresh(level="medium", reason="advanced_filter")

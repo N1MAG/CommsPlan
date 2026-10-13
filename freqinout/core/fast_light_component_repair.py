@@ -235,7 +235,7 @@ def build_legacy_fast_light_repair_inputs(
         draft, managed_root="", platform=platform, storage_home=storage_home or Path.home()
     )
     if not resolution.persistable:
-        raise ValueError(resolution.recovery_action or "FIO could not derive a safe legacy repair.")
+        raise ValueError(resolution.recovery_action or "CommsPlan could not derive a safe legacy repair.")
     updates = recipe_draft_updates(resolution)
     baseline_recipe = dict(updates["launch_recipe"])
     components = _component_index(baseline_recipe.get("components", ()) or ())
@@ -461,7 +461,7 @@ def build_fast_light_component_repair_plan(
         storage_home=operator_home,
     )
     if not resolution.persistable:
-        raise ValueError(resolution.recovery_action or "FIO could not derive a safe FLMsg/FLAmp repair.")
+        raise ValueError(resolution.recovery_action or "CommsPlan could not derive a safe FLMsg/FLAmp repair.")
     updates = recipe_draft_updates(resolution)
     proposed_recipe = dict(updates["launch_recipe"])
     proposed_components = _component_index(proposed_recipe.get("components", ()) or ())

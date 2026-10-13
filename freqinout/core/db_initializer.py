@@ -19,6 +19,7 @@ from freqinout.core.message_projection_store import ensure_message_projection_sc
 from freqinout.core.message_projection_queue import ensure_source_dirty_triggers
 from freqinout.core.multi_radio_store import ensure_multi_radio_settings_schema
 from freqinout.core.operator_activity import ensure_js8_callsign_stats
+from freqinout.core.observation_store import ensure_observation_schema
 from freqinout.core.perf_metrics import span as perf_span
 from freqinout.core.resource_catalog_migration import cutover_resource_catalog_to_canonical
 from freqinout.core.shortwave_store import ensure_shortwave_schema
@@ -264,6 +265,8 @@ def _ensure_js8_links(conn: sqlite3.Connection) -> None:
     for name in ("source_id", "app_instance_id", "source_radio_id", "last_seen_utc"):
         if name not in cols:
             cur.execute(f"ALTER TABLE js8_links ADD COLUMN {name} TEXT")
+    if "direction_known" not in cols:
+        cur.execute("ALTER TABLE js8_links ADD COLUMN direction_known INTEGER NOT NULL DEFAULT 0")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_js8_links_ts ON js8_links(ts)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_js8_links_origin_ts ON js8_links(origin, ts)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_js8_links_destination_ts ON js8_links(destination, ts)")
@@ -2165,6 +2168,8 @@ def _ensure_nets_db() -> None:
             _ensure_local_operator_tables(conn)
         with perf_span("startup.database.nets.js8_message_cache", min_ms=10.0):
             ensure_js8_message_cache_schema(conn)
+        with perf_span("startup.database.nets.observations", min_ms=10.0):
+            ensure_observation_schema(conn)
         with perf_span("startup.database.nets.message_projection", min_ms=10.0):
             ensure_message_projection_schema(conn)
         with perf_span("startup.database.nets.js8_links", min_ms=10.0):

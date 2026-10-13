@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import sys
 import tempfile
 from dataclasses import replace
@@ -55,6 +56,7 @@ def _vara_recipe_component(raw: Mapping[str, Any], runtime: Path, wine_prefix: s
             "executable": "wine",
             "arguments": [str(executable)],
             "effective_command": ["wine", str(executable)],
+            "effective_command_text": shlex.join(["wine", str(executable)]),
             "working_directory": str(runtime),
             "managed_directories": [str(runtime)],
             "environment": {"WINEPREFIX": wine_prefix},
@@ -104,7 +106,7 @@ def _persist_runtime_projection(
                 or ""
             ),
             "native_verification_summary": (
-                "Managed VARA runtime verified inside the VarAC Wine drive; FIO projections synchronized."
+                "Managed VARA runtime verified inside the VarAC Wine drive; CommsPlan projections synchronized."
             ),
         }
     )

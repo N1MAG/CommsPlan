@@ -897,6 +897,10 @@ def build_varac_bbs_vault_activity_signature(settings) -> Tuple[object, ...]:
     live_bbs_dir = str(settings.get("varac_bbs_dir", "") or "").strip()
     managed_root = compute_default_managed_root(live_bbs_dir)
     locations = load_vault_locations(settings.get("varac_bbs_vault_locations_v1", []))
+    catalog_path = _explicit_catalog_db_path(settings)
+    if catalog_path:
+        locations, station_meta = _station_catalog_vault_configuration(catalog_path, locations)
+        managed_root = str(station_meta.get("station_managed_root") or managed_root)
     flamp_enabled = bool(settings.get("varac_bbs_vault_flamp_enabled", False))
     flamp_relay_dir = str(settings.get("varac_bbs_vault_flamp_relay_dir", "") or "").strip()
     config_keys = (
@@ -910,6 +914,8 @@ def build_varac_bbs_vault_activity_signature(settings) -> Tuple[object, ...]:
         "varac_bbs_vault_flamp_listing_max_age_days",
     )
     config_payload = {key: settings.get(key, None) for key in config_keys}
+    config_payload["station_root"] = managed_root
+    config_payload["station_locations"] = [(row.id, row.source_dir, row.enabled) for row in locations]
     config_signature = json.dumps(config_payload, sort_keys=True, default=str)
     path_signatures: List[Tuple[str, bool, int, int]] = [
         stat_signature(live_bbs_dir),
@@ -4344,6 +4350,9 @@ def run_varac_bbs_vault(settings) -> VaracBbsVaultRunResult:
     # process-global station database by accident.
     manifest_db_path = _explicit_catalog_db_path(settings)
     locations, station_meta = _station_catalog_vault_configuration(manifest_db_path, legacy_locations)
+    station_root = str(station_meta.get("station_managed_root") or "").strip()
+    if station_root:
+        managed_root = station_root
     default_location_id = str(
         station_meta.get("station_default_location_id")
         or settings.get("varac_bbs_vault_default_location_id", DEFAULT_LOCATION_ID)

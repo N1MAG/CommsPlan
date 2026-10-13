@@ -6,6 +6,7 @@ from PySide6.QtCore import QEventLoop, Qt
 from PySide6.QtGui import QColor, QFont, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication, QSplashScreen, QWidget
 
+from freqinout.core.product_identity import DISPLAY_NAME
 from freqinout.gui.theme import active_app_theme
 
 
@@ -17,7 +18,7 @@ class StartupSplash:
         "HF Digital Tri-Mode at age 86."
     )
     SUPPORT_MESSAGE = (
-        "If FIO benefits your station, please consider supporting its continued "
+        f"If {DISPLAY_NAME} benefits your station, please encourage its continued "
         "development. There's more to come."
     )
     SUPPORT_URL = "buymeacoffee.com/n1mag"
@@ -27,7 +28,7 @@ class StartupSplash:
         self._splash = QSplashScreen(self._build_pixmap(version))
         self._splash.setWindowFlag(Qt.WindowStaysOnTopHint, True)
         self._splash.setWindowFlag(Qt.FramelessWindowHint, True)
-        self._splash.setAccessibleName("Starting FIO")
+        self._splash.setAccessibleName(f"Starting {DISPLAY_NAME}")
         self._splash.setAccessibleDescription(
             f"{self.DEDICATION} {self.SUPPORT_MESSAGE} {self.SUPPORT_URL}"
         )
@@ -57,13 +58,13 @@ class StartupSplash:
             title_font.setPointSizeF(logical_base_size * 2.4)
             title_font.setBold(True)
             painter.setFont(title_font)
-            painter.drawText(30, 54, "Starting FIO")
+            painter.drawText(30, 54, f"Starting {DISPLAY_NAME}")
 
             subtitle_font = QFont(base_font)
             subtitle_font.setPointSizeF(logical_base_size)
             painter.setFont(subtitle_font)
             painter.setPen(QColor(theme["text_muted"]))
-            subtitle = "FreqInOut"
+            subtitle = DISPLAY_NAME
             if version:
                 subtitle = f"{subtitle} {version}"
             painter.drawText(32, 82, subtitle)
@@ -109,7 +110,7 @@ class StartupSplash:
             painter.end()
         return pixmap
 
-    def show(self, message: str = "Starting FIO...") -> None:
+    def show(self, message: str = f"Starting {DISPLAY_NAME}...") -> None:
         # Prepare the complete first frame before Windows maps the native
         # surface.  Showing first can expose an unpainted top-level window for
         # a frame on slower packaged starts.
@@ -130,7 +131,7 @@ class StartupSplash:
         splash repaint into a multi-second startup stall.
         """
 
-        text = str(message or "").strip() or "Starting FIO..."
+        text = str(message or "").strip() or f"Starting {DISPLAY_NAME}..."
         self._last_message = text
         self._splash.showMessage(
             text,

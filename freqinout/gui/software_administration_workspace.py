@@ -72,7 +72,7 @@ _TASKS: dict[str, tuple[tuple[str, str], ...]] = {
     ),
     "fio_spotter": (
         ("overview", "Overview"), ("dependencies", "Dependencies & Radio Mapping"),
-        ("operational_workspace", "Open FIO Spotter"),
+        ("operational_workspace", "Open CommsPlan Spotter"),
     ),
 }
 
@@ -186,13 +186,13 @@ class SoftwareAdministrationWorkspace(QWidget):
         self.add_instance_button = QPushButton("Add software instance…")
         self.add_instance_button.setAccessibleName("Add software instance")
         self.add_instance_button.setToolTip(
-            "Guided setup for an existing, FIO-managed, manual, or remote software instance"
+            "Guided setup for an existing, CommsPlan-managed, manual, or remote software instance"
         )
         self.add_instance_button.clicked.connect(self._start_instance_action)
         self.disassociate_button = QPushButton("Disassociate…")
         self.disassociate_button.setAccessibleName("Disassociate software instance from selected radio")
         self.disassociate_button.setToolTip(
-            "Remove only the FIO radio assignment and launch links; external applications and files are retained"
+            "Remove only the CommsPlan radio assignment and launch links; external applications and files are retained"
         )
         self.disassociate_button.clicked.connect(self._emit_disassociate_request)
         self.disassociate_button.setVisible(False)
@@ -688,7 +688,7 @@ class SoftwareAdministrationWorkspace(QWidget):
             if dirty:
                 text += " · Unsaved changes"
             verification_hint = (
-                " FIO has not run or received a current verification for this software. "
+                " CommsPlan has not run or received a current verification for this software. "
                 "Choose the radio, then Health, to check it."
                 if state == "Not yet verified"
                 else ""
@@ -820,6 +820,7 @@ class SoftwareAdministrationWorkspace(QWidget):
         *,
         initial_source: str = "managed",
         initial_discovery_results: Iterable[Mapping[str, Any]] = (),
+        initial_edit_instance: Mapping[str, Any] | None = None,
     ) -> None:
         """Open the cache-only instance flow for the selected family.
 
@@ -853,6 +854,29 @@ class SoftwareAdministrationWorkspace(QWidget):
             selected_radio.get("device_class", selected_radio.get("radio_role", "tx_rx"))
             or "tx_rx"
         ).strip().lower()
+        edit_seed: dict[str, Any] | None = None
+        if isinstance(initial_edit_instance, Mapping):
+            edit_seed = dict(initial_edit_instance)
+            # Editing uses the existing assignment as reviewed input but does
+            # not masquerade as a source-locked import. The normal replacement
+            # transaction retains the old row until the complete new identity
+            # and projections commit successfully.
+            for key in (
+                "id",
+                "imported_id",
+                "imported_system_key",
+                "system_key",
+                "source_fingerprint",
+            ):
+                edit_seed.pop(key, None)
+            edit_seed.update(
+                {
+                    "family_key": family.key,
+                    "radio_id": self._radio_id,
+                    "source_locked": False,
+                    "writer_operation": "update",
+                }
+            )
         assistant = SoftwareInstanceAssistant(
             family.key,
             radios=radios,
@@ -860,6 +884,8 @@ class SoftwareAdministrationWorkspace(QWidget):
             varac_clusters=self._varac_clusters,
             selected_radio_id=self._radio_id,
             radio_role=radio_role,
+            initial_draft=edit_seed,
+            editing_existing=edit_seed is not None,
             managed_root=self._managed_root,
             parent=self.editor_host,
         )
@@ -886,6 +912,40 @@ class SoftwareAdministrationWorkspace(QWidget):
             assistant.discovery_hint.setText(
                 "Choose one retained, unassigned instance. It remains inactive until this reviewed radio assignment is saved."
             )
+
+    def open_selected_instance_editor(self) -> bool:
+        """Open the authoritative prefilled edit transaction for this radio."""
+
+        if self._instance_assistant is not None:
+            return self.keep_instance_assistant_visible(announce=True)
+        family = self._snapshot.family(self._family_key)
+        if family is None or self._radio_id is None:
+            return False
+        assignment = next(
+            (
+                item
+                for item in family.assignments
+                if item.radio_id == self._radio_id and item.instance_id is not None
+            ),
+            None,
+        )
+        if assignment is None:
+            return False
+        current = next(
+            (
+                row
+                for row in self._instance_inventory.get(self._family_key, ())
+                if int(row.get("id", 0) or 0) == int(assignment.instance_id or 0)
+            ),
+            None,
+        )
+        if not isinstance(current, Mapping):
+            self.context_banner.setText(
+                "The saved software instance is not in the current inventory. Refresh Software Administration and try again."
+            )
+            return False
+        self._open_instance_assistant(initial_edit_instance=current)
+        return self._instance_assistant is not None
 
     def keep_instance_assistant_visible(self, *, announce: bool = False) -> bool:
         """Keep an active assistant current during cache/editor refreshes.
@@ -1079,10 +1139,10 @@ class SoftwareAdministrationWorkspace(QWidget):
             dirty = self._is_dirty(assignment.radio_id, family.key)
             dirty_suffix = " Unsaved changes for this software and radio." if dirty else ""
             ownership_label = {
-                "fio_managed": "FIO-managed launch",
+                "fio_managed": "CommsPlan-managed launch",
                 "operator": "Operator-managed",
                 "remote": "Remote",
-                "built_in": "Built into FIO",
+                "built_in": "Built into CommsPlan",
             }.get(assignment.management_mode, assignment.management_mode.replace("_", " ").title())
             detail_parts = [part for part in (ownership_label, assignment.endpoint_summary) if part]
             if assignment.configuration_summary:

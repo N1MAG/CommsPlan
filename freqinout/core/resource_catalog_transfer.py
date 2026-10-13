@@ -277,7 +277,7 @@ def preview_json_import(
     limit = _bounded_limit(max_items)
     diagnostics: list[TransferDiagnostic] = []
     if document.get("schema_version") != TRANSFER_SCHEMA_VERSION or document.get("kind") != _TRANSFER_KIND:
-        diagnostics.append(_diagnostic("invalid", "document", None, reason="Unsupported transfer schema.", resolution="Export again from a compatible FIO version."))
+        diagnostics.append(_diagnostic("invalid", "document", None, reason="Unsupported transfer schema.", resolution="Export again from a compatible CommsPlan version."))
         return ImportPreview(target, (), (), (), tuple(diagnostics), {})
     if _contains_secret_field(document):
         diagnostics.append(_diagnostic("invalid", "document", None, reason="Transfer contains a credential-like field.", resolution="Remove secrets and export only catalog resources."))

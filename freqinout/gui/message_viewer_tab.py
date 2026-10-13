@@ -195,7 +195,7 @@ from freqinout.core.commstat_delete import (
     commstat_artifact_key,
     delete_commstat_artifact,
 )
-from freqinout.core.commstat_config import load_commstat_group_state
+from freqinout.core.commstat_config import CommStatGroupState, load_commstat_group_state
 from freqinout.core.compose_guidance import (
     ComposeLastHeard,
     ComposePathEvidence,
@@ -316,6 +316,7 @@ from freqinout.core.message_semantics import (
 )
 from freqinout.core.traffic_actionability import (
     OperatorTrafficContext,
+    TrafficActionSummary,
     build_traffic_action_summary,
     configured_group_names,
     load_operator_traffic_context,
@@ -456,6 +457,11 @@ from freqinout.core.sitrep_metadata import (
     subtype_filter_label,
     subtype_label,
     transport_label,
+)
+from freqinout.core.latest_read_cache import LatestReadCache
+from freqinout.core.commstat_brevity import (
+    load_catalogs, model_fields, field_section, section_entries,
+    encode_brevity_code, analyze_brevity_codes, code_candidates,
 )
 from freqinout.core.commstat_sitrep import (
     COMMSTAT_SCOPE_MAP,
@@ -1164,7 +1170,7 @@ class _ComposeCatalogDiscoveryWorker(QObject):
                     {
                         "kind": "spotter",
                         "key": "JS8SPOTTER",
-                        "label": "FIOSpotter Forms",
+                        "label": "CommsPlan Spotter Forms",
                         "forms": forms,
                     }
                 )
@@ -1191,6 +1197,40 @@ class _ComposeCatalogDiscoveryWorker(QObject):
                 "problems": problems,
             }
         )
+
+
+class _ComposeMeshDiscoveryWorker(QObject):
+    """Read the bounded Mesh model without blocking navigation or selection."""
+
+    finished = Signal(object)
+
+    def __init__(self, generation: int, values: dict, db_path: Path):
+        super().__init__()
+        self.generation, self.values, self.db_path = generation, values, db_path
+
+    def run(self) -> None:
+        result = {"generation": self.generation, "configs": [], "health": {}, "destinations": {}}
+        try:
+            configs = [config for config in load_mesh_connection_configs(self.values)
+                       if config.enabled and config.send_enabled
+                       and mesh_outbound_capability(config.protocol, config.connection_type).supported]
+            result["configs"] = configs
+            if configs:
+                result["health"] = {str(row.get("adapter_id") or ""): dict(row)
+                                   for row in list_mesh_health(self.db_path, read_only=True)}
+            for config in configs:
+                if QThread.currentThread().isInterruptionRequested():
+                    break
+                try:
+                    result["destinations"][config.adapter_id] = (
+                        list_mesh_channel_policies(self.db_path, adapter_id=config.adapter_id, read_only=True),
+                        list_mesh_nodes(self.db_path, adapter_id=config.adapter_id, limit=200, read_only=True),
+                    )
+                except Exception as exc:
+                    result["error"] = str(exc)
+        except Exception as exc:
+            result["error"] = str(exc)
+        self.finished.emit(result)
 
 
 class _ComposeSigningKeyWorker(QObject):
@@ -2357,12 +2397,18 @@ class _ProjectedMessageQueryWorker(QObject):
         request_id: int,
         scope_key: tuple[object, ...],
         query: Mapping[str, object],
+        traffic_context_inputs: tuple[object, ...] | None = None,
+        filter_settings: Mapping[str, object] | None = None,
+        selected_groups: tuple[str, ...] | None = None,
     ):
         super().__init__()
         self._db_path = str(db_path or "")
         self._request_id = int(request_id or 0)
         self._scope_key = tuple(scope_key or ())
         self._query = dict(query or {})
+        self._traffic_context_inputs = traffic_context_inputs
+        self._filter_settings = dict(filter_settings) if filter_settings is not None else None
+        self._selected_groups = selected_groups
 
     def run(self) -> None:
         started = time.perf_counter()
@@ -2374,7 +2420,27 @@ class _ProjectedMessageQueryWorker(QObject):
         focus_counts: dict[str, int] = {}
         focus_counts_generation = 0
         bbs_published_counts: dict[str, int] = {}
+        traffic_context = None
+        traffic_summary = None
+        commstat_groups = None
+        group_families = None
         try:
+            if self._filter_settings is not None:
+                commstat_groups = load_commstat_group_state(self._filter_settings)
+                group_families = load_operator_group_families(Path(self._db_path))
+                if self._query.get("group_names"):
+                    selected = self._selected_groups if self._selected_groups is not None else self._query["group_names"]
+                    groups = tuple(sorted(expand_group_selection(set(selected), group_families)))
+                    self._query["group_names"] = groups
+                    if len(self._scope_key) >= 6:
+                        self._scope_key = (*self._scope_key[:5], groups, *self._scope_key[6:])
+            if self._traffic_context_inputs is not None:
+                callsign, hf_groups, local_groups = self._traffic_context_inputs
+                traffic_context = load_operator_traffic_context(
+                    Path(self._db_path), callsign=str(callsign),
+                    configured_operating_groups=hf_groups,
+                    configured_local_groups=local_groups,
+                )
             page = query_projected_message_page(
                 self._db_path,
                 page_size=200,
@@ -2382,6 +2448,8 @@ class _ProjectedMessageQueryWorker(QObject):
                 **self._query,
             )
             rows = [dict(row) for row in page.rows]
+            if "message_ids" in self._query:
+                traffic_summary = build_traffic_action_summary(rows, traffic_context or OperatorTrafficContext())
             total_count = int(page.total_count or 0)
             generation = int(getattr(page, "generation", 0) or 0)
             message_ids = [str(row.get("message_id") or "") for row in rows]
@@ -2445,15 +2513,18 @@ class _ProjectedMessageQueryWorker(QObject):
                 )
                 if key in self._query
             }
-            focus_snapshot = query_projected_inbox_focus_counts(
-                self._db_path,
-                **count_query,
-            )
-            focus_counts = {
-                str(key): max(0, int(value or 0))
-                for key, value in focus_snapshot.counts.items()
-            }
-            focus_counts_generation = int(focus_snapshot.generation or 0)
+            if "message_ids" not in self._query:
+                focus_snapshot = query_projected_inbox_focus_counts(
+                    self._db_path,
+                    **count_query,
+                )
+                focus_counts = {
+                    str(key): max(0, int(value or 0))
+                    for key, value in focus_snapshot.counts.items()
+                }
+                focus_counts_generation = int(focus_snapshot.generation or 0)
+            else:
+                focus_counts = None
         except Exception as exc:
             error = str(exc)
         self.finished.emit(
@@ -2467,6 +2538,12 @@ class _ProjectedMessageQueryWorker(QObject):
                 "focus_counts": focus_counts,
                 "focus_counts_generation": focus_counts_generation,
                 "bbs_published_counts": bbs_published_counts,
+                "traffic_summary": traffic_summary,
+                "traffic_context": traffic_context,
+                "traffic_context_inputs": self._traffic_context_inputs,
+                "filter_settings": self._filter_settings,
+                "commstat_groups": commstat_groups,
+                "group_families": group_families,
                 "elapsed_ms": (time.perf_counter() - started) * 1000.0,
                 "error": error,
             }
@@ -5573,7 +5650,7 @@ class MessageViewerTab(QWidget):
         self.plan_context_label.refresh_context(refresh=True)
 
         self.message_check_status_label = QLabel("Next check: --")
-        self.message_check_status_label.setToolTip("Shows when FIO will next check for new messages while this tab is open.")
+        self.message_check_status_label.setToolTip("Shows when CommsPlan will next check for new messages while this tab is open.")
 
         loading_row = QHBoxLayout()
         self.loading_label = QLabel("Indexing messages...")
@@ -5627,7 +5704,7 @@ class MessageViewerTab(QWidget):
             self.message_check_combo.addItem(label, seconds)
         idx_check = self.message_check_combo.findData(self._visible_check_interval_sec)
         self.message_check_combo.setCurrentIndex(idx_check if idx_check >= 0 else 1)
-        self.message_check_combo.setToolTip("How often FIO checks for new messages while this tab is open.")
+        self.message_check_combo.setToolTip("How often CommsPlan checks for new messages while this tab is open.")
         self.message_check_combo.currentIndexChanged.connect(self._on_message_check_interval_changed)
         fit_combo_box_to_contents(self.message_check_combo)
 
@@ -5664,7 +5741,7 @@ class MessageViewerTab(QWidget):
         self.show_all_message_groups_chk.setCheckable(True)
         self.show_all_message_groups_chk.setVisible(False)
         self.show_all_message_groups_chk.setToolTip(
-            "Expand Operating Group to every discovered group. Leave off to focus on FIO and CommStat configured groups."
+            "Expand Operating Group to every discovered group. Leave off to focus on CommsPlan and CommStat configured groups."
         )
         self.show_all_message_groups_chk.setChecked(False)
         self.show_all_message_groups_chk.toggled.connect(self._on_show_all_message_groups_changed)
@@ -6275,6 +6352,7 @@ class MessageViewerTab(QWidget):
         if event.type() in {QEvent.FontChange, QEvent.PaletteChange, QEvent.StyleChange}:
             self._message_table_fit_signature = None
             self._queue_message_table_column_fit()
+            self._refresh_compose_layout_geometry_if_needed(force=True)
 
     def _messages_responsive_mode_for_width(self, width: int) -> str:
         try:
@@ -6442,7 +6520,7 @@ class MessageViewerTab(QWidget):
             ("all", "All", "Show all message traffic."),
             ("new", "New", "Show unread or alerting traffic."),
             ("forms", "FLMSG/FLAMP", "Show Fast Light forms and FLAmp files."),
-            ("spotter", "Spotter", "Show FIOSpotter MCF forms."),
+            ("spotter", "Spotter", "Show CommsPlan Spotter MCF forms."),
             ("commstat", "CommStat", "Show CommStat-derived messages and reports."),
             ("js8call", "JS8Call", "Show raw JS8Call messages that are not Spotter MCF forms."),
             ("mesh", "Mesh", "Show MeshCore and Meshtastic local mesh traffic."),
@@ -6451,6 +6529,7 @@ class MessageViewerTab(QWidget):
         ]
 
     def _set_inbox_focus(self, focus: str) -> None:
+        left_ops_scope = self._leave_ops_traffic_scope()
         focus = str(focus or "all").strip().lower()
         valid = {key for key, _label, _tip in self._inbox_focus_options()}
         if focus not in valid:
@@ -6459,6 +6538,8 @@ class MessageViewerTab(QWidget):
         if focus == self._inbox_focus:
             self._sync_inbox_focus_buttons()
             self._sync_source_filter_for_inbox_focus(focus)
+            if left_ops_scope and self._load_projected_messages_into_table():
+                return
             if self._reload_projected_messages_for_scope_change():
                 return
             return
@@ -6536,6 +6617,19 @@ class MessageViewerTab(QWidget):
         label = getattr(self, "message_scope_label", None)
         if label is None:
             return
+        if getattr(self, "_ops_traffic_message_ids", None) is not None:
+            summary = getattr(self, "_ops_traffic_summary", None)
+            bucket = str(self._traffic_action_filter or "")
+            count = None
+            if summary is not None:
+                count = summary.count(bucket) if bucket else len(summary.items)
+            text = f"Ops Center traffic · {bucket.title() or 'All actions'} · "
+            text += f"{count} available" if count is not None else "Loading…"
+            expected = getattr(self, "_ops_traffic_count_at_click", 0)
+            if count is not None and bucket == getattr(self, "_ops_traffic_clicked_bucket", "") and count != expected:
+                text += f" ({expected} at click; traffic changed)"
+            label.setText(text + " · Inbox filters suspended; change a filter to leave this view.")
+            return
         age = str(self.received_filter.currentText() or "All time").strip()
         focus_labels = {key: value for key, value, _tip in self._inbox_focus_options()}
         focus = focus_labels.get(getattr(self, "_inbox_focus", "all"), "All")
@@ -6607,6 +6701,9 @@ class MessageViewerTab(QWidget):
         return self._load_projected_messages_into_table(force=False)
 
     def _projected_scope_key(self) -> tuple[object, ...]:
+        ids = getattr(self, "_ops_traffic_message_ids", None)
+        if ids is not None:
+            return ("ops-traffic", ids)
         age_bounds = _core_age_filter_bounds(
             self.received_filter.currentData() if hasattr(self, "received_filter") else 0
         )
@@ -6713,7 +6810,7 @@ class MessageViewerTab(QWidget):
         self.compose_summary_label.setMinimumWidth(0)
         self.compose_summary_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.compose_summary_label.setToolTip(
-            "FreqInOut stages compose files only. The operator sends them manually from FLMsg, FLAmp, or VarAC."
+            "CommsPlan stages compose files only. The operator sends them manually from FLMsg, FLAmp, or VarAC."
         )
         summary_row.addWidget(self.compose_summary_label, 1)
         self.compose_workbench_btn = QPushButton("Open Full Compose Workbench")
@@ -6723,14 +6820,30 @@ class MessageViewerTab(QWidget):
         self.compose_inline_reset_btn = QPushButton("Reset")
         self.compose_inline_reset_btn.setToolTip("Reset the current compose draft while keeping the selected radio.")
         self.compose_inline_reset_btn.clicked.connect(lambda: self._reset_compose_draft())
-        summary_row.addWidget(self.compose_inline_reset_btn)
+        self.compose_inline_reset_btn.hide()
         self.compose_setup_help_btn = QPushButton("Compose Setup Help")
         self.compose_setup_help_btn.setToolTip("Open help for compose setup, VarAC copy targets, and FLAmp signing.")
         self.compose_setup_help_btn.clicked.connect(lambda: self._open_context_help("messages.compose-setup"))
-        summary_row.addWidget(self.compose_setup_help_btn)
+        self.compose_setup_help_btn.hide()
+        self.compose_tools_btn = QPushButton("Tools")
+        tools_menu = QMenu(self.compose_tools_btn)
+        for text, callback in (
+            ("Reset Draft", lambda: self._reset_compose_draft()),
+            ("Refresh Forms", self._refresh_compose_forms),
+            ("Refresh Radios", lambda: self._refresh_compose_setup_discovery(force=True)),
+            ("Open Form Folder", self._open_compose_source_folder),
+            ("Compose Help", lambda: self._open_context_help("messages.compose")),
+            ("Compose Setup Help", lambda: self._open_context_help("messages.compose-setup")),
+            ("Refresh JS8Call target", self.request_compose_js8_selected_target_refresh),
+        ):
+            action = tools_menu.addAction(text, callback)
+            if text == "Refresh JS8Call target":
+                self.compose_refresh_target_action = action
+        self.compose_tools_btn.setMenu(tools_menu)
+        summary_row.addWidget(self.compose_tools_btn)
         root.addLayout(summary_row)
 
-        compose_type_box = QGroupBox("Compose Type")
+        compose_type_box = QGroupBox()
         self.compose_type_box = compose_type_box
         compose_type_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         compose_type_box.setMaximumHeight(16777215)
@@ -6747,7 +6860,7 @@ class MessageViewerTab(QWidget):
         self.compose_mode_selector.setTextElideMode(Qt.ElideNone)
         self.compose_mode_selector.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.compose_mode_selector.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        for label in ("FLMsg / FLAmp", "JS8Call", "FIOSpotter", "CommStat RF", "Local Mesh"):
+        for label in ("FLMsg / FLAmp", "JS8Call", "CommsPlan Spotter", "CommStat RF", "Local Mesh"):
             item = QListWidgetItem(label)
             item.setTextAlignment(Qt.AlignCenter)
             self.compose_mode_selector.addItem(item)
@@ -6866,7 +6979,7 @@ class MessageViewerTab(QWidget):
         self.compose_js8_target_edit.setMinimumWidth(0)
         self.compose_js8_target_edit.setPlaceholderText("GROUP or CALLSIGN")
         self.compose_js8_target_edit.setToolTip(
-            "Destination typed into the JS8 command. Enter a group or callsign; FIO strips @ before transmit."
+            "Destination typed into the JS8 command. Enter a group or callsign; CommsPlan strips @ before transmit."
         )
         self.compose_js8_target_edit.textChanged.connect(self._on_compose_rf_target_changed)
         js8_target_row.addWidget(self.compose_js8_target_edit, 0, 1)
@@ -6903,7 +7016,7 @@ class MessageViewerTab(QWidget):
 
         # This is deliberately a separate, compact row rather than a value in
         # the target field.  A target selected in JS8Call is live external
-        # state, not part of an FIO draft until the operator explicitly adopts
+        # state, not part of an CommsPlan draft until the operator explicitly adopts
         # it with Use Target.
         self.compose_js8_selected_target_row_widget = QWidget()
         self.compose_js8_selected_target_row_widget.setObjectName("composeJs8SelectedTargetRow")
@@ -7033,7 +7146,7 @@ class MessageViewerTab(QWidget):
         self.compose_js8_plain_text_edit.setMinimumHeight(js8_text_h)
         self.compose_js8_plain_text_edit.setMaximumHeight(js8_text_h)
         self.compose_js8_plain_text_edit.setPlaceholderText("Short JS8 text")
-        self.compose_js8_plain_text_edit.setToolTip("Keep RF traffic short. FIO will prepend the target when a target is set.")
+        self.compose_js8_plain_text_edit.setToolTip("Keep RF traffic short. CommsPlan will prepend the target when a target is set.")
         self.compose_js8_plain_text_edit.textChanged.connect(self._update_compose_preview)
         js8_plain_layout.addWidget(self.compose_js8_plain_kind_label, 0, 0)
         js8_plain_layout.addWidget(self.compose_js8_plain_kind_chip_container, 0, 1)
@@ -7067,7 +7180,7 @@ class MessageViewerTab(QWidget):
         self.compose_commstat_target_edit.setMinimumWidth(220)
         self.compose_commstat_target_edit.setPlaceholderText("GROUP or CALLSIGN")
         self.compose_commstat_target_edit.setToolTip(
-            "CommStat RF destination. Enter a group or callsign; FIO strips @ before transmit."
+            "CommStat RF destination. Enter a group or callsign; CommsPlan strips @ before transmit."
         )
         self.compose_commstat_target_edit.textChanged.connect(self._on_compose_rf_target_changed)
         self.compose_commstat_grid_edit = QLineEdit()
@@ -7092,7 +7205,7 @@ class MessageViewerTab(QWidget):
         self.compose_commstat_brevity_edit.setInsertPolicy(QComboBox.NoInsert)
         self.compose_commstat_brevity_edit.setMinimumWidth(160)
         self.compose_commstat_brevity_edit.setMaximumWidth(260)
-        self.compose_commstat_brevity_edit.setToolTip("CommStat brevity code, such as 4BBGUB. Check Add Brevity to attach it to the StatRep comment.")
+        self.compose_commstat_brevity_edit.setToolTip("Choose a defined brevity model. Check Add Brevity to attach its code to the StatRep comment.")
         self._populate_compose_commstat_brevity_options()
         self.compose_commstat_brevity_edit.currentIndexChanged.connect(self._update_compose_preview)
         self.compose_commstat_brevity_edit.editTextChanged.connect(self._update_compose_preview)
@@ -7128,42 +7241,13 @@ class MessageViewerTab(QWidget):
         brevity_builder_layout.setHorizontalSpacing(8)
         brevity_builder_layout.setVerticalSpacing(4)
         self.compose_commstat_brevity_list_combo = QComboBox()
-        self.compose_commstat_brevity_event_combo = QComboBox()
-        self.compose_commstat_brevity_status_combo = QComboBox()
-        self.compose_commstat_brevity_impact_combo = QComboBox()
-        self.compose_commstat_brevity_public_combo = QComboBox()
-        self.compose_commstat_brevity_station_combo = QComboBox()
-        for combo in (
-            self.compose_commstat_brevity_list_combo,
-            self.compose_commstat_brevity_event_combo,
-            self.compose_commstat_brevity_status_combo,
-            self.compose_commstat_brevity_impact_combo,
-            self.compose_commstat_brevity_public_combo,
-            self.compose_commstat_brevity_station_combo,
-        ):
-            combo.setMinimumWidth(180)
-            combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.compose_commstat_brevity_list_combo.setMinimumWidth(180)
         self.compose_commstat_brevity_list_combo.currentIndexChanged.connect(self._on_compose_commstat_brevity_list_changed)
-        for combo in (
-            self.compose_commstat_brevity_event_combo,
-            self.compose_commstat_brevity_status_combo,
-            self.compose_commstat_brevity_impact_combo,
-            self.compose_commstat_brevity_public_combo,
-            self.compose_commstat_brevity_station_combo,
-        ):
-            combo.currentIndexChanged.connect(self._on_compose_commstat_brevity_builder_changed)
         brevity_builder_layout.addWidget(QLabel("Event List"), 0, 0)
-        brevity_builder_layout.addWidget(self.compose_commstat_brevity_list_combo, 0, 1)
-        brevity_builder_layout.addWidget(QLabel("Event Type"), 0, 2)
-        brevity_builder_layout.addWidget(self.compose_commstat_brevity_event_combo, 0, 3)
-        brevity_builder_layout.addWidget(QLabel("Status/Target"), 1, 0)
-        brevity_builder_layout.addWidget(self.compose_commstat_brevity_status_combo, 1, 1)
-        brevity_builder_layout.addWidget(QLabel("Impact"), 1, 2)
-        brevity_builder_layout.addWidget(self.compose_commstat_brevity_impact_combo, 1, 3)
-        brevity_builder_layout.addWidget(QLabel("Public Response"), 2, 0)
-        brevity_builder_layout.addWidget(self.compose_commstat_brevity_public_combo, 2, 1)
-        brevity_builder_layout.addWidget(QLabel("Station Response"), 2, 2)
-        brevity_builder_layout.addWidget(self.compose_commstat_brevity_station_combo, 2, 3)
+        brevity_builder_layout.addWidget(self.compose_commstat_brevity_list_combo, 0, 1, 1, 3)
+        self._compose_brevity_field_layout = brevity_builder_layout
+        self._compose_brevity_field_combos = {}
+        self._compose_brevity_field_widgets = []
         for col in (1, 3):
             brevity_builder_layout.setColumnStretch(col, 1)
         self.compose_commstat_brevity_builder_widget.setVisible(False)
@@ -7221,13 +7305,13 @@ class MessageViewerTab(QWidget):
         expect_row = QHBoxLayout(self.compose_expect_row_widget)
         expect_row.setContentsMargins(0, 0, 0, 0)
         expect_row.setSpacing(8)
-        self.compose_save_expect_btn = QPushButton("Configure in FIO Spotter")
+        self.compose_save_expect_btn = QPushButton("Configure in CommsPlan Spotter")
         self.compose_save_expect_btn.setToolTip(
-            "Create a disabled response draft, then open FIO Spotter to review access and automation."
+            "Create a disabled response draft, then open CommsPlan Spotter to review access and automation."
         )
         self.compose_save_expect_btn.clicked.connect(self._save_compose_js8_expect)
         expect_row.addWidget(self.compose_save_expect_btn)
-        self.compose_expect_hint_label = QLabel("FIO Spotter manages who may request this saved response.")
+        self.compose_expect_hint_label = QLabel("CommsPlan Spotter manages who may request this saved response.")
         self.compose_expect_hint_label.setWordWrap(True)
         self.compose_expect_hint_label.setMinimumWidth(0)
         self.compose_expect_hint_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Minimum)
@@ -7312,6 +7396,7 @@ class MessageViewerTab(QWidget):
         self.compose_form_combo.setMinimumWidth(240)
         self.compose_form_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.compose_form_combo.currentIndexChanged.connect(self._on_compose_form_changed)
+        self.compose_form_combo.activated.connect(self._reveal_compose_editor)
         row1.addWidget(self.compose_form_combo, 2, 1)
         row1.setColumnStretch(1, 1)
         setup_layout.addWidget(self.compose_form_row_widget)
@@ -7371,7 +7456,8 @@ class MessageViewerTab(QWidget):
         row4 = QGridLayout()
         row4.setHorizontalSpacing(8)
         row4.setVerticalSpacing(8)
-        row4.addWidget(QLabel("Create File"), 0, 0)
+        self.compose_create_file_label = QLabel("Create File")
+        row4.addWidget(self.compose_create_file_label, 0, 0)
         self.compose_send_target_combo = QComboBox()
         self.compose_send_target_combo.addItems(["FLMsg", "FLAmp", "Both"])
         self._configure_compose_combo_width(self.compose_send_target_combo, floor=118)
@@ -7389,7 +7475,8 @@ class MessageViewerTab(QWidget):
         row4.addWidget(self.compose_send_target_chip_container, 0, 1)
         row4.addWidget(self.compose_send_target_combo, 0, 2)
         self.compose_send_target_combo.setVisible(False)
-        row4.addWidget(QLabel("Copy to VarAC"), 1, 0)
+        self.compose_copy_varac_label = QLabel("Copy to VarAC")
+        row4.addWidget(self.compose_copy_varac_label, 1, 0)
         self.compose_varac_target_combo = QComboBox()
         self.compose_varac_target_combo.addItems(["None", "Outbox"])
         self._configure_compose_combo_width(self.compose_varac_target_combo, floor=118)
@@ -7424,6 +7511,11 @@ class MessageViewerTab(QWidget):
         self.compose_nbems_dest_row_widget.setMaximumHeight(16777215)
         self.compose_nbems_dest_row_widget.setLayout(row4)
         setup_layout.addWidget(self.compose_nbems_dest_row_widget)
+        self.compose_output_options_btn = QPushButton("Output options…")
+        self.compose_output_options_btn.setCheckable(True)
+        self.compose_output_options_btn.setToolTip("Change folder, priority, timestamp, signing or BBS publication. Selected signing and BBS states remain visible.")
+        self.compose_output_options_btn.toggled.connect(self._on_compose_output_options_toggled)
+        setup_layout.addWidget(self.compose_output_options_btn)
         self._refresh_compose_static_choice_chips()
 
         folder_row = QGridLayout()
@@ -7526,7 +7618,14 @@ class MessageViewerTab(QWidget):
         body_splitter.setStretchFactor(0, 0)
         body_splitter.setStretchFactor(1, 1)
         self._refresh_compose_splitter_handles()
-        root.addWidget(body_splitter, 1)
+        # Setup, content and review share one scroll owner. The footer stays
+        # outside it so the next action remains reachable on short desktops.
+        self.compose_workflow_scroll = QScrollArea()
+        self.compose_workflow_scroll.setWidgetResizable(True)
+        self.compose_workflow_scroll.setFrameShape(QFrame.NoFrame)
+        self.compose_workflow_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.compose_workflow_scroll.setWidget(body_splitter)
+        root.addWidget(self.compose_workflow_scroll, 1)
 
         self.compose_output_box = QGroupBox("Staging Output")
         self.compose_output_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
@@ -7541,12 +7640,12 @@ class MessageViewerTab(QWidget):
         action_row = QHBoxLayout()
         self.compose_stage_btn = QPushButton("Stage Files")
         self.compose_stage_btn.setToolTip(
-            "Create compose files for the selected destinations. FreqInOut stages only; the operator sends manually."
+            "Create compose files for the selected destinations. CommsPlan stages only; the operator sends manually."
         )
         self.compose_stage_btn.clicked.connect(self._stage_compose_files)
         action_row.addWidget(self.compose_stage_btn)
         self.compose_send_js8_btn = QPushButton("Send via JS8Call")
-        self.compose_send_js8_btn.setToolTip("Send the selected FIOSpotter form now through JS8Call after safety preflight.")
+        self.compose_send_js8_btn.setToolTip("Send the selected CommsPlan Spotter form now through JS8Call after safety preflight.")
         self.compose_send_js8_btn.clicked.connect(self._send_compose_js8_spotter)
         self.compose_send_js8_btn.setVisible(False)
         action_row.addWidget(self.compose_send_js8_btn)
@@ -7555,6 +7654,8 @@ class MessageViewerTab(QWidget):
         self.compose_send_mesh_btn.clicked.connect(self._send_compose_mesh_message)
         self.compose_send_mesh_btn.setVisible(False)
         action_row.addWidget(self.compose_send_mesh_btn)
+        action_row.addWidget(self.compose_save_expect_btn)
+        self.compose_save_expect_btn.hide()
         self.compose_open_flmsg_btn = QPushButton("Open FLMsg")
         self.compose_open_flmsg_btn.clicked.connect(lambda: self._launch_compose_app("FLMsg"))
         action_row.addWidget(self.compose_open_flmsg_btn)
@@ -7606,9 +7707,8 @@ class MessageViewerTab(QWidget):
             pass
 
     def _refresh_compose_splitter_handles(self) -> None:
-        """Keep embedded compose automatic; reserve visible resize handles for the workbench."""
-        in_workbench = bool(getattr(self, "_compose_in_workbench", False))
-        handle_width = 10 if in_workbench else 0
+        """Natural content sizing applies in both Compose hosts."""
+        handle_width = 0
         for splitter_name in ("compose_body_splitter", "compose_splitter"):
             splitter = getattr(self, splitter_name, None)
             if isinstance(splitter, QSplitter):
@@ -7898,7 +7998,7 @@ class MessageViewerTab(QWidget):
                 if type_layout is not None:
                     type_layout.activate()
                 natural_height = max(
-                    height + line_height,
+                    height + type_layout.contentsMargins().top() + type_layout.contentsMargins().bottom(),
                     int(type_box.sizeHint().height()),
                 )
                 type_box.setMinimumHeight(natural_height)
@@ -8010,6 +8110,7 @@ class MessageViewerTab(QWidget):
         if layout is None:
             return
         try:
+            widget.setMinimumHeight(0)
             layout.activate()
             floor = max(
                 int(widget.minimumSizeHint().height()),
@@ -8021,248 +8122,203 @@ class MessageViewerTab(QWidget):
         except Exception:
             return
 
+    def _on_compose_output_options_toggled(self, *_args) -> None:
+        self._update_compose_preview()
+        self._refresh_compose_layout_geometry_if_needed(force=True)
+
+    def _reveal_compose_editor(self, *_args) -> None:
+        """An explicit form choice advances to writing, without changing drafts."""
+        def reveal() -> None:
+            if self._is_shutting_down:
+                return
+            top = self.compose_field_box.mapTo(self.compose_body_splitter, QPoint(0, 0)).y()
+            self.compose_workflow_scroll.verticalScrollBar().setValue(
+                max(0, top - self.fontMetrics().lineSpacing())
+            )
+        QTimer.singleShot(0, reveal)
+
+    def _arrange_compose_setup_choices(self, width: int) -> None:
+        """Keep everyday setup short enough to expose the message itself."""
+        roomy = width >= self.fontMetrics().horizontalAdvance("M") * 75
+        signature = (roomy, self._compose_mode)
+        if signature == getattr(self, "_compose_choice_layout_signature", None):
+            return
+        self._compose_choice_layout_signature = signature
+        form = self.compose_form_row_widget.layout()
+        # Remove items without destroying controls; both modes reuse this grid.
+        while form.count():
+            form.takeAt(0)
+        pairs = [(self.compose_operating_group_label, self.compose_operating_group_combo),
+                 (self.compose_spotter_category_label, self.compose_spotter_category_combo),
+                 (self.compose_family_label, self.compose_family_combo),
+                 (self.compose_form_label, self.compose_form_combo)]
+        for label, control in pairs[:2]:
+            form.addWidget(label, 0, 0)
+            form.addWidget(control, 0, 1)
+        if roomy and self._compose_mode == "nbems":
+            form.addWidget(self.compose_family_label, 0, 2)
+            form.addWidget(self.compose_family_combo, 0, 3)
+            form.addWidget(self.compose_form_label, 1, 0)
+            form.addWidget(self.compose_form_combo, 1, 1, 1, 3)
+        elif roomy and self._compose_mode == "spotter":
+            form.addWidget(self.compose_family_label, 1, 0)
+            form.addWidget(self.compose_family_combo, 1, 1)
+            form.addWidget(self.compose_form_label, 0, 2)
+            form.addWidget(self.compose_form_combo, 0, 3)
+        else:
+            form.addWidget(self.compose_family_label, 1, 0)
+            form.addWidget(self.compose_family_combo, 1, 1)
+            form.addWidget(self.compose_form_label, 2, 0)
+            form.addWidget(self.compose_form_combo, 2, 1)
+        form.setColumnStretch(1, 1)
+        form.setColumnStretch(3, 1 if roomy else 0)
+        destinations = self.compose_nbems_dest_row_widget.layout()
+        for widget in (self.compose_copy_varac_label, self.compose_varac_target_chip_container,
+                       self.compose_sign_flamp_chk, self.compose_publish_bbs_chk):
+            destinations.removeWidget(widget)
+        destinations.addWidget(self.compose_copy_varac_label, 0 if roomy else 1, 2 if roomy else 0)
+        destinations.addWidget(self.compose_varac_target_chip_container, 0 if roomy else 1, 3 if roomy else 1)
+        destinations.addWidget(self.compose_sign_flamp_chk, 1 if roomy else 2, 1)
+        destinations.addWidget(self.compose_publish_bbs_chk, 1 if roomy else 3, 3 if roomy else 1)
+        destinations.setColumnStretch(3, 1 if roomy else 0)
+        header = self.compose_header_row_widget.layout()
+        header.removeWidget(self.compose_zulu_label)
+        header.removeWidget(self.compose_zulu_value)
+        header.removeWidget(self.compose_refresh_time_btn)
+        header.addWidget(self.compose_zulu_label, 1 if roomy else 2, 2 if roomy else 0)
+        header.addWidget(self.compose_zulu_value, 1 if roomy else 2, 3 if roomy else 1)
+        header.addWidget(self.compose_refresh_time_btn, 2, 2)
+
+    @staticmethod
+    def _compose_natural_height(widget: QWidget, width: int) -> int:
+        """Measure content at its assigned width, ignoring derived widget floors."""
+        layout = widget.layout()
+        if layout is None:
+            return max(1, widget.sizeHint().height(), widget.minimumSizeHint().height())
+        layout.invalidate()
+        layout.activate()
+        height = layout.sizeHint().height()
+        if layout.hasHeightForWidth():
+            height = max(1, layout.heightForWidth(max(1, width)))
+        height = max(1, height, layout.minimumSize().height())
+        if isinstance(widget, QGroupBox):
+            margins = widget.contentsMargins()
+            height += margins.top() + margins.bottom()
+        return height
+
     def _refresh_compose_layout_geometry(self) -> None:
-        splitter = getattr(self, "compose_splitter", None)
-        body_splitter = getattr(self, "compose_body_splitter", None)
+        if not hasattr(self, "compose_workflow_scroll"):
+            return
         mode = str(getattr(self, "_compose_mode", "nbems") or "nbems")
         in_workbench = bool(getattr(self, "_compose_in_workbench", False))
-        viewport = self._compose_layout_viewport()
-        viewport_width = max(1, int(viewport.width() or 0))
-        viewport_height = max(1, int(viewport.height() or 0))
-        setup_scroll_value = None
-        setup_scroll_probe = getattr(self, "compose_setup_scroll", None)
-        if mode == "spotter" and isinstance(setup_scroll_probe, QScrollArea):
-            try:
-                setup_scroll_value = int(setup_scroll_probe.verticalScrollBar().value())
-            except Exception:
-                setup_scroll_value = None
-        self._refresh_compose_splitter_handles()
-        # A full workbench retains the wide sidebar until the available dialog
-        # width truly cannot support it.  Embedded Compose follows the normal
-        # Messages compact threshold so it promotes the workbench earlier.
-        compact = viewport_width < (920 if in_workbench else int(self._responsive_compact_width))
-        compose_sidebar = self._compose_sidebar_enabled(
-            mode,
-            viewport_width,
-            in_workbench=in_workbench,
-        )
-        if isinstance(body_splitter, QSplitter):
-            desired_body = Qt.Horizontal if compose_sidebar else Qt.Vertical
-            if body_splitter.orientation() != desired_body:
-                body_splitter.setOrientation(desired_body)
-        if isinstance(splitter, QSplitter):
-            # Keep fields and preview in a readable top-to-bottom sequence.
-            # A horizontal split makes both surfaces too narrow at medium
-            # widths, especially for CommStat's status grid.
-            desired = Qt.Vertical
-            if splitter.orientation() != desired:
-                splitter.setOrientation(desired)
-        setup_box = getattr(self, "compose_setup_box", None)
-        setup_scroll = getattr(self, "compose_setup_scroll", None)
+        viewport = self.compose_workflow_scroll.viewport()
+        width = max(1, viewport.width())
+        sidebar = self._compose_sidebar_enabled(mode, width, in_workbench=in_workbench)
         self._refresh_compose_mode_selector_geometry()
-        self._refresh_compose_responsive_setup(compact)
+        # Stack short setup rows only when their controls actually need it.
+        self._arrange_compose_setup_choices(width if not sidebar else self._compose_sidebar_readable_minimum_width(mode, in_workbench=in_workbench))
+        self._refresh_compose_responsive_setup(width < self.fontMetrics().horizontalAdvance("M") * 60)
+        self._set_compose_row_reflow(self.compose_form_row_widget, False)
+        self._set_compose_row_reflow(self.compose_header_row_widget, False)
         self._refresh_compose_commstat_content_geometry()
-        if setup_box is not None:
-            try:
-                if compose_sidebar:
-                    readable_floor = self._compose_sidebar_readable_minimum_width(
-                        mode,
-                        in_workbench=in_workbench,
-                    )
-                    if mode == "spotter":
-                        sidebar_w = max(readable_floor, self._compose_spotter_sidebar_width(
-                            viewport_width,
-                            in_workbench=in_workbench,
-                        ))
-                    elif mode == "commstat_rf":
-                        sidebar_w = readable_floor
-                    else:
-                        sidebar_w = readable_floor
-                    setup_box.setMinimumWidth(sidebar_w)
-                    setup_box.setMaximumWidth(16777215)
-                    setup_box.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Maximum)
-                    if setup_scroll is not None:
-                        setup_scroll.setMinimumWidth(sidebar_w)
-                        setup_scroll.setMaximumWidth(sidebar_w)
-                        # A vertical scrollbar consumes part of the viewport.
-                        # Match the child to the usable viewport width so the
-                        # setup rail never manufactures a horizontal range.
-                        try:
-                            frame = 2 * int(setup_scroll.frameWidth())
-                            vbar = int(setup_scroll.verticalScrollBar().sizeHint().width())
-                            usable_width = max(1, sidebar_w - frame - vbar)
-                            setup_box.setMinimumWidth(usable_width)
-                            setup_box.setMaximumWidth(usable_width)
-                        except Exception:
-                            pass
-                        setup_scroll.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
-                else:
-                    setup_box.setMinimumWidth(0)
-                    setup_box.setMaximumWidth(16777215)
-                    setup_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-                    if setup_scroll is not None:
-                        setup_scroll.setMinimumWidth(0)
-                        setup_scroll.setMaximumWidth(16777215)
-                        setup_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-                        if compact:
-                            try:
-                                viewport_width = int(setup_scroll.viewport().width() or 0)
-                                if viewport_width > 0:
-                                    setup_box.setFixedWidth(viewport_width)
-                            except Exception:
-                                pass
-                if setup_scroll is not None:
-                    # Compose setup controls reflow vertically at compact
-                    # widths.  This pane is intentionally never a horizontal
-                    # scrolling surface; only data/previews may scroll.
-                    setup_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-                layout = setup_box.layout()
-                visible_heights: List[int] = []
-                if layout is not None:
-                    for idx in range(layout.count()):
-                        item = layout.itemAt(idx)
-                        widget = item.widget() if item is not None else None
-                        if widget is not None and widget.isVisible():
-                            visible_heights.append(max(int(widget.minimumSizeHint().height()), int(widget.sizeHint().height())))
-                    margins = layout.contentsMargins() if layout is not None else None
-                    spacing = max(0, int(layout.spacing() if layout is not None else 0))
-                    margin_h = int((margins.top() + margins.bottom()) if margins is not None else 16)
-                else:
-                    spacing = 6
-                    margin_h = 16
-                row_gaps = spacing * max(0, len(visible_heights) - 1)
-                group_label_h = max(24, int(setup_box.fontMetrics().height() + 10))
-                target_h = margin_h + row_gaps + sum(visible_heights) + group_label_h
-                # Do not collapse an operator- or caller-requested scroll
-                # surface during a form refresh.  The calculated value is the
-                # natural floor, while an existing larger floor is preserved.
-                # target_h = max(86, target_h) remains the natural-floor part
-                # of this calculation.  Authored floors are retained only when
-                # a caller explicitly set one; layout floors can shrink again.
-                target_h = max(
-                    86,
-                    target_h,
-                    int(getattr(setup_box, "explicit_minimum_height", 0)),
-                )
-                if compose_sidebar:
-                    if isinstance(setup_box, _ComposeSetupGroupBox):
-                        setup_box.set_derived_minimum_height(target_h)
-                    else:
-                        setup_box.setMinimumHeight(target_h)
-                    # A side rail is an orientation/setup card, not a second
-                    # full-height work surface. Keep its border at natural
-                    # content height and leave the remaining rail background
-                    # quiet; the scroll area still owns overflow when the
-                    # viewport is shorter than this derived height.
-                    setup_box.setMaximumHeight(target_h)
-                    if setup_scroll is not None:
-                        setup_scroll.setMinimumHeight(min(target_h, max(120, viewport_height // 3)))
-                        setup_scroll.setMaximumHeight(16777215)
-                else:
-                    if isinstance(setup_box, _ComposeSetupGroupBox):
-                        setup_box.set_derived_minimum_height(target_h)
-                    else:
-                        setup_box.setMinimumHeight(target_h)
-                    setup_box.setMaximumHeight(16777215)
-                    if setup_scroll is not None:
-                        # The child keeps its natural height while the scroll
-                        # viewport yields space to preview and primary actions.
-                        # This avoids mode-specific fixed-height clipping.
-                        setup_scroll.setMinimumHeight(min(target_h, max(120, viewport_height // 3)))
-                        setup_scroll.setMaximumHeight(16777215)
-            except Exception:
-                pass
-        if setup_scroll_value is not None and not bool(
-            getattr(self, "_compose_spotter_scroll_reset_pending", False)
-        ):
-            try:
-                bar = setup_scroll_probe.verticalScrollBar()
-                bar.setValue(min(setup_scroll_value, int(bar.maximum())))
-            except Exception:
-                pass
-        for widget_name in (
-            "compose_form_row_widget",
-            "compose_header_row_widget",
-            "compose_js8_target_row_widget",
-            "compose_js8_selected_target_row_widget",
-            "compose_spotter_source_row_widget",
-            "compose_js8_plain_row_widget",
-            "compose_js8_plain_scroll",
-            "compose_commstat_row_widget",
-            "compose_commstat_scroll",
-            "compose_rf_fields_stack",
-            "compose_field_box",
-            "compose_preview_box",
-            "compose_output_box",
-            "compose_body_splitter",
-            "compose_setup_scroll",
-            "compose_page",
-        ):
-            widget = getattr(self, widget_name, None)
-            if widget is not None:
-                try:
-                    widget.updateGeometry()
-                except Exception:
-                    pass
-        if isinstance(splitter, QSplitter) and splitter.orientation() == Qt.Horizontal:
-            try:
-                splitter_width = max(1, int(splitter.width() or viewport_width))
-                self._set_compose_splitter_sizes_if_needed(
-                    splitter,
-                    [
-                        max(300, int(splitter_width * 0.66)),
-                        max(220, int(splitter_width * 0.30)),
-                    ],
-                )
-            except Exception:
-                pass
-        elif isinstance(splitter, QSplitter):
-            try:
-                mode = str(getattr(self, "_compose_mode", "nbems") or "nbems")
-                splitter_height = max(1, int(splitter.height() or viewport_height))
-                if mode == "spotter":
-                    sizes = [max(180, int(splitter_height * 0.58)), max(120, int(splitter_height * 0.28))]
-                elif mode == "commstat_rf":
-                    sizes = [max(180, int(splitter_height * 0.54)), max(120, int(splitter_height * 0.30))]
-                elif mode == "js8":
-                    sizes = [max(160, int(splitter_height * 0.48)), max(110, int(splitter_height * 0.24))]
-                else:
-                    sizes = []
-                if sizes:
-                    self._set_compose_splitter_sizes_if_needed(splitter, sizes)
-            except Exception:
-                pass
-        if isinstance(body_splitter, QSplitter):
-            try:
-                if body_splitter.orientation() == Qt.Horizontal:
-                    readable_floor = self._compose_sidebar_readable_minimum_width(
-                        mode,
-                        in_workbench=in_workbench,
-                    )
-                    if mode == "spotter":
-                        sidebar_w = max(readable_floor, self._compose_spotter_sidebar_width(
-                            viewport_width,
-                            in_workbench=in_workbench,
-                        ))
-                    elif mode == "commstat_rf":
-                        sidebar_w = readable_floor
-                    else:
-                        sidebar_w = readable_floor
-                    self._set_compose_splitter_sizes_if_needed(
-                        body_splitter,
-                        [sidebar_w, max(320, viewport_width - sidebar_w)],
-                    )
-                else:
-                    setup_h = int(setup_scroll.height() if setup_scroll is not None else setup_box.height() if setup_box is not None else 160)
-                    self._set_compose_splitter_sizes_if_needed(
-                        body_splitter,
-                        [
-                            max(120, min(setup_h, viewport_height // 3)),
-                            max(220, int(viewport_height * 0.62)),
-                        ],
-                    )
-            except Exception:
-                pass
+        setup = self.compose_setup_box
+        rail = self._compose_sidebar_readable_minimum_width(mode, in_workbench=in_workbench)
+        if mode == "spotter":
+            rail = max(rail, self._compose_spotter_sidebar_width(width, in_workbench=in_workbench))
+        setup_width = rail if sidebar else width
+        setup_layout = setup.layout()
+        row_heights = []
+        for index in range(setup_layout.count()):
+            row = setup_layout.itemAt(index).widget()
+            if row is None or row.isHidden():
+                continue
+            row_height = self._compose_natural_height(row, max(1, setup_width - 16))
+            row.setFixedHeight(row_height)
+            row_heights.append(row_height)
+        margins = setup_layout.contentsMargins()
+        frame = setup.contentsMargins()
+        setup_height = max(
+            sum(row_heights) + max(0, len(row_heights) - 1) * setup_layout.spacing()
+            + margins.top() + margins.bottom() + frame.top() + frame.bottom(),
+            int(getattr(setup, "explicit_minimum_height", 0)),
+        )
+        setup.set_derived_minimum_height(setup_height)
+        setup.setMaximumHeight(setup_height)
+        self.compose_setup_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.compose_setup_scroll.setFixedHeight(setup_height)
+
+        # Local scroll wrappers remain for widget ownership/API compatibility;
+        # they expose their natural content and never compete with the workflow.
+        active_scroll = (
+            self.compose_js8_plain_scroll if mode == "js8" else
+            self.compose_commstat_scroll if mode == "commstat_rf" else
+            self.compose_mesh_scroll if mode == "mesh" else self.compose_field_scroll
+        )
+        editor_width = max(1, width - rail) if sidebar else width
+        if mode in {"nbems", "spotter"}:
+            self._refresh_compose_form_field_geometry(editor_width)
+        for scroll in (self.compose_field_scroll, self.compose_js8_plain_scroll,
+                       self.compose_commstat_scroll, self.compose_mesh_scroll):
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        content = active_scroll.widget()
+        editor_height = self._compose_natural_height(content, editor_width) if content is not None else 1
+        editor_height = max(editor_height, self.fontMetrics().lineSpacing() * 8)
+        active_scroll.setFixedHeight(editor_height)
+        if mode in {"js8", "commstat_rf", "mesh"}:
+            self.compose_rf_fields_stack.setFixedHeight(editor_height)
+        else:
+            self.compose_rf_fields_stack.setMinimumHeight(0)
+            self.compose_rf_fields_stack.setMaximumHeight(16777215)
+        field_height = editor_height + self.fontMetrics().lineSpacing() * 2
+        self.compose_field_box.setFixedHeight(field_height)
+        review_height = self.fontMetrics().lineSpacing() * 12
+        self.compose_preview_box.setFixedHeight(review_height)
+        self.compose_preview_box.setMinimumWidth(0)
+        self.compose_splitter.setOrientation(Qt.Vertical)
+        self.compose_splitter.setHandleWidth(0)
+        self.compose_splitter.setFixedHeight(field_height + review_height)
+        self._set_compose_splitter_sizes_if_needed(self.compose_splitter, [field_height, review_height])
+        body = self.compose_body_splitter
+        body.setOrientation(Qt.Horizontal if sidebar else Qt.Vertical)
+        body.setHandleWidth(0)
+        body_height = max(setup_height, field_height + review_height) if sidebar else setup_height + field_height + review_height
+        body.setFixedHeight(body_height)
+        if sidebar:
+            self._set_compose_splitter_sizes_if_needed(body, [rail, max(1, width - rail)])
+        else:
+            self._set_compose_splitter_sizes_if_needed(body, [setup_height, field_height + review_height])
+        self._refresh_compose_footer_geometry()
+
+    def _refresh_compose_footer_geometry(self) -> None:
+        self.compose_output_box.setMinimumHeight(0)
+        self.compose_output_box.setMaximumHeight(16777215)
+        footer_height = self._compose_natural_height(self.compose_output_box, self.compose_output_box.width())
+        self.compose_output_box.setFixedHeight(footer_height)
+
+    def _refresh_compose_form_field_geometry(self, width: int) -> None:
+        """Publish wrapped field heights at the width actually available."""
+        container = self.compose_field_scroll.widget()
+        layout = container.layout() if container is not None else None
+        if not isinstance(layout, QGridLayout):
+            return
+        comment = self._compose_field_widgets.get(SPOTTER_COMMENTS_KEY)
+        if self._compose_mode == "spotter" and isinstance(comment, QTextEdit):
+            comment.setFixedHeight(max(comment.minimumSizeHint().height(), comment.fontMetrics().lineSpacing() * 4))
+        margins = layout.contentsMargins()
+        available = max(1, width - margins.left() - margins.right())
+        for index in range(layout.count()):
+            widget = layout.itemAt(index).widget()
+            if widget is None:
+                continue
+            _row, _column, _rows, columns = layout.getItemPosition(index)
+            field_width = available if columns == 2 else max(1, (available - layout.horizontalSpacing()) // 2)
+            widget.setMinimumHeight(0)
+            child_layout = widget.layout()
+            if child_layout is not None:
+                widget.setMinimumHeight(self._compose_natural_height(widget, field_width))
+            elif widget.hasHeightForWidth():
+                widget.setMinimumHeight(max(widget.minimumSizeHint().height(), widget.heightForWidth(field_width)))
 
     def _compose_embedded_needs_workbench(self) -> bool:
         if bool(getattr(self, "_compose_in_workbench", False)):
@@ -8279,23 +8335,13 @@ class MessageViewerTab(QWidget):
         btn = getattr(self, "compose_workbench_btn", None)
         if not isinstance(btn, QPushButton):
             return
-        theme = resolve_theme(self.settings)
-        needs_workbench = self._compose_embedded_needs_workbench()
-        text = "Use Full Compose Workbench" if needs_workbench else "Open Full Compose Workbench"
-        style = button_style("primary" if needs_workbench else "secondary", theme)
-        tooltip = (
-            "This screen is cramped; open the full workbench for a usable compose layout."
-            if needs_workbench
-            else "Open Compose in a larger window with more room for forms, previews, and RF send options."
-        )
-        # Resize can fire in bursts. Avoid invalidating button geometry and
-        # style when its semantic state has not changed.
+        text = "Full Workbench"
+        style = button_style("secondary", resolve_theme(self.settings))
         if btn.text() != text:
             btn.setText(text)
         if btn.styleSheet() != style:
             btn.setStyleSheet(style)
-        if btn.toolTip() != tooltip:
-            btn.setToolTip(tooltip)
+        btn.setToolTip("Open the same draft in a separate, larger composing window.")
 
     def _refresh_compose_layout_geometry_if_needed(self, *, force: bool = False) -> None:
         mode = str(getattr(self, "_compose_mode", "nbems") or "nbems")
@@ -8308,8 +8354,13 @@ class MessageViewerTab(QWidget):
             mode,
             in_workbench,
             compact,
-            viewport_width // 120,
-            viewport_height // 120,
+            viewport_width,
+            viewport_height,
+            self.font().toString(),
+            getattr(self, "_compose_active_form_key", ""),
+            self.compose_output_options_btn.isChecked(),
+            self.compose_spotter_source_hint.text(),
+            getattr(self, "_compose_js8_selected_target_state", "unknown"),
             bool(getattr(getattr(self, "compose_commstat_brevity_chk", None), "isChecked", lambda: False)()),
             bool(getattr(getattr(self, "compose_sign_flamp_chk", None), "isChecked", lambda: False)()),
             bool(
@@ -8334,11 +8385,14 @@ class MessageViewerTab(QWidget):
             return
         requested_signature = getattr(self, "_compose_layout_signature", None)
         self._compose_layout_refresh_running = True
+        started = time.perf_counter()
         try:
             self._refresh_compose_layout_geometry()
             self._refresh_compose_workbench_button_style()
         finally:
             self._compose_layout_refresh_running = False
+            emit_span("compose.layout", (time.perf_counter() - started) * 1000,
+                      settings=self.settings, min_ms=16.0, meta={"mode": self._compose_mode})
         # If a real viewport bucket or mode change arrived while the pass was
         # running, honor it once on the next event turn. Same-signature native
         # resize feedback is intentionally discarded.
@@ -8375,7 +8429,7 @@ class MessageViewerTab(QWidget):
         usable_width = max(1, int(available.width()) - 24)
         usable_height = max(1, int(available.height()) - 24)
         # Keep the workbench inside the usable desktop even on a 900x560
-        # reduced window.  Its internal setup/form scroll areas own overflow;
+        # reduced window. Its workflow scroll area owns overflow;
         # the dialog itself must never extend beyond screen controls.
         dialog.setMinimumSize(min(760, usable_width), min(500, usable_height))
         dialog.setMaximumSize(usable_width, usable_height)
@@ -8384,10 +8438,10 @@ class MessageViewerTab(QWidget):
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(8)
-        for widget_name in ("compose_type_box", "compose_body_splitter", "compose_output_box"):
+        for widget_name in ("compose_type_box", "compose_workflow_scroll", "compose_output_box"):
             widget = getattr(self, widget_name, None)
             if widget is not None:
-                layout.addWidget(widget, 1 if widget_name == "compose_body_splitter" else 0)
+                layout.addWidget(widget, 1 if widget_name == "compose_workflow_scroll" else 0)
 
         close_row = QHBoxLayout()
         close_row.addStretch()
@@ -8405,10 +8459,10 @@ class MessageViewerTab(QWidget):
             self._refresh_compose_splitter_handles()
             root = getattr(self, "compose_root_layout", None)
             if root is not None:
-                for index, widget_name in enumerate(("compose_type_box", "compose_body_splitter", "compose_output_box"), start=1):
+                for index, widget_name in enumerate(("compose_type_box", "compose_workflow_scroll", "compose_output_box"), start=1):
                     widget = getattr(self, widget_name, None)
                     if widget is not None:
-                        root.insertWidget(index, widget, 1 if widget_name == "compose_body_splitter" else 0)
+                        root.insertWidget(index, widget, 1 if widget_name == "compose_workflow_scroll" else 0)
                 try:
                     root.invalidate()
                 except Exception:
@@ -8442,149 +8496,110 @@ class MessageViewerTab(QWidget):
 
     def _compose_commstat_brevity_catalog_dirs(self) -> List[Path]:
         paths: List[Path] = []
-        configured = (
-            self.settings.get("commstat_path", ""),
-            self.settings.get("commstat_app_path", ""),
-            self.settings.get("commstat_config_path", ""),
-        )
+        selected = self._selected_compose_radio_target() if getattr(self, "_compose_radio_targets_loaded", False) else None
+        selected_path = selected.profile.get("commstat_launch_path", "") if selected else ""
+        configured = [selected_path] if selected_path else [self.settings.get(key, "") for key in (
+            "commstat_path", "commstat_app_path", "commstat_config_path", "path_commstat",
+            "commstat_launch_path", "commstat3_db_path", "commstat_db_path")]
         base_raw = str(self.settings.get("radio_apps_base_folder", "") or "").strip()
         base_roots = [Path(base_raw).expanduser()] if base_raw else []
         base_roots.append(Path.home() / "RadioTools" / "Programs")
         candidates: List[str | Path] = list(configured)
-        for root in base_roots:
-            candidates.extend((root / "commstat-4.7", root / "CommStat"))
+        if not any(str(value or "").strip() for value in configured):
+            for root in base_roots:
+                candidates.extend((root / "commstat-5.0", root / "commstat-4.7", root / "CommStat"))
+            candidates.append(Path.home() / "RadioTools" / "commstat-5.0")
         for raw in candidates:
             text = str(raw or "").strip()
             if not text:
                 continue
             path = Path(text).expanduser()
-            if path.is_file():
+            if path.suffix.lower() in {".py", ".exe", ".ini", ".db", ".db3", ".sh", ".cmd"}:
                 path = path.parent
             if path not in paths:
                 paths.append(path)
         return paths
 
     def _compose_commstat_brevity_options(self) -> List[str]:
-        cache_key = tuple(str(path) for path in self._compose_commstat_brevity_catalog_dirs())
-        if (
-            cache_key == getattr(self, "_compose_commstat_brevity_options_cache_key", ())
-            and getattr(self, "_compose_commstat_brevity_options_cache", [])
-        ):
-            return list(self._compose_commstat_brevity_options_cache)
-        options: List[str] = []
-        seen: set[str] = set()
-        for folder in self._compose_commstat_brevity_catalog_dirs():
+        options = []
+        for prefix, name, data in self._compose_commstat_brevity_catalogs():
+            values = {}
+            for field in model_fields(data):
+                entries = section_entries(field_section(data, field, values))
+                letters = [key for key, value in entries.items() if value["name"].strip().lower() != "reserved"]
+                if not letters:
+                    break
+                values[field["key"]] = sorted(letters)[0]
             try:
-                files = sorted(folder.glob("[0-9]-*.json"))
-            except Exception:
-                files = []
-            for file_path in files:
-                try:
-                    with file_path.open("r", encoding="utf-8") as handle:
-                        data = json.load(handle)
-                except Exception:
-                    continue
-                prefix = file_path.name[:1].upper()
-                if not prefix.isdigit():
-                    continue
-                sections = (
-                    data.get("emergency_type"),
-                    data.get("shared_impacts"),
-                    data.get("public_reaction"),
-                    data.get("station_response"),
-                    data.get("status_codes"),
-                )
-                letters: List[List[str]] = []
-                for section in sections:
-                    available: set[str] = set()
-                    if isinstance(section, dict):
-                        for key, value in section.items():
-                            key_text = str(key or "").strip().upper()
-                            if len(key_text) == 1 and key_text.isalpha():
-                                available.add(key_text)
-                            if isinstance(value, dict):
-                                for item in value.get("items", []) or []:
-                                    item_text = str(item or "").strip().upper()
-                                    if len(item_text) == 1 and item_text.isalpha():
-                                        available.add(item_text)
-                    letters.append(sorted(available))
-                if len(letters) != 5 or any(not values for values in letters):
-                    continue
-                sample = "".join([prefix] + [values[0] for values in letters])
-                label = f"{sample} - {file_path.name}"
-                key = label.upper()
-                if key not in seen:
-                    options.append(label)
-                    seen.add(key)
-        if not options:
-            options = ["4BBGUB"]
-        self._compose_commstat_brevity_options_cache_key = cache_key
-        self._compose_commstat_brevity_options_cache = list(options)
+                sample = encode_brevity_code(prefix, values, data)
+            except ValueError:
+                continue
+            options.append(f"{sample} - {name}")
         return options
 
     def _populate_compose_commstat_brevity_options(self) -> None:
         combo = getattr(self, "compose_commstat_brevity_edit", None)
         if not isinstance(combo, QComboBox):
             return
+        draft = combo.currentText()
         combo.blockSignals(True)
         try:
             combo.clear()
             combo.addItem("")
             for label in self._compose_commstat_brevity_options():
                 combo.addItem(label)
-            combo.setCurrentIndex(0)
+            combo.setEditText(draft)
         finally:
             combo.blockSignals(False)
 
     def _compose_commstat_brevity_catalogs(self) -> List[Tuple[str, str, Dict[str, object]]]:
-        cache_key = tuple(str(path) for path in self._compose_commstat_brevity_catalog_dirs())
-        if cache_key == getattr(self, "_compose_commstat_brevity_catalogs_cache_key", ()):
-            return list(getattr(self, "_compose_commstat_brevity_catalogs_cache", []))
-        catalogs: List[Tuple[str, str, Dict[str, object]]] = []
-        seen: set[str] = set()
-        for folder in self._compose_commstat_brevity_catalog_dirs():
-            try:
-                files = sorted(folder.glob("[0-9]-*.json"))
-            except Exception:
-                files = []
-            for file_path in files:
-                prefix = file_path.name[:1].upper()
-                if not prefix.isdigit():
-                    continue
-                key = str(file_path.resolve()) if file_path.exists() else str(file_path)
-                if key in seen:
-                    continue
-                try:
-                    with file_path.open("r", encoding="utf-8") as handle:
-                        data = json.load(handle)
-                except Exception:
-                    continue
-                if isinstance(data, dict):
-                    catalogs.append((prefix, file_path.name, data))
-                    seen.add(key)
-        self._compose_commstat_brevity_catalogs_cache_key = cache_key
-        self._compose_commstat_brevity_catalogs_cache = list(catalogs)
-        return catalogs
+        if getattr(self, "_is_shutting_down", False):
+            return []
+        folders = tuple(str(path) for path in self._compose_commstat_brevity_catalog_dirs())
+        cache = getattr(self, "_compose_brevity_read_cache", None)
+        if cache is None:
+            cache = self._compose_brevity_read_cache = LatestReadCache("fio-compose-brevity")
+        def reader_factory():
+            def read():
+                catalogs, seen = [], set()
+                for folder in folders:
+                    for prefix, data in load_catalogs(folder).items():
+                        version_key = (prefix, len(model_fields(data)))
+                        if version_key in seen:
+                            continue
+                        seen.add(version_key)
+                        catalogs.append((prefix, data["_fio_filename"], data))
+                return catalogs
+            return read
+        result = cache.read(folders, reader_factory, refresh_after_s=10.0)
+        timer = getattr(self, "_compose_brevity_poll", None)
+        if timer is None:
+            timer = self._compose_brevity_poll = QTimer(self)
+            timer.timeout.connect(self._on_compose_brevity_catalog_ready)
+        enabled = bool(getattr(getattr(self, "compose_commstat_brevity_chk", None), "isChecked", lambda: False)())
+        if cache._future is not None or enabled:
+            timer.setInterval(100 if cache._future is not None else 5000)
+            if not timer.isActive():
+                timer.start()
+        else:
+            timer.stop()
+        return list(result or [])
+
+    def _on_compose_brevity_catalog_ready(self) -> None:
+        catalogs = self._compose_commstat_brevity_catalogs()
+        signature = (tuple(str(path) for path in self._compose_commstat_brevity_catalog_dirs()),
+                     tuple((prefix, name, data.get("_fio_fingerprint")) for prefix, name, data in catalogs))
+        if signature == getattr(self, "_compose_brevity_published_signature", None):
+            return
+        self._compose_brevity_published_signature = signature
+        self._populate_compose_commstat_brevity_options()
+        self._populate_compose_commstat_brevity_builder()
+        self._update_compose_preview()
 
     @staticmethod
     def _commstat_brevity_code_items(section: object) -> List[Tuple[str, str]]:
-        out: Dict[str, str] = {}
-
-        def collect(node: object) -> None:
-            if not isinstance(node, dict):
-                return
-            for raw_key, raw_value in node.items():
-                key = str(raw_key or "").strip().upper()
-                if len(key) == 1 and key.isalpha():
-                    name = ""
-                    if isinstance(raw_value, dict):
-                        name = str(raw_value.get("name", "") or "").strip()
-                    out.setdefault(key, name or key)
-                if isinstance(raw_value, dict):
-                    collect(raw_value)
-
-        collect(section)
-        return [(code, out[code]) for code in sorted(out)]
+        return sorted((code, entry["name"]) for code, entry in section_entries(section).items()
+                      if entry["name"].strip().lower() != "reserved")
 
     def _populate_commstat_brevity_combo(self, combo: QComboBox, section: object, placeholder: str) -> None:
         combo.blockSignals(True)
@@ -8600,30 +8615,27 @@ class MessageViewerTab(QWidget):
         list_combo = getattr(self, "compose_commstat_brevity_list_combo", None)
         if not isinstance(list_combo, QComboBox):
             return
+        previous = list_combo.currentData()
+        old_catalogs = getattr(self, "_compose_commstat_brevity_catalog_cache", ())
+        old_key = None
+        if isinstance(previous, int) and 0 <= previous < len(old_catalogs):
+            old_key = (old_catalogs[previous][0], old_catalogs[previous][1])
         catalogs = self._compose_commstat_brevity_catalogs()
         self._compose_commstat_brevity_catalog_cache = catalogs
         list_combo.blockSignals(True)
         try:
             list_combo.clear()
-            list_combo.addItem("Select event list", None)
-            for idx, (prefix, name, _data) in enumerate(catalogs):
-                list_combo.addItem(f"{prefix} - {name}", idx)
+            list_combo.addItem("Select event list" if catalogs else "Definitions unavailable", None)
+            selected = 0
+            for idx, (prefix, name, data) in enumerate(catalogs):
+                if model_fields(data):
+                    list_combo.addItem(f"{prefix} - {name}", idx)
+                    if (prefix, name) == old_key:
+                        selected = list_combo.count() - 1
+            list_combo.setCurrentIndex(selected or (1 if list_combo.count() > 1 else 0))
         finally:
             list_combo.blockSignals(False)
-        if catalogs:
-            list_combo.setCurrentIndex(1)
-            self._on_compose_commstat_brevity_list_changed(refresh_preview=False)
-        else:
-            for combo_name in (
-                "compose_commstat_brevity_event_combo",
-                "compose_commstat_brevity_status_combo",
-                "compose_commstat_brevity_impact_combo",
-                "compose_commstat_brevity_public_combo",
-                "compose_commstat_brevity_station_combo",
-            ):
-                combo = getattr(self, combo_name, None)
-                if isinstance(combo, QComboBox):
-                    self._populate_commstat_brevity_combo(combo, {}, "No catalog")
+        self._on_compose_commstat_brevity_list_changed(refresh_preview=False)
 
     def _on_compose_commstat_brevity_list_changed(self, *_args, refresh_preview: bool = True) -> None:
         list_combo = getattr(self, "compose_commstat_brevity_list_combo", None)
@@ -8635,45 +8647,58 @@ class MessageViewerTab(QWidget):
         if isinstance(idx, int) and 0 <= idx < len(catalogs):
             _prefix, _name, raw_data = catalogs[idx]
             data = raw_data if isinstance(raw_data, dict) else {}
-        mapping = (
-            ("compose_commstat_brevity_event_combo", "emergency_type", "Select event type"),
-            ("compose_commstat_brevity_status_combo", "status_codes", "Select status/target"),
-            ("compose_commstat_brevity_impact_combo", "shared_impacts", "Select impact"),
-            ("compose_commstat_brevity_public_combo", "public_reaction", "Select public response"),
-            ("compose_commstat_brevity_station_combo", "station_response", "Select station response"),
-        )
-        for combo_name, section_key, placeholder in mapping:
-            combo = getattr(self, combo_name, None)
-            if isinstance(combo, QComboBox):
-                self._populate_commstat_brevity_combo(combo, data.get(section_key, {}), placeholder)
-        self._on_compose_commstat_brevity_builder_changed(refresh_preview=refresh_preview)
+        old_values = {key: combo.currentData() for key, combo in getattr(self, "_compose_brevity_field_combos", {}).items()}
+        for widget in getattr(self, "_compose_brevity_field_widgets", ()):
+            self._compose_brevity_field_layout.removeWidget(widget)
+            widget.deleteLater()
+        combos, widgets = {}, []
+        for pos, field in enumerate(model_fields(data)):
+            combo, label = QComboBox(), QLabel(field["label"])
+            label.setTextFormat(Qt.PlainText)
+            label.setWordWrap(True)
+            combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(8)
+            combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            self._populate_commstat_brevity_combo(combo, field_section(data, field, old_values), f"Select {field['label']}")
+            current = combo.findData(old_values.get(field["key"], ""))
+            combo.setCurrentIndex(max(0, current))
+            combo.currentIndexChanged.connect(self._on_compose_commstat_brevity_builder_changed)
+            row, col = 1 + pos // 2, (pos % 2) * 2
+            self._compose_brevity_field_layout.addWidget(label, row, col)
+            self._compose_brevity_field_layout.addWidget(combo, row, col + 1)
+            combos[field["key"]] = combo
+            widgets.extend((label, combo))
+        self._compose_brevity_field_combos = combos
+        self._compose_brevity_field_widgets = widgets
+        if refresh_preview:
+            self._update_compose_preview()
 
     def _compose_commstat_brevity_builder_code(self) -> str:
-        list_combo = getattr(self, "compose_commstat_brevity_list_combo", None)
-        if not isinstance(list_combo, QComboBox):
+        idx = self.compose_commstat_brevity_list_combo.currentData()
+        catalogs = getattr(self, "_compose_commstat_brevity_catalog_cache", ())
+        if not isinstance(idx, int) or not 0 <= idx < len(catalogs):
             return ""
-        idx = list_combo.currentData()
-        catalogs = getattr(self, "_compose_commstat_brevity_catalog_cache", []) or []
-        if not isinstance(idx, int) or idx < 0 or idx >= len(catalogs):
+        prefix, _, data = catalogs[idx]
+        values = {key: combo.currentData() for key, combo in self._compose_brevity_field_combos.items()}
+        try:
+            return encode_brevity_code(prefix, values, data)
+        except ValueError:
             return ""
-        prefix = str(catalogs[idx][0] or "").strip().upper()
-        parts = [prefix]
-        for combo_name in (
-            "compose_commstat_brevity_event_combo",
-            "compose_commstat_brevity_status_combo",
-            "compose_commstat_brevity_impact_combo",
-            "compose_commstat_brevity_public_combo",
-            "compose_commstat_brevity_station_combo",
-        ):
-            combo = getattr(self, combo_name, None)
-            raw_code = combo.currentData() if isinstance(combo, QComboBox) else ""
-            code = str(raw_code or "").strip().upper()
-            if len(code) != 1 or not code.isalpha():
-                return ""
-            parts.append(code)
-        return "".join(parts)
 
     def _on_compose_commstat_brevity_builder_changed(self, *_args, refresh_preview: bool = True) -> None:
+        idx = self.compose_commstat_brevity_list_combo.currentData()
+        catalogs = getattr(self, "_compose_commstat_brevity_catalog_cache", ())
+        if isinstance(idx, int) and 0 <= idx < len(catalogs):
+            data = catalogs[idx][2]
+            values = {key: combo.currentData() for key, combo in self._compose_brevity_field_combos.items()}
+            for field in model_fields(data):
+                if field["key"] == "impact":
+                    combo = self._compose_brevity_field_combos[field["key"]]
+                    previous = combo.currentData()
+                    self._populate_commstat_brevity_combo(combo, field_section(data, field, values), f"Select {field['label']}")
+                    combo.blockSignals(True)
+                    combo.setCurrentIndex(max(0, combo.findData(previous)))
+                    combo.blockSignals(False)
         code = self._compose_commstat_brevity_builder_code()
         combo = getattr(self, "compose_commstat_brevity_edit", None)
         if isinstance(combo, QComboBox) and code:
@@ -8693,8 +8718,16 @@ class MessageViewerTab(QWidget):
             text = combo.text()
         else:
             text = ""
-        match = re.search(r"#?\b([0-9][A-Z]{5})\b", str(text or "").upper())
-        return match.group(1) if match else ""
+        candidates = code_candidates(text)
+        if not candidates:
+            return ""
+        code = candidates[0]
+        for prefix, _, catalog in self._compose_commstat_brevity_catalogs():
+            if prefix == code[0]:
+                records = analyze_brevity_codes(code, {prefix: catalog})
+                if records and records[0]["status"] == "decoded":
+                    return code
+        return ""
 
     def _on_compose_commstat_brevity_enabled_changed(self) -> None:
         if bool(getattr(getattr(self, "compose_commstat_brevity_chk", None), "isChecked", lambda: False)()):
@@ -8993,7 +9026,9 @@ class MessageViewerTab(QWidget):
                     for option in field.options
                     if str(option.value or "")
                 ),
-                kind="choice" if field.options else "prompt",
+                # Prompt rows also carry an empty placeholder option. Only
+                # actual selectors consume compact answer tokens.
+                kind="choice" if field.field_type == "select" else "prompt",
             )
             for field in fields
             if field.key != SPOTTER_COMMENTS_KEY
@@ -9123,7 +9158,7 @@ class MessageViewerTab(QWidget):
         """
         if str(getattr(self, "_compose_mode", "nbems") or "nbems") != "spotter":
             return
-        if not hasattr(self, "compose_setup_scroll"):
+        if not hasattr(self, "compose_workflow_scroll"):
             return
         if bool(getattr(self, "_compose_spotter_scroll_reset_pending", False)):
             return
@@ -9134,7 +9169,7 @@ class MessageViewerTab(QWidget):
         self._compose_spotter_scroll_reset_pending = False
         if str(getattr(self, "_compose_mode", "nbems") or "nbems") != "spotter":
             return
-        scroll = getattr(self, "compose_setup_scroll", None)
+        scroll = getattr(self, "compose_workflow_scroll", None)
         if scroll is None:
             return
         try:
@@ -9167,7 +9202,7 @@ class MessageViewerTab(QWidget):
             log.exception("MessageViewer: failed loading saved Spotter working copy: %s", exc)
             self._set_compose_status(
                 "This saved response could not be loaded completely. "
-                "Choose it again or start a new FIOSpotter draft.",
+                "Choose it again or start a new CommsPlan Spotter draft.",
                 role="warning",
             )
         finally:
@@ -9245,7 +9280,14 @@ class MessageViewerTab(QWidget):
         self._queue_compose_spotter_scroll_reset()
 
     def _on_compose_mode_tab_changed(self, index: int) -> None:
+        with perf_span("compose.mode_switch", settings=self.settings, min_ms=16.0, meta={"index": index}):
+            self._apply_compose_mode_tab_changed(index)
+
+    def _apply_compose_mode_tab_changed(self, index: int) -> None:
         previous_mode = str(getattr(self, "_compose_mode", "nbems") or "nbems")
+        positions = getattr(self, "_compose_workflow_positions", {})
+        positions[previous_mode] = self.compose_workflow_scroll.verticalScrollBar().value()
+        self._compose_workflow_positions = positions
         self._store_compose_form_draft()
         self._store_compose_mode_draft(previous_mode)
         idx = int(index or 0)
@@ -9274,35 +9316,67 @@ class MessageViewerTab(QWidget):
         self._queue_compose_spotter_scroll_reset()
         self._refresh_compose_js8_selected_target_cue()
         self.request_compose_js8_selected_target_refresh()
+        selected_mode = self._compose_mode
+        position = self._compose_workflow_positions.get(selected_mode, 0)
+        QTimer.singleShot(0, lambda: self.compose_workflow_scroll.verticalScrollBar().setValue(position)
+                          if self._compose_mode == selected_mode and not self._is_shutting_down else None)
 
     def _refresh_compose_mesh_targets(self, *, force: bool = False) -> None:
-        combo = getattr(self, "compose_mesh_source_combo", None)
-        if not isinstance(combo, QComboBox):
+        """Single-flight discovery; keep the coherent previous model while loading."""
+        self._compose_mesh_generation = int(getattr(self, "_compose_mesh_generation", 0)) + 1
+        thread = getattr(self, "_compose_mesh_thread", None)
+        if thread is not None and self._qt_thread_running(thread):
+            self._compose_mesh_pending = True
             return
-        previous_id = ""
+        self.compose_send_mesh_btn.setEnabled(False)
+        self.compose_mesh_hint_label.setText("Loading mesh connections…")
+        self._compose_mesh_loading = True
+        for control in (self.compose_mesh_source_combo, self.compose_mesh_channel_combo,
+                        self.compose_mesh_node_combo, self.compose_mesh_destination_kind_combo):
+            control.setEnabled(False)
+        thread = QThread(self)
+        worker = _ComposeMeshDiscoveryWorker(
+            self._compose_mesh_generation, dict(self.settings.all()), default_mesh_db_path()
+        )
+        self._compose_mesh_thread, self._compose_mesh_worker = thread, worker
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_compose_mesh_discovered)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._on_compose_mesh_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def _on_compose_mesh_thread_finished(self) -> None:
+        self._retain_finished_worker_refs(self._compose_mesh_thread, self._compose_mesh_worker)
+        self._compose_mesh_thread = self._compose_mesh_worker = None
+        if getattr(self, "_compose_mesh_pending", False) and not self._is_shutting_down:
+            self._compose_mesh_pending = False
+            pending_intent = getattr(self, "_compose_mesh_pending_intent", None)
+            current_generation = self._compose_mesh_generation
+            self._refresh_compose_mesh_targets(force=True)
+            if pending_intent and pending_intent[0] == current_generation:
+                self._compose_mesh_pending_intent = (self._compose_mesh_generation, pending_intent[1])
+
+    def _on_compose_mesh_discovered(self, payload: object) -> None:
+        if (self._is_shutting_down or not isinstance(payload, dict)
+                or payload.get("generation") != getattr(self, "_compose_mesh_generation", 0)):
+            return
+        self._compose_mesh_loading = False
+        for control in (self.compose_mesh_source_combo, self.compose_mesh_channel_combo,
+                        self.compose_mesh_node_combo, self.compose_mesh_destination_kind_combo):
+            control.setEnabled(True)
+        if self._compose_mode != "mesh":
+            return
+        combo = self.compose_mesh_source_combo
         current = combo.currentData()
-        if current is not None:
-            previous_id = str(getattr(current, "adapter_id", "") or "")
-        try:
-            configs = [
-                config
-                for config in load_mesh_connection_configs(self.settings)
-                if config.enabled
-                and config.send_enabled
-                and mesh_outbound_capability(config.protocol, config.connection_type).supported
-            ]
-        except Exception as exc:
-            configs = []
-            log.debug("MessageViewer: failed loading mesh compose connections: %s", exc)
-        health_by_adapter: dict[str, dict[str, object]] = {}
-        try:
-            health_by_adapter = {
-                str(row.get("adapter_id") or ""): dict(row)
-                for row in list_mesh_health(default_mesh_db_path())
-                if str(row.get("adapter_id") or "")
-            }
-        except Exception:
-            health_by_adapter = {}
+        previous_id = str(getattr(current, "adapter_id", "") or "")
+        previous_channel = self.compose_mesh_channel_combo.currentData()
+        previous_node = self.compose_mesh_node_combo.currentData()
+        configs = payload.get("configs", [])
+        health_by_adapter = payload.get("health", {})
+        self._compose_mesh_destinations = payload.get("destinations", {})
         self._compose_mesh_configs = list(configs)
         self._compose_mesh_health_by_adapter = health_by_adapter
         blocked = combo.blockSignals(True)
@@ -9325,6 +9399,27 @@ class MessageViewerTab(QWidget):
         finally:
             combo.blockSignals(blocked)
         self._on_compose_mesh_source_changed()
+        self._compose_set_combo_data(self.compose_mesh_channel_combo, previous_channel)
+        self._compose_set_combo_data(self.compose_mesh_node_combo, previous_node)
+        pending = getattr(self, "_compose_mesh_pending_intent", None)
+        if pending and pending[0] == payload.get("generation"):
+            self._compose_mesh_pending_intent = None
+            data = pending[1]
+            adapter_id = str(data.get("adapter_id") or "")
+            if adapter_id:
+                index = next((i for i in range(combo.count())
+                              if str(getattr(combo.itemData(i), "adapter_id", "")) == adapter_id), -1)
+                combo.setCurrentIndex(index)
+            kind = str(data.get("destination_kind") or ("direct" if data.get("destination_id") else "channel"))
+            self._compose_set_combo_data(self.compose_mesh_destination_kind_combo, kind)
+            for control, key in ((self.compose_mesh_channel_combo, "channel_id"),
+                                 (self.compose_mesh_node_combo, "destination_id")):
+                value = str(data.get(key) or (data.get("node_id") if key == "destination_id" else "") or "")
+                if value:
+                    control.setCurrentIndex(control.findData(value))
+            self._on_compose_mesh_destination_changed()
+        if payload.get("error"):
+            self.compose_mesh_hint_label.setText("Could not load mesh connections. Refresh to retry.")
 
     def _selected_compose_mesh_config(self):
         combo = getattr(self, "compose_mesh_source_combo", None)
@@ -9345,10 +9440,7 @@ class MessageViewerTab(QWidget):
                 channel_combo.addItem("No reviewed channel available", None)
                 node_combo.addItem("No known node available", None)
             else:
-                try:
-                    policies = list_mesh_channel_policies(default_mesh_db_path(), adapter_id=config.adapter_id)
-                except Exception:
-                    policies = []
+                policies, nodes = getattr(self, "_compose_mesh_destinations", {}).get(config.adapter_id, ([], []))
                 for policy in policies:
                     if str(policy.review_state or "").lower() != "accepted":
                         continue
@@ -9359,10 +9451,7 @@ class MessageViewerTab(QWidget):
                     channel_combo.addItem(f"{policy.channel_name} · channel {policy.channel_id}", str(policy.channel_id))
                 if not channel_combo.count():
                     channel_combo.addItem("No reviewed channel available", None)
-                try:
-                    nodes = list_mesh_nodes(default_mesh_db_path(), adapter_id=config.adapter_id, limit=200)
-                except Exception:
-                    nodes = []
+
                 for node in nodes:
                     node_id = str(node.get("node_id") or "").strip()
                     public_key = str(node.get("public_key_or_hash") or "").strip()
@@ -9423,6 +9512,9 @@ class MessageViewerTab(QWidget):
         )
 
     def _send_compose_mesh_message(self) -> None:
+        if getattr(self, "_compose_mesh_loading", False):
+            self._set_compose_status("Wait for mesh connection verification before sending.", role="warning")
+            return
         if self._compose_mesh_send_inflight:
             self._set_compose_status("A mesh send is already in progress.", role="info")
             return
@@ -9990,10 +10082,10 @@ class MessageViewerTab(QWidget):
         label.setText(text)
         label.setTextFormat(Qt.PlainText)
         row.setVisible(active)
-        use_btn.setVisible(active)
+        use_btn.setVisible(active and state == "selected" and bool(target))
         use_btn.setText("Target in Use" if draft_uses_target else "Use Target")
         use_btn.setEnabled(active and state == "selected" and bool(target) and not draft_uses_target)
-        refresh_btn.setVisible(active)
+        refresh_btn.setVisible(False)
         refresh_btn.setEnabled(active and radio is not None and state != "refreshing")
         try:
             theme = resolve_theme(self.settings)
@@ -10011,6 +10103,7 @@ class MessageViewerTab(QWidget):
             refresh_btn.setStyleSheet(button_style("muted", theme))
         except Exception:
             pass
+        self._refresh_compose_layout_geometry_if_needed()
 
     def _use_compose_js8_selected_target(self) -> None:
         """Explicitly copy the observed JS8Call selection into the active mode draft."""
@@ -10230,6 +10323,9 @@ class MessageViewerTab(QWidget):
 
     def _refresh_compose_forms(self) -> None:
         if not hasattr(self, "compose_family_combo"):
+            return
+        if self._compose_mode not in {"nbems", "spotter"}:
+            self._compose_discovery_generation += 1
             return
         self._refresh_compose_operating_group_options()
         self._compose_discovery_generation += 1
@@ -10530,7 +10626,8 @@ class MessageViewerTab(QWidget):
                     key=SPOTTER_COMMENTS_KEY,
                     label="Comments (optional)",
                     description=f"Add brief context not captured by the form (up to {SPOTTER_COMMENTS_MAX_LENGTH} characters).",
-                    field_type="text",
+                    field_type="textarea",
+                    rows=3,
                     placeholder="Brief additional context",
                 )
             )
@@ -10706,8 +10803,8 @@ class MessageViewerTab(QWidget):
             upper_label = f"{field.label} {field.description}".upper()
             is_spotter_comment = spotter_mode and field.key == SPOTTER_COMMENTS_KEY
             is_long_field = (
-                not is_spotter_comment
-                and (
+                is_spotter_comment
+                or (
                     field.field_type == "textarea"
                     or field.key == "MESSAGE"
                     or any(token in upper_label for token in long_labels)
@@ -10758,19 +10855,15 @@ class MessageViewerTab(QWidget):
                     )
                 )
                 widget.setMaximumHeight(16777215)
+                if is_spotter_comment:
+                    widget.setMaximumHeight(widget.minimumHeight())
                 widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.MinimumExpanding)
                 widget.setPlaceholderText(field.placeholder)
                 widget.setPlainText(initial)
                 widget.textChanged.connect(self._on_compose_form_field_changed)
             else:
-                if is_spotter_comment:
-                    widget = _FontBoundedLineEdit(
-                        display_columns=34,
-                        max_length=SPOTTER_COMMENTS_MAX_LENGTH,
-                    )
-                else:
-                    widget = QLineEdit()
-                    widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+                widget = QLineEdit()
+                widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
                 widget.setPlaceholderText(field.placeholder)
                 widget.setText(initial)
                 widget.textChanged.connect(self._on_compose_form_field_changed)
@@ -12016,6 +12109,7 @@ class MessageViewerTab(QWidget):
             self.compose_js8_plain_text_edit.setPlainText(body)
         if mode in {"mesh", "meshcore", "meshtastic"}:
             self._refresh_compose_mesh_targets(force=True)
+            self._compose_mesh_pending_intent = (self._compose_mesh_generation, dict(data))
             adapter_id = str(data.get("adapter_id") or "")
             source_combo = getattr(self, "compose_mesh_source_combo", None)
             if isinstance(source_combo, QComboBox) and adapter_id:
@@ -12056,7 +12150,7 @@ class MessageViewerTab(QWidget):
                                 combo.blockSignals(blocked)
                             loaded = self._on_compose_spotter_source_changed()
                         if not loaded:
-                            raise ValueError("saved FIOSpotter response could not be decoded")
+                            raise ValueError("saved CommsPlan Spotter response could not be decoded")
                         break
         if requested_spotter_form:
             self._select_compose_spotter_form_code(requested_spotter_form)
@@ -12381,8 +12475,25 @@ class MessageViewerTab(QWidget):
         if save:
             self._save_settings()
 
+    def _leave_ops_traffic_scope(self) -> bool:
+        active = getattr(self, "_ops_traffic_message_ids", None) is not None
+        self._ops_traffic_message_ids = None
+        self._ops_traffic_summary = None
+        if active:
+            self._traffic_action_filter = getattr(self, "_ops_traffic_previous_action_filter", "")
+            if hasattr(self, "traffic_action_summary"):
+                self.traffic_action_summary.set_active_bucket(self._traffic_action_filter)
+            self._traffic_navigation_pending = False
+            self._set_loading(False)
+            # Force the normal intelligence chips to republish on return.
+            self._intel_filter_bar_refresh_key = None
+        return active
+
     def show_inbox_from_navigation(self) -> None:
+        left_ops_scope = self._leave_ops_traffic_scope()
         self._set_messages_mode("Inbox", save=False)
+        if left_ops_scope:
+            self._load_projected_messages_into_table()
 
     def show_inbox_with_context(
         self,
@@ -12397,9 +12508,36 @@ class MessageViewerTab(QWidget):
         grid_filter: str = "",
         fema_region_filter: str = "",
         action_filter: str = "",
+        traffic_message_ids: Sequence[str] | None = None,
+        traffic_count_at_click: int = 0,
     ) -> None:
         self.show_inbox_from_navigation()
+        incoming_bucket = str(action_filter or "").strip().lower()
+        self._traffic_navigation_pending = incoming_bucket in {"reply", "relay", "review", "social"}
+        self._traffic_loading_bucket = incoming_bucket
+        self._traffic_loading_started = time.perf_counter()
+        if self._traffic_navigation_pending:
+            self._set_loading(True)
         self._close_message_reader_for_scope_change()
+        if traffic_message_ids is not None and self._projection_primary_enabled:
+            # Explicit dashboard view leaves saved Inbox controls untouched.
+            if hasattr(self, "_filter_timer"):
+                self._filter_timer.stop()
+            self._ops_traffic_message_ids = tuple(dict.fromkeys(
+                str(value).strip() for value in traffic_message_ids if str(value).strip()
+            ))[:200]
+            self._ops_traffic_previous_action_filter = getattr(self, "_traffic_action_filter", "")
+            self._ops_traffic_count_at_click = max(0, int(traffic_count_at_click))
+            self._ops_traffic_clicked_bucket = incoming_bucket
+            self._ops_traffic_summary = None
+            self._traffic_action_filter = incoming_bucket
+            self.traffic_action_summary.set_active_bucket(incoming_bucket)
+            self._update_visible_message_scope_label()
+            self._update_map_context_filter_label()
+            if hasattr(self, "message_intel_filter_widget"):
+                self.message_intel_filter_widget.setVisible(False)
+            self._load_projected_messages_into_table()
+            return
         try:
             age_seconds = int(age_filter_seconds or 0)
         except Exception:
@@ -12640,7 +12778,7 @@ class MessageViewerTab(QWidget):
             widget.setVisible(compose_active)
             widget.setStyleSheet(button_style("muted", theme))
         if hasattr(self, "_compose_tools_row"):
-            self._compose_tools_row.setVisible(compose_active)
+            self._compose_tools_row.setVisible(False)
         self._update_show_all_message_groups_style()
         for widget in (
             self.received_filter,
@@ -12671,7 +12809,7 @@ class MessageViewerTab(QWidget):
             self.traffic_action_summary.setVisible(not compose_active)
         self._update_map_context_filter_label()
         if hasattr(self, "messages_help_btn"):
-            self.messages_help_btn.setVisible(True)
+            self.messages_help_btn.setVisible(not compose_active)
         if hasattr(self, "bbs_status_btn"):
             self.bbs_status_btn.setVisible(not compose_active)
             self._refresh_varac_bbs_status_label()
@@ -12745,7 +12883,7 @@ class MessageViewerTab(QWidget):
                     ),
                 ),
             )
-        return build_support_summary("FreqInOut Multi-Rig Messages Summary", top_lines, sections=sections)
+        return build_support_summary("CommsPlan Multi-Rig Messages Summary", top_lines, sections=sections)
 
     def _copy_messages_support_summary(self) -> None:
         QApplication.clipboard().setText(self._messages_support_summary())
@@ -12836,7 +12974,7 @@ class MessageViewerTab(QWidget):
         dialog.resize(980, 560)
         root = QVBoxLayout(dialog)
         intro = QLabel(
-            "Review recent delete activity and messages hidden from FIO views. "
+            "Review recent delete activity and messages hidden from CommsPlan views. "
             "This is for troubleshooting and cleanup review; the Inbox remains the primary operating view."
         )
         intro.setWordWrap(True)
@@ -12861,7 +12999,7 @@ class MessageViewerTab(QWidget):
         rebuild_layout = QVBoxLayout(rebuild_panel)
         rebuild_intro = QLabel(
             "Rebuild the derived Message Index only when troubleshooting stale or missing indexed views. "
-            "FIO previews the scope first; native message evidence and received files are never deleted."
+            "CommsPlan previews the scope first; native message evidence and received files are never deleted."
         )
         rebuild_intro.setWordWrap(True)
         rebuild_layout.addWidget(rebuild_intro)
@@ -13006,7 +13144,7 @@ class MessageViewerTab(QWidget):
             QMessageBox.warning(
                 self,
                 "Message Index Rebuild",
-                f"FIO could not prepare the rebuild preview: {type(exc).__name__}.",
+                f"CommsPlan could not prepare the rebuild preview: {type(exc).__name__}.",
             )
             return
         progress = QProgressDialog(
@@ -13050,7 +13188,7 @@ class MessageViewerTab(QWidget):
             QMessageBox.warning(
                 self,
                 "Message Index Rebuild",
-                f"FIO could not prepare the rebuild preview: {type(exc).__name__}.",
+                f"CommsPlan could not prepare the rebuild preview: {type(exc).__name__}.",
             )
             return
         estimate = int(getattr(preview, "source_rows", 0) or 0)
@@ -13059,7 +13197,7 @@ class MessageViewerTab(QWidget):
         answer = QMessageBox.question(
             self,
             "Rebuild Message Index?",
-            "FIO found approximately "
+            "CommsPlan found approximately "
             f"{estimate:,} native records across {available} available source table(s). "
             f"{unavailable} source table(s) are currently unavailable.\n\n"
             "The rebuild is bounded, cancellable, and safely resumes through normal background catch-up "
@@ -13082,7 +13220,7 @@ class MessageViewerTab(QWidget):
             QMessageBox.warning(
                 self,
                 "Message Index Rebuild",
-                f"FIO could not request the rebuild: {type(exc).__name__}.",
+                f"CommsPlan could not request the rebuild: {type(exc).__name__}.",
             )
             return
         request_progress = QProgressDialog(
@@ -13128,7 +13266,7 @@ class MessageViewerTab(QWidget):
             QMessageBox.warning(
                 self,
                 "Message Index Rebuild",
-                f"FIO could not request the rebuild: {type(exc).__name__}.",
+                f"CommsPlan could not request the rebuild: {type(exc).__name__}.",
             )
             return
         if str(getattr(request, "state", "") or "") == "busy":
@@ -13277,7 +13415,7 @@ class MessageViewerTab(QWidget):
                 self,
                 "Message Index Rebuild Paused",
                 "The rebuild was paused. Its durable work remains safe and may resume during normal "
-                "background catch-up or after FIO restarts.",
+                "background catch-up or after CommsPlan restarts.",
             )
         elif state == "deferred":
             QMessageBox.information(
@@ -13589,6 +13727,7 @@ class MessageViewerTab(QWidget):
         self.compose_status_label.setStyleSheet(
             f"padding: 6px 8px; border-radius: 4px; background: {bg}; color: {color}; border: 1px solid {border};"
         )
+        self._refresh_compose_layout_geometry_if_needed(force=True)
 
     @staticmethod
     def _compose_signing_key_short_label(key) -> str:
@@ -13712,6 +13851,11 @@ class MessageViewerTab(QWidget):
         return self._compose_flamp_target_selected()
 
     def _update_compose_preview(self) -> None:
+        with perf_span("compose.preview", settings=self.settings, min_ms=16.0,
+                       meta={"mode": getattr(self, "_compose_mode", "nbems")}):
+            self._render_compose_preview()
+
+    def _render_compose_preview(self) -> None:
         if int(getattr(self, "_compose_update_depth", 0) or 0) > 0:
             self._compose_preview_update_pending = True
             return
@@ -13748,6 +13892,7 @@ class MessageViewerTab(QWidget):
         early_commstat_mode = current_compose_mode == "commstat_rf"
         early_mesh_mode = current_compose_mode == "mesh"
         early_nbems_mode = not (early_js8_mode or early_spotter_mode or early_commstat_mode or early_mesh_mode)
+        self.compose_refresh_target_action.setVisible(early_js8_mode or early_spotter_mode or early_commstat_mode)
         bbs_selected = bool(
             early_nbems_mode
             and hasattr(self, "compose_publish_bbs_chk")
@@ -13771,7 +13916,7 @@ class MessageViewerTab(QWidget):
         )
         self.compose_summary_label.setText(f"Radio: {radio_short_label}  |  File: {filename}  |  Folder: {folder_label}")
         self.compose_summary_label.setToolTip(
-            f"{radio_label}\nFreqInOut stages compose files only. The operator sends them manually from FLMsg, FLAmp, or VarAC."
+            f"{radio_label}\nCommsPlan stages compose files only. The operator sends them manually from FLMsg, FLAmp, or VarAC."
         )
         plans = self._compose_cached_destinations()
         destination_lines: List[str] = []
@@ -13786,7 +13931,12 @@ class MessageViewerTab(QWidget):
                     destination_lines.append(f"{plan.label}: {radio_short_label} - {plan.note}")
         if not destination_lines:
             destination_lines.append("No stage destinations selected yet.")
-        self.compose_destinations_label.setText("\n".join(destination_lines))
+        self.compose_destinations_label.setToolTip("\n".join(destination_lines))
+        self.compose_destinations_label.setText(
+            "\n".join(destination_lines) if radio_target is None else
+            f"Create: {self.compose_send_target_combo.currentText()} · VarAC: {self.compose_varac_target_combo.currentText()} · Folder: {folder_label}"
+        )
+        self.compose_destinations_label.setVisible(early_nbems_mode)
 
         field_values = self._compose_field_values()
         if self._compose_template_kind == "blank":
@@ -13831,9 +13981,9 @@ class MessageViewerTab(QWidget):
             source_label = radio_short_label
             source_count = len([target for target in self._compose_radio_targets if "JS8Call" in tuple(target.capabilities)])
             source_part = f"Send From: {source_label}  |  " if source_count > 1 else ""
-            self.compose_summary_label.setText(f"{source_part}FIOSpotter draft  |  Form: {form_label}")
+            self.compose_summary_label.setText(f"{source_part}CommsPlan Spotter draft  |  Form: {form_label}")
             self.compose_summary_label.setToolTip(
-                "FIOSpotter compose drafts an MCForm command for JS8Call. FIO sends only after JS8Call target-state preflight passes."
+                "CommsPlan Spotter compose drafts an MCForm command for JS8Call. CommsPlan sends only after JS8Call target-state preflight passes."
             )
         mesh_request = self._compose_mesh_request() if mesh_mode else None
         mesh_config = self._selected_compose_mesh_config() if mesh_mode else None
@@ -13886,12 +14036,10 @@ class MessageViewerTab(QWidget):
             self.compose_js8_plain_row_widget.setVisible(js8_mode)
         if hasattr(self, "compose_js8_plain_scroll"):
             self.compose_js8_plain_scroll.setVisible(js8_mode)
-            self.compose_js8_plain_scroll.setMinimumHeight(0)
         if hasattr(self, "compose_commstat_row_widget"):
             self.compose_commstat_row_widget.setVisible(commstat_mode)
         if hasattr(self, "compose_commstat_scroll"):
             self.compose_commstat_scroll.setVisible(commstat_mode)
-            self.compose_commstat_scroll.setMinimumHeight(0)
         if hasattr(self, "compose_mesh_message_widget"):
             self.compose_mesh_message_widget.setVisible(mesh_mode)
         if hasattr(self, "compose_mesh_scroll"):
@@ -13925,23 +14073,28 @@ class MessageViewerTab(QWidget):
         for combo in (getattr(self, "compose_commstat_status_widgets", {}) or {}).values():
             if isinstance(combo, QComboBox):
                 combo.setVisible(commstat_mode)
+        output_options = bool(self.compose_output_options_btn.isChecked())
+        self.compose_output_options_btn.setVisible(nbems_mode)
+        self.compose_output_options_btn.setText("Fewer output options" if output_options else "Output options…")
+        self.compose_sign_flamp_chk.setVisible(nbems_mode and (output_options or sign_flamp_selected))
+        self.compose_publish_bbs_chk.setVisible(nbems_mode and (output_options or bbs_selected))
         if hasattr(self, "compose_priority_label"):
             self.compose_priority_label.setText("Priority")
-            self.compose_priority_label.setVisible(nbems_mode)
+            self.compose_priority_label.setVisible(nbems_mode and output_options)
         if hasattr(self, "compose_priority_combo"):
-            self.compose_priority_combo.setVisible(nbems_mode)
+            self.compose_priority_combo.setVisible(nbems_mode and output_options)
         if hasattr(self, "compose_report_title_label"):
             self.compose_report_title_label.setVisible(nbems_mode)
         if hasattr(self, "compose_report_title_edit"):
             self.compose_report_title_edit.setVisible(nbems_mode)
         if hasattr(self, "compose_zulu_label"):
-            self.compose_zulu_label.setVisible(nbems_mode)
+            self.compose_zulu_label.setVisible(nbems_mode and output_options)
         if hasattr(self, "compose_zulu_value"):
-            self.compose_zulu_value.setVisible(nbems_mode)
+            self.compose_zulu_value.setVisible(nbems_mode and output_options)
         if hasattr(self, "compose_refresh_time_btn"):
-            self.compose_refresh_time_btn.setVisible(nbems_mode and bool(getattr(self, "_compose_in_workbench", False)))
+            self.compose_refresh_time_btn.setVisible(nbems_mode and output_options)
         if hasattr(self, "compose_operator_row_widget"):
-            self.compose_operator_row_widget.setVisible(nbems_mode and bool(getattr(self, "_compose_in_workbench", False)))
+            self.compose_operator_row_widget.setVisible(nbems_mode and output_options)
         if hasattr(self, "compose_output_box"):
             self.compose_output_box.setTitle(
                 "Mesh Send" if mesh_mode else
@@ -13949,8 +14102,9 @@ class MessageViewerTab(QWidget):
                 "JS8 Send" if (js8_mode or spotter_mode) else
                 "Staging Output"
             )
-            self.compose_output_box.setMaximumHeight(16777215)
-            self._refresh_compose_content_floor(self.compose_output_box)
+
+        if mesh_mode:
+            self.compose_guidance_row_widget.hide()
         if hasattr(self, "compose_field_box"):
             self.compose_field_box.setVisible(True)
             if js8_mode:
@@ -13960,14 +14114,10 @@ class MessageViewerTab(QWidget):
             elif mesh_mode:
                 self.compose_field_box.setTitle("Mesh Message")
             else:
-                self.compose_field_box.setTitle("FIOSpotter Form Fields" if spotter_mode else "Form Fields")
-            self.compose_field_box.setMinimumHeight(0)
-            # Historical fixed floor (self.compose_field_box.setMinimumHeight(180))
-            # was replaced by _refresh_compose_content_floor above.
-            self._refresh_compose_content_floor(self.compose_field_box)
+                self.compose_field_box.setTitle("CommsPlan Spotter Form Fields" if spotter_mode else "Form Fields")
+
         if hasattr(self, "compose_field_scroll"):
             self.compose_field_scroll.setVisible(not (js8_mode or commstat_mode or mesh_mode))
-            self.compose_field_scroll.setMinimumHeight(0)
         if hasattr(self, "compose_rf_fields_stack"):
             self.compose_rf_fields_stack.setVisible(js8_mode or commstat_mode or mesh_mode)
             if js8_mode and hasattr(self, "compose_js8_plain_scroll"):
@@ -13976,13 +14126,10 @@ class MessageViewerTab(QWidget):
                 self.compose_rf_fields_stack.setCurrentWidget(self.compose_commstat_scroll)
             elif mesh_mode and hasattr(self, "compose_mesh_scroll"):
                 self.compose_rf_fields_stack.setCurrentWidget(self.compose_mesh_scroll)
-        if hasattr(self, "compose_preview_box"):
-            self.compose_preview_box.setMinimumHeight(0)
-            self._refresh_compose_content_floor(self.compose_preview_box)
         if hasattr(self, "compose_nbems_dest_row_widget"):
             self.compose_nbems_dest_row_widget.setVisible(nbems_mode)
         if hasattr(self, "compose_nbems_folder_row_widget"):
-            self.compose_nbems_folder_row_widget.setVisible(nbems_mode)
+            self.compose_nbems_folder_row_widget.setVisible(nbems_mode and (output_options or sign_flamp_selected or bbs_selected))
         if hasattr(self, "compose_js8_auth_row_widget"):
             auth_available = bool(spotter_mode and self._compose_js8_auth_key_count > 0)
             self.compose_js8_auth_row_widget.setVisible(auth_available)
@@ -13993,7 +14140,8 @@ class MessageViewerTab(QWidget):
                 finally:
                     self.compose_js8_sign_chk.blockSignals(previous_blocked)
         if hasattr(self, "compose_expect_row_widget"):
-            self.compose_expect_row_widget.setVisible(spotter_mode)
+            self.compose_expect_row_widget.setVisible(False)
+            self.compose_save_expect_btn.setVisible(spotter_mode)
         if hasattr(self, "compose_save_expect_btn"):
             expect_active = bool(int(getattr(self, "_compose_spotter_expect_active_id", 0) or 0))
             self.compose_save_expect_btn.setText(
@@ -14006,6 +14154,8 @@ class MessageViewerTab(QWidget):
             )
         if hasattr(self, "compose_spotter_source_row_widget"):
             self.compose_spotter_source_row_widget.setVisible(spotter_mode)
+            self.compose_spotter_source_combo.setToolTip(self.compose_spotter_source_hint.text())
+            self.compose_spotter_source_hint.setVisible(spotter_mode and bool(self._compose_spotter_decode_notice))
         if hasattr(self, "compose_spotter_source_refresh_btn"):
             self.compose_spotter_source_refresh_btn.setVisible(spotter_mode)
             self.compose_spotter_source_refresh_btn.setStyleSheet(button_style("muted", resolve_theme(self.settings)))
@@ -14233,7 +14383,7 @@ class MessageViewerTab(QWidget):
                 self.compose_send_js8_btn.setToolTip("Send short CommStat RF traffic through the selected JS8Call radio.")
             else:
                 self.compose_send_js8_btn.setToolTip(
-                    "Send the selected saved response or FIOSpotter form now through JS8Call after safety preflight."
+                    "Send the selected saved response or CommsPlan Spotter form now through JS8Call after safety preflight."
                 )
             self.compose_send_js8_btn.setStyleSheet(button_style("primary" if can_send_js8 else "muted", theme))
         if hasattr(self, "compose_send_mesh_btn"):
@@ -14244,7 +14394,8 @@ class MessageViewerTab(QWidget):
             max_bytes = 160 if str(getattr(mesh_config, "protocol", "")).lower() == "meshcore" else 220
             payload_bytes = len(str(getattr(mesh_request, "text", "") or "").encode("utf-8")) if mesh_request else 0
             can_send_mesh = bool(
-                mesh_mode
+                not getattr(self, "_compose_mesh_loading", False)
+                and mesh_mode
                 and mesh_request is not None
                 and bool(mesh_health.get("connected"))
                 and payload_bytes <= max_bytes
@@ -14254,12 +14405,14 @@ class MessageViewerTab(QWidget):
             self.compose_send_mesh_btn.setEnabled(can_send_mesh)
             self.compose_send_mesh_btn.setStyleSheet(button_style("primary" if can_send_mesh else "muted", theme))
             if hasattr(self, "compose_mesh_hint_label") and mesh_mode:
-                if mesh_config is None:
+                if bool(getattr(self, "_compose_mesh_loading", False)):
+                    hint = "Loading mesh connections…"
+                elif mesh_config is None:
                     hint = "Enable sending for a qualified Local Mesh connection in Settings."
                 elif not bool(mesh_health.get("connected")):
                     hint = "This connection is offline. Connect it before sending."
                 elif payload_bytes > max_bytes:
-                    hint = f"Payload is {payload_bytes} bytes; {getattr(mesh_config, 'protocol', 'mesh').title()} is limited to {max_bytes} bytes in FIO."
+                    hint = f"Payload is {payload_bytes} bytes; {getattr(mesh_config, 'protocol', 'mesh').title()} is limited to {max_bytes} bytes in CommsPlan."
                 else:
                     hint = f"Connected · {payload_bytes}/{max_bytes} UTF-8 bytes · automatic relays remain off."
                 self.compose_mesh_hint_label.setText(hint)
@@ -14308,6 +14461,32 @@ class MessageViewerTab(QWidget):
             self.compose_copy_paths_btn,
         ):
             btn.setVisible(not (js8_mode or spotter_mode or commstat_mode or mesh_mode))
+        validation_hint = ""
+        if mesh_mode and not self.compose_send_mesh_btn.isEnabled():
+            validation_hint = self.compose_mesh_hint_label.text()
+        elif (js8_mode or spotter_mode or commstat_mode) and not can_send_js8:
+            if radio_target is None or "JS8Call" not in tuple(radio_target.capabilities):
+                validation_hint = "Choose a JS8Call send radio."
+            elif spotter_mode and not spotter_selected:
+                validation_hint = "Choose a CommsPlan Spotter form or saved response."
+            elif spotter_issue or commstat_issue:
+                validation_hint = spotter_issue or commstat_issue
+            else:
+                validation_hint = "Enter a destination and complete the message before sending."
+        elif nbems_mode and not can_stage:
+            if not ready_plans:
+                validation_hint = "Configure a message destination for this radio."
+            elif not signing_ready:
+                validation_hint = "Choose a signing key in Output options."
+            elif bbs_selected and not self._selected_compose_bbs_targets():
+                validation_hint = "Choose a managed BBS location in Output options."
+            else:
+                validation_hint = "Choose a form before staging."
+        previous_hint = str(getattr(self, "_compose_validation_hint", "") or "")
+        if self.compose_status_label.text() in {"Compose is ready.", previous_hint}:
+            self.compose_status_label.setText(validation_hint or "Compose is ready.")
+        self._compose_validation_hint = validation_hint
+        self._refresh_compose_footer_geometry()
 
     def _send_compose_js8_spotter(self) -> None:
         if self._compose_send_inflight:
@@ -14323,7 +14502,7 @@ class MessageViewerTab(QWidget):
             and str(getattr(self, "_compose_spotter_working_response", "") or "").strip()
         )
         if not (js8_mode or commstat_mode) and self._compose_template_kind != "spotter" and not has_saved_spotter:
-            self._set_compose_status("Select a FIOSpotter form before sending via JS8Call.", role="warning")
+            self._set_compose_status("Select a CommsPlan Spotter form before sending via JS8Call.", role="warning")
             return
         try:
             command = (
@@ -14345,10 +14524,10 @@ class MessageViewerTab(QWidget):
             return
         typed_target = self._compose_intent_target()
         if typed_target and not typed_target.startswith("@") and self._compose_base_callsign(typed_target) == self._compose_base_callsign(self._compose_operator_callsign()):
-            self._set_compose_status("Choose another station before sending. FIO will not send a message to your own callsign.", role="warning")
+            self._set_compose_status("Choose another station before sending. CommsPlan will not send a message to your own callsign.", role="warning")
             return
         if not (js8_mode or commstat_mode) and self._compose_js8_msg_auth_selected() and not self._selected_compose_js8_msg_auth_key():
-            self._set_compose_status("Select a matching MsgAuth key before sending a signed FIOSpotter message.", role="warning")
+            self._set_compose_status("Select a matching MsgAuth key before sending a signed CommsPlan Spotter message.", role="warning")
             return
         radio_target = self._selected_compose_radio_target()
         if radio_target is None:
@@ -14378,7 +14557,7 @@ class MessageViewerTab(QWidget):
                 return
             self._update_compose_preview()
         endpoint = js8_endpoint_from_radio_profile(radio_target.profile, fallback_settings=self.settings)
-        label = "JS8Call" if js8_mode else "CommStat RF" if commstat_mode else "FIOSpotter"
+        label = "JS8Call" if js8_mode else "CommStat RF" if commstat_mode else "CommsPlan Spotter"
         radio_short_label = self._compose_radio_target_short_label(radio_target) or radio_target.label
         self._compose_action_generation += 1
         self._compose_send_context = {
@@ -14493,7 +14672,7 @@ class MessageViewerTab(QWidget):
     def _save_compose_js8_expect(self) -> None:
         active_id = int(getattr(self, "_compose_spotter_expect_active_id", 0) or 0)
         if self._compose_template_kind != "spotter" and active_id <= 0:
-            self._set_compose_status("Select a FIOSpotter form before saving to Expect.", role="warning")
+            self._set_compose_status("Select a CommsPlan Spotter form before saving to Expect.", role="warning")
             return
         try:
             message_text = self._compose_spotter_message_text(sign_for_target=False)
@@ -14559,7 +14738,7 @@ class MessageViewerTab(QWidget):
             result = save_expect_entry(payload)
         except ExpectEntryExistsError as exc:
             self._set_compose_status(
-                f"Expect rule {exc.expect_key} already exists. Opening FIO Spotter to review it; "
+                f"Expect rule {exc.expect_key} already exists. Opening CommsPlan Spotter to review it; "
                 "Compose did not replace its access or auto-reply policy.",
                 role="warning",
             )
@@ -14585,7 +14764,7 @@ class MessageViewerTab(QWidget):
             callback(entry_id=entry_id, expect_key=expect_key)
             return
         self._set_compose_status(
-            f"Saved {expect_key}. Open FIO Spotter > Expect to review access before enabling it.",
+            f"Saved {expect_key}. Open CommsPlan Spotter > Expect to review access before enabling it.",
             role="success",
         )
 
@@ -14726,6 +14905,10 @@ class MessageViewerTab(QWidget):
         if not hasattr(self, "_exclude_types_menu") or self._exclude_types_menu is None:
             return
         self._available_type_filters = [str(v).strip() for v in (type_vals or []) if str(v).strip()]
+        menu_key = (tuple(self._available_type_filters), tuple(sorted(self._excluded_msg_types)))
+        if menu_key == getattr(self, "_excluded_types_menu_key", None):
+            self._update_excluded_types_button_state()
+            return
         ordered: List[str] = []
         seen: set[str] = set()
         for label in self._available_type_filters + sorted(self._excluded_msg_types):
@@ -14735,6 +14918,7 @@ class MessageViewerTab(QWidget):
             ordered.append(label)
         menu = self._exclude_types_menu
         menu.clear()
+        self._excluded_types_menu_key = menu_key
         if self._excluded_msg_types:
             clear_action = menu.addAction("Show All Hidden Types")
             clear_action.triggered.connect(self._clear_excluded_types)
@@ -15116,18 +15300,18 @@ class MessageViewerTab(QWidget):
             return
         if int(self._visible_check_interval_sec or 0) <= 0:
             label.setText("Auto-check off")
-            label.setToolTip("Automatic checks are off. Use Refresh Now when you want FIO to check immediately.")
+            label.setToolTip("Automatic checks are off. Use Refresh Now when you want CommsPlan to check immediately.")
             return
         if self._visible_message_check_inflight or self._message_check_status_text == "Checking...":
             label.setText("Checking...")
-            label.setToolTip("FIO is checking for new messages now.")
+            label.setToolTip("CommsPlan is checking for new messages now.")
             return
         now = time.time()
         remaining = int(max(0.0, float(self._next_visible_message_check_ts or 0.0) - now))
         display_remaining = int(math.ceil(max(0, remaining) / 5.0) * 5) if remaining else 0
         if not self._has_active_view:
             label.setText("Checks pause when closed")
-            label.setToolTip("FIO checks faster only while the Messages tab is open.")
+            label.setToolTip("CommsPlan checks faster only while the Messages tab is open.")
             return
         if self._message_check_status_text and self._last_visible_message_check_ts and remaining > 3:
             label.setText(f"{self._message_check_status_text} | Next: {display_remaining}s")
@@ -15135,9 +15319,9 @@ class MessageViewerTab(QWidget):
             label.setText(f"Next check: {display_remaining}s")
         if self._last_visible_message_check_ts:
             checked = datetime.datetime.fromtimestamp(self._last_visible_message_check_ts).strftime("%H:%M:%S")
-            label.setToolTip(f"Last checked {checked}. FIO checks faster only while this tab is open.")
+            label.setToolTip(f"Last checked {checked}. CommsPlan checks faster only while this tab is open.")
         else:
-            label.setToolTip("FIO checks faster only while this tab is open.")
+            label.setToolTip("CommsPlan checks faster only while this tab is open.")
 
     def _on_refresh_now(self) -> None:
         self._unfreeze_table()
@@ -15223,7 +15407,10 @@ class MessageViewerTab(QWidget):
         self._last_activation_refresh_ts = time.time()
 
     def _set_loading(self, active: bool, text: str = "Indexing messages...") -> None:
-        if not self.loading_label:
+        if bool(getattr(self, "_traffic_navigation_pending", False)):
+            active = True
+            text = f"Loading {self._traffic_loading_bucket.title()} traffic…"
+        if not getattr(self, "loading_label", None):
             return
         if self._loading_timer and self._loading_timer.isActive():
             self._loading_timer.stop()
@@ -16985,6 +17172,12 @@ class MessageViewerTab(QWidget):
 
     def shutdown(self) -> None:
         self._is_shutting_down = True
+        cache = getattr(self, "_compose_brevity_read_cache", None)
+        if cache is not None:
+            cache.close()
+        timer = getattr(self, "_compose_brevity_poll", None)
+        if timer is not None:
+            timer.stop()
         # Invalidate any endpoint result that races application shutdown.  The
         # selected-target endpoint worker is attached by the primary runtime.
         self._compose_js8_selected_target_generation += 1
@@ -17053,6 +17246,7 @@ class MessageViewerTab(QWidget):
         # thread during application shutdown.
         for background_thread in (
             getattr(self, "_compose_discovery_thread", None),
+            getattr(self, "_compose_mesh_thread", None),
             getattr(self, "_compose_signing_key_thread", None),
             getattr(self, "_compose_guidance_thread", None),
             getattr(self, "_compose_js8_selected_target_thread", None),
@@ -17120,6 +17314,8 @@ class MessageViewerTab(QWidget):
         except Exception:
             pass
         self._invalidate_bbs_action_cache()
+        if bool(getattr(self, "_projection_primary_enabled", False)):
+            self._request_projected_message_query(force=True)
         watch_sig_changed = False
         auth_sig_changed = False
         try:
@@ -17460,7 +17656,7 @@ class MessageViewerTab(QWidget):
                 "ok": True,
                 "message": "Marked retrieved."
                 if inbox_updated
-                else "Removed from FIO retrievals; the JS8Call inbox could not be updated.",
+                else "Removed from CommsPlan retrievals; the JS8Call inbox could not be updated.",
             }
 
         self._start_pending_action("Marking retrieval complete…", _mark_retrieved)
@@ -17814,6 +18010,9 @@ class MessageViewerTab(QWidget):
         return True
 
     def _projected_query_parameters(self) -> Dict[str, object]:
+        ids = getattr(self, "_ops_traffic_message_ids", None)
+        if ids is not None:
+            return {"message_ids": ids}
         source_families = self._projected_source_families_for_current_scope()
         minimum_age, maximum_age = _core_age_filter_bounds(
             self.received_filter.currentData() if hasattr(self, "received_filter") else 0
@@ -17868,6 +18067,8 @@ class MessageViewerTab(QWidget):
         if getattr(self, "_is_shutting_down", False) or not self._projection_primary_enabled:
             return
         self._projected_query_request_id += 1
+        if bool(getattr(self, "_traffic_navigation_pending", False)):
+            self._traffic_loading_request_id = self._projected_query_request_id
         if not self._has_active_view or not self._app_active:
             # Hidden/minimized views do not render. Multiple invalidations are
             # collapsed into the one activation query, bounded by the declared
@@ -17901,17 +18102,22 @@ class MessageViewerTab(QWidget):
             return
         db_path = self._db_path()
         if db_path is None or not db_path.exists():
+            self._finish_traffic_navigation("Messages database is unavailable.")
             return
         request_id = int(self._projected_query_request_id)
         scope_key = self._projected_scope_key()
         self._projected_query_pending = False
         self._projected_query_pending_force = False
+        selected_groups = self._selected_message_groups()
         self._projected_query_thread = QThread(self)
         self._projected_query_worker = _ProjectedMessageQueryWorker(
             db_path=str(db_path),
             request_id=request_id,
             scope_key=scope_key,
             query=self._projected_query_parameters(),
+            traffic_context_inputs=self._traffic_context_inputs(),
+            filter_settings=self._projection_filter_settings(),
+            selected_groups=tuple(sorted(selected_groups)) if selected_groups is not None else None,
         )
         self._projected_query_worker.moveToThread(self._projected_query_thread)
         self._projected_query_thread.started.connect(self._projected_query_worker.run)
@@ -17931,6 +18137,7 @@ class MessageViewerTab(QWidget):
         error = str(data.get("error", "") or "")
         if error:
             log.warning("MessageViewer: projection query failed: %s", error)
+            self._finish_traffic_navigation("Could not load traffic. Refresh to retry.")
             return
         if not self._has_active_view or not self._app_active or self._is_shutting_down:
             self._projected_query_pending = True
@@ -17939,74 +18146,119 @@ class MessageViewerTab(QWidget):
         generation = int(data.get("generation", 0) or 0)
         if generation and generation < int(self._active_projection_generation or 0):
             log.debug("MessageViewer: discarded projection generation %d", generation)
+            self._finish_traffic_navigation("Traffic changed while loading. Refresh to retry.")
             return
-        apply_started = time.perf_counter()
-        db_rows = data.get("rows", [])
-        refs = data.get("refs", {})
-        rows = self._projected_rows_from_mappings(
-            db_rows if isinstance(db_rows, list) else [],
-            refs if isinstance(refs, dict) else {},
-        )
-        self._install_projected_action_state(
-            rows,
-            data.get("bbs_published_counts", {}),
-        )
-        focus_counts = data.get("focus_counts", data.get("focus_unread_counts"))
-        focus_counts_generation = int(data.get("focus_counts_generation", generation) or 0)
-        if (
-            isinstance(focus_counts, Mapping)
-            and (
-                not focus_counts_generation
-                or focus_counts_generation >= int(getattr(self, "_focus_counts_generation", 0) or 0)
-            )
-        ):
-            focus_keys = [key for key, _label, _tip in self._inbox_focus_options()]
-            self._inbox_focus_unread_counts = {
-                key: max(0, int(focus_counts.get(key, 0) or 0))
-                for key in focus_keys
-            }
-            self._focus_counts_generation = focus_counts_generation
-            self._projection_focus_counts_available = True
-            if hasattr(self, "_inbox_focus_buttons"):
-                self._sync_inbox_focus_buttons()
-        self._projected_table_loading = True
         try:
-            self._message_rows = rows
-            self._last_projection_render_ts = time.time()
-            self._projected_scope_load_key = tuple(data.get("scope_key", ()) or ())
-            self._projected_total_count = int(data.get("total_count", len(rows)) or 0)
-            self._active_projection_generation = generation
-            with perf_span("messages.refresh_filters.projected", settings=self.settings, min_ms=5.0):
-                self._refresh_message_filters(rows)
-            with perf_span("messages.apply_filters.projected", settings=self.settings, min_ms=5.0):
-                self._apply_message_filters(recover_empty_stale_scope=True)
-        finally:
-            self._projected_table_loading = False
-        elapsed_ms = float(data.get("elapsed_ms", 0.0) or 0.0)
+            apply_started = time.perf_counter()
+            inputs = data.get("traffic_context_inputs")
+            filter_settings = data.get("filter_settings")
+            if (
+                inputs is not None and inputs != self._traffic_context_inputs()
+                or filter_settings is not None and filter_settings != self._projection_filter_settings()
+            ):
+                self._request_projected_message_query(force=True)
+                return
+            if isinstance(data.get("commstat_groups"), CommStatGroupState):
+                self._projected_commstat_groups = data["commstat_groups"]
+            if isinstance(data.get("group_families"), dict):
+                self._projected_group_families = data["group_families"]
+            context = data.get("traffic_context")
+            if isinstance(context, OperatorTrafficContext):
+                self._projected_traffic_context = context
+                self._projected_traffic_context_inputs = data.get("traffic_context_inputs")
+            db_rows = data.get("rows", [])
+            refs = data.get("refs", {})
+            rows = self._projected_rows_from_mappings(
+                db_rows if isinstance(db_rows, list) else [],
+                refs if isinstance(refs, dict) else {},
+            )
+            self._install_projected_action_state(
+                rows,
+                data.get("bbs_published_counts", {}),
+            )
+            focus_counts = data.get("focus_counts", data.get("focus_unread_counts"))
+            focus_counts_generation = int(data.get("focus_counts_generation", generation) or 0)
+            if (
+                isinstance(focus_counts, Mapping)
+                and (
+                    not focus_counts_generation
+                    or focus_counts_generation >= int(getattr(self, "_focus_counts_generation", 0) or 0)
+                )
+            ):
+                focus_keys = [key for key, _label, _tip in self._inbox_focus_options()]
+                self._inbox_focus_unread_counts = {
+                    key: max(0, int(focus_counts.get(key, 0) or 0))
+                    for key in focus_keys
+                }
+                self._focus_counts_generation = focus_counts_generation
+                self._projection_focus_counts_available = True
+                if hasattr(self, "_inbox_focus_buttons"):
+                    self._sync_inbox_focus_buttons()
+            self._projected_table_loading = True
+            try:
+                self._message_rows = rows
+                summary = data.get("traffic_summary")
+                if isinstance(summary, TrafficActionSummary):
+                    available_ids = {str(getattr(row.payload, "message_id", "")) for row in rows}
+                    summary = replace(summary, items=tuple(item for item in summary.items if item.stable_id in available_ids))
+                self._ops_traffic_summary = summary
+                self._last_projection_render_ts = time.time()
+                self._projected_scope_load_key = tuple(data.get("scope_key", ()) or ())
+                self._projected_total_count = int(data.get("total_count", len(rows)) or 0)
+                self._active_projection_generation = generation
+                with perf_span("messages.refresh_filters.projected", settings=self.settings, min_ms=5.0):
+                    if getattr(self, "_ops_traffic_message_ids", None) is None:
+                        self._refresh_message_filters(rows)
+                with perf_span("messages.apply_filters.projected", settings=self.settings, min_ms=5.0):
+                    self._apply_message_filters(recover_empty_stale_scope=True)
+            finally:
+                self._projected_table_loading = False
+            elapsed_ms = float(data.get("elapsed_ms", 0.0) or 0.0)
+            emit_span(
+                "messages.model_query",
+                elapsed_ms,
+                settings=self.settings,
+                meta={"rows": len(rows), "total": self._projected_total_count, "generation": generation},
+                min_ms=5.0,
+            )
+            emit_span(
+                "messages.model_apply",
+                (time.perf_counter() - apply_started) * 1000.0,
+                settings=self.settings,
+                meta={
+                    "rows": len(rows),
+                    "total": self._projected_total_count,
+                    "generation": generation,
+                },
+                level="debug",
+            )
+            self._finish_traffic_navigation()
+            log.info(
+                "MESSAGES|projected_table_loaded rows=%d total=%d generation=%d scope=%s",
+                len(rows),
+                self._projected_total_count,
+                generation,
+                self._active_message_scope_summary(),
+            )
+        except Exception:
+            log.exception("MessageViewer: could not apply projected traffic")
+            self._finish_traffic_navigation("Could not display traffic. Refresh to retry.")
+
+    def _finish_traffic_navigation(self, error: str = "") -> None:
+        if not bool(getattr(self, "_traffic_navigation_pending", False)):
+            return
+        if int(getattr(self, "_traffic_loading_request_id", -1)) != int(self._projected_query_request_id):
+            return
+        self._traffic_navigation_pending = False
+        self._set_loading(bool(error), error or "")
+        if error and self._loading_progress is not None:
+            self._loading_progress.setVisible(False)
         emit_span(
-            "messages.model_query",
-            elapsed_ms,
+            "messages.traffic_navigation_complete",
+            (time.perf_counter() - self._traffic_loading_started) * 1000.0,
             settings=self.settings,
-            meta={"rows": len(rows), "total": self._projected_total_count, "generation": generation},
-            min_ms=5.0,
-        )
-        emit_span(
-            "messages.model_apply",
-            (time.perf_counter() - apply_started) * 1000.0,
-            settings=self.settings,
-            meta={
-                "rows": len(rows),
-                "total": self._projected_total_count,
-                "generation": generation,
-            },
-            level="debug",
-        )
-        log.info(
-            "MESSAGES|projected_table_loaded rows=%d total=%d generation=%d scope=%s",
-            len(rows),
-            self._projected_total_count,
-            generation,
-            self._active_message_scope_summary(),
+            meta={"bucket": self._traffic_loading_bucket, "failed": bool(error)},
+            min_ms=0.0,
         )
 
     def _install_projected_action_state(
@@ -18727,52 +18979,64 @@ class MessageViewerTab(QWidget):
         if not current_to:
             current_to = ""
 
-        self.type_filter.blockSignals(True)
-        self.type_filter.clear()
-        self.type_filter.addItem("MSG Type...")
-        self.type_filter.addItems(type_vals)
-        if not self._filters_initialized:
-            self.type_filter.setCurrentText("MSG Type...")
-        elif current_type in ["MSG Type..."] + type_vals:
-            self.type_filter.setCurrentText(current_type)
-        self.type_filter.blockSignals(False)
+        def _sync_combo_options(combo: QComboBox, options: Sequence[str], selected: str) -> bool:
+            desired = tuple(str(value) for value in options)
+            existing = tuple(combo.itemText(index) for index in range(combo.count()))
+            if existing == desired and combo.currentText() == selected:
+                return False
+            combo.blockSignals(True)
+            try:
+                combo.clear()
+                combo.addItems(list(desired))
+                if selected in desired or not desired:
+                    combo.setCurrentText(selected)
+                elif combo.isEditable():
+                    combo.setCurrentText(selected)
+                elif desired:
+                    combo.setCurrentIndex(0)
+            finally:
+                combo.blockSignals(False)
+            return True
 
-        self.status_filter.blockSignals(True)
-        self.status_filter.clear()
-        self.status_filter.addItem("Status...")
-        self.status_filter.addItems(status_vals)
-        if not self._filters_initialized:
-            self.status_filter.setCurrentText("Status...")
-        elif current_status in ["Status..."] + status_vals:
-            self.status_filter.setCurrentText(current_status)
-        self.status_filter.blockSignals(False)
-
-        self.from_filter.blockSignals(True)
-        self.from_filter.clear()
-        self.from_filter.addItems(from_vals)
-        if current_from in from_vals:
-            self.from_filter.setCurrentText(current_from)
-        else:
-            self.from_filter.setCurrentText("")
-        self.from_filter.blockSignals(False)
-
-        self.to_filter.blockSignals(True)
-        self.to_filter.clear()
-        self.to_filter.addItems(to_vals)
-        if current_to in to_vals:
-            self.to_filter.setCurrentText(current_to)
-        else:
-            self.to_filter.setCurrentText("")
-        self.to_filter.blockSignals(False)
+        type_options = ("MSG Type...", *type_vals)
+        status_options = ("Status...", *status_vals)
+        selected_type = (
+            "MSG Type..."
+            if not self._filters_initialized
+            else current_type if current_type in type_options else type_options[0]
+        )
+        selected_status = (
+            "Status..."
+            if not self._filters_initialized
+            else current_status if current_status in status_options else status_options[0]
+        )
+        selected_from = current_from if current_from in from_vals else ""
+        selected_to = current_to if current_to in to_vals else ""
+        changed = _sync_combo_options(self.type_filter, type_options, selected_type)
+        changed = _sync_combo_options(self.status_filter, status_options, selected_status) or changed
+        changed = _sync_combo_options(self.from_filter, from_vals, selected_from) or changed
+        changed = _sync_combo_options(self.to_filter, to_vals, selected_to) or changed
         self._filters_initialized = True
-        self._fit_filter_combo_popup(self.type_filter)
-        self._fit_filter_combo_popup(self.status_filter)
-        self._fit_filter_combo_popup(self.from_filter)
-        self._fit_filter_combo_popup(self.to_filter)
-        fit_combo_box_to_contents(self.type_filter)
-        fit_combo_box_to_contents(self.status_filter)
-        fit_combo_box_to_contents(self.from_filter)
-        fit_combo_box_to_contents(self.to_filter)
+        fit_signature = (
+            tuple(type_options),
+            tuple(status_options),
+            tuple(from_vals),
+            tuple(to_vals),
+            tuple(
+                (
+                    combo.font().toString(),
+                    int(combo.width()),
+                    float(combo.devicePixelRatioF()),
+                    str(combo.style().metaObject().className()),
+                )
+                for combo in (self.type_filter, self.status_filter, self.from_filter, self.to_filter)
+            ),
+        )
+        if changed or fit_signature != getattr(self, "_message_filter_fit_signature", None):
+            for combo in (self.type_filter, self.status_filter, self.from_filter, self.to_filter):
+                self._fit_filter_combo_popup(combo)
+                fit_combo_box_to_contents(combo)
+            self._message_filter_fit_signature = fit_signature
         self._refresh_workspace_filter_options(rows)
         self._update_excluded_types_button_state()
 
@@ -18817,10 +19081,6 @@ class MessageViewerTab(QWidget):
         layout = getattr(self, "message_intel_filter_layout", None)
         if widget is None or layout is None:
             return
-        for btn in list(getattr(self, "_intel_filter_buttons", [])):
-            layout.removeWidget(btn)
-            btn.deleteLater()
-        self._intel_filter_buttons = []
         rollup = build_intel_filter_rollup(
             rows,
             active_status=getattr(self, "_intel_status_filter", ""),
@@ -18828,6 +19088,27 @@ class MessageViewerTab(QWidget):
             topic_limit=8,
         )
         chips = list(rollup.status_chips) + list(rollup.topic_chips)
+        theme_key = tuple(sorted((str(key), str(value)) for key, value in resolve_theme(self.settings).items()))
+        font_key = widget.font().toString()
+        chip_key = tuple(
+            (
+                str(chip.kind or ""),
+                str(chip.label or ""),
+                int(chip.count),
+                bool(chip.active),
+                str(chip.status_bucket or ""),
+                str(chip.value or ""),
+            )
+            for chip in chips
+        )
+        refresh_key = (chip_key, theme_key, font_key)
+        if refresh_key == getattr(self, "_intel_filter_bar_refresh_key", None):
+            return
+        for btn in list(getattr(self, "_intel_filter_buttons", [])):
+            layout.removeWidget(btn)
+            btn.deleteLater()
+        self._intel_filter_buttons = []
+        self._intel_filter_bar_refresh_key = refresh_key
         if not chips:
             widget.setVisible(False)
             return
@@ -18871,6 +19152,7 @@ class MessageViewerTab(QWidget):
         return "muted"
 
     def _toggle_intel_filter(self, kind: str, value: str) -> None:
+        left_ops_scope = self._leave_ops_traffic_scope()
         self._close_message_reader_for_scope_change()
         kind = str(kind or "").strip().lower()
         value = str(value or "").strip()
@@ -18879,9 +19161,16 @@ class MessageViewerTab(QWidget):
         elif kind == "topic":
             self._intel_topic_filter = "" if self._intel_topic_filter == value else value
         self._unfreeze_table()
+        if left_ops_scope and self._load_projected_messages_into_table():
+            return
         self._apply_message_filters_preserve_scroll()
 
     def _operator_traffic_context(self) -> OperatorTrafficContext:
+        if bool(getattr(self, "_projection_primary_enabled", False)):
+            # A coherent context arrives with the existing worker publication.
+            # Pending settings changes use the previous context until the next
+            # publication; no per-row filesystem freshness checks on the GUI.
+            return getattr(self, "_projected_traffic_context", OperatorTrafficContext())
         hf_groups, local_groups = configured_group_names(self.settings)
         callsign = str(self.settings.get("operator_callsign", "") or "").strip().upper()
         db_path = self._db_path()
@@ -18900,9 +19189,26 @@ class MessageViewerTab(QWidget):
             self._traffic_context_cache_key = cache_key
         return self._traffic_context_cache
 
+    def _traffic_context_inputs(self) -> tuple[object, ...]:
+        hf_groups, local_groups = configured_group_names(self.settings)
+        callsign = str(self.settings.get("operator_callsign", "") or "").strip().upper() if self.settings else ""
+        return callsign, hf_groups, local_groups
+
+    def _projection_filter_settings(self) -> dict[str, object]:
+        keys = ("commstat3_db_path", "commstat_db_path", "commstat23_db_path",
+                "path_commstat", "commstat_launch_path", "commstat_config_path")
+        return {key: str(self.settings.get(key, "") or "") for key in keys} if self.settings else {}
+
     def _set_traffic_action_filter(self, bucket: object) -> None:
         self._close_message_reader_for_scope_change()
         self._traffic_action_filter = str(bucket or "").strip().lower()
+        if bool(getattr(self, "_traffic_navigation_pending", False)):
+            if self._traffic_action_filter:
+                self._traffic_loading_bucket = self._traffic_action_filter
+                self._set_loading(True)
+            else:
+                self._traffic_navigation_pending = False
+                self._set_loading(False)
         if hasattr(self, "traffic_action_summary"):
             self.traffic_action_summary.set_active_bucket(self._traffic_action_filter)
         self._unfreeze_table()
@@ -18954,6 +19260,21 @@ class MessageViewerTab(QWidget):
         recover_empty_stale_scope: bool = False,
     ) -> None:
         rows = self._message_rows
+        if getattr(self, "_ops_traffic_message_ids", None) is not None:
+            summary = getattr(self, "_ops_traffic_summary", None)
+            bucket = str(self._traffic_action_filter or "")
+            items = (summary.items_for(bucket) if bucket else summary.items) if summary is not None else ()
+            allowed = {item.stable_id for item in items}
+            filtered = [row for row in rows if str(getattr(row.payload, "message_id", "")) in allowed]
+            self._set_message_table_display_profile(self._message_display_profile_for_current_view("MSG Type..."))
+            self._render_messages_table(self._sort_rows(filtered))
+            if summary is not None:
+                self.traffic_action_summary.set_active_bucket(bucket)
+                self.traffic_action_summary.set_summary(summary)
+            self._update_visible_message_scope_label()
+            self._update_clear_filters_style()
+            self._update_mark_all_read_style()
+            return
         now_ts = datetime.datetime.now(datetime.timezone.utc).timestamp()
         criteria = self._current_inbox_filter_criteria(now_ts=now_ts)
         type_sel = criteria.type_sel
@@ -19392,11 +19713,48 @@ class MessageViewerTab(QWidget):
                 commstat_configured_groups=self._message_group_candidate_set(commstat_state.configured_groups),
                 show_all_groups=self._show_all_message_groups_enabled(),
             )
-            self.operating_group_filter.set_grouped_options(
-                self._message_group_option_sections_from_sources(group_sources),
-                selected_values=selected_groups,
-                select_all_when_empty=select_all_when_empty,
+            sections = self._message_group_option_sections_from_sources(group_sources)
+            group_filter = self.operating_group_filter
+            seen_group_values: set[str] = set()
+            normalized_group_sections: list[tuple[str, tuple[tuple[str, str], ...]]] = []
+            for section, options in sections:
+                normalized_options: list[tuple[str, str]] = []
+                for value, label in options:
+                    clean_value = str(value or "").strip()
+                    clean_label = str(label or clean_value).strip() or clean_value
+                    if not clean_value or clean_value in seen_group_values:
+                        continue
+                    seen_group_values.add(clean_value)
+                    normalized_options.append((clean_value, clean_label))
+                if normalized_options:
+                    normalized_group_sections.append((str(section or "").strip(), tuple(normalized_options)))
+            section_key = tuple(normalized_group_sections)
+            group_option_values = {value for _section, options in section_key for value, _label in options}
+            desired_group_selection = (
+                set(group_option_values)
+                if selected_groups is None
+                else {str(value) for value in selected_groups} & group_option_values
             )
+            if selected_groups is not None and select_all_when_empty and not desired_group_selection:
+                desired_group_selection = set(group_option_values)
+            expected_group_sections = tuple(
+                (section, tuple(value for value, _label in options))
+                for section, options in section_key
+            )
+            if (
+                expected_group_sections != tuple(
+                    (str(section or ""), tuple(str(value) for value in values))
+                    for section, values in getattr(group_filter, "_sections", [])
+                )
+                or tuple((str(value), str(label)) for value, label in getattr(group_filter, "_options", []))
+                != tuple(item for _section, options in section_key for item in options)
+                or desired_group_selection != group_filter.selected_values()
+            ):
+                group_filter.set_grouped_options(
+                    sections,
+                    selected_values=selected_groups,
+                    select_all_when_empty=select_all_when_empty,
+                )
         if hasattr(self, "source_filter"):
             selected_sources = None
             if not self.source_filter.all_selected():
@@ -19407,11 +19765,33 @@ class MessageViewerTab(QWidget):
                     for value in self.source_filter.selected_values()
                     if normalize_message_source_family(value)
                 })
-            self.source_filter.set_options(
-                self._message_source_options(rows),
-                selected_values=selected_sources,
-                select_all_when_empty=selected_sources is None,
+            options = self._message_source_options(rows)
+            source_filter = self.source_filter
+            seen_source_values: set[str] = set()
+            normalized_source_options: list[tuple[str, str]] = []
+            for value, label in options:
+                clean_value = str(value or "").strip()
+                clean_label = str(label or clean_value).strip() or clean_value
+                if not clean_value or clean_value in seen_source_values:
+                    continue
+                seen_source_values.add(clean_value)
+                normalized_source_options.append((clean_value, clean_label))
+            normalized_options = tuple(normalized_source_options)
+            current_options = tuple((str(value), str(label)) for value, label in getattr(source_filter, "_options", []))
+            desired_selection = (
+                {value for value, _label in normalized_options}
+                if selected_sources is None
+                else set(selected_sources) & {value for value, _label in normalized_options}
             )
+            if (
+                normalized_options != current_options
+                or desired_selection != source_filter.selected_values()
+            ):
+                source_filter.set_options(
+                    options,
+                    selected_values=selected_sources,
+                    select_all_when_empty=selected_sources is None,
+                )
         self._refresh_basic_filter_button_texts()
 
     def _message_source_options(self, rows: List[UnifiedMessage]) -> list[tuple[str, str]]:
@@ -19492,6 +19872,9 @@ class MessageViewerTab(QWidget):
         )
 
     def _commstat_group_state(self):
+        if bool(getattr(self, "_projection_primary_enabled", False)):
+            return getattr(self, "_projected_commstat_groups",
+                           CommStatGroupState(frozenset(), frozenset(), frozenset(), True))
         try:
             return load_commstat_group_state(self.settings)
         except Exception:
@@ -19525,6 +19908,8 @@ class MessageViewerTab(QWidget):
         return _core_is_message_group_candidate(value, configured_groups=configured_groups)
 
     def _operator_group_family_map(self) -> dict[str, OperatorGroupFamily]:
+        if bool(getattr(self, "_projection_primary_enabled", False)):
+            return getattr(self, "_projected_group_families", {})
         db_path = self._db_path()
         if not db_path or not db_path.exists():
             return {}
@@ -19823,6 +20208,7 @@ class MessageViewerTab(QWidget):
         self._sync_inbox_focus_buttons()
 
     def _clear_filters(self) -> None:
+        left_ops_scope = self._leave_ops_traffic_scope()
         self._close_message_reader_for_scope_change()
         self._unfreeze_table()
         if (
@@ -19840,6 +20226,8 @@ class MessageViewerTab(QWidget):
             == _core_age_filter_bounds(DEFAULT_RECEIVED_FILTER_SECONDS)
             and not self.rcv_search.text().strip()
         ):
+            if left_ops_scope:
+                self._load_projected_messages_into_table()
             return
         self.type_filter.blockSignals(True)
         self.status_filter.blockSignals(True)
@@ -19882,6 +20270,8 @@ class MessageViewerTab(QWidget):
             self.show_all_message_groups_chk.blockSignals(False)
             self._update_show_all_message_groups_style()
         self._refresh_basic_filter_button_texts()
+        if left_ops_scope and self._load_projected_messages_into_table():
+            return
         self._apply_message_filters()
 
     def _toggle_message_groups_mode_from_menu(self) -> None:
@@ -19963,10 +20353,17 @@ class MessageViewerTab(QWidget):
                 pass
 
     def _on_filter_changed(self) -> None:
+        left_ops_scope = False
+        if not getattr(self, "_projected_table_loading", False):
+            left_ops_scope = self._leave_ops_traffic_scope()
         self._close_message_reader_for_scope_change()
         self._unfreeze_table()
         self._update_excluded_types_button_state()
         self._refresh_basic_filter_button_texts()
+        # Even before the Ops publication lands, exiting must supersede its
+        # pending request rather than reuse an identical previous Inbox key.
+        if left_ops_scope and self._load_projected_messages_into_table():
+            return
         if not getattr(self, "_projected_table_loading", False) and self._reload_projected_messages_for_scope_change():
             return
         self._apply_message_filters_light()
@@ -20134,6 +20531,8 @@ class MessageViewerTab(QWidget):
         return str(self.received_filter.currentText() or "").strip()
 
     def _active_message_scope_summary(self) -> str:
+        if getattr(self, "_ops_traffic_message_ids", None) is not None:
+            return f"Ops Center traffic; Action {str(self._traffic_action_filter or 'All').title()}; Inbox filters suspended"
         focus = str(getattr(self, "_inbox_focus", "all") or "all").strip().lower()
         focus_labels = {key: label for key, label, _tip in self._inbox_focus_options()}
         summary = active_inbox_scope_summary(
@@ -20177,7 +20576,7 @@ class MessageViewerTab(QWidget):
         if label is None:
             return
         context = getattr(self, "_map_context_filter", {}) or {}
-        active = bool(isinstance(context, dict) and context)
+        active = bool(isinstance(context, dict) and context) and getattr(self, "_ops_traffic_message_ids", None) is None
         if not active:
             label.setText("")
             label.setVisible(False)
@@ -21773,7 +22172,7 @@ class MessageViewerTab(QWidget):
         prompt = (
             f"Move this {source} message file to Trash / Recycle Bin?\n\n"
             f"{rec.path}\n\n"
-            "The operating system trash may allow recovery. FIO will remove the message from its current views.\n"
+            "The operating system trash may allow recovery. CommsPlan will remove the message from its current views.\n"
             f"{publication_note}"
         )
         delete_row = self._delete_audit_row_for_payload(rec)
@@ -21794,7 +22193,7 @@ class MessageViewerTab(QWidget):
                 QMessageBox.warning(
                     self,
                     "Delete Message File",
-                    outcome.warning or "FIO could not move the file to Trash / Recycle Bin.",
+                    outcome.warning or "CommsPlan could not move the file to Trash / Recycle Bin.",
                 )
             self._sync_reader_delete_action(row)
             return
@@ -21889,7 +22288,7 @@ class MessageViewerTab(QWidget):
                 self.info_label.setText("Message could not be displayed")
             if hasattr(self, "viewer"):
                 self.viewer.setAcceptRichText(False)
-                self.viewer.setPlainText(f"FIO could not display this message.\n\nError: {exc}")
+                self.viewer.setPlainText(f"CommsPlan could not display this message.\n\nError: {exc}")
             self._scroll_reader_to_top()
         finally:
             # The document is installed before its identity controls change.
@@ -22025,7 +22424,7 @@ class MessageViewerTab(QWidget):
                     self.info_label.setText(f"{row.payload.path.name} - could not load")
                     self.viewer.setAcceptRichText(False)
                     self.viewer.setPlainText(
-                        "FIO could not display this message file.\n\n"
+                        "CommsPlan could not display this message file.\n\n"
                         f"File: {row.payload.path}\n"
                         f"Error: {exc}"
                     )
@@ -22086,7 +22485,7 @@ class MessageViewerTab(QWidget):
                 self.info_label.setText("Message format is not available")
                 self.viewer.setAcceptRichText(False)
                 self.viewer.setPlainText(
-                    "FIO cannot display this message format in the current build.\n\n"
+                    "CommsPlan cannot display this message format in the current build.\n\n"
                     f"Source: {row.origin or 'unknown'}\n"
                     f"Type: {row.msg_type or 'unknown'}"
                 )
@@ -22861,7 +23260,7 @@ class MessageViewerTab(QWidget):
         bbs_context = self._bbs_file_management_context_for_record(rec)
         if bbs_context:
             title = "Delete BBS File"
-            label = str(bbs_context.get("label", "") or "FIO-managed BBS area").strip()
+            label = str(bbs_context.get("label", "") or "CommsPlan-managed BBS area").strip()
             prompt = (
                 f"Delete this file from {label}?\n\n"
                 f"{rec.path}\n\n"
@@ -23872,7 +24271,7 @@ class MessageViewerTab(QWidget):
             return
         rec = self._flamp_relay_source_file_for_row(row)
         if rec is None:
-            QMessageBox.warning(self, "Copy to FLAMP Relay", "FIO could not find the source FLAMP file.")
+            QMessageBox.warning(self, "Copy to FLAMP Relay", "CommsPlan could not find the source FLAMP file.")
             return
         if not self._is_valid_flamp_relay_file(rec):
             QMessageBox.warning(
@@ -23897,7 +24296,7 @@ class MessageViewerTab(QWidget):
                 QMessageBox.warning(
                     self,
                     "Copy to FLAMP Relay",
-                    "FIO could not create a queue-safe FLAMP Relay filename.",
+                    "CommsPlan could not create a queue-safe FLAMP Relay filename.",
                 )
             return
         try:
@@ -23933,7 +24332,7 @@ class MessageViewerTab(QWidget):
         self._populate_messages_table(force=True)
 
     def _remove_row_from_flamp_relay(self, row: UnifiedMessage | None) -> None:
-        """Remove only FIO's Relay copy; never remove the received source."""
+        """Remove only CommsPlan's Relay copy; never remove the received source."""
 
         rec = self._file_record_for_message_row(row, allow_detail_lookup=False)
         if not isinstance(rec, FileRecord):
@@ -24053,7 +24452,7 @@ class MessageViewerTab(QWidget):
             QMessageBox.warning(
                 self,
                 "Delete Message",
-                single_delete_failure_warning(msg, outcome, fallback="FIO could not delete this CommStat item."),
+                single_delete_failure_warning(msg, outcome, fallback="CommsPlan could not delete this CommStat item."),
             )
             return
         self._finalize_single_delete_success(audit_row, outcome)
@@ -24740,7 +25139,7 @@ class MessageViewerTab(QWidget):
             path_text = str(configured)
         looked_for = ", ".join(terms[:5]) if terms else (msg.subject or "No filename found in the title/body")
         lines = [
-            "FIO sees a VarAC file reference, but the received file was not found in the configured VarAC Incoming Files folder.",
+            "CommsPlan sees a VarAC file reference, but the received file was not found in the configured VarAC Incoming Files folder.",
             "",
             f"VarAC Incoming Files: {path_text}",
             f"Looked for: {looked_for}",
@@ -24749,16 +25148,16 @@ class MessageViewerTab(QWidget):
             lines.append("Status: The configured folder does not exist or is not available.")
         elif reason == "not_configured":
             lines.append(
-                "Status: Set VarAC Incoming Files in Configuration so FIO knows where VarAC stores received files."
+                "Status: Set VarAC Incoming Files in Configuration so CommsPlan knows where VarAC stores received files."
             )
         elif scan_requested:
-            lines.append("Status: FIO is checking the configured message folders now. Refresh or select this row again after the scan completes.")
+            lines.append("Status: CommsPlan is checking the configured message folders now. Refresh or select this row again after the scan completes.")
         else:
-            lines.append("Status: The file was not present in FIO's current scan of that folder.")
+            lines.append("Status: The file was not present in CommsPlan's current scan of that folder.")
         lines.extend(
             [
                 "",
-                "Note: FLAMP Relay is a separate watched folder. Copying a file there can make it display because FIO is reading that different folder.",
+                "Note: FLAMP Relay is a separate watched folder. Copying a file there can make it display because CommsPlan is reading that different folder.",
                 "",
                 "VarAC message text:",
                 msg.body or msg.subject or "",
@@ -25001,6 +25400,12 @@ class MessageViewerTab(QWidget):
 
     @staticmethod
     def _commstat_intelligence(msg: CommStatArtifact) -> MessageIntelligence:
+        try:
+            payload = json.loads(msg.payload_json or "{}")
+        except (TypeError, ValueError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
         return analyze_commstat_fields(
             artifact_kind=msg.artifact_kind,
             title=msg.title,
@@ -25015,6 +25420,7 @@ class MessageViewerTab(QWidget):
             alert_color=msg.alert_color,
             subtype=msg.subtype,
             remarks=msg.remarks_text,
+            brevity_models=payload.get("brevity_models", ()),
             transport=msg.transport_label,
             reach=msg.reach_label,
             source_family=msg.source_family_label,
@@ -25132,6 +25538,12 @@ class MessageViewerTab(QWidget):
                 ),
             )
             self._append_text_body(lines, "Message", msg.body_text or "--")
+            try:
+                payload = json.loads(msg.payload_json or "{}")
+            except (TypeError, ValueError):
+                payload = {}
+            if isinstance(payload, dict) and payload.get("brevity_summary"):
+                self._append_text_body(lines, "Brevity", str(payload["brevity_summary"]))
             self._append_detail_section(
                 lines,
                 "Source / Notes",

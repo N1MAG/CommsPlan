@@ -67,6 +67,11 @@ class TrafficActionSummaryWidget(QFrame):
         root.addWidget(self.insight_label)
         self.apply_theme()
 
+    def navigation_snapshot(self, bucket: str) -> tuple[tuple[str, ...], int]:
+        """Copy identities from the same immutable publication as button counts."""
+        ids = tuple(dict.fromkeys(item.stable_id for item in self._summary.items if item.stable_id))
+        return ids[:200], self._summary.count(bucket)
+
     def set_summary(self, summary: TrafficActionSummary) -> None:
         self._summary = summary
         labels = {key: label for key, label, _tip in self._BUCKETS}

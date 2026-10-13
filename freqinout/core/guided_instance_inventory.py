@@ -22,13 +22,14 @@ _IDENTITY_FIELDS = {
     "js8call": (
         "system_key", "host", "port", "udp_port", "rig_name",
         "application_path", "configuration_path", "storage_path",
-        "launch_command",
+        "launch_command", "settings_identity_mode",
     ),
     "fast_light": (
         "system_key", "host", "port", "secondary_port", "arq_port",
         "application_path", "secondary_application_path",
         "configuration_path", "secondary_configuration_path",
         "storage_path", "secondary_storage_path", "launch_command",
+        "settings_identity_mode",
     ),
     "varac": (
         "system_key", "application_path", "configuration_path",
@@ -105,12 +106,13 @@ def _complete_identity(family: str, row: Mapping[str, Any], normalized: Mapping[
     if not (_text(row.get("system_key")) or _text(row.get("instance_key")) or _text(row.get("draft_instance_key"))):
         reasons.append("missing stable instance identity")
     if family == "js8call":
-        required = (
+        required = [
             ("application_path", "missing application path"),
             ("configuration_path", "missing profile/configuration root"),
             ("storage_path", "missing application-data root"),
-            ("rig_name", "missing rig/profile selector"),
-        )
+        ]
+        if _settings_identity_mode(family, normalized) != "default":
+            required.append(("rig_name", "missing rig/profile selector"))
         for key, reason in required:
             if not _text(normalized.get(key)):
                 reasons.append(reason)
@@ -167,6 +169,9 @@ def _resource_claims(family: str, normalized: Mapping[str, Any]) -> tuple[tuple[
         if _text(value):
             claims.add(("path", _normalise_resource_value("path", value)))
 
+    if _settings_identity_mode(family, normalized) == "default":
+        claims.add(("native_settings", f"{family}:default"))
+
     if family == "js8call":
         add_endpoint("tcp", normalized.get("port"))
         add_endpoint("udp", normalized.get("udp_port"))
@@ -186,6 +191,18 @@ def _resource_claims(family: str, normalized: Mapping[str, Any]) -> tuple[tuple[
         add_path(normalized.get("secondary_storage_path"))
         add_path(normalized.get("outbox_path"))
     return tuple(sorted(claims))
+
+
+def _settings_identity_mode(family: str, normalized: Mapping[str, Any]) -> str:
+    explicit = _text(normalized.get("settings_identity_mode")).casefold()
+    if explicit in {"default", "isolated"}:
+        return explicit
+    system_key = _text(normalized.get("system_key")).casefold()
+    if family == "js8call" and system_key == "default_js8_instance":
+        return "default"
+    if family == "fast_light" and system_key == "default_fast_light":
+        return "default"
+    return "isolated"
 
 
 def stable_draft_instance_key(owner_draft_key: object, family_key: object) -> str:
@@ -232,6 +249,11 @@ def _normalized_identity(family_key: object, row: Mapping[str, Any]) -> dict[str
         "udp_port": ("udp_port", "js8_udp_port"),
         "rig_name": ("rig_name", "js8_rig_name"),
         "launch_command": ("launch_command", "launch_cmd"),
+        "settings_identity_mode": (
+            "settings_identity_mode",
+            "native_settings_identity",
+            "profile_identity_mode",
+        ),
     }
     result: dict[str, Any] = {"family_key": family}
     for name in _IDENTITY_FIELDS[family]:

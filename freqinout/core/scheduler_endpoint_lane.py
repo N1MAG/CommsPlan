@@ -316,7 +316,7 @@ class EndpointLane:
                 operation_result = EndpointResult.create(
                     endpoint_key=self.endpoint_key,
                     generation=work.generation,
-                    status="applied_unverified" if succeeded else "failed",
+                    status="applied_unverified" if succeeded else ("rejected" if raw_result.get("safety_hold") else "failed"),
                     actual_state=actual_state if isinstance(actual_state, Mapping) else None,
                     reason_code="" if succeeded else str(raw_result.get("reason_code") or "operation_failed"),
                     detail=str(raw_result.get("detail") or ""),
@@ -371,6 +371,12 @@ class EndpointLane:
                         self._last_success_occurrence_id = work.occurrence_id
                         self._last_result_status = operation_result.status
                         result = operation_result
+                elif operation_result.status == "rejected":
+                    # A current safety/ownership hold is not an adapter fault.
+                    # The next coordinator tick re-evaluates the current intent.
+                    self._last_result_status = operation_result.status
+                    self._half_open = False
+                    result = operation_result
                 else:
                     self._record_failure_locked(self._monotonic_fn())
                     self._half_open = False

@@ -1,10 +1,12 @@
-"""Assemble a native FreqInOut macOS disk image from the PyInstaller app."""
+"""Assemble a native CommsPlan macOS disk image from the PyInstaller app."""
 
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import platform
+import plistlib
 import shutil
 import subprocess
 import tempfile
@@ -36,23 +38,45 @@ def build_dmg(
     architecture: str | None = None,
 ) -> Path:
     source = Path(source_root).resolve()
-    app = source / "dist" / "FreqInOut.app"
-    executable = app / "Contents" / "MacOS" / "FreqInOut"
+    app = source / "dist" / "CommsPlan.app"
+    executable = app / "Contents" / "MacOS" / "CommsPlan"
     if not executable.is_file():
         raise FileNotFoundError(f"PyInstaller macOS app is missing: {executable}")
+    if not os.access(executable, os.X_OK):
+        raise ValueError("macOS app main binary is not executable")
 
     version = validated_version(source)
+    try:
+        with (app / "Contents" / "Info.plist").open("rb") as handle:
+            metadata = plistlib.load(handle)
+    except (OSError, ValueError, plistlib.InvalidFileException) as exc:
+        raise ValueError("macOS app has no readable bundle identity") from exc
+    expected = {
+        "CFBundleIdentifier": "org.n1mag.freqinout",
+        "CFBundleExecutable": "CommsPlan",
+        "CFBundleName": "CommsPlan",
+        "CFBundleDisplayName": "CommsPlan",
+        "CFBundleShortVersionString": version,
+        "CFBundleVersion": version,
+    }
+    if not isinstance(metadata, dict) or any(metadata.get(key) != value for key, value in expected.items()):
+        raise ValueError("macOS app identity/version does not match the CommsPlan release")
+    instructions = source / "docs" / "CommsPlan-macos-upgrade.txt"
+    if not instructions.is_file() or not instructions.read_text(encoding="utf-8").strip():
+        raise ValueError("macOS replacement instructions are missing or empty")
     arch = architecture or macos_architecture()
     output = Path(output_dir).resolve()
     output.mkdir(parents=True, exist_ok=True)
-    destination = output / f"FreqInOut-{version}-macos-{arch}.dmg"
+    destination = output / f"CommsPlan-{version}-macos-{arch}.dmg"
     if destination.exists():
         destination.unlink()
 
     with tempfile.TemporaryDirectory(prefix="freqinout-dmg-") as temporary:
-        staging = Path(temporary) / "FreqInOut"
+        staging = Path(temporary) / "CommsPlan"
         staging.mkdir()
         shutil.copytree(app, staging / app.name, symlinks=True)
+        shutil.copy2(instructions, staging / "READ ME - Upgrading from FreqInOut.txt")
+        shutil.copy2(source / "docs/CommsPlan-migration.md", staging / "CommsPlan-migration.md")
         (staging / "Applications").symlink_to("/Applications", target_is_directory=True)
         subprocess.run(
             [
@@ -63,7 +87,7 @@ def build_dmg(
                 "-format",
                 "UDZO",
                 "-volname",
-                "FreqInOut",
+                "CommsPlan",
                 "-srcfolder",
                 str(staging),
                 str(destination),

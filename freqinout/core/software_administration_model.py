@@ -86,7 +86,7 @@ _FAMILY_DEFINITIONS: tuple[tuple[str, str, str], ...] = (
     ("varac", "VarAC", "Radio-specific VarAC runtime, paths, guard, and cluster setup."),
     ("commstat", "CommStat", "External CommStat application and JS8 transport mapping."),
     ("external_spotter", "External Spotter", "Optional external Spotter application and forms."),
-    ("fio_spotter", "FIO Spotter", "Built-in rules, Expect queries, watches, forms, and activity."),
+    ("fio_spotter", "CommsPlan Spotter", "Built-in rules, Expect queries, watches, forms, and activity."),
     ("receiver", "Receiver Software", "Receive-only application and control adapter."),
 )
 
@@ -467,7 +467,7 @@ def build_software_administration_snapshot(
                 description=description,
                 assignments=tuple(family_assignments[key]),
                 unassigned_instances=tuple(unassigned),
-                operational_route="FIO Spotter" if key == "fio_spotter" else "",
+                operational_route="CommsPlan Spotter" if key == "fio_spotter" else "",
             )
         )
 

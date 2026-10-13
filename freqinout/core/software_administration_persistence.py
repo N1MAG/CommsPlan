@@ -26,6 +26,7 @@ FAMILY_STATE_KEYS: dict[str, tuple[str, ...]] = {
         "varac_bbs_auto_archive_enabled", "varac_bbs_auto_archive_days",
         "varac_guard_allow_bbs_allowed_callsigns",
         "varac_guard_allow_operator_trusted", "varac_bbs_vault_enabled",
+        "varac_guard_access_policy_v1",
         "varac_bbs_vault_managed_root", "varac_bbs_vault_default_location_id",
         "varac_bbs_vault_global_code_policy", "varac_bbs_vault_trigger_mode",
         "varac_bbs_vault_return_mode", "varac_bbs_vault_failed_attempt_limit",

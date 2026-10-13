@@ -626,12 +626,12 @@ def _backup_v1_database(
     )
     if primary is None or primary.status != "backed_up" or not Path(primary.backup_path).is_file():
         detail = primary.error if primary is not None else "backup result omitted the database"
-        raise RuntimeError(f"FIO Managed BBS migration backup failed: {detail}")
+        raise RuntimeError(f"CommsPlan Managed BBS migration backup failed: {detail}")
     try:
         with sqlite3.connect(primary.backup_path) as backup_conn:
             conn.backup(backup_conn)
     except Exception as exc:
-        raise RuntimeError(f"FIO Managed BBS migration backup verification failed: {exc}") from exc
+        raise RuntimeError(f"CommsPlan Managed BBS migration backup verification failed: {exc}") from exc
     return result
 
 
@@ -798,7 +798,7 @@ def ensure_bbs_library_schema(conn: sqlite3.Connection) -> None:
         existing_version = 1
     if existing_version > BBS_LIBRARY_SCHEMA_VERSION:
         raise RuntimeError(
-            f"FIO Managed BBS schema {existing_version} is newer than supported {BBS_LIBRARY_SCHEMA_VERSION}."
+            f"CommsPlan Managed BBS schema {existing_version} is newer than supported {BBS_LIBRARY_SCHEMA_VERSION}."
         )
     if existing_version == BBS_LIBRARY_SCHEMA_VERSION:
         return

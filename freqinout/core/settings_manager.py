@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from freqinout.core.logger import log
+from freqinout.core.operating_group_frequency import ensure_operating_group_frequency_keys
 from freqinout.core.config_paths import get_config_dir
 from freqinout.core.sqlite_utils import connect_sqlite, connect_sqlite_runtime_write
 from freqinout.core.system_timezone import detect_system_timezone_name
@@ -220,6 +221,9 @@ class SettingsManager:
                 loaded[key] = json.loads(val)
             except Exception:
                 loaded[key] = val
+        groups = loaded.get("operating_groups")
+        if isinstance(groups, list) and all(isinstance(row, dict) for row in groups):
+            loaded["operating_groups"] = ensure_operating_group_frequency_keys(groups)
         self._data = loaded
 
     # ---------- public persistence API ---------- #
@@ -289,6 +293,8 @@ class SettingsManager:
         Set a key and immediately persist to SQLite.
         """
         self._assert_thread_affinity()
+        if key == "operating_groups" and isinstance(value, list) and all(isinstance(row, dict) for row in value):
+            value = ensure_operating_group_frequency_keys(value)
         self._data[key] = value
         try:
             with self._conn:
@@ -317,6 +323,10 @@ class SettingsManager:
         Batch update multiple keys. Saves once by default to avoid repeated writes.
         """
         self._assert_thread_affinity()
+        values = dict(values)
+        groups = values.get("operating_groups")
+        if isinstance(groups, list) and all(isinstance(row, dict) for row in groups):
+            values["operating_groups"] = ensure_operating_group_frequency_keys(groups)
         self._data.update(values)
         try:
             payload = [(k, json.dumps(v)) for k, v in values.items()]

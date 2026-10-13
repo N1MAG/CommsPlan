@@ -533,18 +533,12 @@ class VarACStatusClient:
             return list(self._cached_log_paths)
         bases: List[Path] = []
         if raw_install:
-            bases.append(Path(raw_install))
+            install = Path(raw_install)
+            bases.append(install.parent if install.suffix.lower() == ".exe" else install)
         elif raw_db:
             p = Path(raw_db)
             bases.append(p.parent if p.is_file() or p.suffix.lower() == ".db" else p)
-        # Fallback: detect VarAC install folder from running process.
-        if not bases:
-            try:
-                exe = self._software_status.find_process_exe("VarAC")
-                if exe:
-                    bases.append(Path(exe).parent)
-            except Exception:
-                pass
+        # Radio-scoped readers never discover another instance’s sources.
         # De-duplicate while preserving order.
         uniq_bases: List[Path] = []
         seen: set[str] = set()
@@ -580,7 +574,7 @@ class VarACStatusClient:
             p = Path(raw_install)
             if p.is_file() and p.name.lower() == "varac.db":
                 return p
-            candidate = p / "VarAC.db"
+            candidate = (p.parent if p.suffix.lower() == ".exe" else p) / "VarAC.db"
             if candidate.exists():
                 return candidate
         return None
@@ -638,6 +632,8 @@ class VarACStatusClient:
                 "reason": None,
                 "transfer_active": False,
                 "cooldown_active": False,
+                "source_available": False,
+                "source_checked_monotonic": 0.0,
             }
             self._last_db_transfer_path = ""
             self._last_db_transfer_poll_monotonic = time.monotonic()
@@ -669,6 +665,7 @@ class VarACStatusClient:
                 )
             except Exception:
                 pass
+            self._last_db_transfer_status["source_available"] = False
             return dict(self._last_db_transfer_status)
 
         last_transfer: Optional[datetime.datetime] = None
@@ -706,6 +703,7 @@ class VarACStatusClient:
                 )
             except Exception:
                 pass
+            self._last_db_transfer_status["source_available"] = False
             return dict(self._last_db_transfer_status)
         finally:
             try:
@@ -757,6 +755,8 @@ class VarACStatusClient:
             "reason": reason,
             "transfer_active": bool(transfer_active),
             "cooldown_active": bool(cooldown_active),
+            "source_available": True,
+            "source_checked_monotonic": time.monotonic(),
         }
         try:
             health.record_success(
@@ -771,26 +771,60 @@ class VarACStatusClient:
         return dict(self._last_db_transfer_status)
 
     @staticmethod
-    def _read_tail(path: Path, max_bytes: int = 16384) -> str:
+    def _read_tail_checked(path: Path, max_bytes: int = 16384) -> tuple[str, bool]:
         try:
             with path.open("rb") as fh:
                 try:
                     fh.seek(-max_bytes, 2)
                 except OSError:
                     fh.seek(0)
-                return fh.read().decode("utf-8", errors="replace")
+                return fh.read(max_bytes).decode("utf-8", errors="replace"), True
         except Exception:
-            return ""
+            return "", False
+
+    @staticmethod
+    def _read_tail(path: Path, max_bytes: int = 16384) -> str:
+        return VarACStatusClient._read_tail_checked(path, max_bytes)[0]
+
+    def _reader_process_state(self) -> Dict[str, object]:
+        """Worker-only, configured instance attribution from existing inventory."""
+        install = str(self.settings.get("varac_path", "") or "").strip()
+        db = str(self.settings.get("varac_db_path", "") or "").strip()
+        if not install and not db:
+            return {"running": None, "checked_monotonic": 0.0}
+        base = Path(install or db).expanduser()
+        target = base if base.suffix.lower() == ".exe" else (
+            base.parent / "VarAC.exe" if base.suffix.lower() == ".db" else base / "VarAC.exe")
+        # A relative name cannot prove a radio's process identity.
+        if not target.is_absolute():
+            return {"running": None, "checked_monotonic": 0.0}
+        arguments = ()
+        default_ini = ""
+        ini = str(self.settings.get("varac_ini_path", "") or "").strip()
+        from freqinout.core.varac_launch_recipe import _wine_identity
+        default_path = str(target.parent / "VarAC.ini")
+        wine_default = _wine_identity(default_path)
+        default_ini = wine_default[1] if wine_default else default_path
+        if ini and Path(ini).resolve() != (target.parent / "VarAC.ini").resolve():
+            wine_identity = _wine_identity(ini)
+            arguments = (wine_identity[1] if wine_identity else ini,)
+            default_ini = ""
+        return self._software_status.cached_instance_process_state("VarAC", str(target), arguments, default_ini=default_ini)
 
     def get_status(self, *, include_db_transfer: bool = True) -> Dict[str, object]:
         log_paths = self._resolve_log_paths()
         status = {"busy": False, "waiting_for_frequency": False, "reason": None}
+        readable = False
+        read_stamp = 0.0
         try:
             if log_paths:
                 # Read tails from available VarAC logs. Main and traffic logs carry
                 # different event types depending on VarAC version/settings.
-                chunks = [self._read_tail(p) for p in log_paths]
-                text = "\n".join([c for c in chunks if c])
+                reads = [self._read_tail_checked(p) for p in log_paths]
+                readable = any(ok for _, ok in reads)
+                if readable:
+                    read_stamp = time.monotonic()
+                text = "\n".join(text for text, ok in reads if ok and text)
                 status = self._evaluate_status(text)
         except Exception as e:
             log.debug("VarACStatusClient: failed to read log: %s", e)
@@ -802,6 +836,16 @@ class VarACStatusClient:
         status["db_transfer_busy"] = bool(db_status.get("busy"))
         status["db_transfer_active"] = bool(db_status.get("transfer_active"))
         status["db_transfer_cooldown"] = bool(db_status.get("cooldown_active"))
+        if db_status.get("source_available"):
+            readable = True
+            read_stamp = max(read_stamp, float(db_status.get("source_checked_monotonic") or 0.0))
+        process = self._reader_process_state()
+        # Availability is tied to explicitly configured sources only.
+        configured = bool(self.settings.get("varac_path", "") or self.settings.get("varac_db_path", ""))
+        status.update(process_running=process["running"],
+                      process_checked_monotonic=process["checked_monotonic"],
+                      reader_available=bool(configured and readable),
+                      reader_checked_monotonic=read_stamp if configured else 0.0)
         self._last_status = status
         return status
 

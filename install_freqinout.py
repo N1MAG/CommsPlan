@@ -1,5 +1,5 @@
 
-"""Prepare and verify a FreqInOut source installation before first launch."""
+"""Prepare and verify a CommsPlan source installation before first launch."""
 
 from __future__ import annotations
 
@@ -45,8 +45,8 @@ def _venv_python(venv: Path) -> Path:
     return venv / "bin" / "python"
 
 
-def _run(command: list[str], *, env: dict[str, str] | None = None) -> None:
-    subprocess.check_call(command, env=env)
+def _run(command: list[str], *, env: dict[str, str] | None = None, cwd: Path | None = None) -> None:
+    subprocess.check_call(command, env=env, cwd=cwd)
 
 
 def _python_is_usable(python: Path) -> bool:
@@ -115,7 +115,16 @@ def _ensure_pip(python: Path) -> None:
 def _default_profile_root() -> Path:
     configured = str(os.environ.get("FREQINOUT_CONFIG_DIR", "") or "").strip()
     if configured:
-        return Path(configured).expanduser()
+        return Path(configured).expanduser().resolve()
+    receipt = Path(__file__).resolve().parent / ".freqinout-install-verified.json"
+    if receipt.exists():
+        try:
+            root = json.loads(receipt.read_text()).get("profile_root")
+            if not isinstance(root, str) or not Path(root).is_absolute():
+                raise ValueError("profile_root must be an absolute path")
+            return Path(root)
+        except (OSError, ValueError, TypeError) as exc:
+            raise InstallationError("Cannot read the remembered profile; set FREQINOUT_CONFIG_DIR explicitly.") from exc
     if os.name == "nt":
         base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
         if base:
@@ -155,8 +164,8 @@ def _active_fio_lock(profile_root: Path) -> bool:
         pid = int(first_line.strip())
     except (OSError, ValueError, IndexError):
         raise InstallationError(
-            f"The FIO lock file could not be validated: {lock_path}\n"
-            "Close FIO. If it is already closed, restart the computer before retrying."
+            f"The application lock file could not be validated: {lock_path}\n"
+            "Close FIO/CommsPlan. If it is already closed, restart the computer before retrying."
         )
     return _pid_is_running(pid)
 
@@ -169,13 +178,13 @@ def _sqlite_quick_check(path: Path) -> None:
     except sqlite3.Error as exc:
         raise InstallationError(
             f"Database validation failed for {path}: {exc}\n"
-            "The installer made no changes. Keep this database and contact FreqInOut support before upgrading."
+            "The installer made no changes. Keep this database and contact CommsPlan support before upgrading."
         ) from exc
     if rows != ["ok"]:
         detail = "; ".join(rows[:5]) or "unknown integrity error"
         raise InstallationError(
             f"Database validation failed for {path}: {detail}\n"
-            "The installer made no changes. Keep this database and contact FreqInOut support before upgrading."
+            "The installer made no changes. Keep this database and contact CommsPlan support before upgrading."
         )
 
 
@@ -239,13 +248,15 @@ def _finalize_verified_profile_backup(temporary_dir: Path, final_dir: Path) -> P
 
 
 def _create_verified_profile_backup(profile_root: Path) -> Path | None:
+    if (profile_root / ".commsplan-copy-incomplete").exists():
+        raise InstallationError("Profile copy is incomplete; use the original profile. Installation selection was not changed.")
     station_db = _existing_station_database(profile_root)
     if station_db is None:
-        print(f"New installation detected. No existing FIO station profile was found at {profile_root}.")
+        print(f"New installation detected. No existing FIO/CommsPlan station profile was found at {profile_root}.")
         return None
     if _active_fio_lock(profile_root):
         raise InstallationError(
-            "FreqInOut is still running. Close FIO and its companion radio applications, then rerun this installer."
+            "FIO/CommsPlan is still running. Close FIO/CommsPlan and its companion radio applications, then rerun this installer."
         )
 
     config_dir = profile_root / "config"
@@ -308,14 +319,14 @@ def _project_version(root: Path) -> str:
     source = (root / "freqinout" / "version.py").read_text(encoding="utf-8")
     match = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', source, re.MULTILINE)
     if not match:
-        raise InstallationError("FIO version metadata is missing or invalid.")
+        raise InstallationError("CommsPlan version metadata is missing or invalid.")
     return match.group(1)
 
 
 def _validate_project(root: Path) -> str:
     missing = [relative for relative in REQUIRED_PROJECT_FILES if not (root / relative).is_file()]
     if missing:
-        raise InstallationError("The FIO release is incomplete. Missing: " + ", ".join(missing))
+        raise InstallationError("The CommsPlan release is incomplete. Missing: " + ", ".join(missing))
     free_bytes = shutil.disk_usage(root).free
     if free_bytes < MIN_FREE_BYTES:
         raise InstallationError(
@@ -339,12 +350,12 @@ def _verify_runtime(python: Path, root: Path) -> None:
             "assert load_radio_catalog().get('entries'); "
             "print(__version__)"
         )
-        _run([str(python), "-c", script], env=env)
-    for launcher in ("start-freqinout.sh", "start-freqinout.cmd"):
+        _run([str(python), "-c", script], env=env, cwd=root)
+    for launcher in ("start-freqinout.sh", "start-freqinout.cmd", "start-commsplan.sh", "start-commsplan.cmd"):
         if not (root / launcher).is_file():
             raise InstallationError(f"Required launcher is missing: {launcher}")
     if os.name != "nt":
-        for launcher in ("start-freqinout.sh", "start-multi-rig.sh"):
+        for launcher in ("start-freqinout.sh", "start-multi-rig.sh", "start-commsplan.sh"):
             (root / launcher).chmod((root / launcher).stat().st_mode | 0o111)
 
 
@@ -366,24 +377,24 @@ def _write_install_receipt(root: Path, python: Path, version: str, backup: Path 
 def install() -> None:
     if not (MIN_PYTHON <= sys.version_info[:2] <= MAX_PYTHON):
         raise InstallationError(
-            "FreqInOut requires Python 3.10 through 3.13; found "
+            "CommsPlan requires Python 3.10 through 3.13; found "
             f"{sys.version_info.major}.{sys.version_info.minor}."
         )
     root = Path(__file__).resolve().parent
     version = _validate_project(root)
-    print(f"Preparing FreqInOut {version} from: {root}")
+    print(f"Preparing CommsPlan {version} from: {root}")
     backup = _create_verified_profile_backup(_default_profile_root())
     python, quarantined = _ensure_virtual_environment(root)
     _ensure_pip(python)
     requirements = root / "requirements.txt"
-    print("Installing FreqInOut requirements...")
+    print("Installing CommsPlan requirements...")
     _run([str(python), "-m", "pip", "install", "-r", str(requirements)])
     _verify_runtime(python, root)
     _write_install_receipt(root, python, version, backup)
     if sys.platform.startswith("win"):
-        run_hint = r".\start-freqinout.cmd"
+        run_hint = r".\start-commsplan.cmd"
     else:
-        run_hint = "./start-freqinout.sh"
+        run_hint = "./start-commsplan.sh"
     if quarantined is not None:
         print(f"The unusable prior environment was retained at: {quarantined}")
     print(f"Installation verified. Run: {run_hint}")
@@ -394,7 +405,7 @@ def main() -> None:
         install()
     except (InstallationError, OSError, subprocess.SubprocessError) as exc:
         print("", file=sys.stderr)
-        print("Installation failed. Do not launch FreqInOut.", file=sys.stderr)
+        print("Installation failed. Do not launch CommsPlan.", file=sys.stderr)
         print(str(exc), file=sys.stderr)
         raise SystemExit(1) from exc
 

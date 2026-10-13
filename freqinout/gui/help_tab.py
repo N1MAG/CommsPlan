@@ -64,7 +64,7 @@ class HelpTab(QWidget):
         viewer_col = QVBoxLayout()
         viewer_col.setAlignment(Qt.AlignTop)
         header_row = QHBoxLayout()
-        self.guide_title = QLabel("FreqInOut Guide")
+        self.guide_title = QLabel("CommsPlan Guide")
         header_row.addWidget(self.guide_title)
         header_row.addStretch()
         self.export_pdf_btn = QPushButton("Export to PDF")
@@ -81,7 +81,7 @@ class HelpTab(QWidget):
         self.viewer = QTextBrowser()
         self.viewer.setOpenExternalLinks(True)
         self.viewer.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.viewer.setHtml("<p>Loading the FreqInOut guide…</p>")
+        self.viewer.setHtml("<p>Loading the CommsPlan guide…</p>")
         viewer_col.addWidget(self.viewer)
 
         layout.addLayout(viewer_col, stretch=1)
@@ -169,7 +169,7 @@ class HelpTab(QWidget):
         if int(generation) != self._document_generation:
             return
         if error is not None or not isinstance(payload, str):
-            self.viewer.setPlainText(f"The FreqInOut guide could not be loaded: {error or 'invalid document'}")
+            self.viewer.setPlainText(f"The CommsPlan guide could not be loaded: {error or 'invalid document'}")
             return
         try:
             # QTextBrowser.setHtml() accepts only the HTML string in PySide6.
@@ -184,7 +184,7 @@ class HelpTab(QWidget):
         except Exception as exc:
             self._document_html = ""
             self.toc_list.clear()
-            self.viewer.setPlainText(f"The FreqInOut guide could not be displayed: {exc}")
+            self.viewer.setPlainText(f"The CommsPlan guide could not be displayed: {exc}")
             return
         self._document_html = payload
         self._update_responsive_layout()
@@ -239,7 +239,7 @@ class HelpTab(QWidget):
         dialog.setWindowTitle("Recent Issues")
         dialog.resize(820, 420)
         layout = QVBoxLayout(dialog)
-        intro = QLabel("Recent warnings and errors from this FIO session.")
+        intro = QLabel("Recent warnings and errors from this CommsPlan session.")
         intro.setWordWrap(True)
         layout.addWidget(intro)
         box = QPlainTextEdit()
@@ -264,7 +264,7 @@ class HelpTab(QWidget):
         if not self._doc_path.exists():
             QMessageBox.warning(self, "Missing guide", "guide.html was not found.")
             return
-        default_path = str(self._doc_path.parent / "FreqInOut User Guide.pdf")
+        default_path = str(self._doc_path.parent / "CommsPlan User Guide.pdf")
         fn, _ = QFileDialog.getSaveFileName(
             self,
             "Export Guide to PDF",

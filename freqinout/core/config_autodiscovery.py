@@ -509,7 +509,7 @@ def build_radio_instance_proposals(
                 enabled_apps=clean_enabled_apps,
                 ports=ports,
                 varac_enabled=include_varac,
-                notes=(f"FIO-managed instance {instance_name}.",),
+                notes=(f"CommsPlan-managed instance {instance_name}.",),
             )
         )
     return tuple(radios)
@@ -1163,7 +1163,7 @@ def build_autoconfig_proposal(
     warnings = []
     if missing_apps:
         labels = ", ".join(APP_DISPLAY_NAMES.get(app_id, app_id) for app_id in missing_apps)
-        warnings.append(f"FIO could not find {labels}; the user can choose paths, search again, or skip those apps.")
+        warnings.append(f"CommsPlan could not find {labels}; the user can choose paths, search again, or skip those apps.")
     if not include_varac:
         warnings.append("VarAC is optional and remains disabled unless the operator enables it.")
 

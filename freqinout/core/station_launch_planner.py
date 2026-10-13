@@ -537,11 +537,27 @@ class StationLaunchPlanner:
         rig_source = ""
         legacy_default = False
         launch_arguments: Tuple[str, ...] = ()
+        readiness = item.get("readiness_policy", {})
+        readiness = readiness if isinstance(readiness, Mapping) else {}
+        component_evidence = readiness.get("evidence", {})
+        component_evidence = component_evidence if isinstance(component_evidence, Mapping) else {}
+        settings_identity_mode = str(
+            component_evidence.get("settings_identity_mode")
+            or readiness.get("settings_identity_mode")
+            or ""
+        ).strip().casefold()
+        explicit_default = settings_identity_mode == "default"
         if command:
             rig_name = StationLaunchPlanner._rig_name_from_command(command)
             if rig_name:
                 rig_source = "command_override"
-        if not rig_name:
+        if explicit_default and rig_name:
+            raise ValueError(
+                "JS8Call is set to use existing default settings, but its launch override contains --rig-name."
+            )
+        if explicit_default:
+            rig_source = "settings_default"
+        elif not rig_name:
             stored_rig = str(profile.get("js8_rig_name", profile.get("rig_name", "")) or "").strip()
             system_key = str(profile.get("js8_instance_system_key", "") or "").strip()
             instance_name = str(profile.get("js8_instance_name", "") or "").strip()

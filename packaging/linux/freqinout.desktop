@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
-Name=FreqInOut
+Name=CommsPlan
 Comment=HF radio operations console
-Exec=freqinout
-Icon=freqinout
+Exec=commsplan
+Icon=commsplan
 Terminal=false
 Categories=Network;HamRadio;
-StartupWMClass=FreqInOut
+StartupWMClass=CommsPlan

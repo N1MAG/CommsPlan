@@ -102,7 +102,7 @@ def mesh_transport_capability(
             normalized_protocol,
             kind,
             False,
-            "Meshtastic HTTP and MQTT connections are planned but are not implemented in this FIO release.",
+            "Meshtastic HTTP and MQTT connections are planned but are not implemented in this CommsPlan release.",
         )
     if normalized_protocol == "meshcore":
         if kind is MeshConnectionType.BLE:
@@ -121,13 +121,13 @@ def mesh_transport_capability(
             normalized_protocol,
             kind,
             False,
-            "MeshCore HTTP is not a Companion transport and MeshCore MQTT is not implemented in this FIO release.",
+            "MeshCore HTTP is not a Companion transport and MeshCore MQTT is not implemented in this CommsPlan release.",
         )
     return MeshTransportCapability(
         normalized_protocol or "mesh",
         kind,
         False,
-        f"{normalized_protocol.title() or 'Mesh'} connections are not implemented in this FIO release.",
+        f"{normalized_protocol.title() or 'Mesh'} connections are not implemented in this CommsPlan release.",
     )
 
 

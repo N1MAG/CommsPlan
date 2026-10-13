@@ -170,7 +170,7 @@ def build_receiver_launch_items(
         launch_command = _clean(selection.get("launch_command_override") or selection.get("launch_command"))
         startup = _truthy(selection.get("startup", selection.get("launch_at_startup", True)))
         if startup and not (launch_path or launch_command):
-            raise ValueError(f"{name} needs an application path or launch command before FIO can launch it.")
+            raise ValueError(f"{name} needs an application path or launch command before CommsPlan can launch it.")
         _validate_receiver_launch_target(name, launch_path, launch_command)
 
         readiness = dict(meta.get("default_readiness", {}))

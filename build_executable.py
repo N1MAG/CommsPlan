@@ -37,7 +37,7 @@ def main() -> int:
         print("[build_executable] Tip: install PyInstaller in your active environment.")
         return rc
 
-    dist_exe = ROOT / "dist" / "FreqInOut" / "FreqInOut.exe"
+    dist_exe = ROOT / "dist" / "CommsPlan" / "CommsPlan.exe"
     if dist_exe.exists():
         print(f"[build_executable] SUCCESS: Built {dist_exe}")
     else:

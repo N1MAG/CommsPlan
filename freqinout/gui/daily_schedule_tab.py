@@ -10,7 +10,7 @@ import uuid
 from pathlib import Path
 from typing import Any, List, Dict, Optional, Set, Tuple
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, Signal, QEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QWidget,
@@ -35,10 +35,19 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QDialog,
     QDialogButtonBox,
+    QSizePolicy,
 )
 from PySide6.QtGui import QAction, QColor
 
 from freqinout.core.settings_manager import SettingsManager
+from freqinout.core.daily_schedule_resolution import rows_have_ambiguous_overlap
+from freqinout.core.operating_group_frequency import (
+    ensure_operating_group_frequency_keys,
+    format_frequency_mhz,
+    normalize_frequency_hz,
+    reattach_schedule_frequency_keys,
+    resolve_operating_group_frequency,
+)
 from freqinout.core.plan_context_service import PlanContextService
 from freqinout.core.schedule_source_sets import (
     LIVE_SOURCE_SET_ID,
@@ -78,6 +87,9 @@ from freqinout.gui.theme import (
     button_style,
     font_css,
     item_view_height_for_rows,
+    font_derived_widget_height,
+    control_height_for_font,
+    fit_combo_box_to_contents,
 )
 from freqinout.gui.qsy_helper import (
     load_operating_groups as qsy_load_operating_groups,
@@ -294,6 +306,14 @@ class DailyScheduleTab(QWidget):
         self._last_activation_schedule_token: Tuple[Any, ...] | None = None
         self._responsive_layout_mode = "wide"
         self._responsive_compact_width = 1200
+        self._daily_geometry_pending = False
+        self._daily_geometry_timer = QTimer(self)
+        self._daily_geometry_timer.setSingleShot(True)
+        self._daily_geometry_timer.timeout.connect(self._refresh_daily_geometry)
+        self._daily_toolbar_pool: List[QHBoxLayout] = [QHBoxLayout() for _ in range(4)]
+        self._daily_filter_pool: List[QHBoxLayout] = [QHBoxLayout() for _ in range(2)]
+        self._daily_toolbar_rows: List[QHBoxLayout] = []
+        self._daily_filter_rows: List[QHBoxLayout] = []
 
         self._build_ui()
         self._refresh_qsy_options()
@@ -452,6 +472,7 @@ class DailyScheduleTab(QWidget):
 
         content = QWidget()
         content.setObjectName("dailyScheduleScrollContent")
+        content.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.daily_schedule_scroll_area.setWidget(content)
         layout = QVBoxLayout(content)
         layout.setSpacing(10)
@@ -553,6 +574,7 @@ class DailyScheduleTab(QWidget):
 
         # Active schedule table
         self.table = QTableWidget()
+        self.table.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         self._set_headers()
 
         hv = self.table.horizontalHeader()
@@ -705,6 +727,7 @@ class DailyScheduleTab(QWidget):
         self._arrange_daily_action_rows(compact=False)
 
         self.resources_table = QTableWidget()
+        self.resources_table.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         self.resources_table.setColumnCount(self.RES_COL_CONFLICT + 1)
         self.resources_table.setHorizontalHeaderLabels(
             [
@@ -744,7 +767,7 @@ class DailyScheduleTab(QWidget):
         self.resources_table.setColumnWidth(self.RES_COL_SET, 210)
         self.resources_table.setColumnWidth(self.RES_COL_GROUP, 150)
         self.resources_table.setColumnWidth(self.RES_COL_UPDATED, 90)
-        layout.addWidget(self.resources_table)
+        layout.addWidget(self.resources_table, 1)
 
         # Signals
         self.add_row_btn.clicked.connect(self._add_row)
@@ -792,13 +815,38 @@ class DailyScheduleTab(QWidget):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        self._queue_daily_geometry_refresh()
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() in (QEvent.FontChange, QEvent.ApplicationFontChange, QEvent.StyleChange):
+            self._queue_daily_geometry_refresh()
+
+    def _queue_daily_geometry_refresh(self) -> None:
+        if not hasattr(self, "_daily_geometry_timer") or self._daily_geometry_pending:
+            return
+        self._daily_geometry_pending = True
+        self._daily_geometry_timer.start(0)
+
+    def _refresh_daily_geometry(self) -> None:
+        self._daily_geometry_pending = False
+        self._responsive_layout_mode = ""
         self._update_daily_responsive_layout()
+        self._apply_schedule_table_height_hints()
 
     def _daily_responsive_mode_for_width(self, width: int) -> str:
         try:
-            return "compact" if int(width) < int(self._responsive_compact_width) else "wide"
+            controls = [
+                self.time_toggle_btn, self.schedule_source_label,
+                self.save_source_btn, self.new_source_btn,
+                self.rename_source_btn, self.delete_source_btn,
+            ]
+            natural = sum(control.sizeHint().width() for control in controls)
+            natural += self.schedule_source_combo.fontMetrics().horizontalAdvance("M" * 24)
+            natural += self._daily_action_layout.spacing() * len(controls)
+            return "compact" if int(width) < natural else "wide"
         except Exception:
-            return "wide"
+            return "compact" if int(width) < int(self._responsive_compact_width) else "wide"
 
     def _current_radio_context_name(self) -> str:
         try:
@@ -856,71 +904,133 @@ class DailyScheduleTab(QWidget):
         for grid in (self._daily_action_layout, self._daily_resource_filter_layout):
             self._clear_grid_layout(grid)
 
-        if compact:
-            # Grid reflow owns the compact width; release wide desktop floors
-            # so Large Text can use the page's vertical scroll surface.
-            self.schedule_source_combo.setMinimumWidth(0)
-            self.resources_set_combo.setMinimumWidth(0)
-            action_placements = [
-                (self.time_toggle_btn, 0, 0),
-                (self.schedule_source_label, 0, 1),
-                (self.schedule_source_combo, 0, 2, 1, 2),
-                (self.new_source_btn, 0, 4),
-                (self.rename_source_btn, 0, 5),
-                (self.save_source_btn, 0, 6),
-                (self.delete_source_btn, 0, 7),
-                (self.add_row_btn, 1, 0),
-                (self.del_row_btn, 1, 1),
-                (self.view_edit_btn, 1, 2),
-                (self.resources_resolve_btn, 1, 3),
-                (self.import_export_btn, 2, 0),
-                (self.save_btn, 2, 1),
-            ]
-            filter_placements = [
-                (self.resources_set_label, 0, 0),
-                (self.resources_set_combo, 0, 1),
-                (self.resources_filter_label, 0, 2),
-                (self.resources_group_filter, 0, 3, 1, 2),
-                (self.add_to_schedule_btn, 1, 0),
-                (self.resources_refresh_btn, 1, 1),
-            ]
-        else:
-            self.schedule_source_combo.setMinimumWidth(360)
-            self.resources_set_combo.setMinimumWidth(260)
-            action_placements = [
-                (self.time_toggle_btn, 0, 0),
-                (self.schedule_source_label, 0, 1),
-                (self.schedule_source_combo, 0, 2, 1, 3),
-                (self.new_source_btn, 0, 5),
-                (self.rename_source_btn, 0, 6),
-                (self.save_source_btn, 0, 7),
-                (self.delete_source_btn, 0, 8),
-                (self.add_row_btn, 1, 0),
-                (self.del_row_btn, 1, 1),
-                (self.view_edit_btn, 1, 2),
-                (self.resources_resolve_btn, 1, 3),
-                (self.import_export_btn, 1, 4),
-                (self.save_btn, 1, 5),
-            ]
-            filter_placements = [
-                (self.resources_set_label, 0, 0),
-                (self.resources_set_combo, 0, 1),
-                (self.resources_filter_label, 0, 2),
-                (self.resources_group_filter, 0, 3),
-                (self.add_to_schedule_btn, 0, 4),
-                (self.resources_refresh_btn, 0, 5),
-            ]
+        for row in self._daily_toolbar_pool + self._daily_filter_pool:
+            while row.count():
+                row.takeAt(0)
+        self._daily_toolbar_rows.clear()
+        self._daily_filter_rows.clear()
 
-        self._place_grid_widgets(self._daily_action_layout, action_placements)
-        self._place_grid_widgets(self._daily_resource_filter_layout, filter_placements)
-        self._daily_action_layout.setColumnStretch(9 if not compact else 8, 1)
-        self._daily_resource_filter_layout.setColumnStretch(3 if not compact else 4, 1)
+        self.schedule_source_combo.setMinimumWidth(0)
+        self.schedule_source_combo.setMaximumWidth(self.schedule_source_combo.fontMetrics().horizontalAdvance("M" * 40))
+        if compact:
+            self.schedule_source_combo.setProperty("fio_no_auto_fit", True)
+            self.schedule_source_combo.setMinimumContentsLength(18)
+            self.schedule_source_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            self.schedule_source_combo.setMaximumWidth(
+                self.schedule_source_combo.fontMetrics().horizontalAdvance("M" * 20)
+            )
+        else:
+            self.schedule_source_combo.setProperty("fio_no_auto_fit", False)
+            self.schedule_source_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.resources_set_combo.setMinimumWidth(
+            0 if compact else self.resources_set_combo.fontMetrics().horizontalAdvance("M" * 18)
+        )
+        self.resources_set_combo.setMaximumWidth(self.resources_set_combo.fontMetrics().horizontalAdvance("M" * 28))
+        self.resources_group_filter.setMaximumWidth(
+            self.resources_group_filter.fontMetrics().horizontalAdvance("M" * (48 if not compact else 64))
+        )
+
+        def add_toolbar_row(widgets: list[QWidget]) -> None:
+            row = self._daily_toolbar_pool[len(self._daily_toolbar_rows)]
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(self._daily_action_layout.spacing())
+            for widget in widgets:
+                if widget is self.schedule_source_combo:
+                    row.addWidget(widget, 1)
+                else:
+                    row.addWidget(widget, 0, Qt.AlignLeft)
+            row.addStretch()
+            self._daily_action_layout.addLayout(row, len(self._daily_toolbar_rows), 0)
+            self._daily_toolbar_rows.append(row)
+
+        context = [self.time_toggle_btn, self.schedule_source_label, self.schedule_source_combo]
+        management = [self.new_source_btn, self.rename_source_btn, self.delete_source_btn]
+        editing = [self.add_row_btn, self.del_row_btn, self.view_edit_btn, self.resources_resolve_btn]
+        utilities = [self.import_export_btn, self.save_btn]
+        if compact:
+            add_toolbar_row(context + [self.save_source_btn])
+            add_toolbar_row(management)
+            add_toolbar_row(editing)
+            add_toolbar_row(utilities)
+        else:
+            add_toolbar_row(context + [self.save_source_btn] + management)
+            add_toolbar_row(editing + utilities)
+
+        filter_widgets = [self.resources_set_label, self.resources_set_combo,
+                          self.resources_filter_label, self.resources_group_filter]
+        filter_row = self._daily_filter_pool[0]
+        filter_row.setContentsMargins(0, 0, 0, 0)
+        filter_row.setSpacing(self._daily_resource_filter_layout.spacing())
+        for widget in filter_widgets:
+            if widget is self.resources_group_filter:
+                filter_row.addWidget(widget, 1)
+            else:
+                filter_row.addWidget(widget, 0, Qt.AlignLeft)
+        self._daily_resource_filter_layout.addLayout(filter_row, 0, 0)
+        self._daily_filter_rows.append(filter_row)
+        if compact:
+            action_row = self._daily_filter_pool[1]
+            action_row.setContentsMargins(0, 0, 0, 0)
+            action_row.setSpacing(self._daily_resource_filter_layout.spacing())
+            for widget in (self.add_to_schedule_btn, self.resources_refresh_btn):
+                action_row.addWidget(widget, 0, Qt.AlignLeft)
+            action_row.addStretch()
+            self._daily_resource_filter_layout.addLayout(action_row, 1, 0)
+            self._daily_filter_rows.append(action_row)
+        else:
+            for widget in (self.add_to_schedule_btn, self.resources_refresh_btn):
+                filter_row.addWidget(widget, 0, Qt.AlignLeft)
+        filter_row.addStretch()
+        self._size_daily_group_column(compact=compact)
         self._apply_schedule_table_height_hints()
+
+    def _size_daily_group_column(self, *, compact: bool) -> None:
+        if not hasattr(self, "table"):
+            return
+        header = self.table.horizontalHeader()
+        if compact:
+            header.setSectionResizeMode(self.COL_GROUP, QHeaderView.Stretch)
+            return
+        header.setSectionResizeMode(self.COL_GROUP, QHeaderView.Interactive)
+        try:
+            unit = max(1, self.table.fontMetrics().horizontalAdvance("M"))
+            viewport_width = max(1, self.table.viewport().width())
+            target = max(unit * 16, min(unit * 36, int(viewport_width * 0.24)))
+            self.table.setColumnWidth(self.COL_GROUP, target)
+        except Exception:
+            pass
 
     def _apply_schedule_table_height_hints(self) -> None:
         if not hasattr(self, "table") or not hasattr(self, "resources_table"):
             return
         try:
+            row_height = control_height_for_font(self.table)
+            for row in range(self.table.rowCount()):
+                for col in range(self.table.columnCount()):
+                    editor = self.table.cellWidget(row, col)
+                    if editor is None:
+                        continue
+                    if isinstance(editor, QComboBox):
+                        # The Group editor owns a flexible table column.  Its
+                        # popup still fits long labels, while the closed
+                        # editor must follow the cell through responsive
+                        # resizes instead of imposing a long-label minimum.
+                        if col == self.COL_GROUP:
+                            editor.setProperty("fio_no_auto_fit", False)
+                            fit_combo_box_to_contents(editor)
+                            editor.setMinimumWidth(0)
+                            editor.setMinimumContentsLength(12)
+                            editor.setProperty("fio_no_auto_fit", True)
+                        else:
+                            fit_combo_box_to_contents(editor)
+                    editor.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+                    row_height = max(row_height, font_derived_widget_height(editor))
+            self.table.verticalHeader().setMinimumSectionSize(row_height)
+            self.table.verticalHeader().setDefaultSectionSize(row_height)
+            self.table.horizontalHeader().setMinimumHeight(
+                font_derived_widget_height(self.table.horizontalHeader())
+            )
+            self.table.doItemsLayout()
             row_count = max(1, int(self.table.rowCount()))
             visible_rows = max(4, min(row_count, 10))
             self.table.setMaximumHeight(
@@ -1249,6 +1359,13 @@ class DailyScheduleTab(QWidget):
             auto_tune = self._get_checkbox_value(r, self.COL_AUTOTUNE)
             target_scope, target_device_profile_id, target_operating_profile_id = self._selected_schedule_target(r)
 
+            if group_name and band and mode and not freq_text:
+                resolution = resolve_operating_group_frequency(
+                    self.operating_groups, group=group_name, band=band, mode=mode
+                )
+                if resolution.state == "ambiguous":
+                    format_errors.append(f"Row {r+1}: Select a frequency for {group_name} {band}.")
+                    continue
             if not group_name or not band or not freq_text or not start_val or not end_val:
                 continue
             if target_scope == TARGET_SCOPE_DEVICE_PROFILE and target_device_profile_id is None:
@@ -1367,7 +1484,7 @@ class DailyScheduleTab(QWidget):
                 QMessageBox.warning(
                     self,
                     "Plan Refresh Warning",
-                    "The HF Daily schedule was saved, but FIO could not refresh dependent Frequency Plans.\n\n"
+                    "The HF Daily schedule was saved, but CommsPlan could not refresh dependent Frequency Plans.\n\n"
                     f"{exc}",
                 )
         try:
@@ -1539,20 +1656,12 @@ class DailyScheduleTab(QWidget):
         else:
             self._set_table_resize_modes(
                 self.table,
-                {self.COL_SELECT},
                 {
-                    self.COL_DAY,
-                    self.COL_SOURCE,
-                    self.COL_GROUP,
-                    self.COL_MODE,
-                    self.COL_BAND,
-                    self.COL_FREQ,
-                    self.COL_START,
-                    self.COL_END,
-                    self.COL_AUTOTUNE,
-                    self.COL_TARGET_SCOPE,
-                    self.COL_TARGET,
+                    self.COL_SELECT, self.COL_DAY, self.COL_SOURCE, self.COL_MODE,
+                    self.COL_BAND, self.COL_FREQ, self.COL_START, self.COL_END,
+                    self.COL_AUTOTUNE, self.COL_TARGET_SCOPE, self.COL_TARGET,
                 },
+                {self.COL_GROUP},
             )
 
         self._set_table_resize_modes(
@@ -1571,9 +1680,11 @@ class DailyScheduleTab(QWidget):
             },
             {self.RES_COL_GROUP, self.RES_COL_CONFLICT},
         )
+        self._size_daily_group_column(compact=compact)
+        self._apply_schedule_table_height_hints()
 
     def _load_operating_groups(self) -> List[Dict]:
-        return qsy_load_operating_groups(self.settings)
+        return ensure_operating_group_frequency_keys(qsy_load_operating_groups(self.settings))
 
     def _snapshot_operating_groups(self, og_list: List[Dict]) -> str:
         return qsy_snapshot_operating_groups(og_list)
@@ -2548,10 +2659,7 @@ class DailyScheduleTab(QWidget):
         txt = str(value or "").strip()
         if not txt:
             return ""
-        try:
-            return f"{float(txt):.3f}"
-        except Exception:
-            return txt
+        return format_frequency_mhz(txt)
 
     def _display_resource_day_time(self, day_utc: str, start_utc: str, end_utc: str) -> Tuple[str, str, str]:
         day_txt = str(day_utc or "ALL").strip() or "ALL"
@@ -3626,7 +3734,7 @@ class DailyScheduleTab(QWidget):
                 group = str(group)[4:]
         mode = self._get_combo_value(row_index, self.COL_MODE, "Digi")
         band = self._get_combo_value(row_index, self.COL_BAND, "")
-        freq = self._normalize_freq_text(self._get_text_value(row_index, self.COL_FREQ))
+        freq = self._frequency_value(row_index)
         start = self._normalize_hhmm(self._get_text_value(row_index, self.COL_START))
         end = self._normalize_hhmm(self._get_text_value(row_index, self.COL_END))
         auto_tune = self._get_checkbox_value(row_index, self.COL_AUTOTUNE) if not is_sop_overlay else False
@@ -3647,7 +3755,8 @@ class DailyScheduleTab(QWidget):
                 "group_name": str(group).strip(),
                 "mode": str(mode).strip().upper(),
                 "band": str(band).strip().upper(),
-                "frequency": self._normalize_freq_text(freq),
+                "frequency": str(freq).strip(),
+                "operating_group_frequency_key": self._frequency_key(row_index),
                 "start_utc": self._normalize_hhmm(start),
                 "end_utc": self._normalize_hhmm(end),
                 "auto_tune": bool(auto_tune),
@@ -4717,7 +4826,6 @@ class DailyScheduleTab(QWidget):
             if selected_scope:
                 selected_rows = {int(r) for r in selected_scope}
             day_intervals: Dict[str, List[Tuple[int, int, int, bool]]] = {d: [] for d in DAY_CANON}
-            row_frequency_key: Dict[int, Tuple[str, str]] = {}
             row_target_context: Dict[int, Dict[str, Any]] = {}
             for r in range(self.table.rowCount()):
                 if self._is_sop_overlay_row(r):
@@ -4726,10 +4834,6 @@ class DailyScheduleTab(QWidget):
                 if not row:
                     continue
                 row_target_context[r] = dict(row)
-                row_frequency_key[r] = (
-                    str(row.get("band") or "").strip().upper(),
-                    self._normalize_freq_text(str(row.get("frequency") or "")),
-                )
                 start_m = self._time_to_minutes(str(row.get("start_utc") or ""))
                 end_m = self._time_to_minutes(str(row.get("end_utc") or ""))
                 if start_m is None or end_m is None:
@@ -4751,21 +4855,19 @@ class DailyScheduleTab(QWidget):
             seen: Set[Tuple[int, int, str]] = set()
             conflict_rows: Set[int] = set()
 
-            def _is_same_frequency_pair(left_row: int, right_row: int) -> bool:
-                left = row_frequency_key.get(int(left_row))
-                right = row_frequency_key.get(int(right_row))
-                if not left or not right:
-                    return False
-                left_band, left_freq = left
-                right_band, right_freq = right
-                return bool(left_band and left_freq and left_band == right_band and left_freq == right_freq)
-
             def _targets_overlap(left_row: int, right_row: int) -> bool:
                 left = row_target_context.get(int(left_row))
                 right = row_target_context.get(int(right_row))
                 if not left or not right:
                     return True
                 return schedule_targets_may_overlap(left, right)
+
+            def _is_ambiguous_pair(left_row: int, right_row: int) -> bool:
+                left = row_target_context.get(int(left_row))
+                right = row_target_context.get(int(right_row))
+                if not left or not right:
+                    return True
+                return rows_have_ambiguous_overlap(left, right)
 
             for day_name, spans in day_intervals.items():
                 spans_sorted = sorted(spans, key=lambda x: (x[1], x[2], x[0], int(x[3])))
@@ -4779,9 +4881,9 @@ class DailyScheduleTab(QWidget):
 
                     if selected_rows is None or is_selected:
                         for other_row, _other_end, _other_selected in active_all:
-                            if _is_same_frequency_pair(row_idx, other_row):
-                                continue
                             if not _targets_overlap(row_idx, other_row):
+                                continue
+                            if not _is_ambiguous_pair(row_idx, other_row):
                                 continue
                             pair_key = (min(row_idx, other_row), max(row_idx, other_row), day_name)
                             if pair_key in seen:
@@ -4792,9 +4894,9 @@ class DailyScheduleTab(QWidget):
                             conflict_rows.add(pair_key[1])
                     else:
                         for other_row, _other_end in active_selected:
-                            if _is_same_frequency_pair(row_idx, other_row):
-                                continue
                             if not _targets_overlap(row_idx, other_row):
+                                continue
+                            if not _is_ambiguous_pair(row_idx, other_row):
                                 continue
                             pair_key = (min(row_idx, other_row), max(row_idx, other_row), day_name)
                             if pair_key in seen:
@@ -5469,6 +5571,13 @@ class DailyScheduleTab(QWidget):
         self._refresh_schedule_target_catalogs()
         hf_sched = self._load_schedule_from_db()
         loaded_from_db = bool(hf_sched)
+        if loaded_from_db:
+            try:
+                data = self.settings.all()
+                stored_rows = data.get("hf_schedule") or data.get("daily_schedule", [])
+            except Exception:
+                stored_rows = []
+            hf_sched = reattach_schedule_frequency_keys(hf_sched, stored_rows if isinstance(stored_rows, list) else [])
 
         if not hf_sched:
             data = self.settings.all()
@@ -6073,12 +6182,19 @@ class DailyScheduleTab(QWidget):
             group_name = self._get_combo_value(r, self.COL_GROUP, default="")
             mode = self._get_combo_value(r, self.COL_MODE, default="Digi")
             band = self._get_combo_value(r, self.COL_BAND, default="")
-            freq_text = self._get_text_value(r, self.COL_FREQ)
+            freq_text = self._frequency_value(r)
             start_val = self._get_text_value(r, self.COL_START)
             end_val = self._get_text_value(r, self.COL_END)
             auto_tune = self._get_checkbox_value(r, self.COL_AUTOTUNE)
             target_scope, target_device_profile_id, target_operating_profile_id = self._selected_schedule_target(r)
 
+            if group_name and band and mode and not freq_text:
+                resolution = resolve_operating_group_frequency(
+                    self.operating_groups, group=group_name, band=band, mode=mode
+                )
+                if resolution.state == "ambiguous":
+                    format_errors.append(f"Row {r+1}: Select a frequency for {group_name} {band}.")
+                    continue
             if not group_name or not band or not freq_text or not start_val or not end_val:
                 continue
             if target_scope == TARGET_SCOPE_DEVICE_PROFILE and target_device_profile_id is None:
@@ -6091,7 +6207,7 @@ class DailyScheduleTab(QWidget):
             # Enforce frequency validity for band/mode
             if not self._validate_frequency(band, mode, freq_text):
                 return  # validation already warned the user
-            freq_text = self._format_freq(freq_text)
+            freq_text = str(freq_text).strip()
 
             # Validate times
             start_val = self._normalize_hhmm(start_val)
@@ -6118,6 +6234,7 @@ class DailyScheduleTab(QWidget):
                         "mode": mode,
                         "vfo": "A",
                         "frequency": freq_text,
+                        "operating_group_frequency_key": self._frequency_key(r),
                         "start_utc": start_utc,
                         "end_utc": end_utc,
                         "group_name": group_name,
@@ -6256,6 +6373,7 @@ class DailyScheduleTab(QWidget):
                         "band": r.get("band", ""),
                         "mode": r.get("mode", ""),
                         "frequency": r.get("frequency", ""),
+                        "operating_group_frequency_key": r.get("operating_group_frequency_key", ""),
                         "target_scope": r.get("target_scope", TARGET_SCOPE_STATION),
                         "target_device_profile_id": r.get("target_device_profile_id"),
                         "target_operating_profile_id": r.get("target_operating_profile_id"),
@@ -6327,7 +6445,7 @@ class DailyScheduleTab(QWidget):
             group = str(raw.get("group_name") or "").strip()
             mode = str(raw.get("mode") or "").strip().upper()
             band = str(raw.get("band") or "").strip().upper()
-            freq = self._normalize_freq_text(str(raw.get("frequency") or ""))
+            freq = str(raw.get("frequency") or "").strip()
             start = self._normalize_hhmm(str(raw.get("start_utc") or ""))
             end = self._normalize_hhmm(str(raw.get("end_utc") or ""))
             if not group:
@@ -6351,6 +6469,7 @@ class DailyScheduleTab(QWidget):
                         "mode": mode,
                         "band": band,
                         "frequency": freq,
+                        "operating_group_frequency_key": str(raw.get("operating_group_frequency_key") or "").strip(),
                         "start_utc": start,
                         "end_utc": end,
                         "auto_tune": False,
@@ -6738,7 +6857,7 @@ class DailyScheduleTab(QWidget):
         self.sop_runtime_box.setStyleSheet(
             "QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; padding: 0 4px; }"
         )
-        self.add_row_btn.setStyleSheet(button_style("primary", theme))
+        self.add_row_btn.setStyleSheet(button_style("muted", theme))
         if hasattr(self, "new_source_btn"):
             self.new_source_btn.setStyleSheet(button_style("muted", theme))
         if hasattr(self, "rename_source_btn"):
@@ -6751,7 +6870,7 @@ class DailyScheduleTab(QWidget):
             self.view_edit_btn.setStyleSheet(button_style("info" if self.view_edit_btn.isChecked() else "muted", theme))
         self._refresh_save_button_state(theme)
         menu_font_css = font_css(self.add_row_btn.font())
-        self.import_export_btn.setStyleSheet(button_style("info", theme) + menu_font_css)
+        self.import_export_btn.setStyleSheet(button_style("muted", theme) + menu_font_css)
         self.import_export_btn.setFont(self.add_row_btn.font())
         self.add_to_schedule_btn.setStyleSheet(button_style("muted", theme) + menu_font_css)
         self.add_to_schedule_btn.setFont(self.add_row_btn.font())
@@ -6764,6 +6883,7 @@ class DailyScheduleTab(QWidget):
 
     def apply_theme(self) -> None:
         self._apply_theme()
+        self._queue_daily_geometry_refresh()
 
     def _rows_signature(self, rows: List[Dict]) -> str:
         normalized: List[Dict[str, object]] = []
@@ -6782,6 +6902,7 @@ class DailyScheduleTab(QWidget):
                     "mode": str(row.get("mode", "")),
                     "band": str(row.get("band", "")),
                     "frequency": str(row.get("frequency", "")),
+                    "operating_group_frequency_key": str(row.get("operating_group_frequency_key", "")),
                     "start_utc": str(row.get("start_utc", "")),
                     "end_utc": str(row.get("end_utc", "")),
                     "auto_tune": bool(row.get("auto_tune", False)),
@@ -6931,6 +7052,7 @@ class DailyScheduleTab(QWidget):
         sel_wrap.setProperty("source_key", str(entry.get("source_key") or entry.get("_source_key") or "").strip())
         sel_wrap.setProperty("source_table", str(entry.get("source_table") or "daily_schedule_tab"))
         sel_wrap.setProperty("resource_set", str(entry.get("_resource_set") or ""))
+        sel_wrap.setProperty("operating_group_frequency_key", str(entry.get("operating_group_frequency_key") or ""))
         sel_wrap.setProperty("sop_overlay", is_sop_overlay)
         sel_wrap.setProperty("sop_profile_name", overlay_profile)
         sel_wrap.setProperty("sop_overlay_source_key", str(entry.get("_source_key") or "").strip())
@@ -7200,6 +7322,7 @@ class DailyScheduleTab(QWidget):
             except Exception:
                 entry["_resource_id"] = 0
             entry["_resource_set"] = str(sel_wrap.property("resource_set") or "")
+            entry["operating_group_frequency_key"] = str(sel_wrap.property("operating_group_frequency_key") or "")
             if is_sop:
                 entry["_sop_overlay"] = True
                 entry["_source_key"] = str(sel_wrap.property("sop_overlay_source_key") or "").strip()
@@ -7280,6 +7403,9 @@ class DailyScheduleTab(QWidget):
     def _get_text_value(self, row: int, col: int) -> str:
         w = self.table.cellWidget(row, col)
         if isinstance(w, QComboBox):
+            if col == self.COL_FREQ:
+                value = w.currentData(Qt.UserRole + 1)
+                return str(value if value is not None else w.currentText()).strip()
             return w.currentText().strip()
         item = self.table.item(row, col)
         if item is None:
@@ -7287,6 +7413,12 @@ class DailyScheduleTab(QWidget):
         return item.text().strip()
 
     def _set_text_value(self, row: int, col: int, value: str) -> None:
+        w = self.table.cellWidget(row, col)
+        if isinstance(w, QComboBox):
+            idx = w.findData(value, Qt.UserRole + 1)
+            if idx >= 0:
+                w.setCurrentIndex(idx)
+            return
         item = self.table.item(row, col)
         if item is not None and item.text() != value:
             item.setText(value)
@@ -7310,6 +7442,75 @@ class DailyScheduleTab(QWidget):
             for g in self.operating_groups
             if g.get("group") == group and g.get("band") == band
         ]
+
+    def _frequency_value(self, row: int) -> str:
+        widget = self.table.cellWidget(row, self.COL_FREQ)
+        if isinstance(widget, QComboBox):
+            value = widget.currentData(Qt.UserRole + 1)
+            return str(value if value is not None else widget.currentText()).strip()
+        return self._get_text_value(row, self.COL_FREQ)
+
+    def _frequency_key(self, row: int) -> str:
+        widget = self.table.cellWidget(row, self.COL_FREQ)
+        if isinstance(widget, QComboBox):
+            return str(widget.currentData(Qt.UserRole) or "").strip()
+        select = self.table.cellWidget(row, self.COL_SELECT)
+        return str(select.property("operating_group_frequency_key") or "").strip() if isinstance(select, QWidget) else ""
+
+    def _set_frequency_choice(self, row: int, group: str, band: str, mode: str, frequency: str = "", frequency_key: str = "") -> None:
+        result = resolve_operating_group_frequency(
+            self.operating_groups, group=group, band=band, mode=mode,
+            frequency_key=frequency_key, frequency=frequency or None,
+        )
+        candidates = [g for g in result.candidates if normalize_frequency_hz(g.get("frequency")) is not None]
+        if not candidates and not frequency_key:
+            # Preserve legacy free-text schedule rows when no valid configured
+            # frequency variant exists for this group/mode.
+            self.table.removeCellWidget(row, self.COL_FREQ)
+            item = self.table.item(row, self.COL_FREQ)
+            if item is None:
+                item = QTableWidgetItem()
+                item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                self.table.setItem(row, self.COL_FREQ, item)
+            item.setText(str(frequency or "").strip())
+            return
+        combo = QComboBox()
+        combo.setMinimumContentsLength(7)
+        combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        combo.addItem("Select frequency…", "")
+        combo.setItemData(0, "", Qt.UserRole + 1)
+        for candidate in candidates:
+            value = str(candidate.get("frequency") or "").strip()
+            key = str(candidate.get("operating_group_frequency_key") or "").strip()
+            combo.addItem(format_frequency_mhz(value), key)
+            combo.setItemData(combo.count() - 1, value, Qt.UserRole + 1)
+        selected = -1
+        if result.resolved and result.row is not None:
+            selected_key = str(result.row.get("operating_group_frequency_key") or "")
+            selected = combo.findData(selected_key, Qt.UserRole)
+        elif frequency or frequency_key:
+            # Keep stale or incompatible references visible and intact until the
+            # operator explicitly selects a configured alternative.
+            combo.addItem(f"Unresolved — {frequency}" if frequency else "Unresolved frequency reference", frequency_key)
+            combo.setItemData(combo.count() - 1, frequency, Qt.UserRole + 1)
+            selected = combo.count() - 1
+        if selected >= 0:
+            combo.setCurrentIndex(selected)
+        combo.setToolTip(result.reason if result.state != "resolved" else "Choose the configured frequency for this schedule row.")
+        combo.currentIndexChanged.connect(lambda _idx, r=row: self._on_frequency_choice_changed(r))
+        combo.currentIndexChanged.connect(self._mark_dirty)
+        self.table.setCellWidget(row, self.COL_FREQ, combo)
+        select = self.table.cellWidget(row, self.COL_SELECT)
+        if isinstance(select, QWidget):
+            select.setProperty("operating_group_frequency_key", self._frequency_key(row))
+
+    def _on_frequency_choice_changed(self, row: int) -> None:
+        select = self.table.cellWidget(row, self.COL_SELECT)
+        if isinstance(select, QWidget):
+            select.setProperty("operating_group_frequency_key", self._frequency_key(row))
+        mode = self._get_combo_value(row, self.COL_MODE, "")
+        if mode:
+            self._auto_start_for_mode(mode)
 
     def _set_mode_widget(
         self, row: int, group: str, band: str, preferred_mode: str = "", entries: Optional[List[Dict]] = None
@@ -7339,25 +7540,9 @@ class DailyScheduleTab(QWidget):
         preferred_mode = self._get_combo_value(row, self.COL_MODE, "")
         mode_combo = self._set_mode_widget(row, group, band, preferred_mode, entries)
         mode_val = mode_combo.currentText().strip() if isinstance(mode_combo, QComboBox) else preferred_mode
-        entry = None
-        for g in entries:
-            if (g.get("mode") or "").strip() == mode_val:
-                entry = g
-                break
-        if entry is None and entries:
-            entry = entries[0]
-            if isinstance(mode_combo, QComboBox):
-                mode_combo.blockSignals(True)
-                mode_combo.setCurrentText(entry.get("mode", ""))
-                mode_combo.blockSignals(False)
-            mode_val = entry.get("mode", "")
-        freq_val = self._format_freq(entry.get("frequency", "")) if entry else ""
-        freq_item = self.table.item(row, self.COL_FREQ)
-        if freq_item is None:
-            freq_item = QTableWidgetItem()
-            freq_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-            self.table.setItem(row, self.COL_FREQ, freq_item)
-        freq_item.setText(freq_val)
+        old_frequency = self._frequency_value(row)
+        old_key = self._frequency_key(row)
+        self._set_frequency_choice(row, group, band, mode_val, old_frequency, old_key)
         # trigger autostart if mode changes
         if mode_val:
             self._auto_start_for_mode(mode_val)

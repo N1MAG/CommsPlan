@@ -11,7 +11,7 @@ import json
 import re
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, Signal, QRegularExpression, QItemSelectionModel
+from PySide6.QtCore import Qt, QTimer, Signal, QRegularExpression, QItemSelectionModel, QEvent
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QToolButton,
     QMenu,
     QScrollArea,
+    QSizePolicy,
 )
 from PySide6.QtGui import QRegularExpressionValidator, QAction, QColor
 
@@ -47,6 +48,13 @@ from freqinout.core.schedule_targeting import (
     normalize_schedule_target_fields,
     normalize_target_scope,
     schedule_target_identity_parts,
+)
+from freqinout.core.operating_group_frequency import (
+    ensure_operating_group_frequency_keys,
+    format_frequency_mhz,
+    normalize_frequency_hz,
+    reattach_schedule_frequency_keys,
+    resolve_operating_group_frequency,
 )
 from freqinout.core.settings_manager import SettingsManager
 from freqinout.core.resource_catalog_store import ResourceCatalogStore
@@ -79,7 +87,10 @@ from freqinout.core.legacy_resource_projection import (
 from freqinout.utils.timezones import get_timezone
 from freqinout.gui.help_registry import resolve_help_host
 from freqinout.gui.plan_context_label import PlanContextLabel
-from freqinout.gui.theme import resolve_theme, button_style, font_css, item_view_height_for_rows
+from freqinout.gui.theme import (
+    resolve_theme, button_style, font_css, item_view_height_for_rows,
+    font_derived_widget_height, control_height_for_font, fit_combo_box_to_contents,
+)
 
 
 # ---- Band / Mode metadata (keep in sync with HF tab) ----
@@ -303,7 +314,10 @@ class NetScheduleTab(QWidget):
         self._net_sop_conflict_cache_limit: int = 6
         self._net_sop_conflict_cache_epoch: int = 0
         self._responsive_layout_mode = "wide"
-        self._responsive_compact_width = 1200
+        self._net_geometry_pending = False
+        self._net_geometry_timer = QTimer(self)
+        self._net_geometry_timer.setSingleShot(True)
+        self._net_geometry_timer.timeout.connect(self._refresh_net_geometry)
 
         self._build_ui()
         self._load()
@@ -378,9 +392,6 @@ class NetScheduleTab(QWidget):
         self._set_headers()
         self.table.setSortingEnabled(False)
         self.table.setSelectionMode(QAbstractItemView.NoSelection)
-        self.table.setStyleSheet(
-            "QComboBox:focus, QLineEdit:focus { outline: none; border: 1px solid #888; }"
-        )
         hv = self.table.horizontalHeader()
         hv.setSectionResizeMode(QHeaderView.ResizeToContents)
         hv.setSectionResizeMode(self.COL_NETNAME, QHeaderView.Stretch)
@@ -405,7 +416,8 @@ class NetScheduleTab(QWidget):
         self.schedule_source_combo.setObjectName("netScheduleSourceCombo")
         self.schedule_source_combo.setEditable(True)
         self.schedule_source_combo.setInsertPolicy(QComboBox.NoInsert)
-        self.schedule_source_combo.setMinimumWidth(360)
+        self.schedule_source_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.schedule_source_combo.setMinimumContentsLength(24)
         if self.schedule_source_combo.lineEdit() is not None:
             self.schedule_source_combo.lineEdit().setPlaceholderText("Name or select a net schedule")
         self.schedule_source_combo.setToolTip(
@@ -427,6 +439,8 @@ class NetScheduleTab(QWidget):
         self._net_action_layout = QGridLayout()
         self._net_action_layout.setContentsMargins(0, 0, 0, 0)
         self._net_action_layout.setSpacing(8)
+        self._net_toolbar_rows: list[QHBoxLayout] = []
+        self._net_toolbar_pool = [QHBoxLayout() for _ in range(4)]
         layout.addLayout(self._net_action_layout)
         self.source_usage_label.setVisible(True)
         layout.addWidget(self.source_usage_label)
@@ -577,10 +591,32 @@ class NetScheduleTab(QWidget):
         self._update_net_responsive_layout()
 
     def _net_responsive_mode_for_width(self, width: int) -> str:
-        try:
-            return "compact" if int(width) < int(self._responsive_compact_width) else "wide"
-        except Exception:
-            return "wide"
+        # Natural action widths remain independent of grid columns and viewport.
+        controls = [self.time_toggle_btn, self.schedule_source_label,
+                    self.new_source_btn, self.save_btn, self.rename_source_btn,
+                    self.delete_source_btn]
+        spacing = self._net_action_layout.spacing()
+        natural = sum(w.sizeHint().width() for w in controls)
+        natural += self.schedule_source_combo.fontMetrics().horizontalAdvance("M" * 24)
+        natural += spacing * len(controls) + self.fontMetrics().horizontalAdvance("MM")
+        return "compact" if int(width) < natural else "wide"
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() in (QEvent.FontChange, QEvent.ApplicationFontChange, QEvent.StyleChange):
+            self._queue_net_geometry_refresh()
+
+    def _queue_net_geometry_refresh(self) -> None:
+        if not hasattr(self, "_net_action_layout") or self._net_geometry_pending:
+            return
+        self._net_geometry_pending = True
+        self._net_geometry_timer.start(0)
+
+    def _refresh_net_geometry(self) -> None:
+        self._net_geometry_pending = False
+        self._responsive_layout_mode = ""
+        self._update_net_responsive_layout()
+        self._apply_schedule_table_height_hints()
 
     def _update_net_responsive_layout(self) -> None:
         if not hasattr(self, "_net_resource_filter_layout"):
@@ -610,25 +646,39 @@ class NetScheduleTab(QWidget):
         for grid in (self._net_action_layout, self._net_resource_filter_layout):
             self._clear_grid_layout(grid)
 
+        # Independent rows keep buttons at natural width, with trailing space.
+        for row in self._net_toolbar_pool:
+            while row.count():
+                row.takeAt(0)
+        self._net_toolbar_rows.clear()
+
+        def add_row(widgets):
+            row = self._net_toolbar_pool[len(self._net_toolbar_rows)]
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(self._net_action_layout.spacing())
+            for widget in widgets:
+                if widget is self.schedule_source_combo:
+                    row.addWidget(widget, 1)
+                else:
+                    row.addWidget(widget, 0, Qt.AlignLeft)
+            row.addStretch()
+            self._net_action_layout.addLayout(row, len(self._net_toolbar_rows), 0)
+            self._net_toolbar_rows.append(row)
+
+        self.schedule_source_combo.setMinimumWidth(0)
+        self.schedule_source_combo.setMaximumWidth(
+            self.schedule_source_combo.fontMetrics().horizontalAdvance("M" * 40)
+        )
+        context = [self.time_toggle_btn, self.schedule_source_label, self.schedule_source_combo]
+        management = [self.new_source_btn, self.rename_source_btn, self.delete_source_btn]
+        editing = [self.add_btn, self.add_hf_net_btn, self.del_btn, self.view_edit_btn]
+        utilities = [self.move_to_resources_btn, self.export_btn, self.manage_net_sop_policies_btn]
         if compact:
-            self.schedule_source_combo.setMinimumWidth(0)
+            add_row(context + [self.save_btn])
+            add_row(management)
+            add_row(editing)
+            add_row(utilities)
             self.resource_set_combo.setMinimumWidth(0)
-            action_placements = [
-                (self.time_toggle_btn, 0, 0),
-                (self.schedule_source_label, 0, 1),
-                (self.schedule_source_combo, 0, 2, 1, 2),
-                (self.new_source_btn, 0, 4),
-                (self.save_btn, 0, 5),
-                (self.rename_source_btn, 0, 6),
-                (self.delete_source_btn, 0, 7),
-                (self.add_btn, 1, 0),
-                (self.add_hf_net_btn, 1, 1),
-                (self.del_btn, 1, 2),
-                (self.view_edit_btn, 1, 3),
-                (self.move_to_resources_btn, 1, 4, 1, 2),
-                (self.export_btn, 1, 6),
-                (self.manage_net_sop_policies_btn, 1, 7),
-            ]
             filter_placements = [
                 (self.resource_set_label, 0, 0),
                 (self.resource_set_combo, 0, 1),
@@ -640,24 +690,9 @@ class NetScheduleTab(QWidget):
                 (self.delete_resource_btn, 1, 3),
             ]
         else:
-            self.schedule_source_combo.setMinimumWidth(360)
+            add_row(context + [self.save_btn] + management)
+            add_row(editing + utilities)
             self.resource_set_combo.setMinimumWidth(260)
-            action_placements = [
-                (self.time_toggle_btn, 0, 0),
-                (self.schedule_source_label, 0, 1),
-                (self.schedule_source_combo, 0, 2, 1, 3),
-                (self.new_source_btn, 0, 5),
-                (self.save_btn, 0, 6),
-                (self.rename_source_btn, 0, 7),
-                (self.delete_source_btn, 0, 8),
-                (self.add_btn, 1, 0),
-                (self.add_hf_net_btn, 1, 1),
-                (self.del_btn, 1, 2),
-                (self.view_edit_btn, 1, 3),
-                (self.move_to_resources_btn, 1, 4),
-                (self.export_btn, 1, 5),
-                (self.manage_net_sop_policies_btn, 1, 6),
-            ]
             filter_placements = [
                 (self.resource_set_label, 0, 0),
                 (self.resource_set_combo, 0, 1),
@@ -668,10 +703,7 @@ class NetScheduleTab(QWidget):
                 (self.edit_resource_btn, 0, 6),
                 (self.delete_resource_btn, 0, 7),
             ]
-
-        self._place_grid_widgets(self._net_action_layout, action_placements)
         self._place_grid_widgets(self._net_resource_filter_layout, filter_placements)
-        self._net_action_layout.setColumnStretch(8 if not compact else 6, 1)
         self._net_resource_filter_layout.setColumnStretch(3 if not compact else 4, 1)
         self._apply_schedule_table_height_hints()
 
@@ -679,6 +711,22 @@ class NetScheduleTab(QWidget):
         if not hasattr(self, "table") or not hasattr(self, "resources_table"):
             return
         try:
+            row_height = control_height_for_font(self.table)
+            for row in range(self.table.rowCount()):
+                for col in range(self.table.columnCount()):
+                    editor = self.table.cellWidget(row, col)
+                    if editor is not None:
+                        if isinstance(editor, QComboBox):
+                            fit_combo_box_to_contents(editor)
+                        editor.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+                        row_height = max(row_height, font_derived_widget_height(editor))
+            # Republish persistent-editor rectangles after late editor polish.
+            self.table.doItemsLayout()
+            self.table.verticalHeader().setMinimumSectionSize(row_height)
+            self.table.verticalHeader().setDefaultSectionSize(row_height)
+            self.table.horizontalHeader().setMinimumHeight(
+                font_derived_widget_height(self.table.horizontalHeader())
+            )
             row_count = max(1, int(self.table.rowCount()))
             visible_rows = max(4, min(row_count, 10))
             self.table.setMaximumHeight(
@@ -1122,7 +1170,7 @@ class NetScheduleTab(QWidget):
                 QMessageBox.warning(
                     self,
                     "Plan Refresh Warning",
-                    "The HF Net schedule was saved, but FIO could not refresh dependent Frequency Plans.\n\n"
+                    "The HF Net schedule was saved, but CommsPlan could not refresh dependent Frequency Plans.\n\n"
                     f"{exc}",
                 )
         try:
@@ -1297,13 +1345,17 @@ class NetScheduleTab(QWidget):
                 {
                     self.COL_SELECT,
                     self.COL_DAY,
+                    self.COL_GROUP,
                     self.COL_MODE,
                     self.COL_BAND,
                     self.COL_FREQ,
                     self.COL_START,
                     self.COL_END,
                 },
-                {self.COL_GROUP, self.COL_NETNAME},
+                set(),
+            )
+            self.table.setColumnWidth(
+                self.COL_NETNAME, self.table.fontMetrics().horizontalAdvance("M" * 20)
             )
         else:
             self._set_table_resize_modes(
@@ -1311,6 +1363,7 @@ class NetScheduleTab(QWidget):
                 {
                     self.COL_SELECT,
                     self.COL_DAY,
+                    self.COL_GROUP,
                     self.COL_RECURRENCE,
                     self.COL_MONTH_WEEKS,
                     self.COL_MODE,
@@ -1324,7 +1377,7 @@ class NetScheduleTab(QWidget):
                     self.COL_AUTOTUNE,
                     self.COL_TARGET_SCOPE,
                 },
-                {self.COL_GROUP, self.COL_NETNAME, self.COL_TARGET},
+                {self.COL_NETNAME, self.COL_TARGET},
             )
 
         self._set_table_resize_modes(
@@ -1519,7 +1572,7 @@ class NetScheduleTab(QWidget):
                     current_band = band_combo.currentText()
                     if current_band and band_combo.findText(current_band) >= 0:
                         band_combo.setCurrentText(current_band)
-                self._update_mode_freq(r)
+                self._update_mode_freq(r, preserve_frequency=True)
             self._refresh_schedule_target_widgets()
         finally:
             self._suppress_autostart = prev_suppress
@@ -1565,7 +1618,7 @@ class NetScheduleTab(QWidget):
         menu_font_css = font_css(self.add_btn.font())
         self._update_time_toggle_style(theme)
         self.help_btn.setStyleSheet(button_style("secondary", theme))
-        self.add_btn.setStyleSheet(button_style("primary", theme))
+        self.add_btn.setStyleSheet(button_style("muted", theme))
         self.del_btn.setStyleSheet(button_style("muted", theme))
         if hasattr(self, "new_source_btn"):
             self.new_source_btn.setStyleSheet(button_style("muted", theme))
@@ -1578,7 +1631,7 @@ class NetScheduleTab(QWidget):
         if hasattr(self, "view_edit_btn"):
             self.view_edit_btn.setStyleSheet(button_style("info" if self.view_edit_btn.isChecked() else "muted", theme))
         self.move_to_resources_btn.setStyleSheet(button_style("muted", theme))
-        self.export_btn.setStyleSheet(button_style("info", theme))
+        self.export_btn.setStyleSheet(button_style("muted", theme))
         self.manage_net_sop_policies_btn.setStyleSheet(button_style("muted", theme))
         self._refresh_save_button_state(theme)
         self.add_to_schedule_btn.setStyleSheet(button_style("muted", theme) + menu_font_css)
@@ -1592,6 +1645,7 @@ class NetScheduleTab(QWidget):
 
     def apply_theme(self) -> None:
         self._apply_theme()
+        self._queue_net_geometry_refresh()
 
     def _rows_signature(self, rows: List[Dict[str, Any]]) -> str:
         normalized: List[Dict[str, Any]] = []
@@ -1614,6 +1668,7 @@ class NetScheduleTab(QWidget):
                     "band": str(row.get("band") or "").strip().upper(),
                     "mode": str(row.get("mode") or "").strip(),
                     "frequency": self._normalize_freq_key(row.get("frequency")),
+                    "operating_group_frequency_key": str(row.get("operating_group_frequency_key") or ""),
                     "start_utc": self._normalize_hhmm(str(row.get("start_utc") or "")),
                     "end_utc": self._normalize_hhmm(str(row.get("end_utc") or "")),
                     "early_checkin": str(row.get("early_checkin") or ""),
@@ -2043,6 +2098,7 @@ class NetScheduleTab(QWidget):
             sel_wrap.setProperty("source_row_id", 0)
         sel_wrap.setProperty("source_key", str(row_data.get("source_key") or row_data.get("_source_key") or "").strip())
         sel_wrap.setProperty("source_table", str(row_data.get("source_table") or "net_schedule_tab"))
+        sel_wrap.setProperty("operating_group_frequency_key", str(row_data.get("operating_group_frequency_key") or ""))
         # Canonical directory subscription metadata is carried through the
         # existing HF source-row save path; it never becomes a bare legacy ID.
         for key in (
@@ -2074,7 +2130,7 @@ class NetScheduleTab(QWidget):
         if day_combo.lineEdit():
             day_combo.lineEdit().setReadOnly(True)
         day_combo.setMinimumContentsLength(6)
-        day_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        day_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         day_combo.currentIndexChanged.connect(lambda _, c=day_combo: self._update_day_display(c))
         day_combo.currentTextChanged.connect(self._mark_dirty)
         self._update_day_display(day_combo)
@@ -2094,7 +2150,7 @@ class NetScheduleTab(QWidget):
         recur_combo.currentTextChanged.connect(self._mark_dirty)
         self.table.setCellWidget(r, self.COL_RECURRENCE, recur_combo)
         recur_combo.setMinimumContentsLength(7)
-        recur_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        recur_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
 
         # Month weeks summary for Periodic recurrence
         weeks_txt = (row_data.get("month_weeks") or "").strip()
@@ -2129,7 +2185,7 @@ class NetScheduleTab(QWidget):
         group_combo.currentTextChanged.connect(self._mark_dirty)
         self.table.setCellWidget(r, self.COL_GROUP, group_combo)
         group_combo.setMinimumContentsLength(10)
-        group_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        group_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
 
         # Mode combo (cascades from group+band)
         mode_combo = self._set_mode_widget(r, group_combo.currentText(), "", row_data.get("mode", ""))
@@ -2148,7 +2204,7 @@ class NetScheduleTab(QWidget):
         band_combo.currentTextChanged.connect(self._mark_dirty)
         self.table.setCellWidget(r, self.COL_BAND, band_combo)
         band_combo.setMinimumContentsLength(5)
-        band_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        band_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
 
         # Early check-in
         early_combo = QComboBox()
@@ -2160,14 +2216,14 @@ class NetScheduleTab(QWidget):
         early_combo.currentTextChanged.connect(self._mark_dirty)
         self.table.setCellWidget(r, self.COL_EARLY, early_combo)
         early_combo.setMinimumContentsLength(3)
-        early_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        early_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
 
         # FLDigi mode / offset (explicit per-row schedule values)
         fldigi_mode_combo = self._build_fldigi_mode_combo(str(row_data.get("fldigi_mode") or ""))
         fldigi_mode_combo.currentTextChanged.connect(self._mark_dirty)
         self.table.setCellWidget(r, self.COL_FLDIGI_MODE, fldigi_mode_combo)
         fldigi_mode_combo.setMinimumContentsLength(10)
-        fldigi_mode_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        fldigi_mode_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         fldigi_offset_edit = QLineEdit(str(row_data.get("fldigi_offset") or ""))
         fldigi_offset_edit.setValidator(QRegularExpressionValidator(QRegularExpression(r"[0-9]*")))
         fldigi_offset_edit.textChanged.connect(self._mark_dirty)
@@ -2236,10 +2292,10 @@ class NetScheduleTab(QWidget):
             self._populate_band_combo(band_combo, text)
             if band_combo.count() > 0:
                 band_combo.setCurrentIndex(0)
-            self._update_mode_freq(row)
+            self._update_mode_freq(row, preserve_frequency=True)
 
         def on_band_changed(text: str, self=self, row=r):
-            self._update_mode_freq(row)
+            self._update_mode_freq(row, preserve_frequency=True)
 
         group_combo.currentTextChanged.connect(on_group_changed)
         band_combo.currentTextChanged.connect(on_band_changed)
@@ -2258,7 +2314,7 @@ class NetScheduleTab(QWidget):
                 fldigi_offset_edit.setText(d_offset)
         self._update_delete_button_state()
         self._mark_dirty()
-        self._apply_schedule_table_height_hints()
+        self._queue_net_geometry_refresh()
 
     def _parse_month_weeks(self, txt: str) -> set[int]:
         out: set[int] = set()
@@ -2340,6 +2396,9 @@ class NetScheduleTab(QWidget):
     def _get_combo_value(self, row: int, col: int, default: str = "") -> str:
         w = self.table.cellWidget(row, col)
         if isinstance(w, QComboBox):
+            if col == self.COL_FREQ:
+                value = w.currentData(Qt.UserRole + 1)
+                return str(value if value is not None else w.currentText()).strip()
             if col == self.COL_DAY:
                 data = w.currentData(Qt.UserRole)
                 if data:
@@ -2401,7 +2460,7 @@ class NetScheduleTab(QWidget):
         data = self.settings.all()
         og = data.get("operating_groups", [])
         if isinstance(og, list):
-            self.operating_groups = [g for g in og if isinstance(g, dict)]
+            self.operating_groups = ensure_operating_group_frequency_keys([g for g in og if isinstance(g, dict)])
         else:
             self.operating_groups = []
 
@@ -2440,7 +2499,7 @@ class NetScheduleTab(QWidget):
         elif modes:
             combo.setCurrentIndex(0)
         combo.setEnabled(len(modes) > 1 or not modes)
-        combo.currentTextChanged.connect(lambda m, r=row: self._on_mode_changed(r, m))
+        combo.currentTextChanged.connect(lambda _m, r=row: self._update_mode_freq(r, preserve_frequency=True))
         combo.currentTextChanged.connect(self._mark_dirty)
         self.table.setCellWidget(row, self.COL_MODE, combo)
         return combo
@@ -2479,35 +2538,100 @@ class NetScheduleTab(QWidget):
         group = self._get_combo_value(row, self.COL_GROUP, "")
         band = self._get_combo_value(row, self.COL_BAND, "")
         entries = self._matching_operating_groups(group, band)
-        if not entries:
-            return
         preferred_mode = self._get_combo_value(row, self.COL_MODE, "")
         mode_combo = self._set_mode_widget(row, group, band, preferred_mode, entries)
         mode_val = mode_combo.currentText().strip() if isinstance(mode_combo, QComboBox) else preferred_mode
-        entry = None
-        for g in entries:
-            if (g.get("mode") or "").strip() == mode_val:
-                entry = g
-                break
-        if entry is None and entries:
-            entry = entries[0]
-            if isinstance(mode_combo, QComboBox):
-                mode_combo.blockSignals(True)
-                mode_combo.setCurrentText(entry.get("mode", ""))
-                mode_combo.blockSignals(False)
-            mode_val = entry.get("mode", "")
-        freq_item = self.table.item(row, self.COL_FREQ)
-        if freq_item is None:
-            freq_item = QTableWidgetItem()
-            self.table.setItem(row, self.COL_FREQ, freq_item)
-        current_freq = (freq_item.text() or "").strip()
-        if not (preserve_frequency and current_freq):
-            freq_val = self._format_freq(entry.get("frequency", "")) if entry else ""
-            freq_item.setText(freq_val)
-        self._set_fldigi_from_operating_group(row, entry, force=False)
+        current_freq = self._frequency_value(row)
+        current_key = self._frequency_key(row)
+        previous_key = current_key
+        previous_frequency = current_freq
+        if not preserve_frequency:
+            current_freq, current_key = "", ""
+        self._set_frequency_choice(row, group, band, mode_val, current_freq, current_key)
+        selected = resolve_operating_group_frequency(
+            self.operating_groups, group=group, band=band, mode=mode_val,
+            frequency_key=self._frequency_key(row), frequency=self._frequency_value(row) or None,
+        )
+        selection_changed = bool(selected.resolved and selected.row is not None and (
+            previous_key != str(selected.row.get("operating_group_frequency_key") or "")
+            or previous_frequency != str(selected.row.get("frequency") or "").strip()
+        ))
+        self._set_fldigi_from_operating_group(row, selected.row if selected.resolved else None, force=selection_changed)
         # trigger autostart if mode changes
         if mode_val:
             self._on_mode_changed(row, mode_val)
+
+    def _frequency_value(self, row: int) -> str:
+        widget = self.table.cellWidget(row, self.COL_FREQ)
+        if isinstance(widget, QComboBox):
+            value = widget.currentData(Qt.UserRole + 1)
+            return str(value if value is not None else widget.currentText()).strip()
+        item = self.table.item(row, self.COL_FREQ)
+        return item.text().strip() if item is not None else ""
+
+    def _frequency_key(self, row: int) -> str:
+        widget = self.table.cellWidget(row, self.COL_FREQ)
+        if isinstance(widget, QComboBox):
+            return str(widget.currentData(Qt.UserRole) or "").strip()
+        select = self.table.cellWidget(row, self.COL_SELECT)
+        return str(select.property("operating_group_frequency_key") or "").strip() if isinstance(select, QWidget) else ""
+
+    def _set_frequency_choice(self, row: int, group: str, band: str, mode: str, frequency: str = "", frequency_key: str = "") -> None:
+        result = resolve_operating_group_frequency(
+            self.operating_groups, group=group, band=band, mode=mode,
+            frequency_key=frequency_key, frequency=frequency or None,
+        )
+        candidates = [g for g in result.candidates if normalize_frequency_hz(g.get("frequency")) is not None]
+        if not candidates and not frequency_key:
+            # Keep legacy free-text schedule entry behavior if there is no valid
+            # configured variant to offer in the selector.
+            self.table.removeCellWidget(row, self.COL_FREQ)
+            item = self.table.item(row, self.COL_FREQ)
+            if item is None:
+                item = QTableWidgetItem()
+                self.table.setItem(row, self.COL_FREQ, item)
+            item.setText(str(frequency or "").strip())
+            return
+        combo = QComboBox()
+        combo.setMinimumContentsLength(7)
+        combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        combo.addItem("Select frequency…", "")
+        combo.setItemData(0, "", Qt.UserRole + 1)
+        for candidate in candidates:
+            value = str(candidate.get("frequency") or "").strip()
+            key = str(candidate.get("operating_group_frequency_key") or "").strip()
+            combo.addItem(format_frequency_mhz(value), key)
+            combo.setItemData(combo.count() - 1, value, Qt.UserRole + 1)
+        selected = -1
+        if result.resolved and result.row is not None:
+            selected = combo.findData(str(result.row.get("operating_group_frequency_key") or ""), Qt.UserRole)
+        elif frequency or frequency_key:
+            combo.addItem(f"Unresolved — {frequency}" if frequency else "Unresolved frequency reference", frequency_key)
+            combo.setItemData(combo.count() - 1, frequency, Qt.UserRole + 1)
+            selected = combo.count() - 1
+        if selected >= 0:
+            combo.setCurrentIndex(selected)
+        combo.setToolTip(result.reason if result.state != "resolved" else "Choose the configured frequency for this net row.")
+        combo.currentIndexChanged.connect(lambda _idx, r=row: self._on_frequency_choice_changed(r))
+        combo.currentIndexChanged.connect(self._mark_dirty)
+        self.table.setCellWidget(row, self.COL_FREQ, combo)
+        select = self.table.cellWidget(row, self.COL_SELECT)
+        if isinstance(select, QWidget):
+            select.setProperty("operating_group_frequency_key", self._frequency_key(row))
+
+    def _on_frequency_choice_changed(self, row: int) -> None:
+        select = self.table.cellWidget(row, self.COL_SELECT)
+        if isinstance(select, QWidget):
+            select.setProperty("operating_group_frequency_key", self._frequency_key(row))
+        group = self._get_combo_value(row, self.COL_GROUP, "")
+        band = self._get_combo_value(row, self.COL_BAND, "")
+        mode = self._get_combo_value(row, self.COL_MODE, "")
+        result = resolve_operating_group_frequency(
+            self.operating_groups, group=group, band=band, mode=mode,
+            frequency_key=self._frequency_key(row), frequency=self._frequency_value(row) or None,
+        )
+        if result.resolved:
+            self._set_fldigi_from_operating_group(row, result.row, force=True)
 
     def _format_freq(self, freq: str | float) -> str:
         try:
@@ -2742,7 +2866,7 @@ class NetScheduleTab(QWidget):
             else:
                 subscription_values = {}
 
-            freq = text(self.COL_FREQ)
+            freq = self._frequency_value(r)
             start_txt = text(self.COL_START)
             end_txt = text(self.COL_END)
 
@@ -2855,7 +2979,8 @@ class NetScheduleTab(QWidget):
                     "band": band,
                     "mode": mode,
                     "vfo": "A",
-                    "frequency": self._format_freq(freq_mhz),
+                    "frequency": str(freq).strip(),
+                    "operating_group_frequency_key": self._frequency_key(r),
                     "start_utc": start_txt,
                     "end_utc": end_txt,
                     "early_checkin": str(early_int),
@@ -3315,6 +3440,12 @@ class NetScheduleTab(QWidget):
             self._load_operating_groups()
             data = self._load_from_db()
             loaded_from_db = bool(data)
+            if loaded_from_db:
+                try:
+                    stored_rows = self.settings.get("net_schedule", [])
+                except Exception:
+                    stored_rows = []
+                data = reattach_schedule_frequency_keys(data, stored_rows if isinstance(stored_rows, list) else [])
             if not data:
                 data = self.settings.get("net_schedule", [])
                 if not isinstance(data, list):
@@ -3947,6 +4078,7 @@ class NetScheduleTab(QWidget):
                         "band": normalized.get("band", ""),
                         "mode": normalized.get("mode", ""),
                         "frequency": normalized.get("frequency", ""),
+                        "operating_group_frequency_key": normalized.get("operating_group_frequency_key", ""),
                         "start_utc": normalized.get("start_utc", ""),
                         "end_utc": normalized.get("end_utc", ""),
                         "early_checkin": normalized.get("early_checkin", 0),
@@ -4246,10 +4378,7 @@ class NetScheduleTab(QWidget):
         return txt
 
     def _normalize_freq_key(self, freq: Any) -> str:
-        try:
-            return self._format_freq(freq)
-        except Exception:
-            return str(freq or "").strip()
+        return format_frequency_mhz(freq)
 
     def _default_fldigi_for_row(self, group_name: str, band: str, mode: str) -> Tuple[str, str]:
         g = (group_name or "").strip()
@@ -4257,15 +4386,10 @@ class NetScheduleTab(QWidget):
         m = (mode or "").strip()
         if not (g and b and m):
             return "", ""
-        matches = self._matching_operating_groups(g, b)
-        if not matches:
+        result = resolve_operating_group_frequency(self.operating_groups, group=g, band=b, mode=m)
+        if not result.resolved:
             return "", ""
-        exact = None
-        for item in matches:
-            if (item.get("mode") or "").strip().upper() == m.upper():
-                exact = item
-                break
-        chosen = exact or matches[0]
+        chosen = result.row
         fld_mode = (chosen.get("fldigi_mode") or "").strip()
         fld_offset = (chosen.get("fldigi_offset") or "").strip()
         return fld_mode, fld_offset
@@ -5178,11 +5302,10 @@ class NetScheduleTab(QWidget):
     def _ui_row_is_empty(self, row_index: int) -> bool:
         day = self._get_combo_value(row_index, self.COL_DAY, "")
         band = self._get_combo_value(row_index, self.COL_BAND, "")
-        freq_item = self.table.item(row_index, self.COL_FREQ)
         start_item = self.table.item(row_index, self.COL_START)
         end_item = self.table.item(row_index, self.COL_END)
         net_edit = self.table.cellWidget(row_index, self.COL_NETNAME)
-        freq = freq_item.text().strip() if freq_item else ""
+        freq = self._frequency_value(row_index)
         start = start_item.text().strip() if start_item else ""
         end = end_item.text().strip() if end_item else ""
         net_name = net_edit.text().strip() if isinstance(net_edit, QLineEdit) else ""
@@ -5220,9 +5343,12 @@ class NetScheduleTab(QWidget):
                     self.table.selectRow(r)
                     widget = self.table.cellWidget(r, self.COL_NETNAME)
                     item = self.table.item(r, self.COL_FREQ)
+                    frequency_widget = self.table.cellWidget(r, self.COL_FREQ)
                     if item is not None:
                         self.table.scrollToItem(item)
                         self.table.setCurrentItem(item)
+                    elif isinstance(frequency_widget, QWidget):
+                        frequency_widget.setFocus(Qt.TabFocusReason)
                     if isinstance(widget, QLineEdit):
                         widget.setFocus(Qt.TabFocusReason)
                         widget.selectAll()

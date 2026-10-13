@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import sqlite3
+from freqinout.core.sqlite_utils import connect_sqlite_readonly
 import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -199,6 +200,7 @@ def build_regional_intelligence_from_db(
     state: str = "",
     max_age_sec: int = 0,
     limit: int = 5000,
+    readonly: bool = False,
     now: dt.datetime | None = None,
     station_index: Mapping[str, Mapping[str, object]] | None = None,
 ) -> RegionalIntelligenceSnapshot:
@@ -221,6 +223,7 @@ def build_regional_intelligence_from_db(
             since_utc=since_utc,
             limit=max(1, int(limit or 5000)),
         ),
+        readonly=readonly,
     )
     observations = _enrich_commstat_observations_from_artifacts(db_path, observations)
     if state_filter:
@@ -264,7 +267,7 @@ def _enrich_commstat_observations_from_artifacts(
     placeholders = ",".join("?" for _ in ids)
     lookup: dict[str, dict[str, object]] = {}
     try:
-        with sqlite3.connect(str(db_path)) as conn:
+        with connect_sqlite_readonly(str(db_path)) as conn:
             exists = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='commstat_artifacts'"
             ).fetchone()

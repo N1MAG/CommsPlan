@@ -175,5 +175,6 @@ def mesh_error_requires_operator_action(error: object) -> bool:
             "bleakbluetoothnotavailablereason.powered_off",
             "br-connection-canceled",
             "linux could not complete meshcore bluetooth pairing",
+            "reconnect paused",
         )
     )

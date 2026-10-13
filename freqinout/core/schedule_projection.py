@@ -6,7 +6,13 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from freqinout.core.schedule_targeting import normalize_schedule_target_fields
+from freqinout.core.daily_schedule_resolution import resolve_daily_schedule_segments
+from freqinout.core.operating_group_frequency import format_frequency_mhz
+from freqinout.core.schedule_targeting import (
+    normalize_schedule_target_fields,
+    schedule_target_identity_parts,
+    schedule_targets_may_overlap,
+)
 
 
 DAY_NAMES = ("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday")
@@ -30,6 +36,7 @@ class ScheduleSegment:
     recurrence: str = "Weekly"
     month_weeks: str = ""
     row_signature: str = ""
+    operating_group_frequency_key: str = ""
     raw: Mapping[str, Any] = field(default_factory=dict)
 
     @property
@@ -60,6 +67,7 @@ class ScheduleSegment:
             "mode": self.mode,
             "vfo": self.vfo,
             "group_name": self.group_name,
+            "operating_group_frequency_key": self.operating_group_frequency_key,
             "net_name": self.net_name,
             "profile_name": self.profile_name,
             "target_scope": str(self.raw.get("target_scope") or ""),
@@ -73,6 +81,11 @@ class ScheduleSegment:
             "resource_id",
             "sop_profile_id",
             "sop_layer_id",
+            "implicit_continuation",
+            "resolution_provenance",
+            "occurrence_start_utc",
+            "occurrence_end_utc",
+            "canonical_source_row",
         ):
             if key in self.raw and self.raw.get(key) not in (None, ""):
                 ref[key] = self.raw.get(key)
@@ -152,7 +165,8 @@ def build_blended_schedule_projection(
 ) -> BlendedScheduleProjection:
     week_start = week_start_utc or _current_week_start_sunday_utc()
     policies = list(policy_rows or [])
-    hf = _segments_for_rows(hf_rows, "HF", week_start)
+    hf_source = _segments_for_rows(hf_rows, "HF", week_start)
+    hf = _resolved_hf_segments(hf_rows, week_start)
     net = _segments_for_rows(net_rows, "NET", week_start)
     sop = _segments_for_rows(sop_rows, "SOP", week_start)
 
@@ -165,13 +179,13 @@ def build_blended_schedule_projection(
     effective.extend(net_effective)
     effective.extend(sop_effective)
     effective = _merge_adjacent_segments(sorted(effective, key=_segment_sort_key))
-    cells = tuple(_build_cells(week_start, hf, net, sop, effective))
+    cells = tuple(_build_cells(week_start, hf_source, net, sop, effective))
     return BlendedScheduleProjection(
         week_start_utc=week_start,
         effective_segments=tuple(effective),
         cells=cells,
-        source_counts={"HF": len(hf), "NET": len(net), "SOP": len(sop)},
-        source_segments=tuple(sorted(hf + net + sop, key=_segment_sort_key)),
+        source_counts={"HF": len(hf_source), "NET": len(net), "SOP": len(sop)},
+        source_segments=tuple(sorted(hf_source + net + sop, key=_segment_sort_key)),
     )
 
 
@@ -262,13 +276,7 @@ def _normalize_hhmm(value: Any) -> str:
 
 
 def _normalize_frequency(value: Any) -> str:
-    text = str(value or "").strip()
-    if not text:
-        return ""
-    try:
-        return f"{float(text):.3f}"
-    except Exception:
-        return text
+    return format_frequency_mhz(value)
 
 
 def _row_applies_this_week(row: Mapping[str, Any], targets: Iterable[str], week_start: dt.date) -> bool:
@@ -386,6 +394,10 @@ def _segment_raw(row: Mapping[str, Any], source: str, row_signature: str) -> Dic
             except Exception:
                 raw.setdefault("resource_id", resource_id)
     if source == "SOP":
+        # Retain the authoring row, not this week's split/clipped occurrence.
+        # Do not nest copies when an existing canonical row is already attached.
+        raw.setdefault("canonical_source_row", {key: value for key, value in row.items()
+                                                if key != "canonical_source_row"})
         raw.setdefault("sop_profile_id", int(row.get("sop_profile_id") or 0))
         raw.setdefault("sop_layer_id", int(row.get("sop_layer_id") or row.get("id") or 0))
     return raw
@@ -430,9 +442,87 @@ def _segments_for_rows(
                         recurrence=str(row.get("recurrence") or "Weekly").strip() or "Weekly",
                         month_weeks=str(row.get("month_weeks") or "").strip(),
                         row_signature=row_signature,
+                        operating_group_frequency_key=str(row.get("operating_group_frequency_key") or ""),
                         raw=raw,
                     )
                 )
+    return segments
+
+
+def _resolved_hf_segments(
+    rows: Sequence[Mapping[str, Any]],
+    week_start: dt.date,
+) -> List[ScheduleSegment]:
+    window_start = dt.datetime.combine(week_start, dt.time(), tzinfo=dt.timezone.utc)
+    window_end = window_start + dt.timedelta(days=7)
+    station_rows: List[Mapping[str, Any]] = []
+    target_rows: Dict[Tuple[str, str, str], List[Mapping[str, Any]]] = {}
+    for row in rows:
+        target = schedule_target_identity_parts(row)
+        if target[0] == "station":
+            station_rows.append(row)
+        else:
+            target_rows.setdefault(target, []).append(row)
+
+    resolved = list(resolve_daily_schedule_segments(station_rows, window_start, window_end))
+    for target, lane_rows in target_rows.items():
+        lane_resolved = resolve_daily_schedule_segments(
+            station_rows + lane_rows,
+            window_start,
+            window_end,
+        )
+        # The station timeline is already retained once. Add only target-owned
+        # winners from this lane so a target override survives without cloning
+        # the station baseline into every radio lane.
+        resolved.extend(
+            item
+            for item in lane_resolved
+            if schedule_target_identity_parts(item.row) == target
+        )
+    segments: List[ScheduleSegment] = []
+    for item in resolved:
+        row = item.row
+        row_signature = _row_signature(row, "HF")
+        raw = _segment_raw(row, "HF", row_signature)
+        raw.update(
+            {
+                "implicit_continuation": bool(item.implicit_continuation),
+                "resolution_provenance": item.provenance,
+                "occurrence_start_utc": item.occurrence_start_utc.isoformat(),
+                "occurrence_end_utc": item.occurrence_end_utc.isoformat(),
+            }
+        )
+        cursor = item.start_utc
+        while cursor < item.end_utc:
+            next_midnight = dt.datetime.combine(
+                cursor.date() + dt.timedelta(days=1),
+                dt.time(),
+                tzinfo=dt.timezone.utc,
+            )
+            part_end = min(item.end_utc, next_midnight)
+            day_index = (cursor.date() - week_start).days
+            if 0 <= day_index < len(DAY_NAMES):
+                start_minute = cursor.hour * 60 + cursor.minute
+                end_minute = 24 * 60 if part_end == next_midnight else part_end.hour * 60 + part_end.minute
+                segments.append(
+                    ScheduleSegment(
+                        source="HF",
+                        day_utc=DAY_NAMES[day_index],
+                        start_minute=start_minute,
+                        end_minute=end_minute,
+                        band=str(row.get("band") or "").strip().upper(),
+                        frequency=str(row.get("frequency") or row.get("freq") or "").strip(),
+                        mode=str(row.get("mode") or "").strip(),
+                        vfo=(str(row.get("vfo") or "A").strip().upper() or "A"),
+                        group_name=str(row.get("group_name") or row.get("group") or "").strip().upper(),
+                        recurrence=str(row.get("recurrence") or "Weekly").strip() or "Weekly",
+                        month_weeks=str(row.get("month_weeks") or "").strip(),
+                        row_signature=row_signature,
+                        operating_group_frequency_key=str(row.get("operating_group_frequency_key") or ""),
+                        raw=raw,
+                    )
+                )
+            cursor = part_end
     return segments
 
 
@@ -449,6 +539,7 @@ def _same_day_overlap(left: ScheduleSegment, right: ScheduleSegment) -> bool:
         left.day_utc == right.day_utc
         and left.start_minute < right.end_minute
         and right.start_minute < left.end_minute
+        and schedule_targets_may_overlap(left.raw, right.raw)
     )
 
 
@@ -496,6 +587,7 @@ def _replace_segment_window(segment: ScheduleSegment, start: int, end: int) -> S
         recurrence=segment.recurrence,
         month_weeks=segment.month_weeks,
         row_signature=segment.row_signature,
+        operating_group_frequency_key=segment.operating_group_frequency_key,
         raw=segment.raw,
     )
 
@@ -586,8 +678,14 @@ def _merge_adjacent_segments(segments: Sequence[ScheduleSegment]) -> List[Schedu
             and merged[-1].band == segment.band
             and merged[-1].frequency == segment.frequency
             and merged[-1].mode == segment.mode
+            and merged[-1].vfo == segment.vfo
             and merged[-1].group_name == segment.group_name
+            and merged[-1].operating_group_frequency_key == segment.operating_group_frequency_key
             and merged[-1].net_name == segment.net_name
+            and merged[-1].raw.get("implicit_continuation") == segment.raw.get("implicit_continuation")
+            and merged[-1].raw.get("resolution_provenance") == segment.raw.get("resolution_provenance")
+            and merged[-1].raw.get("occurrence_start_utc") == segment.raw.get("occurrence_start_utc")
+            and merged[-1].raw.get("occurrence_end_utc") == segment.raw.get("occurrence_end_utc")
         ):
             merged[-1] = _replace_segment_window(merged[-1], merged[-1].start_minute, segment.end_minute)
         else:

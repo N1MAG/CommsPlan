@@ -8,6 +8,7 @@ from pathlib import Path
 
 from freqinout.core.sqlite_utils import connect_sqlite
 from freqinout.core.varac_bbs_library_store import (
+    list_bbs_locations,
     sync_bbs_location_from_folder,
     upsert_bbs_location,
 )
@@ -25,6 +26,7 @@ class BbsInitializationResult:
     default_location_dir: str
     imported_files: int
     cataloged_files: int
+    reused: bool = False
 
 
 def initialize_station_bbs_library(
@@ -43,6 +45,20 @@ def initialize_station_bbs_library(
     live_dir = Path(live_bbs_dir).expanduser()
     if not live_dir.exists() or not live_dir.is_dir():
         raise ValueError("The selected VarAC live BBS folder does not exist or is not a folder.")
+    with connect_sqlite(Path(db_path)) as conn:
+        locations = list_bbs_locations(conn, include_disabled=True)
+        meta = dict(conn.execute("SELECT key, value FROM bbs_library_meta").fetchall())
+        station_root = str(meta.get("station_managed_root") or "").strip()
+        if station_root or locations:
+            default_id = str(meta.get("station_default_location_id") or DEFAULT_LOCATION_ID)
+            default = next((row for row in locations if row.location_id == default_id), None)
+            # A second adapter attaches to the station catalog. Never rebase
+            # its locations, reset its access rules or import another live view.
+            if not station_root:
+                raise ValueError("The station BBS already has locations but no library root. Repair the station library before attaching another radio.")
+            if default is None or not str(default.source_dir or "").strip():
+                raise ValueError("The station BBS library has no valid Default location. Repair the station library before attaching another radio.")
+            return BbsInitializationResult(station_root, default.source_dir, 0, 0, reused=True)
     managed_root = compute_default_managed_root(live_dir)
     if not managed_root:
         raise ValueError("A Managed BBS library location could not be derived from the live BBS folder.")
@@ -61,6 +77,12 @@ def initialize_station_bbs_library(
             imported += 1
     with connect_sqlite(Path(db_path)) as conn:
         with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            # Filesystem preparation can overlap another administration window.
+            # Recheck under the write lock before changing any catalog policy.
+            if (conn.execute("SELECT 1 FROM bbs_locations LIMIT 1").fetchone()
+                    or conn.execute("SELECT 1 FROM bbs_library_meta WHERE key='station_managed_root' AND value<>'' LIMIT 1").fetchone()):
+                raise ValueError("The station BBS catalog changed during initialization. Refresh and attach this radio to the existing library.")
             upsert_bbs_location(
                 conn,
                 location_id=DEFAULT_LOCATION_ID,
@@ -89,7 +111,7 @@ def initialize_station_bbs_library(
                 ("station_default_location_id", DEFAULT_LOCATION_ID),
             ):
                 conn.execute(
-                    "INSERT OR REPLACE INTO bbs_library_meta(key, value) VALUES(?, ?)",
+                    "INSERT OR IGNORE INTO bbs_library_meta(key, value) VALUES(?, ?)",
                     (key, value),
                 )
     return BbsInitializationResult(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
 import math
+import sys
 import threading
 
 from freqinout.core.mesh.adapter_base import MeshAdapter
@@ -32,6 +33,10 @@ def default_mesh_adapter_factory(config: MeshConnectionConfig) -> MeshAdapter:
     if protocol == "meshtastic":
         return MeshtasticLocalAdapter(config)
     if protocol == "meshcore":
+        if sys.platform.startswith("linux") and config.connection_type is MeshConnectionType.BLE:
+            from freqinout.core.mesh.linux_ble_supervisor import LinuxMeshCoreBleSupervisorAdapter
+
+            return LinuxMeshCoreBleSupervisorAdapter(config)
         return MeshCorePythonAdapter(config)
     raise MeshConnectionError(f"{config.protocol or 'Mesh'} adapters are configured for a later implementation slice.")
 
@@ -386,5 +391,23 @@ class MeshConnectionManager:
         )
 
     def _publish(self, event: MeshAdapterEvent) -> None:
+        cache = None
+        if event.node is not None:
+            # Contacts are periodically resynchronized. Identical retained
+            # state does not warrant another database write or map revision.
+            cache = getattr(self, "_published_nodes", None)
+            if cache is None:
+                from collections import OrderedDict
+                cache = self._published_nodes = OrderedDict()
+            key = (event.node.adapter_id, event.node.transport, event.node.node_id)
+            if cache.get(key) == event.node:
+                return
         for listener in tuple(self._listeners):
             listener(event)
+        # Cache only after sinks accepted the event; a failed write must be
+        # retried by an identical subsequent contact synchronization.
+        if cache is not None:
+            cache[key] = event.node
+            cache.move_to_end(key)
+            while len(cache) > 4096:
+                cache.popitem(last=False)

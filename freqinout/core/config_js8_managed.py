@@ -111,7 +111,7 @@ def build_js8call_managed_profile_plans(
             else:
                 rig_summary = "JS8Call controls the radio; confirm the radio in JS8Call."
         elif route_key in {"none", "manual", "later"}:
-            rig_summary = "No FIO-managed JS8Call frequency control."
+            rig_summary = "No CommsPlan-managed JS8Call frequency control."
         if callsign.strip():
             settings["MyCall"] = callsign.strip().upper()
         if grid.strip():

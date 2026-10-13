@@ -121,7 +121,7 @@ def receiver_state_presentation(
         title="Manual / reminders only",
         detail=(
             "The receiver remains usable for manual tuning and schedule reminders. "
-            "FIO will not retune it automatically without matching verification and explicit tuning opt-in."
+            "CommsPlan will not retune it automatically without matching verification and explicit tuning opt-in."
         ),
         tone="info",
         automatic_retune_allowed=False,
@@ -182,7 +182,7 @@ def guided_recovery_presentation(
         names = ", ".join(operator_apps)
         return GuidedRecoveryPresentation(
             status="Saved — operator start required",
-            detail=f"FIO will not start {names}; start the application manually when it is needed.",
+            detail=f"CommsPlan will not start {names}; start the application manually when it is needed.",
             retry_route=f"Settings → Software → {operator_apps[0]} → Launch",
             tone="info",
         )

@@ -16,7 +16,7 @@ STATUS_DISPLAY_ITEMS: Sequence[Tuple[str, str]] = (
     ("FLAmp", "FLAmp"),
     ("JS8Call_API", "JS8"),
     ("VarAC", "VarAC"),
-    ("JS8Spotter", "FIO Spotter"),
+    ("JS8Spotter", "CommsPlan Spotter"),
     ("CommStat", "CommStat"),
 )
 
@@ -35,14 +35,14 @@ READINESS_STATE_SPECS: Dict[str, ReadinessStateSpec] = {
         key="ready",
         label="Ready",
         sentence_fragment="is ready",
-        description="Configured for the workflows FreqInOut is currently tracking.",
+        description="Configured for the workflows CommsPlan is currently tracking.",
         card_level="success",
     ),
     "needs_setup": ReadinessStateSpec(
         key="needs_setup",
         label="Needs Setup",
         sentence_fragment="needs setup",
-        description="Required setup is missing before FreqInOut can rely on this area.",
+        description="Required setup is missing before CommsPlan can rely on this area.",
         card_level="danger",
     ),
     "degraded": ReadinessStateSpec(
@@ -63,7 +63,7 @@ READINESS_STATE_SPECS: Dict[str, ReadinessStateSpec] = {
         key="external_manual",
         label="External / Manual",
         sentence_fragment="is managed externally",
-        description="This area is intentionally managed outside FreqInOut or excluded from FreqInOut-managed launch behavior.",
+        description="This area is intentionally managed outside CommsPlan or excluded from CommsPlan-managed launch behavior.",
         card_level="info",
     ),
 }
@@ -615,7 +615,7 @@ def build_station_readiness_report(
                 section_key="freqinout",
                 scope="global",
                 message="Callsign missing",
-                resolution_hint="Set the station callsign in FreqInOut Settings.",
+                resolution_hint="Set the station callsign in CommsPlan Settings.",
                 deep_link_target=_issue_deep_link("freqinout", None),
                 state_key="needs_setup",
             )
@@ -627,7 +627,7 @@ def build_station_readiness_report(
                 section_key="freqinout",
                 scope="global",
                 message="Grid missing",
-                resolution_hint="Set the station grid in FreqInOut Settings.",
+                resolution_hint="Set the station grid in CommsPlan Settings.",
                 deep_link_target=_issue_deep_link("freqinout", None),
                 state_key="needs_setup",
             )
@@ -713,7 +713,7 @@ def build_station_readiness_report(
                     scope=scope,
                     radio_id=radio_id,
                     message=f"{name}: radio model not selected",
-                    resolution_hint="Select the actual radio model so FreqInOut can offer smarter setup guidance for this radio.",
+                    resolution_hint="Select the actual radio model so CommsPlan can offer smarter setup guidance for this radio.",
                     deep_link_target=_issue_deep_link("radio_profiles", radio_id),
                     state_key="degraded",
                 )
@@ -1013,7 +1013,7 @@ def build_station_readiness_report(
                 scope="global",
                 integration_key="fldigi",
                 message="FLDigi check in support is configured without an FLDigi executable path",
-                resolution_hint="Set the FLDigi launch path if this station should run FLDigi from FreqInOut.",
+                resolution_hint="Set the FLDigi launch path if this station should run FLDigi from CommsPlan.",
                 deep_link_target=_issue_deep_link("fast_light", None),
                 state_key="degraded",
             )

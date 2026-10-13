@@ -37,6 +37,8 @@ _KNOWN_JS8_VERSIONS = {
     "js8call_subspace_4_1": "4.1.0.478",
 }
 _KEY_RE = re.compile(r"[^a-z0-9_.-]+")
+SETTINGS_IDENTITY_DEFAULT = "default"
+SETTINGS_IDENTITY_ISOLATED = "isolated"
 
 
 def _text(value: object) -> str:
@@ -67,6 +69,79 @@ def _native_identity_child(draft: Mapping[str, Any]) -> str:
         _text(draft.get("owner_label") or draft.get("instance_name") or "Radio"),
     ).strip("-._")[:48] or "Radio"
     return label
+
+
+def settings_identity_mode_from_mapping(
+    draft: Mapping[str, Any],
+    *,
+    family_key: object | None = None,
+) -> str:
+    """Return the explicit or safely inferred native settings identity.
+
+    Older records predate this field, so inference is intentionally narrow:
+    migrated application keys and complete structured recipes are
+    authoritative. New or incomplete drafts remain isolated by default.
+    """
+
+    explicit = _key(
+        draft.get("settings_identity_mode")
+        or draft.get("native_settings_identity")
+        or draft.get("profile_identity_mode")
+    )
+    if explicit in {SETTINGS_IDENTITY_DEFAULT, SETTINGS_IDENTITY_ISOLATED}:
+        return explicit
+    family = _key(family_key or draft.get("family_key"))
+    system_key = _key(
+        draft.get("application_system_key")
+        or draft.get("imported_system_key")
+        or draft.get("system_key")
+    )
+    if family == "js8call" and system_key == "default_js8_instance":
+        return SETTINGS_IDENTITY_DEFAULT
+    if family == "fast_light" and system_key == "default_fast_light":
+        return SETTINGS_IDENTITY_DEFAULT
+    recipe = draft.get("launch_recipe")
+    if not isinstance(recipe, Mapping):
+        return SETTINGS_IDENTITY_ISOLATED
+    components = tuple(
+        item for item in recipe.get("components", ()) if isinstance(item, Mapping)
+    )
+    if not components:
+        return SETTINGS_IDENTITY_ISOLATED
+    if family == "js8call":
+        js8 = next(
+            (item for item in components if _key(item.get("component_key")) == "js8call"),
+            None,
+        )
+        if js8 is not None:
+            arguments = tuple(_text(item) for item in js8.get("arguments", ()) or ())
+            has_selector = any(
+                item in {"-r", "--rig-name"}
+                or item.startswith("--rig-name=")
+                or item.startswith("-r=")
+                for item in arguments
+            )
+            return SETTINGS_IDENTITY_ISOLATED if has_selector else SETTINGS_IDENTITY_DEFAULT
+    if family == "fast_light":
+        relevant = tuple(
+            item
+            for item in components
+            if _key(item.get("component_key")) in {"flrig", "fldigi", "flmsg", "flamp"}
+        )
+        if relevant:
+            selector_options = {"--config-dir", "--flmsg-dir"}
+            has_selector = any(
+                any(
+                    argument in selector_options
+                    or any(argument.startswith(f"{option}=") for option in selector_options)
+                    for argument in (
+                        _text(value) for value in component.get("arguments", ()) or ()
+                    )
+                )
+                for component in relevant
+            )
+            return SETTINGS_IDENTITY_ISOLATED if has_selector else SETTINGS_IDENTITY_DEFAULT
+    return SETTINGS_IDENTITY_ISOLATED
 
 
 def managed_instance_window_title(application_name: object, radio_label: object) -> str:
@@ -139,6 +214,48 @@ def _fast_light_native_roots(
         "flamp_receive": str(flamp_receive),
         "flamp_outgoing": str(flamp_outgoing),
         "nbems_base": str(nbems_base),
+    }
+
+
+def _fast_light_default_roots(
+    draft: Mapping[str, Any],
+    *,
+    platform: object | None = None,
+    storage_home: Path | None = None,
+) -> dict[str, str]:
+    """Describe application default roots without granting write ownership."""
+
+    system = str(platform or os.sys.platform or "").strip().casefold()
+    home = Path(storage_home) if storage_home is not None else Path.home()
+    flrig_root = Path(
+        _text(draft.get("configuration_path") or draft.get("flrig_native_root"))
+        or home / ".flrig"
+    ).expanduser()
+    fldigi_root = Path(
+        _text(draft.get("secondary_configuration_path") or draft.get("fldigi_native_root"))
+        or home / ".fldigi"
+    ).expanduser()
+    default_nbems = home / "NBEMS.files" if system in {"windows", "win", "win32", "cygwin"} else home / ".nbems"
+    nbems_root = Path(
+        _text(draft.get("flmsg_native_root") or draft.get("nbems_native_base"))
+        or default_nbems
+    ).expanduser()
+    logs = Path(_text(draft.get("storage_path")) or fldigi_root / "logs").expanduser()
+    checkins = Path(
+        _text(draft.get("secondary_storage_path")) or nbems_root / "WRAP" / "auto"
+    ).expanduser()
+    return {
+        "flrig_root": str(flrig_root),
+        "fldigi_root": str(fldigi_root),
+        "fldigi_logs": str(logs),
+        "flmsg_root": str(nbems_root),
+        "flmsg_messages": str(nbems_root / "ICS" / "messages"),
+        "flmsg_templates": str(nbems_root / "ICS" / "templates"),
+        "flmsg_auto": str(checkins),
+        "flamp_root": str(nbems_root),
+        "flamp_receive": str(nbems_root / "FLAMP" / "rx"),
+        "flamp_outgoing": str(nbems_root / "FLAMP" / "tx"),
+        "nbems_base": str(nbems_root),
     }
 
 
@@ -381,7 +498,7 @@ def _safety_block(family: str, detail: str, *, code: str = "resource_collision")
         status="blocked_for_safety",
         raw_override_allowed=False,
         recovery_action=detail,
-        summary="FIO cannot safely create this isolated launch plan until the collision is resolved.",
+        summary="CommsPlan cannot safely create this isolated launch plan until the collision is resolved.",
         confidence="blocked",
         blocker_code=code,
     )
@@ -440,7 +557,7 @@ def _collision_detail(draft: Mapping[str, Any], instance_key: str) -> tuple[str,
             return code, message
     requested_keys = draft.get("existing_instance_keys")
     if requested_keys and instance_key and instance_key in {str(item).strip() for item in requested_keys}:
-        return "instance_key_collision", "FIO could not allocate a distinct managed instance identity."
+        return "instance_key_collision", "CommsPlan could not allocate a distinct managed instance identity."
     return None
 
 
@@ -494,7 +611,7 @@ def resolve_js8_managed_recipe(
     if not instance_key:
         return _safety_block(
             "js8call",
-            "FIO could not allocate a distinct JS8Call identity. Return to Identity and prepare again.",
+            "CommsPlan could not allocate a distinct JS8Call identity. Return to Identity and prepare again.",
             code="missing_distinct_identity",
         )
     collision = _collision_detail(draft, instance_key)
@@ -514,15 +631,20 @@ def resolve_js8_managed_recipe(
     unknown_variant = bool(
         executable and (variant not in _KNOWN_JS8_VERSIONS or not known_variant_hint)
     )
+    identity_mode = settings_identity_mode_from_mapping(draft, family_key="js8call")
+    use_default_settings = identity_mode == SETTINGS_IDENTITY_DEFAULT
     radio_name = _text(draft.get("owner_label") or draft.get("instance_name") or "Radio")
-    try:
-        rig_name = normalize_rig_name(draft.get("rig_name")) or native_managed_rig_name(radio_name)
-    except ValueError:
-        return _safety_block(
-            "js8call",
-            "The reviewed JS8Call rig name contains a slash, backslash, or comma. Return to Identity and choose a valid distinct name.",
-            code="invalid_rig_name",
-        )
+    if use_default_settings:
+        rig_name = ""
+    else:
+        try:
+            rig_name = normalize_rig_name(draft.get("rig_name")) or native_managed_rig_name(radio_name)
+        except ValueError:
+            return _safety_block(
+                "js8call",
+                "The reviewed JS8Call rig name contains a slash, backslash, or comma. Return to Identity and choose a valid distinct name.",
+                code="invalid_rig_name",
+            )
     application_name = js8_application_name(rig_name)
     data_root = str(
         qt_data_root_candidates(
@@ -546,7 +668,7 @@ def resolve_js8_managed_recipe(
     if not tcp_port or not udp_port:
         return _safety_block(
             "js8call",
-            "FIO could not allocate distinct JS8Call TCP and UDP endpoints. Return to Connections and prepare again.",
+            "CommsPlan could not allocate distinct JS8Call TCP and UDP endpoints. Return to Connections and prepare again.",
             code="missing_distinct_endpoint",
         )
     version_evidence = _version_evidence(draft, variant=variant, version=version)
@@ -566,32 +688,37 @@ def resolve_js8_managed_recipe(
         else "launch_pending"
     )
     if not executable:
-        recovery = "Browse for the JS8Call executable to enable launch; this isolated profile can still be saved."
-        summary = f"JS8Call profile {rig_name} prepared; launch setup is pending the executable."
+        recovery = "Browse for the JS8Call executable to enable launch; the reviewed settings choice can still be saved."
+        summary = "Default JS8Call settings prepared; launch setup is pending the executable." if use_default_settings else f"JS8Call profile {rig_name} prepared; launch setup is pending the executable."
     elif unknown_variant:
         recovery = (
-            f"Confirm that {executable} supports FIO's distinct --rig-name launch contract, "
-            "then enable launch. The isolated profile can still be saved."
+            f"Confirm that {executable} supports CommsPlan's "
+            f"{'default settings launch without --rig-name' if use_default_settings else 'distinct --rig-name launch contract'}, "
+            f"then enable launch. The {'default settings choice' if use_default_settings else 'isolated profile'} can still be saved."
         )
-        summary = f"JS8Call profile {rig_name} prepared; launch is pending variant confirmation."
+        summary = "Default JS8Call settings prepared; launch is pending variant confirmation." if use_default_settings else f"JS8Call profile {rig_name} prepared; launch is pending variant confirmation."
     elif not qualified_version:
         recovery = (
             f"JS8Call executable found at {executable}; verify its exact supported version after first launch."
         )
-        summary = f"JS8Call profile {rig_name} prepared with unverified version evidence; review before launch."
+        summary = "Default JS8Call settings prepared with unverified version evidence; review before launch." if use_default_settings else f"JS8Call profile {rig_name} prepared with unverified version evidence; review before launch."
     else:
         recovery = ""
-        summary = f"Launch {variant} {qualified_version} as {rig_name} on {host}:{tcp_port}."
+        summary = (
+            f"Launch {variant} {qualified_version} with existing default settings on {host}:{tcp_port}."
+            if use_default_settings
+            else f"Launch {variant} {qualified_version} as {rig_name} on {host}:{tcp_port}."
+        )
     component = GuidedLaunchComponent(
         component_key="js8call",
         label="JS8Call",
         executable=executable,
-        arguments=("--rig-name", rig_name),
+        arguments=() if use_default_settings else ("--rig-name", rig_name),
         profile_selector=rig_name,
         working_directory="",
         configuration_roots=(profile_path,),
         data_roots=(data_root, save_root, forms_root),
-        managed_directories=tuple(
+        managed_directories=() if use_default_settings else tuple(
             dict.fromkeys((parent_directory_text(profile_path), data_root, save_root, forms_root))
         ),
         endpoints=(
@@ -599,7 +726,7 @@ def resolve_js8_managed_recipe(
             {"name": "JS8Call UDP", "protocol": "udp", "host": host, "port": udp_port},
         ),
         readiness={"kind": "js8_api", "host": host, "port": tcp_port, "require_api": True},
-        evidence={"executable": executable_evidence, "version": version_evidence, "profile": {"source": "js8call_qt_native", "confidence": "isolated", "root": profile_path}},
+        evidence={"executable": executable_evidence, "version": version_evidence, "profile": {"source": "js8call_qt_native", "confidence": "existing_default" if use_default_settings else "isolated", "root": profile_path}, "settings_identity_mode": identity_mode},
         confidence=confidence,
         execution_scope=_scope(draft),
         launch_at_startup=bool(draft.get("launch_at_startup", False)) and status != "launch_pending",
@@ -612,7 +739,7 @@ def resolve_js8_managed_recipe(
         recovery_action=recovery,
         summary=summary,
         confidence=confidence,
-        evidence={"executable": executable_evidence, "version": version_evidence, "profile_root": profile_path, "data_root": data_root},
+        evidence={"executable": executable_evidence, "version": version_evidence, "profile_root": profile_path, "data_root": data_root, "settings_identity_mode": identity_mode},
     )
 
 
@@ -630,17 +757,19 @@ def resolve_fast_light_managed_recipe(
     if not instance_key:
         return _safety_block(
             "fast_light",
-            "FIO could not allocate a distinct Fast Light identity. Return to Identity and prepare again.",
+            "CommsPlan could not allocate a distinct Fast Light identity. Return to Identity and prepare again.",
             code="missing_distinct_identity",
         )
     collision = _collision_detail(draft, instance_key)
     if collision is not None:
         code, detail = collision
         return _safety_block("fast_light", detail, code=code)
-    native = _fast_light_native_roots(
-        draft,
-        platform=platform,
-        storage_home=storage_home,
+    identity_mode = settings_identity_mode_from_mapping(draft, family_key="fast_light")
+    use_default_settings = identity_mode == SETTINGS_IDENTITY_DEFAULT
+    native = (
+        _fast_light_default_roots(draft, platform=platform, storage_home=storage_home)
+        if use_default_settings
+        else _fast_light_native_roots(draft, platform=platform, storage_home=storage_home)
     )
     radio_label = _text(draft.get("owner_label") or draft.get("instance_name")) or "Radio"
     flrig_profile = native["flrig_root"]
@@ -654,7 +783,7 @@ def resolve_fast_light_managed_recipe(
     if not fldigi_port or (not observer and not flrig_port):
         return _safety_block(
             "fast_light",
-            "FIO could not allocate distinct Fast Light endpoints. Return to Connections and prepare again.",
+            "CommsPlan could not allocate distinct Fast Light endpoints. Return to Connections and prepare again.",
             code="missing_distinct_endpoint",
         )
     startup = bool(draft.get("launch_at_startup", False))
@@ -693,7 +822,7 @@ def resolve_fast_light_managed_recipe(
     if selected_flamp and not flamp_arq_port:
         missing_labels.append("FLDigi ARQ port")
     recovery = (
-        "Browse for " + " and ".join(missing_labels) + " to enable launch; this isolated Fast Light profile can still be saved."
+        "Browse for " + " and ".join(missing_labels) + " to enable launch; this Fast Light settings choice can still be saved."
         if missing_labels
         else ""
     )
@@ -704,26 +833,26 @@ def resolve_fast_light_managed_recipe(
                 component_key="flrig",
                 label="FLRig",
                 executable=flrig,
-                arguments=("--config-dir", flrig_profile),
-                working_directory=flrig_profile,
-                profile_selector=flrig_profile,
+                arguments=() if use_default_settings else ("--config-dir", flrig_profile),
+                working_directory="" if use_default_settings else flrig_profile,
+                profile_selector="" if use_default_settings else flrig_profile,
                 configuration_roots=(flrig_profile,),
-                managed_directories=(flrig_profile,),
+                managed_directories=() if use_default_settings else (flrig_profile,),
                 endpoints=({"name": "FLRig XML-RPC", "protocol": "tcp", "host": host, "port": flrig_port},),
                 readiness={"kind": "xmlrpc", "host": host, "port": flrig_port, "require_service": True},
-                evidence={"executable": flrig_evidence, "profile": {"source": "generated", "confidence": "isolated", "root": flrig_profile}},
+                evidence={"executable": flrig_evidence, "profile": {"source": "application_default" if use_default_settings else "generated", "confidence": "existing_default" if use_default_settings else "isolated", "root": flrig_profile}, "settings_identity_mode": identity_mode},
                 confidence="pending" if not flrig else "verified",
                 launch_at_startup=startup and not missing_required,
                 operator_starts=missing_required,
             )
         )
     fldigi_arguments = (
-        "--config-dir", fldigi_profile,
+        *(("--config-dir", fldigi_profile) if not use_default_settings else ()),
         "--xmlrpc-server-address", host,
         "--xmlrpc-server-port", str(fldigi_port),
         *(("--arq-server-address", host, "--arq-server-port", str(flamp_arq_port)) if flamp_arq_port else ()),
-        *(("--flmsg-dir", native["flmsg_root"]) if selected_flmsg else ()),
-        "--auto-dir", native["flmsg_auto"],
+        *(("--flmsg-dir", native["flmsg_root"]) if selected_flmsg and not use_default_settings else ()),
+        *(("--auto-dir", native["flmsg_auto"]) if not use_default_settings else ()),
     )
     components.append(
         GuidedLaunchComponent(
@@ -731,15 +860,15 @@ def resolve_fast_light_managed_recipe(
             label="FLDigi",
             executable=fldigi,
             arguments=fldigi_arguments,
-            working_directory=fldigi_profile,
+            working_directory="" if use_default_settings else fldigi_profile,
             dependencies=() if observer else ("flrig",),
-            profile_selector=fldigi_profile,
+            profile_selector="" if use_default_settings else fldigi_profile,
             configuration_roots=(fldigi_profile,),
             data_roots=(logs, checkins),
-            managed_directories=(fldigi_profile, logs, checkins),
+            managed_directories=() if use_default_settings else (fldigi_profile, logs, checkins),
             endpoints=({"name": "FLDigi XML-RPC", "protocol": "tcp", "host": host, "port": fldigi_port},),
             readiness={"kind": "xmlrpc", "host": host, "port": fldigi_port, "require_service": True},
-            evidence={"executable": fldigi_evidence, "profile": {"source": "generated", "confidence": "isolated", "root": fldigi_profile}, "logs": logs, "checkins": checkins},
+            evidence={"executable": fldigi_evidence, "profile": {"source": "application_default" if use_default_settings else "generated", "confidence": "existing_default" if use_default_settings else "isolated", "root": fldigi_profile}, "logs": logs, "checkins": checkins, "settings_identity_mode": identity_mode},
             confidence="pending" if not fldigi else "verified",
             execution_scope="receive_only" if observer else "standard",
             launch_at_startup=startup and not missing_required,
@@ -756,19 +885,19 @@ def resolve_fast_light_managed_recipe(
                 # accept it.  --flmsg-dir is the supported multi-instance
                 # selector; FLDigi receives the same root plus --auto-dir.
                 arguments=(
-                    "--flmsg-dir", native["flmsg_root"],
+                    *(("--flmsg-dir", native["flmsg_root"]) if not use_default_settings else ()),
                     "-title", managed_instance_window_title("FLMsg", radio_label),
                 ),
-                working_directory=native["flmsg_root"],
+                working_directory="" if use_default_settings else native["flmsg_root"],
                 dependencies=("fldigi",),
-                profile_selector=native["flmsg_root"],
+                profile_selector="" if use_default_settings else native["flmsg_root"],
                 configuration_roots=(native["flmsg_root"],),
                 data_roots=(
                     native["flmsg_messages"],
                     native["flmsg_templates"],
                     native["flmsg_auto"],
                 ),
-                managed_directories=(
+                managed_directories=() if use_default_settings else (
                     native["flmsg_root"],
                     native["flmsg_messages"],
                     native["flmsg_templates"],
@@ -776,7 +905,8 @@ def resolve_fast_light_managed_recipe(
                 ),
                 evidence={
                     "source": "nbems_native_radio_root",
-                    "confidence": "isolated",
+                    "confidence": "existing_default" if use_default_settings else "isolated",
+                    "settings_identity_mode": identity_mode,
                     "nbems_base": native["nbems_base"],
                     "fldigi_host": host,
                     "fldigi_xmlrpc_port": fldigi_port,
@@ -798,19 +928,19 @@ def resolve_fast_light_managed_recipe(
                 label="FLAmp",
                 executable=flamp_path,
                 arguments=(
-                    "--config-dir", native["flamp_root"],
+                    *(("--config-dir", native["flamp_root"]) if not use_default_settings else ()),
                     "--arq-server-address", host,
                     "--arq-server-port", str(flamp_arq_port),
                     "--xmlrpc-server-address", host,
                     "--xmlrpc-server-port", str(fldigi_port),
                     "-title", managed_instance_window_title("FLAmp", radio_label),
                 ) if flamp_arq_port else (),
-                working_directory=native["flamp_root"],
+                working_directory="" if use_default_settings else native["flamp_root"],
                 dependencies=("fldigi",),
-                profile_selector=native["flamp_root"],
+                profile_selector="" if use_default_settings else native["flamp_root"],
                 configuration_roots=(native["flamp_root"],),
                 data_roots=(native["flamp_receive"], native["flamp_outgoing"]),
-                managed_directories=(
+                managed_directories=() if use_default_settings else (
                     native["flamp_root"],
                     native["flamp_receive"],
                     native["flamp_outgoing"],
@@ -829,8 +959,9 @@ def resolve_fast_light_managed_recipe(
                 },
                 evidence={
                     "source": "flamp_config_dir_and_endpoint_pair",
-                    "confidence": "isolated" if flamp_arq_port else "pending",
+                    "confidence": "existing_default" if use_default_settings and flamp_arq_port else "isolated" if flamp_arq_port else "pending",
                     "attribution": "radio_scoped",
+                    "settings_identity_mode": identity_mode,
                 },
                 confidence="pending" if not flamp_path or not flamp_arq_port else "verified",
                 execution_scope=_scope(draft),
@@ -844,11 +975,11 @@ def resolve_fast_light_managed_recipe(
         components=tuple(components),
         recovery_action=recovery,
         summary=(
-            f"Fast Light receive-only profile prepared on {host}:{fldigi_port}; launch setup is pending."
+            f"Fast Light receive-only settings prepared on {host}:{fldigi_port}; launch setup is pending."
             if observer and missing_required
             else f"Fast Light transceiver profile prepared; launch setup is pending {', '.join(missing_labels)}."
             if missing_required
-            else f"Launch FLDigi receive-only on {host}:{fldigi_port}."
+            else f"Launch FLDigi receive-only with {'existing default' if use_default_settings else 'isolated'} settings on {host}:{fldigi_port}."
             if observer
             else f"Launch FLRig on {host}:{flrig_port}, then FLDigi on {host}:{fldigi_port}."
         ),
@@ -869,6 +1000,7 @@ def resolve_fast_light_managed_recipe(
             "flamp_outgoing": native["flamp_outgoing"],
             "fldigi_arq_port": flamp_arq_port,
             "native_layout": "application_standard",
+            "settings_identity_mode": identity_mode,
         },
     )
 
@@ -887,7 +1019,7 @@ def resolve_guided_launch_recipe(
             status="operator_start",
             raw_override_allowed=True,
             recovery_action="Review the imported or manual application's exact launch behavior in Advanced.",
-            summary="Operator-managed launch; FIO does not rewrite this application's identity.",
+            summary="Operator-managed launch; CommsPlan does not rewrite this application's identity.",
         )
     if family == "js8call":
         return resolve_js8_managed_recipe(

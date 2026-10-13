@@ -204,7 +204,7 @@ class UiEventLoopWatchdog(QObject):
             stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%SZ")
             path = dump_dir / f"fio_ui_hang_{stamp}_{os.getpid()}.txt"
             with path.open("w", encoding="utf-8") as handle:
-                handle.write("FreqInOut UI hang watchdog report\n")
+                handle.write("CommsPlan UI hang watchdog report\n")
                 handle.write(f"UTC: {stamp}\n")
                 handle.write(f"PID: {os.getpid()}\n")
                 handle.write(f"Python: {sys.version.replace(chr(10), ' ')}\n")
@@ -377,13 +377,13 @@ class ProcessCpuWatchdog:
             path = dump_dir / f"fio_cpu_hotspot_{stamp}_{os.getpid()}.txt"
             stacks, hot_locations = self._thread_stack_snapshot()
             with path.open("w", encoding="utf-8") as handle:
-                handle.write("FreqInOut sustained CPU hotspot report\n")
+                handle.write("CommsPlan sustained CPU hotspot report\n")
                 handle.write(f"UTC: {stamp}\n")
                 handle.write(f"PID: {os.getpid()}\n")
                 handle.write(f"Python: {sys.version.replace(chr(10), ' ')}\n")
                 handle.write(f"Platform: {platform.platform()}\n")
                 handle.write(f"Process CPU: {cpu_percent:.1f}% of one logical core\n")
-                handle.write("\nLikely active FIO locations (one bounded frame per thread):\n")
+                handle.write("\nLikely active CommsPlan locations (one bounded frame per thread):\n")
                 handle.write(json.dumps(hot_locations, indent=2, sort_keys=True)[:12000])
                 handle.write("\n\nCached service diagnostics:\n")
                 handle.write(

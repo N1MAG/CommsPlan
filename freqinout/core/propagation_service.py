@@ -4,6 +4,7 @@ import datetime as dt
 import json
 import math
 import sqlite3
+from freqinout.core.sqlite_utils import connect_sqlite_readonly
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -25,6 +26,7 @@ class PropagationService:
         climatology_db_path: Optional[Path] = None,
         outcome_db_path: Optional[Path] = None,
         db_index_mode: str = "floor5",
+        climatology_month: Optional[int] = None,
     ) -> None:
         self._default_profiles: Dict[str, Dict[str, float]] = {
             str(k).strip().upper(): dict(v) for k, v in dict(default_profiles).items()
@@ -33,6 +35,7 @@ class PropagationService:
         self._climatology_db_path = Path(climatology_db_path) if climatology_db_path else None
         self._outcome_db_path = Path(outcome_db_path) if outcome_db_path else None
         self._db_index_mode = str(db_index_mode).strip().lower()
+        self._climatology_month = climatology_month
 
         self._profiles_cache: Optional[Dict[str, Dict[str, float]]] = None
         self._db_cache: Dict[Tuple[int, str, int, int], float] = {}
@@ -108,9 +111,14 @@ class PropagationService:
             self._db_available = False
             return
         try:
-            conn = sqlite3.connect(path)
+            conn = connect_sqlite_readonly(path)
             cur = conn.cursor()
-            cur.execute("SELECT month, band, lat_idx, lon_idx, muf_score FROM muf_grid")
+            sql = "SELECT month, band, lat_idx, lon_idx, muf_score FROM muf_grid"
+            if self._climatology_month is None:
+                cur.execute(sql)
+            else:
+                # A map snapshot needs only the current month, never the full archive.
+                cur.execute(sql + " WHERE month=? LIMIT 20000", (self._climatology_month,))
             for month, band, lat_idx, lon_idx, score in cur.fetchall():
                 key = (int(month), str(band).upper(), int(lat_idx), int(lon_idx))
                 self._db_cache[key] = float(score)
@@ -289,7 +297,7 @@ class PropagationService:
             self._outcome_table_available = False
             return False
         try:
-            conn = sqlite3.connect(path)
+            conn = connect_sqlite_readonly(path)
             cur = conn.cursor()
             cur.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='prop_contact_events'"
@@ -372,7 +380,7 @@ class PropagationService:
         sql += "ORDER BY ts_utc DESC LIMIT ?"
         params.append(int(max(100, row_limit)))
         try:
-            conn = sqlite3.connect(path)
+            conn = connect_sqlite_readonly(path)
             cur = conn.cursor()
             cur.execute(sql, tuple(params))
             rows = cur.fetchall()

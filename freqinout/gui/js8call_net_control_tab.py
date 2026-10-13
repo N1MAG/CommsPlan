@@ -6,6 +6,7 @@ import sqlite3
 import time
 import json
 import queue
+import uuid
 from pathlib import Path
 from typing import List, Dict, Set, Optional
 
@@ -138,6 +139,7 @@ class JS8CallNetControlTab(QWidget):
         * Prefills net name if the field is empty and no net is in progress.
     """
     net_status_changed = Signal(str, bool)
+    net_session_status_changed = Signal(str, bool, int, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -147,6 +149,8 @@ class JS8CallNetControlTab(QWidget):
         self._net_in_progress = False
         self._net_start_utc: str | None = None
         self._net_end_utc: str | None = None
+        self._ncs_session_radio_id: Optional[int] = None
+        self._ncs_session_id: str = ""
 
         self._directed_path: Path | None = None
         self._last_directed_size: int = 0
@@ -311,6 +315,8 @@ class JS8CallNetControlTab(QWidget):
                 widget.deleteLater()
 
     def _select_ncs_radio_session(self, profile_id: int) -> None:
+        if self._net_in_progress:
+            return
         ident = int(profile_id or 0)
         if ident <= 0:
             return
@@ -331,7 +337,7 @@ class JS8CallNetControlTab(QWidget):
 
     def _current_ncs_session_snapshot(self, *, timing_state: Optional[str] = None) -> NcsSessionSnapshot:
         profiles = self._ncs_radio_profiles()
-        selected_id = self._ncs_selected_radio_id(profiles)
+        selected_id = self._ncs_session_radio_id or self._ncs_selected_radio_id(profiles)
         selected_profile = next((p for p in profiles if int(p.get("id", 0) or 0) == selected_id), None)
         state = timing_state or ("active" if self._net_in_progress else "idle")
         return NcsSessionSnapshot(
@@ -356,7 +362,7 @@ class JS8CallNetControlTab(QWidget):
         if not hasattr(self, "ncs_session_chip_layout") or not hasattr(self, "ncs_session_summary_label"):
             return
         profiles = self._ncs_radio_profiles()
-        selected_id = self._ncs_selected_radio_id(profiles)
+        selected_id = self._ncs_session_radio_id or self._ncs_selected_radio_id(profiles)
         theme = resolve_theme(self.settings)
         self._clear_ncs_session_chip_layout()
         if not profiles:
@@ -367,6 +373,7 @@ class JS8CallNetControlTab(QWidget):
             chip = QPushButton(name)
             chip.setToolTip(f"Switch this NCS workspace to {name}.")
             chip.setStyleSheet(button_style("success" if ident == selected_id else "info", theme))
+            chip.setEnabled(not self._net_in_progress)
             chip.clicked.connect(lambda _checked=False, profile_id=ident: self._select_ncs_radio_session(profile_id))
             self.ncs_session_chip_layout.addWidget(chip)
         self.ncs_session_chip_layout.addStretch()
@@ -1193,6 +1200,9 @@ class JS8CallNetControlTab(QWidget):
             return
 
         self._net_in_progress = True
+        profiles = self._ncs_radio_profiles()
+        self._ncs_session_radio_id = self._ncs_selected_radio_id(profiles) or None
+        self._ncs_session_id = uuid.uuid4().hex
         self._net_start_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
         self._net_end_utc = None
         self._all_calls_seen.clear()
@@ -1215,6 +1225,9 @@ class JS8CallNetControlTab(QWidget):
         self.ack_callsign_btn.setEnabled(True)
         self._persist_ncs_session_snapshot(timing_state="active")
         self.net_status_changed.emit("JS8", True)
+        self.net_session_status_changed.emit(
+            "JS8", True, int(self._ncs_session_radio_id or 0), self._ncs_session_id
+        )
         self._refresh_ncs_session_context()
 
           # Track file size so we only read new lines
@@ -1271,6 +1284,8 @@ class JS8CallNetControlTab(QWidget):
         if clicked == btn_no:
             return
         send_concluded = clicked == btn_yes
+        session_radio_id = getattr(self, "_ncs_session_radio_id", None)
+        session_id = getattr(self, "_ncs_session_id", "")
 
         if not self._net_in_progress:
             log.info("JS8Call End Net clicked but net_in_progress flag not set; writing log from current state.")
@@ -1299,6 +1314,11 @@ class JS8CallNetControlTab(QWidget):
         self._net_in_progress = False
         self._persist_ncs_session_snapshot(timing_state="ended")
         self.net_status_changed.emit("JS8", False)
+        self.net_session_status_changed.emit(
+            "JS8", False, int(session_radio_id or 0), session_id
+        )
+        self._ncs_session_radio_id = None
+        self._ncs_session_id = ""
         self._refresh_ncs_session_context()
         self._auto_query_paused_by_net = False
         self.end_btn.setEnabled(False)

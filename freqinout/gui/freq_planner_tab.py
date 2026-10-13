@@ -37,6 +37,9 @@ from PySide6.QtWidgets import (
 from pathlib import Path
 
 from freqinout.core.settings_manager import SettingsManager
+from freqinout.core.schedule_configuration_cache import ScheduleRevisionTracker
+from freqinout.core.scheduler_serial_executor import DaemonSerialExecutor
+from freqinout.core.operating_group_frequency import format_frequency_mhz, resolve_operating_group_frequency
 from freqinout.core.logger import log
 from freqinout.core.config_paths import get_config_dir
 from freqinout.core.perf_metrics import emit_span
@@ -174,10 +177,17 @@ class FreqPlannerTab(QWidget):
     MAX_PROJECTION_TABLE_ROWS = 500
     MAX_RF_GUARD_ROWS = 200
 
+    schedule_saved = Signal()
+
     def __init__(self, parent=None, *, plan_context_service: Optional[PlanContextService] = None):
         super().__init__(parent)
         self.settings = SettingsManager()
         self.plan_context_service = plan_context_service or PlanContextService()
+        self._revision_executor = DaemonSerialExecutor(thread_name_prefix="fio-plan-revisions")
+        self._revision_tracker = None
+        self._revision_future = None
+        self._revision_key = None
+        self._revision_closed = False
         default_mode = (self.settings.get("display_time_mode", "LOCAL") or "LOCAL").upper()
         self._show_local = default_mode != "UTC"
         self._show_band = True
@@ -1535,11 +1545,9 @@ class FreqPlannerTab(QWidget):
             self.frequency_plan_action_hint_label.setText(message)
 
     def _has_sop_schedule_rows(self) -> bool:
-        try:
-            _hf_sched, _net_sched, sop_sched, _policy_rows = self._load_schedules()
-        except Exception:
-            sop_sched = []
-        return any(isinstance(row, dict) for row in (sop_sched or []))
+        # Header/action presentation consumes the last selected schedule load;
+        # it must not reread all Daily/Net/SOP tables on every activation.
+        return bool(getattr(self, "_sop_schedule_rows_present", False))
 
     def _update_sop_plan_action_state(self) -> None:
         if not hasattr(self, "save_sop_plan_btn"):
@@ -1660,7 +1668,32 @@ class FreqPlannerTab(QWidget):
                 changed = True
         return changed
 
-    def _on_frequency_plan_selected(self, *_args: Any) -> None:
+    def focus_frequency_plan(self, plan_id: int, *, device_profile_id: int) -> bool:
+        """Inspect a card's assigned plan without changing command authority."""
+        index = self.frequency_plan_combo.findData(int(plan_id)) if plan_id > 0 else -1
+        if index < 0:
+            self.frequency_plan_action_hint_label.setText(
+                "This radio's assigned Frequency Plan is unavailable. Select a plan to review."
+                if plan_id > 0 else "This radio has no assigned Frequency Plan. Select a plan to review."
+            )
+            return False
+        previous_block = self.frequency_plan_combo.blockSignals(True)
+        try:
+            self.frequency_plan_combo.setCurrentIndex(index)
+        finally:
+            self.frequency_plan_combo.blockSignals(previous_block)
+        self._refresh_radio_window_radio_combo(self._selected_frequency_plan_row())
+        radio_index = self.radio_window_radio_combo.findData(int(device_profile_id))
+        if radio_index >= 0:
+            previous_block = self.radio_window_radio_combo.blockSignals(True)
+            try:
+                self.radio_window_radio_combo.setCurrentIndex(radio_index)
+            finally:
+                self.radio_window_radio_combo.blockSignals(previous_block)
+        self._on_frequency_plan_selected(inspect_only=True)
+        return True
+
+    def _on_frequency_plan_selected(self, *_args: Any, inspect_only: bool = False) -> None:
         if self.frequency_plan_combo.currentIndex() < 0 and self._current_frequency_plan_name():
             self._creating_new_frequency_plan = True
             self._editing_frequency_plan_id = 0
@@ -1679,8 +1712,9 @@ class FreqPlannerTab(QWidget):
         except Exception:
             self._editing_frequency_plan_id = 0
         plan = self._selected_frequency_plan_row()
-        loaded_sources = self._apply_frequency_plan_source_refs(plan)
-        assignment_hint = self._sync_command_radio_for_selected_plan(plan)
+        loaded_sources = (self._apply_frequency_plan_source_refs(plan, persist=False) if inspect_only
+                          else self._apply_frequency_plan_source_refs(plan))
+        assignment_hint = "" if inspect_only else self._sync_command_radio_for_selected_plan(plan)
         self._update_frequency_plan_summary()
         self._update_assign_plan_action_state(plan=plan)
         if hasattr(self, "rename_plan_btn"):
@@ -2327,6 +2361,7 @@ class FreqPlannerTab(QWidget):
         except Exception as exc:
             log.debug("FreqPlanner: assigned-plan RF Guard refresh skipped: %s", exc)
             return False
+        validation = self._merge_frequency_variant_validation(validation, dict(plan))
         state = str(validation.get("state") or "").strip().lower()
         if state not in {"blocked", "warning"}:
             self._set_rf_guard_review_card({})
@@ -2343,6 +2378,57 @@ class FreqPlannerTab(QWidget):
         self._set_rf_guard_review_card(validation)
         self._set_rf_guard_resolution_available(True)
         return True
+
+    def _merge_frequency_variant_validation(
+        self, validation: Mapping[str, Any], plan_payload: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        """Add cache-only exact frequency-reference checks to review/save validation."""
+        result = dict(validation)
+        operating_groups = self.settings.get("operating_groups", [])
+        if not isinstance(operating_groups, (list, tuple)):
+            operating_groups = []
+        issues: List[str] = []
+        for ref in self._schedule_refs_from_plan_row(plan_payload):
+            variant_key = str(ref.get("operating_group_frequency_key") or "").strip()
+            group_key = str(ref.get("operating_group_key") or "").strip()
+            if not variant_key and not group_key and not any(
+                str(ref.get(field) or "").strip() for field in ("band", "frequency", "freq", "frequency_mhz")
+            ):
+                continue
+            group = ref.get("group_name") or ref.get("group")
+            resolution = resolve_operating_group_frequency(
+                operating_groups,
+                group=group,
+                group_key=group_key,
+                frequency_key=variant_key,
+                band=ref.get("band"),
+                mode=ref.get("mode"),
+                frequency=ref.get("frequency") or ref.get("freq") or ref.get("frequency_mhz"),
+            )
+            missing_keyed_band = bool(variant_key and not str(ref.get("band") or "").strip())
+            if resolution.resolved and not missing_keyed_band:
+                continue
+            family = resolve_operating_group_frequency(operating_groups, group=group, group_key=group_key)
+            # Explicit variant/group identities and references into a known
+            # configured family must fail closed. Unknown keyless legacy groups
+            # remain compatible with existing explicit scheduler rows.
+            if not variant_key and not group_key and not family.candidates:
+                continue
+            group = str(group or "unknown group").strip()
+            band = str(ref.get("band") or "").strip().upper()
+            frequency = format_frequency_mhz(ref.get("frequency") or ref.get("freq") or ref.get("frequency_mhz"))
+            label = " ".join(bit for bit in (group, band, frequency) if bit)
+            issues.append(
+                f"{label}: unresolved operating-group frequency variant ({'band is missing' if missing_keyed_band else resolution.reason or resolution.state}). "
+                "Choose the intended configured frequency before saving or assigning this plan."
+            )
+        if issues:
+            blocked = [str(item) for item in result.get("blocked", []) or []]
+            messages = [str(item) for item in result.get("messages", []) or []]
+            result["blocked"] = list(dict.fromkeys(blocked + issues))
+            result["messages"] = list(dict.fromkeys(messages + issues))
+            result["state"] = "blocked"
+        return result
 
     def _open_schedule_assignment_settings(
         self,
@@ -2430,6 +2516,7 @@ class FreqPlannerTab(QWidget):
                 "messages": [f"RF Guard review could not complete: {exc}"],
                 "warnings": [f"RF Guard review could not complete: {exc}"],
             }
+        validation = self._merge_frequency_variant_validation(validation, plan_payload)
         self.frequency_plan_action_hint_label.setText(
             self._rf_guard_validation_summary_text(
                 validation,
@@ -2845,6 +2932,7 @@ class FreqPlannerTab(QWidget):
                 "state": "warning",
                 "messages": [f"RF Guard preflight could not complete: {exc}"],
             }
+        validation = self._merge_frequency_variant_validation(validation, plan_payload)
         state = str(validation.get("state") or "").strip().lower()
         messages = [str(item) for item in validation.get("messages", []) if str(item or "").strip()]
         if state == "blocked":
@@ -3062,6 +3150,7 @@ class FreqPlannerTab(QWidget):
                 for row in self._schedule_refs_from_plan_row(sop_plan)
                 if isinstance(row, dict) and str(row.get("source") or "").strip().upper() == "SOP"
             ]
+        self._sop_schedule_rows_present = any(isinstance(row, dict) for row in sop)
         return hf, net, sop, policies
 
     @staticmethod
@@ -3210,10 +3299,7 @@ class FreqPlannerTab(QWidget):
         txt = str(value or "").strip()
         if not txt:
             return ""
-        try:
-            return f"{float(txt):.3f}"
-        except Exception:
-            return txt
+        return format_frequency_mhz(txt)
 
     def _normalize_month_weeks_for_signature(self, value: Any) -> str:
         weeks = self._parse_month_weeks(str(value or ""))
@@ -4958,10 +5044,12 @@ class FreqPlannerTab(QWidget):
             rows,
             existing_plan_id=existing_id,
         )
+        # The scheduler reprojects assigned plans on its existing worker.
+        self.schedule_saved.emit()
         self.plan_context_service.invalidate()
         self.rebuild_table()
         self.frequency_plan_action_hint_label.setText(
-            f"Updated {source_label} source '{str(saved.get('name') or name)}'. Review and save affected Frequency Plans if needed."
+            f"Updated {source_label} source '{str(saved.get('name') or name)}'. Assigned Frequency Plans refresh automatically."
         )
 
     def _row_user_role_cell(self, row: int, expected_type: type) -> Optional[object]:
@@ -5106,10 +5194,7 @@ class FreqPlannerTab(QWidget):
         text = str(value or "").strip()
         if not text:
             return ""
-        try:
-            return f"{float(text):.3f}"
-        except Exception:
-            return text
+        return format_frequency_mhz(text)
 
     @staticmethod
     def _widget_text(widget: Any) -> str:
@@ -5360,6 +5445,10 @@ class FreqPlannerTab(QWidget):
         return self._projection_executor
 
     def _shutdown_projection_worker(self) -> None:
+        if not self._revision_closed:
+            self._revision_closed = True
+            self._revision_executor.submit(self._close_revision_tracker)
+            self._revision_executor.shutdown(wait=False, cancel_futures=False)
         executor = self._projection_executor
         self._projection_executor = None
         if executor is not None:
@@ -6245,6 +6334,7 @@ class FreqPlannerTab(QWidget):
         self.table.clearContents()
         self.table.clearSpans()
         hf_sched, net_sched, sop_sched, policy_rows = self._load_schedules()
+        self._update_sop_plan_action_state()
         theme = resolve_theme(self.settings)
         snapshot = self._snapshot(hf_sched, net_sched, sop_sched, policy_rows)
         self._last_snapshot = snapshot
@@ -6313,13 +6403,45 @@ class FreqPlannerTab(QWidget):
         }
         return json.dumps(state, sort_keys=True, default=str, separators=(",", ":"))
 
-    def _maybe_rebuild_if_changed(self):
-        if self._projection_pending:
+    def _read_configuration_revision(self, config_dir):
+        # This method runs only on the serial worker. It never reads widgets or
+        # the Qt-owned SettingsManager; the path is captured by the caller.
+        if self._revision_tracker is None:
+            self._revision_tracker = ScheduleRevisionTracker(config_dir, allow_missing=True)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        return self._revision_tracker.key(), self._week_start_sunday_utc(now)
+
+    def _close_revision_tracker(self):
+        if self._revision_tracker is not None:
+            self._revision_tracker.close()
+
+    def _poll_configuration_revision(self):
+        if self._revision_closed or self._revision_future is None:
             return
-        hf_sched, net_sched, sop_sched, policy_rows = self._load_schedules()
-        snap = self._snapshot(hf_sched, net_sched, sop_sched, policy_rows)
-        if snap != self._last_snapshot:
+        future = self._revision_future
+        if not future.done():
+            QTimer.singleShot(50, self._poll_configuration_revision)
+            return
+        self._revision_future = None
+        try:
+            revision = future.result()
+        except Exception:
+            # Keep the prior display; failed input probes never publish a new
+            # revision. Explicit editing keeps its existing fresh-read checks.
+            log.debug("Plan Builder revision probe failed", exc_info=True)
+            return
+        if revision != self._revision_key:
+            self._revision_key = revision
+            # Retain the established authoring/validation path. Only recurring
+            # unchanged checks bypass its full source reads and projection.
             self.rebuild_table()
+
+    def _maybe_rebuild_if_changed(self):
+        if self._revision_closed or self._projection_pending or self._revision_future is not None:
+            return
+        self._revision_future = self._revision_executor.submit(
+            self._read_configuration_revision, self.settings.config_dir)
+        QTimer.singleShot(0, self._poll_configuration_revision)
 
     def _ui_tz_abbr(self, tz_name: str, fallback: str) -> str:
         mapping = {

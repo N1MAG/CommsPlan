@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime
 import json
 import sqlite3
+import uuid
 from pathlib import Path
 from typing import List, Dict, Optional
 import re
@@ -87,7 +88,6 @@ from freqinout.gui.theme import (
     contrast_text_for_background,
     resolve_theme,
     button_style,
-    horizontal_layout_breakpoint,
     style_splitter_handles,
 )
 
@@ -146,6 +146,7 @@ class FldigiNetControlTab(QWidget):
         * Late Check-in Macro File (feed for late/new check-ins)
     """
     net_status_changed = Signal(str, bool)
+    net_session_status_changed = Signal(str, bool, int, str)
     LOG_ASSISTED_INTAKE_VISIBLE = False
     FLDIGI_MACRO_PROFILES_KEY = "fldigi_macro_profiles_v1"
     FLDIGI_SELECTED_MACRO_PROFILE_KEY = "fldigi_selected_macro_profile"
@@ -170,6 +171,8 @@ class FldigiNetControlTab(QWidget):
         self._net_start_utc: Optional[str] = None
         self._net_end_utc: Optional[str] = None
         self._active = False
+        self._ncs_session_radio_id: Optional[int] = None
+        self._ncs_session_id: str = ""
 
         self._clock_timer: Optional[QTimer] = None
         self._log_assisted_timer: Optional[QTimer] = None
@@ -218,6 +221,10 @@ class FldigiNetControlTab(QWidget):
         self._log_assisted_session_tx_context: str = ""
         self._log_assisted_seen_normalized: set[str] = set()
         self._log_assisted_candidates_by_callsign: Dict[str, FldigiLogCheckinCandidate] = {}
+
+        self._responsive_geometry_timer = QTimer(self)
+        self._responsive_geometry_timer.setSingleShot(True)
+        self._responsive_geometry_timer.timeout.connect(self._refresh_responsive_geometry)
 
         self._build_ui()
         self._apply_theme()
@@ -279,6 +286,8 @@ class FldigiNetControlTab(QWidget):
                 widget.deleteLater()
 
     def _select_ncs_radio_session(self, profile_id: int) -> None:
+        if self._net_in_progress:
+            return
         ident = int(profile_id or 0)
         if ident <= 0:
             return
@@ -299,7 +308,7 @@ class FldigiNetControlTab(QWidget):
 
     def _current_ncs_session_snapshot(self, *, timing_state: Optional[str] = None) -> NcsSessionSnapshot:
         profiles = self._ncs_radio_profiles()
-        selected_id = self._ncs_selected_radio_id(profiles)
+        selected_id = self._ncs_session_radio_id or self._ncs_selected_radio_id(profiles)
         selected_profile = next((p for p in profiles if int(p.get("id", 0) or 0) == selected_id), None)
         state = timing_state or ("active" if self._net_in_progress else "idle")
         return NcsSessionSnapshot(
@@ -324,7 +333,7 @@ class FldigiNetControlTab(QWidget):
         if not hasattr(self, "ncs_session_chip_layout") or not hasattr(self, "ncs_session_summary_label"):
             return
         profiles = self._ncs_radio_profiles()
-        selected_id = self._ncs_selected_radio_id(profiles)
+        selected_id = self._ncs_session_radio_id or self._ncs_selected_radio_id(profiles)
         theme = resolve_theme(self.settings)
         self._clear_ncs_session_chip_layout()
         if not profiles:
@@ -335,6 +344,7 @@ class FldigiNetControlTab(QWidget):
             chip = QPushButton(name)
             chip.setToolTip(f"Switch this NCS workspace to {name}.")
             chip.setStyleSheet(button_style("success" if ident == selected_id else "info", theme))
+            chip.setEnabled(not self._net_in_progress)
             chip.clicked.connect(lambda _checked=False, profile_id=ident: self._select_ncs_radio_session(profile_id))
             self.ncs_session_chip_layout.addWidget(chip)
         self.ncs_session_chip_layout.addStretch()
@@ -349,6 +359,8 @@ class FldigiNetControlTab(QWidget):
             summary = f"{summary} | Active"
         self.ncs_session_summary_label.setText(summary)
         self.ncs_session_summary_label.setToolTip(summary)
+        if hasattr(self, "_responsive_geometry_timer"):
+            self._responsive_geometry_timer.start(0)
 
     def _build_session_bar(self, layout: QVBoxLayout) -> None:
         session_frame = QFrame()
@@ -1060,33 +1072,35 @@ class FldigiNetControlTab(QWidget):
             widget.setMinimumWidth(max(0, int(original or 0)))
 
     def _refresh_responsive_geometry(self) -> None:
-        """Stack task actions and release child width floors on compact rails."""
+        """Reflow each control row independently of optional setup content."""
         if not hasattr(self, "_ncs_scroll_content"):
             return
         try:
             width = int(self._ncs_scroll_area.viewport().width() or self.width() or 0)
         except Exception:
             width = int(self.width() or 0)
-        compact_threshold = max(
-            horizontal_layout_breakpoint(
-                getattr(self, name, None), reserve_controls=1
-            )
-            for name in (
-                "_session_context_row",
-                "_session_context_details_row",
-                "_session_partner_row",
-                "_macro_summary_row",
-                "_macro_path_row",
-                "_known_operator_layout",
-                "_known_buttons_layout",
-                "_roster_header_layout",
-                "_roster_scope_layout",
-                "_roster_primary_actions_layout",
-                "_roster_secondary_actions_layout",
-                "_roster_post_net_actions_layout",
-            )
-        )
-        compact = width < compact_threshold
+        # Size hints can exceed an editor's explicit maximum (long net/macro
+        # names). Count bounded widths and nested radio/tool rows, not the
+        # currently stacked layout's geometry.
+        def row_width(row) -> int:
+            if row is None:
+                return 0
+            widths = []
+            for index in range(row.count()):
+                item = row.itemAt(index)
+                widget = item.widget()
+                if widget is not None:
+                    if widget.isHidden():
+                        continue
+                    widths.append(min(widget.maximumWidth(), max(0, widget.sizeHint().width(), widget.minimumSizeHint().width())))
+                elif item.layout() is not None:
+                    widths.append(row_width(item.layout()))
+                elif item.spacerItem() is not None:
+                    widths.append(max(0, item.spacerItem().sizeHint().width()))
+            margins = row.contentsMargins()
+            return sum(widths) + max(0, row.spacing()) * max(0, len(widths) - 1) + margins.left() + margins.right()
+
+        available = max(0, width - 32)
         for name in (
             "_session_context_row",
             "_session_context_details_row",
@@ -1102,14 +1116,22 @@ class FldigiNetControlTab(QWidget):
             "_roster_post_net_actions_layout",
             "ncs_session_chip_layout",
         ):
-            self._set_responsive_layout_direction(getattr(self, name, None), compact)
+            row = getattr(self, name, None)
+            self._set_responsive_layout_direction(row, available < row_width(row))
         for child in self._ncs_scroll_content.findChildren(QWidget):
-            self._set_responsive_min_width(child, compact)
+            self._set_responsive_min_width(child, width < 900)
         self._ncs_scroll_content.updateGeometry()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        QTimer.singleShot(0, self._refresh_responsive_geometry)
+        if hasattr(self, "_responsive_geometry_timer"):
+            self._responsive_geometry_timer.start(0)
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() in (QEvent.FontChange, QEvent.ApplicationFontChange, QEvent.StyleChange):
+            if hasattr(self, "_responsive_geometry_timer"):
+                self._responsive_geometry_timer.start(0)
 
     def _on_ncs_session_context_changed(self) -> None:
         self._persist_ncs_session_snapshot()
@@ -3219,6 +3241,8 @@ class FldigiNetControlTab(QWidget):
             self.partner_primary_btn.setText("Set ANCS")
             self.partner_primary_edit.setText(self._ancs_partner_call)
         self._update_partner_action_state()
+        if hasattr(self, "_responsive_geometry_timer"):
+            self._responsive_geometry_timer.start(0)
 
     def _update_partner_action_state(self) -> None:
         if not hasattr(self, "partner_primary_edit"):
@@ -5561,6 +5585,9 @@ class FldigiNetControlTab(QWidget):
         self._update_bucket_card_states()
 
         self._net_in_progress = True
+        profiles = self._ncs_radio_profiles()
+        self._ncs_session_radio_id = self._ncs_selected_radio_id(profiles) or None
+        self._ncs_session_id = uuid.uuid4().hex
         self._net_start_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
         self._net_end_utc = None
         if self._log_assisted_enabled():
@@ -5585,6 +5612,9 @@ class FldigiNetControlTab(QWidget):
         self._update_copy_buttons_state()
         self._persist_ncs_session_snapshot(timing_state="active")
         self.net_status_changed.emit("FLDIGI", True)
+        self.net_session_status_changed.emit(
+            "FLDIGI", True, int(self._ncs_session_radio_id or 0), self._ncs_session_id
+        )
         self._refresh_ncs_session_context()
         log.info("FLDigi net started: %s (%s)", self.net_name_combo.currentText().strip(), self.role_combo.currentText())
         QTimer.singleShot(0, self._refresh_operator_history_views)
@@ -5772,6 +5802,8 @@ class FldigiNetControlTab(QWidget):
         confirmed, copy_state_summary = self._confirm_end_net()
         if not confirmed:
             return
+        session_radio_id = getattr(self, "_ncs_session_radio_id", None)
+        session_id = getattr(self, "_ncs_session_id", "")
         self._stop_log_assisted_timer()
         if not self._net_in_progress:
             log.info("End Net clicked but no net_in_progress flag set; proceeding with DB load from file.")
@@ -5794,6 +5826,11 @@ class FldigiNetControlTab(QWidget):
             self._update_copy_buttons_state()
             self._persist_ncs_session_snapshot(timing_state="ended")
             self.net_status_changed.emit("FLDIGI", False)
+            self.net_session_status_changed.emit(
+                "FLDIGI", False, int(session_radio_id or 0), session_id
+            )
+            self._ncs_session_radio_id = None
+            self._ncs_session_id = ""
             self._refresh_ncs_session_context()
             self._show_roster_action_status("Net ended. No check-ins were logged.", "info")
             log.info("FLDigi net ended (no check-ins file content).")
@@ -5870,6 +5907,11 @@ class FldigiNetControlTab(QWidget):
         self._update_copy_buttons_state()
         self._persist_ncs_session_snapshot(timing_state="ended")
         self.net_status_changed.emit("FLDIGI", False)
+        self.net_session_status_changed.emit(
+            "FLDIGI", False, int(session_radio_id or 0), session_id
+        )
+        self._ncs_session_radio_id = None
+        self._ncs_session_id = ""
         self._refresh_ncs_session_context()
         if copy_state_summary:
             state_summary = self._state_summary_text()

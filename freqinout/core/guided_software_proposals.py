@@ -181,7 +181,7 @@ class DiscoveredSoftwareCandidate:
         object.__setattr__(self, "candidate_key", _key(self.candidate_key, "candidate_key"))
         bundle = self.bundle if isinstance(self.bundle, AtomicInstanceBundle) else atomic_bundle_from_mapping(self.bundle)
         if bundle.family == SoftwareFamily.FIO_SPOTTER:
-            raise GuidedSoftwareProposalError("built-in FIO Spotter is not a discovered software candidate")
+            raise GuidedSoftwareProposalError("built-in CommsPlan Spotter is not a discovered software candidate")
         object.__setattr__(self, "bundle", lock_existing_bundle(bundle))
         object.__setattr__(self, "state", _enum(CandidateState, self.state, "candidate state"))
         evidence = tuple(
@@ -596,7 +596,7 @@ def propose_complete_bundle(request: CompleteBundleRequest, inventory: ProposalI
     if bundle.source_mode not in allowed_sources:
         raise GuidedSoftwareProposalError("proposal bundle must be distinct, manual/remote, or station-shared")
     if bundle.source_mode == InstanceSourceMode.CREATE_DISTINCT and bundle.management_mode != ManagementMode.FIO_MANAGED:
-        raise GuidedSoftwareProposalError("distinct managed proposal must use FIO-managed lifecycle")
+        raise GuidedSoftwareProposalError("distinct managed proposal must use CommsPlan-managed lifecycle")
     if bundle.source_mode == InstanceSourceMode.MANUAL_OR_REMOTE and bundle.management_mode not in (
         ManagementMode.OPERATOR,
         ManagementMode.REMOTE,
@@ -606,7 +606,7 @@ def propose_complete_bundle(request: CompleteBundleRequest, inventory: ProposalI
         ManagementMode.OPERATOR,
         ManagementMode.FIO_MANAGED,
     ):
-        raise GuidedSoftwareProposalError("shared station proposal must be operator- or FIO-managed")
+        raise GuidedSoftwareProposalError("shared station proposal must be operator- or CommsPlan-managed")
     if bundle.source_mode == InstanceSourceMode.SHARED_STATION_TOOL and bundle.owner_radio_key:
         raise GuidedSoftwareProposalError("station-shared proposal must not claim one owning radio")
     if bundle.source_mode != InstanceSourceMode.SHARED_STATION_TOOL and bundle.owner_radio_key != request.radio_key:

@@ -118,7 +118,7 @@ class ReceiverQualificationCoordinator:
         identity = receiver_identity_from_profile(factory_snapshot)
         adapter = str(snapshot.get("sdr_adapter") or "manual").strip().lower().replace("-", "_")
         if adapter in {"", "manual", "none"}:
-            raise ValueError("Select a receive-only FIO control adapter before testing.")
+            raise ValueError("Select a receive-only CommsPlan control adapter before testing.")
         host = str(snapshot.get("sdr_host") or "").strip()
         port = snapshot.get("sdr_port")
         target = str(snapshot.get("sdr_target") or "").strip().lower()
@@ -166,7 +166,7 @@ class ReceiverQualificationCoordinator:
                     return {
                         "ok": False,
                         "reason_code": "receiver_frequency_unavailable",
-                        "detail": "FIO connected but could not read the selected VFO frequency; manual tuning remains available.",
+                        "detail": "CommsPlan connected but could not read the selected VFO frequency; manual tuning remains available.",
                     }
                 # The explicit test changes the selected VFO by a small visible
                 # amount, verifies it, then restores and verifies the original.

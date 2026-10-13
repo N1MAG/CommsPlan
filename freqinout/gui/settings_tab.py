@@ -70,6 +70,7 @@ from freqinout.core.logger import log, set_log_level, get_log_level, _get_log_fi
 from freqinout.core.perf_metrics import emit_span, span as perf_span
 from freqinout.core.checkins_db import ensure_operator_checkins_schema, get_all_operators as get_shared_operators
 from freqinout.core.settings_manager import SettingsManager
+from freqinout.gui.bbs_access_editor import BbsAccessEditor
 from freqinout.core.config_paths import get_fldigi_checkin_dir, get_config_dir
 from freqinout.core.config_autodiscovery import (
     DEFAULT_PORT_PLAN,
@@ -126,7 +127,88 @@ from freqinout.core.js8_msg_auth_store import (
     save_msg_auth_key,
 )
 from freqinout.core.known_operating_groups import WEFAX_STATIONS, load_known_operating_group_catalog
-from freqinout.core.operating_group_identity import ensure_operating_group_keys
+from freqinout.core.operating_group_identity import ensure_operating_group_keys, rename_operating_group
+from freqinout.core.operating_group_frequency import (
+    ensure_operating_group_frequency_keys,
+    frequency_identity,
+    new_operating_group_frequency_key,
+    normalize_frequency_hz,
+)
+
+
+def _settings_operating_group_frequency_rows(rows):
+    """Normalize identities while keeping imported colliding rows addressable."""
+    raw_rows = [dict(row) for row in (rows or ()) if isinstance(row, dict)]
+    for row in raw_rows:
+        value = str(row.get("frequency", "") or "").strip()
+        if value.count(".") == 2:
+            hz = _settings_frequency_hz(value)
+            if hz is not None:
+                row["frequency"] = f"{hz // 1_000_000}.{hz % 1_000_000:06d}"
+    normalized = ensure_operating_group_frequency_keys(raw_rows)
+    seen = set()
+    for index, row in enumerate(normalized):
+        key = str(row.get("operating_group_frequency_key", "") or "").strip()
+        original_key = str(raw_rows[index].get("operating_group_frequency_key", "") or "").strip()
+        if key in seen and not original_key:
+            # Two keyless legacy duplicates get distinct persisted identities
+            # so Settings can address each row for explicit repair.
+            row["operating_group_frequency_key"] = new_operating_group_frequency_key()
+        else:
+            seen.add(key)
+    return normalized
+
+
+def _settings_operating_group_integrity_issues(rows):
+    identities = {}
+    issues = {}
+    for row in rows or ():
+        key = str(row.get("operating_group_frequency_key", "") or "")
+        hz = _settings_frequency_hz(row.get("frequency"))
+        identity = frequency_identity(row)
+        if hz is None or not str(row.get("group", "") or "").strip() or not str(row.get("band", "") or "").strip():
+            issues[key] = "Invalid configured frequency row. Repair group, band, mode, and positive whole-Hz frequency in Settings."
+        if identity[-1] is not None:
+            identities.setdefault(identity, []).append(key)
+    keys = {}
+    for row in rows or ():
+        key = str(row.get("operating_group_frequency_key", "") or "")
+        if key:
+            keys.setdefault(key, []).append(row)
+    for key, keyed_rows in keys.items():
+        if len(keyed_rows) > 1:
+            for row in keyed_rows:
+                issues[key] = "Duplicate persisted frequency-row key. Repair this identity conflict before editing or deleting the row."
+    for keys in identities.values():
+        if len(keys) > 1:
+            for key in keys:
+                issues[key] = "Duplicate configured frequency identity. Resolve this conflict before selecting or tuning this variant."
+    return issues
+
+
+def _settings_rename_operating_group_family(rows, group_key, new_name, old_name):
+    key = str(group_key or "").strip()
+    return _settings_operating_group_frequency_rows([
+        rename_operating_group(row, new_name, alias=old_name)
+        if str(row.get("operating_group_key", "") or "") == key else row
+        for row in rows or ()
+    ])
+
+
+def _settings_frequency_hz(value):
+    """Read decimal MHz or the Settings UI's grouped MHz.kHz.Hz display exactly."""
+    hz = normalize_frequency_hz(value)
+    if hz is not None:
+        return hz
+    parts = str(value or "").strip().replace(",", ".").split(".")
+    if (len(parts) == 3 and all(part.strip().isdigit() for part in parts)
+            and len(parts[1]) <= 3 and len(parts[2]) <= 3):
+        whole = int(parts[0])
+        khz = int(parts[1])
+        remainder_hz = int(parts[2])
+        result = whole * 1_000_000 + khz * 1_000 + remainder_hz
+        return result if result > 0 else None
+    return None
 from freqinout.core.nbems_compose import discover_form_families
 from freqinout.core.launch_orchestrator import (
     DEFAULT_LAUNCH_READINESS_TIMEOUT_SEC,
@@ -135,9 +217,12 @@ from freqinout.core.launch_orchestrator import (
     LaunchOrchestrator,
 )
 from freqinout.gui.current_page_stack import CurrentPageStack
+from freqinout.gui.radio_hardware_connections_dialog import RadioHardwareConnectionsDialog
 from freqinout.core.dependency_status_service import get_dependency_status_service
 from freqinout.core.software_path_detector import SoftwarePathDetector, PathDetectionResult
 from freqinout.core.software_status_service import SoftwareStatusService
+from freqinout.core.latest_read_cache import LatestReadCache
+from freqinout.gui.widget_updates import set_widget_value
 from freqinout.core.commstat_config import resolve_commstat_db_path
 from freqinout.core.gpg_tools import (
     clearsign_file,
@@ -528,7 +613,7 @@ class _CustomToolDialog(QDialog):
         self.setWindowTitle("Custom Tool")
         layout = QVBoxLayout(self)
         hint = QLabel(
-            "Set a display name and the launch command FreqInOut should run for this tool."
+            "Set a display name and the launch command CommsPlan should run for this tool."
             if not str(name or "").strip()
             else "Update this tool's command for the selected radio. The identity name stays stable."
         )
@@ -588,7 +673,7 @@ DEVICE_CLASS_OPTIONS = [
 ]
 
 OPERATING_SCHEDULER_MODE_OPTIONS = [
-    ("All FIO features", "full"),
+    ("All CommsPlan features", "full"),
     ("Basic frequency control", "simple"),
 ]
 
@@ -1327,7 +1412,7 @@ def _release_detached_gpg_probe_job(job_id: int) -> None:
 
 class SettingsTab(QWidget):
     """
-    Global settings for FreqInOut.
+    Global settings for CommsPlan.
 
     - Call sign / Name / State
     - Control mode
@@ -1346,6 +1431,8 @@ class SettingsTab(QWidget):
     or by updating SettingsManager._data as a fallback. We *do not*
     call any .write() or .save() here to avoid AttributeError.
     """
+
+    _CONTROL_LAUNCH_STATUS_KEYS = frozenset(("FLRig", "RigCtlD", "JS8Call_API"))
 
     settings_saved = Signal()
     appearance_changed = Signal()
@@ -1597,6 +1684,10 @@ class SettingsTab(QWidget):
         self._software_administration_selected_radio_id: Optional[int] = None
         self._software_task_editors: Dict[Tuple[str, Optional[int], str], SoftwareTaskEditor] = {}
         self._software_dirty_families: set[Tuple[int, str]] = set()
+        # The Settings selector only consumes the latest lifecycle-owned
+        # operational projection.  It must never probe an endpoint while
+        # painting or rebuilding its radio choices.
+        self._radio_operational_status_cache: Dict[int, object] = {}
         self._multi_rig_runtime_status: MultiRigRuntimeStatus | None = None
         self._multi_rig_radio_catalog_payload: Dict[str, Any] | None = None
         self._active = False
@@ -2239,7 +2330,7 @@ class SettingsTab(QWidget):
         QMessageBox.information(
             self,
             "Add Group Family",
-            f"Added {added} trusted callsign(s) from {group_summary} to BBS Allowed Callsigns. FIO will remember this group source for roster refresh.",
+            f"Added {added} trusted callsign(s) from {group_summary} to BBS Allowed Callsigns. CommsPlan will remember this group source for roster refresh.",
         )
 
     def _remove_selected_varac_bbs_allowed_callsigns(self) -> None:
@@ -2573,7 +2664,7 @@ class SettingsTab(QWidget):
         if location_id == DEFAULT_LOCATION_ID:
             text = (
                 "All BBS views include: 00 HOW TO USE — Type command then refresh BBS\n"
-                "Default is the FIO Managed Root BBS menu. It publishes helper files for visible locations "
+                "Default is the CommsPlan Managed Root BBS menu. It publishes helper files for visible locations "
                 "and any files placed in the Default folder."
             )
         else:
@@ -2744,7 +2835,7 @@ class SettingsTab(QWidget):
         hint = (
             f"Suggested from FLAMP/rx: {suggestion}. Override this any time if your relay queue lives elsewhere."
             if suggestion
-            else "Set FLAMP/rx first and FreqInOut will suggest a sibling relay folder automatically."
+            else "Set FLAMP/rx first and CommsPlan will suggest a sibling relay folder automatically."
         )
         self.varac_bbs_vault_flamp_relay_hint_label.setText(hint)
         self.varac_bbs_vault_flamp_relay_hint_label.setToolTip(hint)
@@ -2774,7 +2865,7 @@ class SettingsTab(QWidget):
         if default_root:
             hint = (
                 f"Automatic library location in the VarAC BBS area: {default_root}. New library locations and files live here, "
-                "alongside the live BBS folder, not inside the live published file list and not under the FreqInOut app folder."
+                "alongside the live BBS folder, not inside the live published file list and not under the CommsPlan app folder."
             )
         else:
             hint = "Set the VarAC BBS directory first to see the default library location."
@@ -3446,7 +3537,7 @@ class SettingsTab(QWidget):
             self,
             "Managed BBS Library",
             "Managed Root is automatic in this release.\n\n"
-            "FreqInOut always creates the library root in the VarAC BBS area, next to the live BBS directory.",
+            "CommsPlan always creates the library root in the VarAC BBS area, next to the live BBS directory.",
         )
 
     def _choose_varac_bbs_vault_location_source(self) -> None:
@@ -3579,7 +3670,7 @@ class SettingsTab(QWidget):
             self,
             "Re-add Existing Location Folder",
             "A managed BBS folder already exists for this location.\n\n"
-            "Re-add this folder to FIO Settings without changing files on disk?",
+            "Re-add this folder to CommsPlan Settings without changing files on disk?",
             QMessageBox.Yes | QMessageBox.Cancel,
             QMessageBox.Yes,
         )
@@ -4023,7 +4114,7 @@ class SettingsTab(QWidget):
         tooltip: str | None = None,
     ) -> QPushButton:
         btn = QPushButton(text)
-        btn.setToolTip(tooltip or "Open focused help for this part of FreqInOut.")
+        btn.setToolTip(tooltip or "Open focused help for this part of CommsPlan.")
         btn.clicked.connect(lambda _checked=False, key=context_key: self._open_context_help(key))
         btn.setProperty("context_help_key", context_key)
         btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
@@ -4109,7 +4200,7 @@ class SettingsTab(QWidget):
         callsign_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.operator_information_section_group = callsign_group
 
-        # FreqInOut settings
+        # CommsPlan settings
         op_layout = QVBoxLayout()
 
         # control mode (no timezone dropdown anymore)
@@ -4131,7 +4222,7 @@ class SettingsTab(QWidget):
         self.control_combo = QComboBox()
         self.control_combo.addItems(["FLRig", "RIGCTLD", "JS8Call", "Manual"])
         top_preferences_grid.addWidget(self.control_combo, 1, 1)
-        self.use_scheduler_chk = QCheckBox("Use FreqInOut Scheduler")
+        self.use_scheduler_chk = QCheckBox("Use CommsPlan Scheduler")
         self.use_scheduler_chk.setToolTip("Enable automatic schedule-driven frequency changes.")
         top_preferences_grid.addWidget(self.use_scheduler_chk, 1, 2, 1, 2)
         top_preferences_grid.addWidget(QLabel("Radio Apps Base Folder:"), 2, 0)
@@ -4139,7 +4230,7 @@ class SettingsTab(QWidget):
         self.radio_apps_base_folder_edit.setObjectName("radioAppsBaseFolder")
         self.radio_apps_base_folder_edit.setPlaceholderText("Optional folder for external radio apps")
         self.radio_apps_base_folder_edit.setToolTip(
-            "Optional. Point FIO at a common folder such as RadioTools/Programs to improve app autodetection."
+            "Optional. Point CommsPlan at a common folder such as RadioTools/Programs to improve app autodetection."
         )
         self.radio_apps_base_folder_browse_btn = QPushButton("Browse")
         self.radio_apps_base_folder_browse_btn.setToolTip("Choose the common folder where external radio apps are installed.")
@@ -4377,7 +4468,7 @@ class SettingsTab(QWidget):
         radio_selector_actions.setContentsMargins(0, 0, 0, 0)
         radio_selector_actions.setSpacing(6)
         self.selector_activate_device_profile_btn = QPushButton("Use Radio")
-        self.selector_activate_device_profile_btn.setToolTip("Activate the selected radio so FIO can use it now.")
+        self.selector_activate_device_profile_btn.setToolTip("Activate the selected radio so CommsPlan can use it now.")
         self.selector_activate_device_profile_btn.setAccessibleName("Use selected radio")
         self.selector_activate_device_profile_btn.clicked.connect(self._activate_selected_device_profiles)
         self.selector_deactivate_device_profile_btn = QPushButton("Stop Using")
@@ -4388,13 +4479,19 @@ class SettingsTab(QWidget):
         self.selector_set_default_device_profile_btn.setToolTip("Make the selected radio the station default command radio.")
         self.selector_set_default_device_profile_btn.setAccessibleName("Make selected radio default")
         self.selector_set_default_device_profile_btn.clicked.connect(self._set_active_selected_device_profile)
+        self.selector_manage_connections_btn = QPushButton("Manage Connections")
+        self.selector_manage_connections_btn.setToolTip(
+            "Identify and assign the selected radio's physical CAT, PTT, receive-audio, and transmit-audio connections."
+        )
+        self.selector_manage_connections_btn.setAccessibleName("Manage selected radio hardware connections")
+        self.selector_manage_connections_btn.clicked.connect(self._open_selected_radio_connections)
         self.selector_edit_apps_btn = QPushButton("Edit Apps")
         self.selector_edit_apps_btn.setToolTip(
             "Choose or change the software used by the selected radio, including JS8Call, Fast Light, CommStat, and VarAC."
         )
         self.selector_edit_apps_btn.setAccessibleName("Edit selected radio apps")
         self.selector_edit_apps_btn.clicked.connect(self._open_selected_radio_apps_task)
-        self.selector_software_details_btn = QPushButton("Software Details")
+        self.selector_software_details_btn = QPushButton("Configure Software…")
         self.selector_software_details_btn.setToolTip(
             "Open detailed paths, endpoints, message folders, and BBS settings for the selected radio."
         )
@@ -4402,7 +4499,7 @@ class SettingsTab(QWidget):
         self.selector_software_details_btn.clicked.connect(self._open_selected_radio_software_details)
         self.selector_remove_device_profile_btn = QPushButton("Remove Radio")
         self.selector_remove_device_profile_btn.setToolTip(
-            "Remove the selected inactive radio profile from FIO. External app profiles and files are not deleted."
+            "Remove the selected inactive radio profile from CommsPlan. External app profiles and files are not deleted."
         )
         self.selector_remove_device_profile_btn.setAccessibleName("Remove selected radio")
         self.selector_remove_device_profile_btn.clicked.connect(self._delete_device_profiles)
@@ -4414,6 +4511,7 @@ class SettingsTab(QWidget):
         radio_selector_actions.addWidget(self.selector_activate_device_profile_btn)
         radio_selector_actions.addWidget(self.selector_deactivate_device_profile_btn)
         radio_selector_actions.addWidget(self.selector_set_default_device_profile_btn)
+        radio_selector_actions.addWidget(self.selector_manage_connections_btn)
         radio_selector_actions.addWidget(self.selector_edit_apps_btn)
         radio_selector_actions.addWidget(self.selector_software_details_btn)
         radio_selector_actions.addWidget(self.selector_remove_device_profile_btn)
@@ -4707,12 +4805,12 @@ class SettingsTab(QWidget):
         multi_rig_status_actions.setSpacing(8)
         self.multi_rig_preview_autoconfig_btn = QPushButton("Preview Configure Automatically")
         self.multi_rig_preview_autoconfig_btn.setToolTip(
-            "Scan for installed apps and show what FIO would configure before changing anything."
+            "Scan for installed apps and show what CommsPlan would configure before changing anything."
         )
         self.multi_rig_preview_autoconfig_btn.clicked.connect(self._preview_multi_rig_autoconfiguration)
         self.multi_rig_setup_btn = QPushButton("Upgrade Existing Station")
         self.multi_rig_setup_btn.clicked.connect(self._start_multi_rig_setup)
-        self.multi_rig_exit_btn = QPushButton("Exit FIO")
+        self.multi_rig_exit_btn = QPushButton("Exit CommsPlan")
         self.multi_rig_exit_btn.clicked.connect(lambda: self.window().close())
         self.multi_rig_copy_summary_btn = QPushButton("Copy Summary")
         self.multi_rig_copy_summary_btn.clicked.connect(self._copy_multi_rig_status_summary)
@@ -4747,25 +4845,32 @@ class SettingsTab(QWidget):
         detail_actions.setContentsMargins(0, 0, 0, 0)
         detail_actions.setSpacing(8)
         self.profile_activate_device_profile_btn = QPushButton("Use Radio")
-        self.profile_activate_device_profile_btn.setToolTip("Activate the selected radio so FIO can use it now.")
+        self.profile_activate_device_profile_btn.setToolTip("Activate the selected radio so CommsPlan can use it now.")
         self.profile_activate_device_profile_btn.setAccessibleName("Use selected radio from profile")
         self.profile_activate_device_profile_btn.clicked.connect(self._activate_selected_device_profiles)
         self.profile_deactivate_device_profile_btn = QPushButton("Stop Using")
         self.profile_deactivate_device_profile_btn.setToolTip("Stop using the selected radio without deleting its configuration.")
         self.profile_deactivate_device_profile_btn.setAccessibleName("Stop using selected radio from profile")
         self.profile_deactivate_device_profile_btn.clicked.connect(self._deactivate_selected_device_profiles)
+        self.profile_manage_connections_btn = QPushButton("Manage Connections")
+        self.profile_manage_connections_btn.setToolTip(
+            "Review or repair this radio's physical CAT, PTT, and audio assignments."
+        )
+        self.profile_manage_connections_btn.setAccessibleName("Manage selected radio hardware connections from profile")
+        self.profile_manage_connections_btn.clicked.connect(self._open_selected_radio_connections)
         self.profile_edit_apps_btn = QPushButton("Edit Apps")
         self.profile_edit_apps_btn.setToolTip(
             "Open the selected radio's app choices so software can be added or removed."
         )
         self.profile_edit_apps_btn.setAccessibleName("Edit selected radio apps from profile")
         self.profile_edit_apps_btn.clicked.connect(self._open_selected_radio_apps_task)
-        self.profile_software_details_btn = QPushButton("Software Details")
+        self.profile_software_details_btn = QPushButton("Configure Software…")
         self.profile_software_details_btn.setToolTip("Open detailed software configuration for this radio.")
         self.profile_software_details_btn.setAccessibleName("Open selected radio software details from profile")
         self.profile_software_details_btn.clicked.connect(self._open_selected_radio_software_details)
         detail_actions.addWidget(self.profile_activate_device_profile_btn)
         detail_actions.addWidget(self.profile_deactivate_device_profile_btn)
+        detail_actions.addWidget(self.profile_manage_connections_btn)
         detail_actions.addWidget(self.profile_edit_apps_btn)
         detail_actions.addWidget(self.profile_software_details_btn)
         detail_actions.addStretch(1)
@@ -4778,7 +4883,7 @@ class SettingsTab(QWidget):
         radio_identity_layout.addWidget(self.device_profile_detail_card)
         identity_help = QLabel(
             "Start here. Give the radio a plain station name, identify what kind of device it is, "
-            "and mark whether it should be available to FIO."
+            "and mark whether it should be available to CommsPlan."
         )
         identity_help.setWordWrap(True)
         radio_identity_layout.addWidget(identity_help)
@@ -4801,7 +4906,7 @@ class SettingsTab(QWidget):
         self.radio_profile_identity_deploy_combo.addItem("Full", "full")
         self.radio_profile_identity_deploy_combo.addItem("Minimal", "minimal")
         identity_form.addRow("Deployment Mode:", self.radio_profile_identity_deploy_combo)
-        self.radio_profile_identity_enabled_chk = QCheckBox("Use this radio in FIO")
+        self.radio_profile_identity_enabled_chk = QCheckBox("Use this radio in CommsPlan")
         identity_form.addRow("", self.radio_profile_identity_enabled_chk)
         identity_actions = QHBoxLayout()
         identity_actions.setContentsMargins(0, 0, 0, 0)
@@ -4896,12 +5001,27 @@ class SettingsTab(QWidget):
         radio_profile_connection_outer_layout.setContentsMargins(0, 0, 0, 0)
         radio_profile_connection_outer_layout.setSpacing(8)
         rig_control_help = QLabel(
-            "Choose the one control path FIO should use for this radio. Most operators should use FLRig. "
-            "Use Manual when FIO should display the schedule without controlling hardware."
+            "Choose the one control path CommsPlan should use for this radio. Most operators should use FLRig. "
+            "Use Manual when CommsPlan should display the schedule without controlling hardware."
         )
         rig_control_help.setWordWrap(True)
         rig_control_help.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         radio_profile_connection_outer_layout.addWidget(rig_control_help)
+        self.radio_profile_hardware_summary_label = QLabel("Physical connections: application-managed")
+        self.radio_profile_hardware_summary_label.setObjectName("radioProfileHardwareSummary")
+        self.radio_profile_hardware_summary_label.setWordWrap(True)
+        self.radio_profile_hardware_summary_label.setAccessibleName("Selected radio physical connection summary")
+        radio_profile_connection_outer_layout.addWidget(self.radio_profile_hardware_summary_label)
+        self.radio_profile_manage_connections_btn = QPushButton("Manage connections...")
+        self.radio_profile_manage_connections_btn.setAccessibleName("Manage selected radio physical connections")
+        self.radio_profile_manage_connections_btn.setToolTip(
+            "Open the authoritative CAT, PTT, receive-audio, and transmit-audio assignment editor."
+        )
+        self.radio_profile_manage_connections_btn.clicked.connect(self._open_selected_radio_connections)
+        hardware_actions = QHBoxLayout()
+        hardware_actions.addStretch(1)
+        hardware_actions.addWidget(self.radio_profile_manage_connections_btn)
+        radio_profile_connection_outer_layout.addLayout(hardware_actions)
         radio_profile_connection_summary, radio_profile_connection_summary_layout = _make_radio_profile_detail_grid()
         self.radio_profile_connection_backend_label = QLabel("--")
         self.radio_profile_connection_endpoint_label = QLabel("--")
@@ -4977,7 +5097,7 @@ class SettingsTab(QWidget):
         radio_profile_connections_layout.setContentsMargins(0, 0, 0, 0)
         radio_profile_connections_layout.setSpacing(8)
         connections_help = QLabel(
-            "Open the app-specific connection page for this radio. FIO shows only pages for software enabled on the selected radio."
+            "Open the app-specific connection page for this radio. CommsPlan shows only pages for software enabled on the selected radio."
         )
         connections_help.setWordWrap(True)
         radio_profile_connections_layout.addWidget(connections_help)
@@ -5266,7 +5386,7 @@ class SettingsTab(QWidget):
         self.set_active_device_profile_btn.clicked.connect(self._set_active_selected_device_profile)
         self.delete_device_profile_btn = QPushButton("Remove Selected")
         self.delete_device_profile_btn.setToolTip(
-            "Remove selected inactive radio profiles from FIO. External app profiles and files are not deleted."
+            "Remove selected inactive radio profiles from CommsPlan. External app profiles and files are not deleted."
         )
         self.delete_device_profile_btn.clicked.connect(self._delete_device_profiles)
         device_actions.addWidget(QLabel("Selected Radio:"), 0, 0)
@@ -5299,7 +5419,7 @@ class SettingsTab(QWidget):
         self._add_radio_profile_guided_task_button(
             "control",
             "Rig Control",
-            "How FIO controls or follows this radio.",
+            "How CommsPlan controls or follows this radio.",
             ("radio_profile_connection_section",),
         )
         self._add_radio_profile_guided_task_button(
@@ -5474,7 +5594,7 @@ class SettingsTab(QWidget):
                 "Enabled",
                 "Model",
                 "Scheduler",
-                "FIO Features",
+                "CommsPlan Features",
                 "Description",
             ]
         )
@@ -5609,7 +5729,7 @@ class SettingsTab(QWidget):
                 "Radio",
                 "Operating Model",
                 "State",
-                "FIO Features",
+                "CommsPlan Features",
             ]
         )
         self.device_assignments_table.verticalHeader().setVisible(False)
@@ -6451,8 +6571,8 @@ class SettingsTab(QWidget):
         mesh_ble_results_layout.addWidget(self.mesh_ble_use_selected_btn)
         discovery_layout.addWidget(self.mesh_ble_results_row)
         self.mesh_ble_guidance_label = QLabel(
-            "Use Scan, select the MeshCore device, then Connect. Keep FIO open: when authentication is needed, "
-            "FIO requests pairing and the operating system asks for the PIN shown on the device. FIO does not store the PIN."
+            "Use Scan, select the MeshCore device, then Connect. Keep CommsPlan open: when authentication is needed, "
+            "CommsPlan requests pairing and the operating system asks for the PIN shown on the device. CommsPlan does not store the PIN."
         )
         self.mesh_ble_guidance_label.setWordWrap(True)
         self.mesh_ble_guidance_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
@@ -6467,7 +6587,7 @@ class SettingsTab(QWidget):
         mesh_form.setFormAlignment(Qt.AlignTop | Qt.AlignLeft)
         mesh_form.setSpacing(8)
         self.mesh_enabled_chk = QCheckBox("Enable local mesh ingest")
-        self.mesh_enabled_chk.setToolTip("Receive mesh traffic into FIO. Sending stays off unless you enable it below.")
+        self.mesh_enabled_chk.setToolTip("Receive mesh traffic into CommsPlan. Sending stays off unless you enable it below.")
         mesh_form.addRow("Use:", self.mesh_enabled_chk)
         self.mesh_protocol_combo = QComboBox()
         self.mesh_protocol_combo.addItem("Meshtastic", "meshtastic")
@@ -6493,7 +6613,7 @@ class SettingsTab(QWidget):
         mesh_form.addRow("Connection Name:", mesh_connection_name_row)
         self.mesh_adapter_id_edit = QLineEdit()
         self.mesh_adapter_id_edit.setPlaceholderText("Stable internal identifier (optional)")
-        self.mesh_adapter_id_edit.setToolTip("Stable internal identifier used by FIO. Leave blank to use the protocol default.")
+        self.mesh_adapter_id_edit.setToolTip("Stable internal identifier used by CommsPlan. Leave blank to use the protocol default.")
         mesh_form.addRow("Adapter ID:", self.mesh_adapter_id_edit)
         self.mesh_source_radio_id_edit = QLineEdit()
         self.mesh_source_radio_id_edit.setPlaceholderText("Optional radio profile ID")
@@ -6556,7 +6676,7 @@ class SettingsTab(QWidget):
         self.mesh_ble_device_id_edit = QLineEdit()
         self.mesh_ble_device_id_edit.setPlaceholderText("Saved BLE device id")
         self.mesh_ble_device_id_edit.setToolTip(
-            "Stable BLE identifier captured during scan. FIO prefers this id for reconnect, then falls back to the advertised name."
+            "Stable BLE identifier captured during scan. CommsPlan prefers this id for reconnect, then falls back to the advertised name."
         )
         self.mesh_ble_device_name_edit = QLineEdit()
         self.mesh_ble_device_name_edit.setPlaceholderText("Advertised device name (optional)")
@@ -6614,7 +6734,7 @@ class SettingsTab(QWidget):
         mesh_policy_layout.setContentsMargins(0, 0, 0, 0)
         mesh_policy_layout.setSpacing(10)
         self.mesh_store_messages_chk = QCheckBox("Inbox")
-        self.mesh_store_messages_chk.setToolTip("Store received mesh text in FIO's message pipeline.")
+        self.mesh_store_messages_chk.setToolTip("Store received mesh text in CommsPlan's message pipeline.")
         self.mesh_map_positions_chk = QCheckBox("Map")
         self.mesh_map_positions_chk.setToolTip("Use node position data for map context when available.")
         self.mesh_reticulum_bridge_chk = QCheckBox("Reticulum Bridge")
@@ -7143,7 +7263,7 @@ class SettingsTab(QWidget):
         self.js8spotter_path_edit = QLineEdit()
         self.js8spotter_path_edit.setPlaceholderText("Optional external JS8Spotter launcher/script/shortcut")
         self.js8spotter_path_edit.setToolTip(
-            "Optional. Built-in FIO Spotter does not require this path. Set it only when FIO should track or launch "
+            "Optional. Built-in CommsPlan Spotter does not require this path. Set it only when CommsPlan should track or launch "
             "the separate JS8Spotter application for the selected radio."
         )
         js8_v.addWidget(
@@ -7157,7 +7277,7 @@ class SettingsTab(QWidget):
         self.js8_forms_edit = QLineEdit()
         self.js8_forms_edit.setPlaceholderText("Optional custom station MCF catalog")
         self.js8_forms_edit.setToolTip(
-            "Advanced station override only. Leave blank to use FIO's packaged Spotter form catalog."
+            "Advanced station override only. Leave blank to use CommsPlan's packaged Spotter form catalog."
         )
         js8_v.addWidget(
             build_js8_path_row(
@@ -7809,7 +7929,7 @@ class SettingsTab(QWidget):
         self.js8_msg_auth_enabled_chk = QCheckBox("Verify JS8 text signatures when MsgAuth keys are configured")
         self.js8_msg_auth_enabled_chk.setToolTip(
             "MsgAuth keys are scoped to operating group and callsign. Unsigned Spotter traffic remains visible; "
-            "verified messages can show the same green trust cue used elsewhere in FIO."
+            "verified messages can show the same green trust cue used elsewhere in CommsPlan."
         )
         js8_auth_v.addWidget(self.js8_msg_auth_enabled_chk)
         js8_auth_note = QLabel(
@@ -7883,7 +8003,7 @@ class SettingsTab(QWidget):
         self.js8_msg_auth_generate_label_edit = QLineEdit()
         self.js8_msg_auth_generate_label_edit.setPlaceholderText("Label prefix")
         self.js8_msg_auth_generate_btn = QPushButton("Generate Keys")
-        self.js8_msg_auth_generate_btn.setToolTip("Generate strong MsgAuth shared keys FIO can use when you sign outgoing JS8 text.")
+        self.js8_msg_auth_generate_btn.setToolTip("Generate strong MsgAuth shared keys CommsPlan can use when you sign outgoing JS8 text.")
         generator_layout.addWidget(QLabel("Group"), 0, 0)
         generator_layout.addWidget(self.js8_msg_auth_generate_group_edit, 0, 1)
         generator_layout.addWidget(QLabel("My Callsign"), 0, 2)
@@ -8156,7 +8276,7 @@ class SettingsTab(QWidget):
         passphrase_row.addWidget(passphrase_label)
         self.gpg_signing_passphrase_edit = QLineEdit()
         self.gpg_signing_passphrase_edit.setEchoMode(QLineEdit.Password)
-        self.gpg_signing_passphrase_edit.setPlaceholderText("Stored in OS credential store, not FIO settings")
+        self.gpg_signing_passphrase_edit.setPlaceholderText("Stored in OS credential store, not CommsPlan settings")
         passphrase_row.addWidget(self.gpg_signing_passphrase_edit, 1)
         self.gpg_check_save_passphrase_btn = QPushButton("Check/Save")
         self.gpg_clear_passphrase_btn = QPushButton("Clear Saved")
@@ -8175,7 +8295,7 @@ class SettingsTab(QWidget):
         passphrase_confirm_row.addStretch()
         signing_v.addLayout(passphrase_confirm_row)
         self.gpg_signing_status_label = QLabel(
-            "FIO stores the selected key fingerprint in settings. Saved passphrases use the OS credential store."
+            "CommsPlan stores the selected key fingerprint in settings. Saved passphrases use the OS credential store."
         )
         self.gpg_signing_status_label.setWordWrap(True)
         signing_v.addWidget(self.gpg_signing_status_label)
@@ -8316,11 +8436,11 @@ class SettingsTab(QWidget):
         bbs_settings_v.setContentsMargins(8, 8, 8, 8)
         bbs_settings_v.setSpacing(8)
         live_bbs_scope_note = QLabel(
-            "Radio-specific live BBS folder. VarAC serves this folder on the selected radio; FIO can publish managed content into it."
+            "Radio-specific live BBS folder. VarAC serves this folder on the selected radio; CommsPlan can publish managed content into it."
         )
         live_bbs_scope_note.setWordWrap(True)
         bbs_settings_v.addWidget(live_bbs_scope_note)
-        self.varac_manage_station_bbs_btn = QPushButton("Manage FIO BBS")
+        self.varac_manage_station_bbs_btn = QPushButton("Manage CommsPlan BBS")
         self.varac_manage_station_bbs_btn.setToolTip(
             "Open the station-owned Managed BBS catalog, locations, retention, access, and publication workspace."
         )
@@ -8412,7 +8532,7 @@ class SettingsTab(QWidget):
                 "Usually leave blank. Advanced override only (example: env WINEPREFIX=/home/user/.wine wine-stable C:\\VarAC\\VarAC.exe)"
             )
         self.varac_launch_cmd_edit.setToolTip(
-            "Recommended: leave blank. FreqInOut auto-launches VarAC from Install Folder (including Wine wrapping on Linux). "
+            "Recommended: leave blank. CommsPlan auto-launches VarAC from Install Folder (including Wine wrapping on Linux). "
             "Use only if default launch fails or you need a custom Wine command/prefix."
         )
         self.varac_launch_cmd_edit.textChanged.connect(self._on_launch_paths_changed)
@@ -8628,7 +8748,7 @@ class SettingsTab(QWidget):
         varac_sync_note_row = QHBoxLayout()
         varac_sync_note_row.setContentsMargins(0, 0, 0, 0)
         self.varac_bbs_sync_note_label = QLabel(
-            "VarAC remains the source of truth; FreqInOut can sync only the [BBS] section with explicit confirmation."
+            "VarAC remains the source of truth; CommsPlan can sync only the [BBS] section with explicit confirmation."
         )
         self.varac_bbs_sync_note_label.setWordWrap(True)
         varac_sync_note_row.addWidget(self.varac_bbs_sync_note_label, 1)
@@ -8689,7 +8809,7 @@ class SettingsTab(QWidget):
         vault_enabled_top.addStretch()
         vault_enabled_inner.addLayout(vault_enabled_top)
         vault_enabled_note = QLabel(
-            "The library is shared FIO-managed storage. FIO publishes selected library locations into each radio's separate live VarAC BBS folder. "
+            "The library is shared CommsPlan-managed storage. CommsPlan publishes selected library locations into each radio's separate live VarAC BBS folder. "
             "Access codes are operational controls, not strong secrets."
         )
         vault_enabled_note.setWordWrap(True)
@@ -8787,7 +8907,7 @@ class SettingsTab(QWidget):
             self.varac_bbs_vault_flamp_listing_age_combo.addItem(f"{days} days", days)
         vault_policy_inner.addWidget(self.varac_bbs_vault_flamp_listing_age_combo, 4, 1)
         self.varac_bbs_vault_flamp_relay_hint_label = QLabel(
-            "Set FLAMP/rx first and FreqInOut will suggest a sibling relay folder automatically."
+            "Set FLAMP/rx first and CommsPlan will suggest a sibling relay folder automatically."
         )
         self.varac_bbs_vault_flamp_relay_hint_label.setWordWrap(True)
         vault_policy_inner.addWidget(self.varac_bbs_vault_flamp_relay_hint_label, 5, 0, 1, 4)
@@ -8841,7 +8961,7 @@ class SettingsTab(QWidget):
         self.varac_bbs_vault_description_edit.setMaxLength(80)
         self.varac_bbs_vault_description_edit.setPlaceholderText("Optional text appended to the helper filename")
         self.varac_bbs_vault_description_edit.setToolTip(
-            "FIO generates the command text. This optional text is appended to the helper filename."
+            "CommsPlan generates the command text. This optional text is appended to the helper filename."
         )
         vault_editor_grid.addWidget(self.varac_bbs_vault_description_edit, 1, 1, 1, 3)
         vault_editor_grid.addWidget(QLabel("Helper Filename"), 2, 0)
@@ -8923,7 +9043,7 @@ class SettingsTab(QWidget):
         )
         vault_locations_layout.addWidget(self.varac_bbs_vault_code_status_label)
         vault_locations_hint = QLabel(
-            "FIO keeps location content in the shared library, then publishes a clean copy into the selected radio's live BBS folder. "
+            "CommsPlan keeps location content in the shared library, then publishes a clean copy into the selected radio's live BBS folder. "
             "Saved access codes are hashed, and nested source subfolders are still ignored in this release."
         )
         vault_locations_hint.setWordWrap(True)
@@ -8935,7 +9055,7 @@ class SettingsTab(QWidget):
         preview_title.setStyleSheet("font-weight: 700;")
         preview_v.addWidget(preview_title)
         preview_note = QLabel(
-            "Review the root helper files, visible locations, and files callers will browse after FIO publishes the managed BBS view. "
+            "Review the root helper files, visible locations, and files callers will browse after CommsPlan publishes the managed BBS view. "
             "This preview does not publish files or change VarAC.ini."
         )
         preview_note.setWordWrap(True)
@@ -9184,6 +9304,24 @@ class SettingsTab(QWidget):
         guard_trust_row.addStretch()
         vguard_v.addLayout(guard_trust_row)
 
+        self.varac_guard_access_mode_combo = QComboBox()
+        self.varac_guard_access_mode_combo.addItems([
+            "All trusted HF Operators (legacy)", "Only selected groups and callsigns",
+        ])
+        self.varac_guard_access_mode_combo.setAccessibleName("Inbound Guard operator access scope")
+        vguard_v.addWidget(self.varac_guard_access_mode_combo)
+        self.varac_guard_access_editor = BbsAccessEditor(
+            self, operator_db_path=(
+                Path(self.settings.db_path).with_name("freqinout_nets.db")
+                if getattr(self.settings, "db_path", None) else self._operator_group_family_db_path()
+            )
+        )
+        self.varac_guard_access_editor.setVisible(False)
+        vguard_v.addWidget(self.varac_guard_access_editor)
+        self.varac_guard_access_mode_combo.currentIndexChanged.connect(self._update_varac_guard_access_mode)
+        self.varac_guard_access_mode_combo.currentIndexChanged.connect(self._mark_settings_dirty)
+        self.varac_guard_access_editor.changed.connect(self._mark_settings_dirty)
+
         guard_dir_row = QHBoxLayout()
         guard_dir_row.setContentsMargins(0, 0, 0, 0)
         guard_dir_row.setSpacing(8)
@@ -9209,7 +9347,7 @@ class SettingsTab(QWidget):
         guard_note_row = QHBoxLayout()
         guard_note_row.setContentsMargins(0, 0, 0, 0)
         self.varac_guard_note_label = QLabel(
-            "BBS Access Guard watches inbound VarAC files and checks sender trust. It does not decide what the Managed BBS Library publishes."
+            "CommsPlan-only inbound safety: Guard checks inbound VarAC sender access. Save settings applies this policy in CommsPlan. Native Get/Update is in BBS > Radio Service."
         )
         self.varac_guard_note_label.setWordWrap(True)
         guard_note_row.addWidget(self.varac_guard_note_label, 1)
@@ -9430,7 +9568,7 @@ class SettingsTab(QWidget):
         condition_alert_detail_layout.setContentsMargins(8, 8, 8, 8)
         condition_alert_detail_layout.setHorizontalSpacing(8)
         condition_alert_detail_layout.setVerticalSpacing(6)
-        self.condition_alert_detail_label = QLabel("Select a rule to review how FIO will match it.")
+        self.condition_alert_detail_label = QLabel("Select a rule to review how CommsPlan will match it.")
         self.condition_alert_detail_label.setWordWrap(True)
         self.condition_alert_detail_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         condition_alert_detail_layout.addWidget(self.condition_alert_detail_label, 0, 0, 1, 4)
@@ -9455,7 +9593,7 @@ class SettingsTab(QWidget):
         custom_tools_group.setLayout(custom_tools_v)
 
         custom_tools_hint = QLabel(
-            "Add named launch commands for helper scripts and tools. "
+            "Add a script with the picker or define a named launch command for helper tools. "
             "Configured custom tools also appear in Launch Control."
         )
         custom_tools_hint.setWordWrap(True)
@@ -9476,11 +9614,13 @@ class SettingsTab(QWidget):
 
         custom_tools_btn_row = QHBoxLayout()
         self.custom_tool_add_btn = QPushButton("Add")
+        self.custom_tool_add_script_btn = QPushButton("Add Script…")
         self.custom_tool_edit_btn = QPushButton("Edit")
         self.custom_tool_remove_btn = QPushButton("Remove")
         self.custom_tool_up_btn = QPushButton("Up")
         self.custom_tool_down_btn = QPushButton("Down")
         custom_tools_btn_row.addWidget(self.custom_tool_add_btn)
+        custom_tools_btn_row.addWidget(self.custom_tool_add_script_btn)
         custom_tools_btn_row.addWidget(self.custom_tool_edit_btn)
         custom_tools_btn_row.addWidget(self.custom_tool_remove_btn)
         custom_tools_btn_row.addSpacing(12)
@@ -9493,6 +9633,7 @@ class SettingsTab(QWidget):
         custom_tools_v.addWidget(self.custom_tools_summary_label)
 
         self.custom_tool_add_btn.clicked.connect(self._add_custom_tool)
+        self.custom_tool_add_script_btn.clicked.connect(self._add_script_custom_tool)
         self.custom_tool_edit_btn.clicked.connect(self._edit_custom_tool)
         self.custom_tool_remove_btn.clicked.connect(self._remove_custom_tool)
         self.custom_tool_up_btn.clicked.connect(lambda: self._move_custom_tool(-1))
@@ -9541,7 +9682,7 @@ class SettingsTab(QWidget):
         launch_global_row.setSpacing(8)
         launch_global_row.addWidget(self.launch_hint_label, 1)
         self.launch_all_with_startup_chk = QCheckBox(
-            "Automatically launch this radio's startup apps when FIO opens"
+            "Automatically launch this radio's startup apps when CommsPlan opens"
         )
         launch_global_row.addWidget(self.launch_all_with_startup_chk)
         launch_v.addLayout(launch_global_row)
@@ -9616,6 +9757,7 @@ class SettingsTab(QWidget):
             help_context_key="settings.launch-control",
         )
         self._register_collapsible_group(launch_group, self._summary_launch_control)
+        self._set_section_health_key(launch_group, "launch_control")
         launch_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.launch_control_section_group = launch_group
         self._add_settings_section(launch_group, scope="radio")
@@ -9955,6 +10097,21 @@ class SettingsTab(QWidget):
         # manifests, and launch recipes are saved as one reviewed transaction.
         self._edit_device_profile_at_step(dict(profile), initial_step="software")
 
+    def _open_selected_radio_connections(self) -> None:
+        profile = self._selected_settings_radio_profile()
+        if not profile:
+            QMessageBox.information(
+                self,
+                "Radio Connections",
+                "Select one radio before managing its physical connections.",
+            )
+            return
+        dialog = RadioHardwareConnectionsDialog(self.multi_radio_store, profile, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        self._refresh_radio_profile_connection_details(profile)
+        self._update_device_profile_action_buttons()
+
     def _open_selected_receiver_setup(self) -> None:
         """Open an observer profile directly at its receiver-control task."""
 
@@ -10111,7 +10268,10 @@ class SettingsTab(QWidget):
         key = (family_key, radio_id, task_key)
         editor = self._software_task_editors.get(key)
         if editor is None:
-            editor = SoftwareTaskEditor()
+            editor = SoftwareTaskEditor(operator_db_path=(
+                Path(self.settings.db_path).with_name("freqinout_nets.db")
+                if getattr(self.settings, "db_path", None) else self._operator_group_family_db_path()
+            ))
             editor.value_changed.connect(
                 lambda field_key, value, ident=radio_id, family_name=family_key: self._on_software_task_value_changed(
                     ident, family_name, field_key, value
@@ -10259,6 +10419,15 @@ class SettingsTab(QWidget):
                 task_key=task_key,
                 radio_id=radio_id,
             )
+        elif action_key == "edit_canonical_configuration":
+            workspace = getattr(self, "software_administration_workspace", None)
+            opener = getattr(workspace, "open_selected_instance_editor", None)
+            if not callable(opener) or not opener():
+                QMessageBox.information(
+                    self,
+                    "Edit software configuration",
+                    "The saved instance could not be opened from the current inventory. Refresh Software Administration and try again.",
+                )
         elif action_key == "fio_spotter" and host is not None and hasattr(host, "open_fio_spotter"):
             host.open_fio_spotter()
         elif action_key == "bbs" and host is not None and hasattr(host, "open_station_bbs"):
@@ -10391,7 +10560,7 @@ class SettingsTab(QWidget):
             QMessageBox.warning(
                 self,
                 "FLMsg / FLAmp repair",
-                "FIO could not prepare a safe component repair. Nothing was changed.",
+                "CommsPlan could not prepare a safe component repair. Nothing was changed.",
             )
             return
 
@@ -10400,7 +10569,7 @@ class SettingsTab(QWidget):
             "Update FLMsg / FLAmp launch setup?",
             (
                 f"{plan.summary}\n\n"
-                "This updates FIO's saved FLMsg/FLAmp identity, message folders, and launch rows. "
+                "This updates CommsPlan's saved FLMsg/FLAmp identity, message folders, and launch rows. "
                 "FLDigi receives only the required NBEMS/ARQ pairing arguments. FLRig, unrelated "
                 "software, Launch Control choices, and external application files are retained.\n\n"
                 "Apply this reviewed repair?"
@@ -10507,7 +10676,7 @@ class SettingsTab(QWidget):
                 self,
                 "Canonical software identity",
                 "This software was configured by Add Radio as one complete identity. "
-                "Use Add software instance… / Replace instance so FIO can update the application, "
+                "Use Add software instance… / Replace instance so CommsPlan can update the application, "
                 "profile, endpoints, launch recipe, and Software Administration record together.",
             )
             return
@@ -10628,7 +10797,7 @@ class SettingsTab(QWidget):
         self._add_device_profile()
 
     def _on_software_instance_disassociate_requested(self, raw_payload: object) -> None:
-        """Remove one reviewed FIO assignment while retaining external data."""
+        """Remove one reviewed CommsPlan assignment while retaining external data."""
 
         workspace = getattr(self, "software_administration_workspace", None)
         if not isinstance(workspace, SoftwareAdministrationWorkspace) or not isinstance(raw_payload, Mapping):
@@ -10666,7 +10835,7 @@ class SettingsTab(QWidget):
             f"Disassociate {family_title}?",
             (
                 f"Stop using {instance_name} for {radio_name}?\n\n"
-                "FIO will remove this radio assignment and its FIO-managed startup links. "
+                "CommsPlan will remove this radio assignment and its CommsPlan-managed startup links. "
                 "VarAC cluster membership is also removed when applicable.\n\n"
                 "The saved instance record, external application, configuration, messages, and files are retained."
             ),
@@ -10869,6 +11038,12 @@ class SettingsTab(QWidget):
             row = dict(raw)
             manifest = by_application.get((family, str(row.get("system_key") or "").strip()))
             if manifest:
+                manifest_evidence = manifest.get("evidence", {})
+                manifest_evidence = (
+                    dict(manifest_evidence)
+                    if isinstance(manifest_evidence, Mapping)
+                    else {}
+                )
                 ownership = {
                     "fio_managed": "fio-managed",
                     "operator": "operator-managed",
@@ -10887,6 +11062,14 @@ class SettingsTab(QWidget):
                         "launch_command": manifest.get("launch_command") or row.get("launch_cmd"),
                         "variant": row.get("variant_family", "") if family == "js8call" else "",
                         "version": row.get("variant_version", "") if family == "js8call" else "",
+                        "settings_identity_mode": manifest_evidence.get(
+                            "settings_identity_mode", ""
+                        ),
+                        "launch_recipe": (
+                            dict(manifest_evidence.get("launch_recipe") or {})
+                            if isinstance(manifest_evidence.get("launch_recipe"), Mapping)
+                            else {}
+                        ),
                     }
                 )
                 for claim in manifest.get("ports", ()) or ():
@@ -11044,7 +11227,7 @@ class SettingsTab(QWidget):
             return
         # Outside Add Radio, Add instance is the final reviewed boundary rather
         # than a draft handoff. Reuse the same immutable native preparation and
-        # verified external/FIO session path before persisting the assignment.
+        # verified external/CommsPlan session path before persisting the assignment.
         # The nested Add Radio route does not reach this handler; it retains the
         # request until outer Save Radio and Software.
         varac_apply_request = payload.get("_varac_native_apply_request")
@@ -11138,6 +11321,7 @@ class SettingsTab(QWidget):
                 "rig_name_source": "managed" if payload.get("mode") == "managed" else "imported",
                 "variant_family": str(payload.get("variant") or "unknown").strip(),
                 "variant_version": str(payload.get("version") or "").strip(),
+                "offset_hz": int(payload.get("offset_hz") or payload.get("js8_offset_hz") or 0),
                 "application_data_root": storage_path,
                 "directed_path": str(data_root / "DIRECTED.TXT") if data_root else "",
                 "all_path": str(data_root / "ALL.TXT") if data_root else "",
@@ -11230,7 +11414,7 @@ class SettingsTab(QWidget):
                         workspace.complete_instance_add(
                             success=False,
                             message=(
-                                "FIO could not safely apply and verify the reviewed native application configuration. "
+                                "CommsPlan could not safely apply and verify the reviewed native application configuration. "
                                 "The backup was restored and the instance was not saved."
                             ),
                         )
@@ -11265,6 +11449,9 @@ class SettingsTab(QWidget):
             ).strip(),
             "reviewed_radio_id": radio_id,
             "radio_role": "observer" if observer_mode else "transceiver",
+            "settings_identity_mode": str(
+                payload.get("settings_identity_mode") or "isolated"
+            ).strip().lower(),
         }
         launch_recipe = payload.get("launch_recipe")
         if isinstance(launch_recipe, Mapping):
@@ -11304,9 +11491,9 @@ class SettingsTab(QWidget):
                     if str(payload.get("native_configuration_status") or "").strip()
                     == "native_applied_readback_verified"
                     else (
-                        "Imported into FIO; run Health to verify the live endpoint and files."
+                        "Imported into CommsPlan; run Health to verify the live endpoint and files."
                         if payload.get("mode") == "discover"
-                        else "Saved in FIO; complete the application action if shown, then run Health before operational use."
+                        else "Saved in CommsPlan; complete the application action if shown, then run Health before operational use."
                     )
                 ),
                 "evidence": evidence,
@@ -11451,7 +11638,7 @@ class SettingsTab(QWidget):
                         existing_manifest, Mapping
                     ) or not isinstance(existing_application, Mapping):
                         raise ValueError(
-                            "FIO could not mirror the converted VarAC member into Software Administration."
+                            "CommsPlan could not mirror the converted VarAC member into Software Administration."
                         )
                     self._sync_converted_varac_identity(
                         radio_id=existing_radio_id,
@@ -11680,7 +11867,7 @@ class SettingsTab(QWidget):
         )
         descriptions = {
             "radio": ("Radio", "Name, model, role, and basic radio identity."),
-            "control": ("Rig Control", "How FIO controls or follows this radio."),
+            "control": ("Rig Control", "How CommsPlan controls or follows this radio."),
             "apps": ("Apps", "Choose and review software used by this radio."),
             "connections": ("Connections", "Ports, paths, message files, profiles, and app endpoints."),
             "plans": ("Schedule Control", "Assigned frequency plan, scheduler automation, and hold/timer defaults."),
@@ -11691,11 +11878,11 @@ class SettingsTab(QWidget):
         if observer_mode:
             descriptions.update(
                 {
-                    "control": ("Receiver", "Receive-only role and manual or verified FIO tuning state."),
+                    "control": ("Receiver", "Receive-only role and manual or verified CommsPlan tuning state."),
                     "apps": ("Receiver App", "The application that owns this SDR and its receive stream."),
                     "connections": (
                         "Receiver Setup",
-                        "Review the receiver endpoint, test reversible tuning, and enable FIO tuning.",
+                        "Review the receiver endpoint, test reversible tuning, and enable CommsPlan tuning.",
                     ),
                 }
             )
@@ -11957,6 +12144,8 @@ class SettingsTab(QWidget):
             else "radio"
         )
         self._settings_nav_context = "software" if scope == "software" else "main" if scope == "global" else "radios"
+        if scope != "global" and radio_id:
+            self._set_settings_radio_focus(int(radio_id))
         if scope == "global":
             if hasattr(self, "global_settings_toggle_btn"):
                 self.global_settings_toggle_btn.setChecked(True)
@@ -12028,7 +12217,7 @@ class SettingsTab(QWidget):
             self.settings_task_hint_label.setText(
                 "Select the radio, then choose the setting area to review or finish."
                 if radio_mode
-                else "These settings apply to the whole FIO station."
+                else "These settings apply to the whole CommsPlan station."
             )
         if hasattr(self, "settings_compact_header"):
             # Re-evaluate after scope visibility has been applied.  The
@@ -12542,6 +12731,7 @@ class SettingsTab(QWidget):
         snapshot["radio_profiles"] = self._build_section_health_entry(engaged=True, issues=radio_profile_issues)
 
         op_group_issues = [] if self.operating_groups else ["No HF operating groups configured"]
+        op_group_issues.extend(sorted(set(_settings_operating_group_integrity_issues(self.operating_groups).values())))
         snapshot["operating_groups"] = self._build_section_health_entry(engaged=True, issues=op_group_issues)
 
         js8_directed = self.js8_directed_edit.text().strip() if hasattr(self, "js8_directed_edit") else ""
@@ -13455,14 +13645,14 @@ class SettingsTab(QWidget):
             return
         archive_mesh_channel_policy(self._mesh_policy_db_path(), policy)
         self._refresh_mesh_channel_table()
-        self.mesh_channel_admin.set_sync_state(f"{policy.display_name} removed from FIO; device unchanged")
+        self.mesh_channel_admin.set_sync_state(f"{policy.display_name} removed from CommsPlan; device unchanged")
         self._mark_settings_dirty()
 
     def _confirm_mesh_channel_device_removal(self, adapter_id: str, channel_id: str) -> None:
         choice = QMessageBox.question(
             self,
             "Remove channel from device?",
-            "This changes the connected mesh device. FIO channel policy is separate. Continue?",
+            "This changes the connected mesh device. CommsPlan channel policy is separate. Continue?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -13537,7 +13727,7 @@ class SettingsTab(QWidget):
         if isinstance(status, QLabel):
             status.setText(
                 f"Added private feed {policy.display_name}. Join it with the encryption key on the mesh device, "
-                "then choose Mark Joined before accepting it in FIO."
+                "then choose Mark Joined before accepting it in CommsPlan."
             )
         self._mark_settings_dirty()
 
@@ -13588,7 +13778,7 @@ class SettingsTab(QWidget):
                     names = f"{names}, +{len(blocked_private) - 3} more"
                 status.setText(
                     f"Private channel key needed for {names}. Join the channel with its encryption key on the mesh device, "
-                    "then choose Mark Joined before accepting it in FIO."
+                    "then choose Mark Joined before accepting it in CommsPlan."
                 )
         self._mark_settings_dirty()
 
@@ -13728,7 +13918,7 @@ class SettingsTab(QWidget):
     ) -> None:
         """Show only usable choices, while keeping a legacy selection reviewable.
 
-        HTTP/MQTT were historically persisted even though FIO has no adapter for
+        HTTP/MQTT were historically persisted even though CommsPlan has no adapter for
         them.  A saved record is evidence and must not be silently rewritten,
         but it is not an option for a newly chosen connection.
         """
@@ -13950,6 +14140,9 @@ class SettingsTab(QWidget):
     def shutdown(self) -> None:
         """Cancel Settings-owned device work before QObject teardown."""
 
+        status_cache = getattr(self, "_status_recipe_read_cache", None)
+        if status_cache is not None:
+            status_cache.close()
         self._gpg_probe_shutdown = True
         self._gpg_probe_pending = False
         gpg_thread = getattr(self, "_gpg_probe_thread", None)
@@ -14627,7 +14820,7 @@ class SettingsTab(QWidget):
         external_spotter = "set" if hasattr(self, "js8spotter_path_edit") and self.js8spotter_path_edit.text().strip() else "not used"
         commstat = "set" if hasattr(self, "commstat_path_edit") and self.commstat_path_edit.text().strip() else "missing"
         return (
-            f"JS8Call {js8call}, profile {profile}, FIO Spotter catalog {fio_spotter_forms}, "
+            f"JS8Call {js8call}, profile {profile}, CommsPlan Spotter catalog {fio_spotter_forms}, "
             f"External JS8Spotter app {external_spotter}, CommStat {commstat}, DIRECTED {directed}"
         )
 
@@ -14801,11 +14994,11 @@ class SettingsTab(QWidget):
             return
         row = table.currentRow()
         if row < 0:
-            label.setText("Select a rule to review how FIO will match it.")
+            label.setText("Select a rule to review how CommsPlan will match it.")
             return
         rules = self._table_to_condition_alert_rules()
         if row >= len(rules):
-            label.setText("Select a rule to review how FIO will match it.")
+            label.setText("Select a rule to review how CommsPlan will match it.")
             return
         rule = rules[row]
         source_text = self._condition_alert_join(rule.source_families) or "all sources"
@@ -15376,7 +15569,7 @@ class SettingsTab(QWidget):
         self._publish_autofill_feedback(
             status="in_progress",
             summary=text,
-            detail="FreqInOut searches only when requested; Settings remains usable during the search.",
+            detail="CommsPlan searches only when requested; Settings remains usable during the search.",
             section=section,
             operation="scan",
         )
@@ -15465,7 +15658,7 @@ class SettingsTab(QWidget):
                         continue
                     row = dict(raw_row)
                     # Bounded native discovery is explicit source evidence,
-                    # but it does not imply FIO ownership.  Give the immutable
+                    # but it does not imply CommsPlan ownership.  Give the immutable
                     # detected bundle a stable evidence key, then let the core
                     # classifier decide whether it is complete enough for the
                     # explicit recovery/import picker.
@@ -16180,7 +16373,7 @@ class SettingsTab(QWidget):
         if hasattr(self, "js8spotter_import_db_edit"):
             self.js8spotter_import_db_edit.setText(str(data.get("js8spotter_import_db_path", "") or ""))
         # Legacy JS8Spotter/Expect compatibility widgets remain available to
-        # import code, but the top-level FIO Spotter workspace owns their
+        # import code, but the top-level CommsPlan Spotter workspace owns their
         # operator UI. Do not synchronously query and populate hidden tables
         # during Settings startup.
         self.js8call_path_edit.setText((data.get("path_js8call", "") or "").strip())
@@ -16301,6 +16494,7 @@ class SettingsTab(QWidget):
             self.varac_guard_allow_bbs_chk.setChecked(bool(data.get("varac_guard_allow_bbs_allowed_callsigns", True)))
         if hasattr(self, "varac_guard_allow_trusted_chk"):
             self.varac_guard_allow_trusted_chk.setChecked(bool(data.get("varac_guard_allow_operator_trusted", True)))
+        self._set_varac_guard_access_policy(data.get("varac_guard_access_policy_v1", ""))
         if hasattr(self, "varac_guard_quarantine_dir_edit"):
             self.varac_guard_quarantine_dir_edit.setText(str(data.get("varac_guard_quarantine_dir", "") or "").strip())
         if hasattr(self, "varac_guard_retry_combo"):
@@ -16359,7 +16553,7 @@ class SettingsTab(QWidget):
                 for g in og:
                     if not isinstance(g, dict):
                         continue
-                    vfo_val = (g.get("vfo") or "A").strip().upper()
+                    vfo_val = str(g.get("vfo") or "A").strip().upper()
                     if vfo_val not in ("A", "B"):
                         vfo_val = "A"
                     try:
@@ -16372,14 +16566,16 @@ class SettingsTab(QWidget):
                     mode_val = normalize_operating_group_mode(g.get("mode", ""), band_val)
                     self.operating_groups.append(
                         {
+                            **g,
                             "group": str(g.get("group", "")).upper(),
                             "operating_group_key": str(g.get("operating_group_key", "") or "").strip(),
+                            "operating_group_frequency_key": str(g.get("operating_group_frequency_key", "") or "").strip(),
                             "mode": mode_val,
                             "band": band_val,
                             "frequency": g.get("frequency", ""),
                             "vfo": vfo_val,
-                            "fldigi_mode": (g.get("fldigi_mode") or "").strip(),
-                            "fldigi_offset": (g.get("fldigi_offset") or "").strip(),
+                            "fldigi_mode": str(g.get("fldigi_mode") or "").strip(),
+                            "fldigi_offset": str(g.get("fldigi_offset") or "").strip(),
                             "auto_tune": bool(g.get("auto_tune", False)),
                             "use_condition_levels": bool(g.get("use_condition_levels", False)),
                             "condition_level": cond_level,
@@ -16390,9 +16586,9 @@ class SettingsTab(QWidget):
                             "fastlight_form_family": str(g.get("fastlight_form_family", "group_default") or "group_default").strip().upper(),
                         }
                     )
-                self.operating_groups = list(ensure_operating_group_keys(self.operating_groups))
+                self.operating_groups = list(_settings_operating_group_frequency_rows(self.operating_groups))
         except Exception:
-            self.operating_groups = []
+            log.exception("Failed to fully normalize Operating Groups; preserving rows loaded so far.")
         self._load_known_operating_group_catalog()
         self._refresh_operating_groups_table()
 
@@ -16476,6 +16672,7 @@ class SettingsTab(QWidget):
         self._set_save_button_state("success")
 
     def _emit_settings_saved(self) -> None:
+        self._status_identity_epoch = int(getattr(self, "_status_identity_epoch", 0)) + 1
         try:
             self.settings_saved.emit()
         except Exception:
@@ -16661,7 +16858,7 @@ class SettingsTab(QWidget):
         data["js8spotter_import_db_path"] = (
             self.js8spotter_import_db_edit.text().strip() if hasattr(self, "js8spotter_import_db_edit") else ""
         )
-        # Form mappings are exclusively owned by the FIO Spotter Forms surface.
+        # Form mappings are exclusively owned by the CommsPlan Spotter Forms surface.
         # Preserve its persisted data here without rebuilding or rewriting its UI.
         data["path_js8call"] = self.js8call_path_edit.text().strip() if hasattr(self, "js8call_path_edit") else ""
         data["path_js8spotter"] = (
@@ -16753,6 +16950,7 @@ class SettingsTab(QWidget):
         data["varac_guard_allow_operator_trusted"] = bool(
             self.varac_guard_allow_trusted_chk.isChecked() if hasattr(self, "varac_guard_allow_trusted_chk") else True
         )
+        data["varac_guard_access_policy_v1"] = self._varac_guard_access_policy_json()
         retry_txt = self.varac_guard_retry_combo.currentText().strip() if hasattr(self, "varac_guard_retry_combo") else "120"
         if retry_txt not in {"30", "60", "120", "300", "600"}:
             retry_txt = "120"
@@ -16953,7 +17151,7 @@ class SettingsTab(QWidget):
             QMessageBox.warning(
                 self,
                 "Launch Control",
-                "Launch path appears to point back to FreqInOut for:\n"
+                "Launch path appears to point back to CommsPlan for:\n"
                 f"{', '.join(self_target_apps)}\n\n"
                 "This can cause repeated already-running windows and extra Python processes. "
                 "Choose the correct app executable/script path.",
@@ -17334,7 +17532,7 @@ class SettingsTab(QWidget):
                         zf.write(p, arcname=p.name)
                         added += 1
                 info = (
-                    f"FreqInOut version: {__version__}\n"
+                    f"CommsPlan version: {__version__}\n"
                     f"Exported: {datetime.datetime.now(datetime.timezone.utc).isoformat()}\n"
                     f"Platform: {platform.platform()}\n"
                     f"Log level: {(self.settings.get('log_level', 'DISABLED') or 'DISABLED')}\n"
@@ -18084,7 +18282,7 @@ class SettingsTab(QWidget):
         radio_context = f"{target} (radio id {radio_id})" if radio_id else target
         return "\n".join(
             [
-                "FIO multi-rig guardrail warnings",
+                "CommsPlan multi-rig guardrail warnings",
                 f"Copied UTC: {copied_at}",
                 f"Radio context: {radio_context}",
                 "Warnings:",
@@ -18638,12 +18836,13 @@ class SettingsTab(QWidget):
             return "muted"
         if self._profile_needs_operator_name(profile):
             return "warning"
-        status = self._radio_selector_readiness_summary(profile, readiness_report).strip().lower()
-        if any(token in status for token in ("offline", "unreachable", "not responding", "failed")):
-            return "danger"
-        if any(token in status for token in ("needs", "warning", "degraded", "issue", "missing")):
+        setup_status = self._radio_selector_setup_summary(profile, readiness_report).strip().lower()
+        if "needs setup" in setup_status:
             return "warning"
-        if "ready" in status or "ok" in status:
+        operational_status = self._radio_selector_operational_status(profile).strip().lower()
+        if operational_status == "disconnected":
+            return "danger"
+        if operational_status == "connected":
             return "success_muted"
         return "info"
 
@@ -18681,13 +18880,11 @@ class SettingsTab(QWidget):
     ) -> str:
         name = self._profile_display_name(profile)
         status_bits: List[str] = []
-        readiness = self._radio_selector_readiness_summary(profile, readiness_report).strip()
-        if readiness:
-            status_bits.append(readiness)
-        if int(profile.get("runtime_active", 0) or 0) == 1:
-            status_bits.append("Active")
-        else:
-            status_bits.append("Inactive")
+        setup_status = self._radio_selector_setup_summary(profile, readiness_report).strip()
+        if setup_status:
+            status_bits.append(setup_status)
+        status_bits.append("Enabled" if int(profile.get("enabled", 1) or 0) == 1 else "Disabled")
+        status_bits.append(self._radio_selector_operational_status(profile))
         if int(profile.get("runtime_primary", 0) or 0) == 1:
             status_bits.append("Default")
         if self._profile_needs_operator_name(profile):
@@ -18695,6 +18892,236 @@ class SettingsTab(QWidget):
         if selected:
             status_bits.insert(0, "SELECTED")
         return f"{name} | {' | '.join(dict.fromkeys(status_bits))}"
+
+    def _radio_selector_setup_summary(
+        self,
+        profile: Dict[str, Any],
+        readiness_report: Any | None = None,
+    ) -> str:
+        """Return setup completeness without making a connection claim.
+
+        Readiness is useful for deciding whether configuration needs attention,
+        but a complete configuration does not prove that its endpoint is live.
+        Keep that distinction explicit in the selector copy.
+        """
+
+        if not int(profile.get("enabled", 1) or 0):
+            return "Disabled"
+        summary = None
+        if readiness_report is not None:
+            try:
+                summary = readiness_report.summary_for_radio(int(profile.get("id", 0) or 0))
+            except Exception:
+                summary = None
+        if summary is not None:
+            if int(getattr(summary, "required_count", 0) or 0) > 0:
+                return "Needs Setup"
+            return "Configured"
+        # No readiness snapshot means setup has not been evaluated in this
+        # view; keep that uncertainty explicit instead of claiming readiness.
+        return "Setup unchecked"
+
+    @staticmethod
+    def _radio_selector_operational_status_from_cache(cache_row: object) -> str:
+        """Classify one cached operational row without doing any I/O."""
+
+        if cache_row is None:
+            return "Checking"
+        if isinstance(cache_row, Mapping):
+            row: Mapping[str, object] = cache_row
+            if any(
+                bool(row.get(key, False))
+                for key in ("stale", "expired", "invalidated", "closed")
+            ):
+                return "Checking"
+            state = str(
+                row.get("state")
+                or row.get("operational_state")
+                or row.get("control_state")
+                or ""
+            ).strip().lower()
+            if state in {
+                "on_schedule_verified",
+                "js8_verification_unavailable",
+                "readback_mismatch",
+                "connected",
+                "ok",
+                "operational",
+            }:
+                return "Connected"
+            if state in {
+                "control_stalled",
+                "endpoint_unavailable",
+                "receiver_unavailable",
+                "disconnected",
+                "unavailable",
+                "error",
+                "failed",
+            }:
+                return "Disconnected"
+            if "connected" in row:
+                return "Connected" if bool(row.get("connected")) else "Disconnected"
+            control_ready = row.get("control_ready")
+            if control_ready is True:
+                return "Connected"
+            if control_ready is False:
+                return "Disconnected"
+            return "Checking"
+
+        if any(
+            bool(getattr(cache_row, key, False))
+            for key in ("stale", "expired", "invalidated", "closed")
+        ):
+            return "Checking"
+        state = str(getattr(cache_row, "operational_state", "") or "").strip().lower()
+        if state in {
+            "on_schedule_verified",
+            "js8_verification_unavailable",
+            "readback_mismatch",
+            "connected",
+            "ok",
+            "operational",
+        }:
+            return "Connected"
+        if state in {
+            "control_stalled",
+            "endpoint_unavailable",
+            "receiver_unavailable",
+            "disconnected",
+            "unavailable",
+            "error",
+            "failed",
+        }:
+            return "Disconnected"
+        control_ready = getattr(cache_row, "control_ready", None)
+        if control_ready is True:
+            return "Connected"
+        if control_ready is False:
+            return "Disconnected"
+        return "Checking"
+
+    def _radio_selector_operational_status(self, profile: Dict[str, Any]) -> str:
+        """Return Connected/Disconnected/Checking from cached radio evidence."""
+
+        try:
+            radio_id = int(profile.get("id", 0) or 0)
+        except Exception:
+            radio_id = 0
+        cache = getattr(self, "_radio_operational_status_cache", {})
+        if not isinstance(cache, Mapping) or radio_id <= 0:
+            return "Checking"
+        row = cache.get(radio_id)
+        if row is None:
+            row = cache.get(str(radio_id))
+        return self._radio_selector_operational_status_from_cache(row)
+
+    def _refresh_radio_selector_operational_cache(self) -> None:
+        """Copy the host's already-published endpoint projection, if present."""
+
+        # SchedulerEngine.get_endpoint_operational_summaries() is explicitly a
+        # cache-only projection.  Calling it here does not request a poll or
+        # perform endpoint/process/database I/O; an unavailable provider simply
+        # leaves every selector badge at Checking.
+        try:
+            window = self.window()
+            scheduler = getattr(window, "scheduler", None)
+            provider = getattr(scheduler, "get_endpoint_operational_summaries", None)
+            if not callable(provider):
+                self._radio_operational_status_cache = {}
+                return
+            snapshot = provider()
+        except Exception:
+            self._radio_operational_status_cache = {}
+            return
+        if not isinstance(snapshot, Mapping):
+            self._radio_operational_status_cache = {}
+            return
+        normalized: Dict[int, object] = {}
+        for raw_id, row in snapshot.items():
+            try:
+                radio_id = int(raw_id or 0)
+            except Exception:
+                continue
+            if radio_id > 0 and (isinstance(row, Mapping) or row is not None):
+                normalized[radio_id] = row
+        # An explicit empty published projection is authoritative.  Do not
+        # retain an older connected badge after lifecycle status is withdrawn.
+        self._radio_operational_status_cache = normalized
+
+    def set_radio_operational_status_cache(self, snapshot: object) -> None:
+        """Accept a detached lifecycle projection and repaint the selector.
+
+        Callers provide an already-published per-radio mapping; this method
+        intentionally does not discover or refresh status itself.
+        """
+
+        previous = getattr(self, "_radio_operational_status_cache", {})
+        if not isinstance(previous, Mapping):
+            previous = {}
+        normalized: Dict[int, object] = {}
+        if isinstance(snapshot, Mapping):
+            for raw_id, row in snapshot.items():
+                try:
+                    radio_id = int(raw_id or 0)
+                except Exception:
+                    continue
+                if radio_id > 0 and (isinstance(row, Mapping) or row is not None):
+                    normalized[radio_id] = row
+        self._radio_operational_status_cache = normalized
+        profiles = tuple(
+            profile
+            for profile in getattr(self, "device_profiles", ())
+            if isinstance(profile, dict) and int(profile.get("id", 0) or 0) > 0
+        )
+        changed_ids = {
+            int(profile.get("id", 0) or 0)
+            for profile in profiles
+            if self._radio_selector_operational_status_from_cache(
+                previous.get(int(profile.get("id", 0) or 0), previous.get(str(int(profile.get("id", 0) or 0))))
+            )
+            != self._radio_selector_operational_status(profile)
+        }
+        if not changed_ids:
+            return
+
+        readiness_report = getattr(self, "_last_station_readiness_report", None)
+        theme = resolve_theme(self.settings)
+        buttons = getattr(self, "_settings_radio_selector_buttons", {})
+        focused_id = int(getattr(self, "_settings_radio_focus_id", 0) or 0)
+        for profile in profiles:
+            radio_id = int(profile.get("id", 0) or 0)
+            if radio_id not in changed_ids:
+                continue
+            button = buttons.get(radio_id) if isinstance(buttons, Mapping) else None
+            if button is None:
+                continue
+            selected = radio_id == focused_id
+            button.setText(self._radio_selector_button_text(profile, readiness_report, selected=selected))
+            button.setStyleSheet(
+                self._radio_selector_button_style(
+                    profile,
+                    selected=selected,
+                    readiness_report=readiness_report,
+                    theme=theme,
+                )
+            )
+
+        if focused_id in changed_ids:
+            profile = next((item for item in profiles if int(item.get("id", 0) or 0) == focused_id), None)
+            if profile is not None:
+                self._refresh_device_profile_status_chips(profile, readiness_report)
+                detail_label = getattr(self, "device_profile_detail_label", None)
+                if detail_label is not None:
+                    operational_text = f"Operational: {self._radio_selector_operational_status(profile)}"
+                    current_text = str(detail_label.text()) if callable(getattr(detail_label, "text", None)) else ""
+                    lines = current_text.splitlines()
+                    for index, line in enumerate(lines):
+                        if line.startswith("Operational:"):
+                            lines[index] = operational_text
+                            break
+                    else:
+                        lines.append(operational_text)
+                    detail_label.setText("\n".join(lines).strip())
 
     def _radio_selector_readiness_summary(
         self,
@@ -18729,7 +19156,10 @@ class SettingsTab(QWidget):
                 widget.deleteLater()
         self._settings_radio_selector_buttons = {}
         focused_id = int(self._ensure_settings_radio_focus_id() or 0)
-        readiness_report = self._current_station_readiness_report()
+        readiness_report = getattr(self, "_last_station_readiness_report", None)
+        if readiness_report is None:
+            readiness_report = self._current_station_readiness_report()
+        self._refresh_radio_selector_operational_cache()
         theme = resolve_theme(self.settings)
         if not self.device_profiles:
             empty = QLabel("No radios are configured yet. Add a radio to start the selected-radio workflow.")
@@ -18799,26 +19229,20 @@ class SettingsTab(QWidget):
             flags.append("Name Needed")
         if int(profile.get("runtime_primary", 0) or 0) == 1:
             flags.append("Station Default")
-        if int(profile.get("runtime_active", 0) or 0) == 1:
-            flags.append("Active")
-        else:
-            flags.append("Inactive")
+        flags.append(
+            "Participation Enabled"
+            if int(profile.get("runtime_active", 0) or 0) == 1
+            else "Participation Disabled"
+        )
         enabled = "Enabled" if int(profile.get("enabled", 1) or 0) == 1 else "Disabled"
         flags.append(enabled)
         schedule_text = self._assignment_display_text(assignment_name, assignment_state)
-        readiness_text = "Not evaluated"
-        if readiness_report is not None and radio_id > 0:
-            summary_for_radio = getattr(readiness_report, "summary_for_radio", None)
-            if callable(summary_for_radio):
-                summary = summary_for_radio(radio_id)
-                if summary is not None:
-                    readiness_text = readiness_summary_status_text(
-                        summary,
-                        subject=str(profile.get("name", "") or "This radio").strip() or "This radio",
-                    )
+        setup_text = self._radio_selector_setup_summary(profile, readiness_report)
+        operational_text = self._radio_selector_operational_status(profile)
         detail_lines = [
             f"State: {'; '.join(flags)}",
-            f"Readiness: {readiness_text}",
+            f"Setup: {setup_text}",
+            f"Operational: {operational_text}",
             f"Radio model: {self._device_radio_model_summary(profile)}",
             f"Role: {self._device_class_label(str(profile.get('device_class', '') or ''))}",
             f"Control: {self._device_backend_label(str(profile.get('control_backend', '') or ''))}",
@@ -18847,7 +19271,9 @@ class SettingsTab(QWidget):
             chips.append(("Station Default", "success"))
         chips.append(
             (
-                "Active" if int(profile.get("runtime_active", 0) or 0) == 1 else "Inactive",
+                "Participation Enabled"
+                if int(profile.get("runtime_active", 0) or 0) == 1
+                else "Participation Disabled",
                 "info" if int(profile.get("runtime_active", 0) or 0) == 1 else "muted",
             )
         )
@@ -18857,16 +19283,16 @@ class SettingsTab(QWidget):
                 "success" if int(profile.get("enabled", 1) or 0) == 1 else "danger",
             )
         )
-        readiness_label = "Not Evaluated"
-        readiness_role = "muted"
-        if readiness_report is not None and radio_id > 0:
-            summary_for_radio = getattr(readiness_report, "summary_for_radio", None)
-            if callable(summary_for_radio):
-                summary = summary_for_radio(radio_id)
-                if summary is not None:
-                    readiness_label = readiness_summary_badge_text(summary)
-                    readiness_role = readiness_state_card_level(str(summary.overall_state or ""))
-        chips.append((readiness_label, readiness_role))
+        setup_label = self._radio_selector_setup_summary(profile, readiness_report)
+        setup_role = "success" if setup_label == "Configured" else "warning" if setup_label == "Needs Setup" else "muted"
+        chips.append((setup_label, setup_role))
+        operational_label = self._radio_selector_operational_status(profile)
+        operational_role = {
+            "Connected": "success",
+            "Disconnected": "danger",
+            "Checking": "muted",
+        }.get(operational_label, "muted")
+        chips.append((operational_label, operational_role))
         return chips
 
     @staticmethod
@@ -19061,6 +19487,44 @@ class SettingsTab(QWidget):
                 label.setText(value)
                 label.setAccessibleName(f"Selected radio {key}: {value}")
                 label.setMinimumHeight(max(label.sizeHint().height(), label.fontMetrics().lineSpacing() + 6))
+        hardware_summary = getattr(self, "radio_profile_hardware_summary_label", None)
+        manage_button = getattr(self, "radio_profile_manage_connections_btn", None)
+        if isinstance(hardware_summary, QLabel):
+            if not isinstance(profile, dict):
+                summary_text = "Physical connections: select a radio"
+            else:
+                try:
+                    bundle = self.multi_radio_store.get_radio_hardware_bundle(int(profile.get("id", 0) or 0))
+                except Exception:
+                    log.exception("Failed loading the selected radio hardware assignment.")
+                    bundle = None
+                if not bundle or str(bundle.get("lifecycle_state", "") or "") == "retired":
+                    summary_text = "Physical connections: application-managed · automatic rebind not configured"
+                else:
+                    roles = {
+                        str(binding.get("role", "") or "")
+                        for binding in bundle.get("bindings", [])
+                        if bool(binding.get("active", True))
+                    }
+                    labels = [
+                        label
+                        for role, label in (
+                            ("cat", "CAT"),
+                            ("ptt", "PTT"),
+                            ("audio_rx", "receive audio"),
+                            ("audio_tx", "transmit audio"),
+                        )
+                        if role in roles
+                    ]
+                    assigned = ", ".join(labels) if labels else "none"
+                    summary_text = (
+                        f"Physical connections: {assigned} assigned · verification pending · "
+                        f"generation {int(bundle.get('generation', 0) or 0)}"
+                    )
+            hardware_summary.setText(summary_text)
+            hardware_summary.setAccessibleName(summary_text)
+        if isinstance(manage_button, QPushButton):
+            manage_button.setEnabled(isinstance(profile, dict))
         self._refresh_radio_profile_control_inline_controls(profile)
 
     def _refresh_radio_profile_connection_shortcuts(
@@ -19313,7 +19777,7 @@ class SettingsTab(QWidget):
                     prompt_enabled = has_profile and str(values[mode_key]) == "Prompt"
                     prompt_combo.setEnabled(prompt_enabled)
                     prompt_combo.setToolTip(
-                        "Choose how often FIO should prompt while this timer is in Prompt mode."
+                        "Choose how often CommsPlan should prompt while this timer is in Prompt mode."
                         if prompt_enabled
                         else "Prompt interval is used only when mode is Prompt."
                     )
@@ -19735,7 +20199,7 @@ class SettingsTab(QWidget):
             ("flmsg", "FLMsg"),
             ("flamp", "FLAmp"),
             ("js8call", "JS8Call"),
-            ("js8spotter", "FIO Spotter"),
+            ("js8spotter", "CommsPlan Spotter"),
             ("commstat", "CommStat"),
             ("varac", "VarAC"),
         )
@@ -19852,17 +20316,17 @@ class SettingsTab(QWidget):
         if str(profile.get("device_class", "") or "").strip().lower() == "observer":
             application = str(profile.get("sdr_application", "") or "").strip() or "the receiver application"
             return (
-                f"{application} owns this receive-only SDR. Use Receiver Setup… to test or update FIO tuning; conventional radio app options are not required.",
+                f"{application} owns this receive-only SDR. Use Receiver Setup… to test or update CommsPlan tuning; conventional radio app options are not required.",
                 "info",
             )
         if int(profile.get("enabled", 1) or 0) != 1:
             return (
-                "No radio software is enabled yet. Enable software above when this radio should participate in FIO workflows.",
+                "No radio software is enabled yet. Enable software above when this radio should participate in CommsPlan workflows.",
                 "muted",
             )
         if int(profile.get("runtime_active", 0) or 0) == 1 or int(profile.get("runtime_primary", 0) or 0) == 1:
             return (
-                "No software options are enabled for this radio. Enable at least one software option above so FIO can operate it.",
+                "No software options are enabled for this radio. Enable at least one software option above so CommsPlan can operate it.",
                 "warning",
             )
         return (
@@ -19903,6 +20367,12 @@ class SettingsTab(QWidget):
                 ) > 0
             except Exception:
                 canonical_backed = False
+        flags_widget = getattr(self, "radio_profile_software_flags_widget", None)
+        if isinstance(flags_widget, QWidget):
+            # Canonical identities are edited as complete reviewed software
+            # transactions. Hiding the older quick toggles removes two
+            # competing mental models while retaining them for legacy rows.
+            flags_widget.setVisible(has_profile and not canonical_backed)
         self._refreshing_radio_profile_software_flags = True
         try:
             for key, chk in checks.items():
@@ -20126,7 +20596,7 @@ class SettingsTab(QWidget):
                 and receiver_control_verification_matches(profile)
             )
             if tuning_ready:
-                status_label, role = ("FIO Tuning Ready", "success")
+                status_label, role = ("CommsPlan Tuning Ready", "success")
             elif adapter == "sdrpp_rigctl":
                 status_label, role = ("Test Control", "warning")
             else:
@@ -20136,7 +20606,7 @@ class SettingsTab(QWidget):
             btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             btn.setStyleSheet(button_style(role, theme))
             btn.setToolTip(
-                "Open Receiver Setup to review the application endpoint, run the reversible control test, and enable FIO tuning."
+                "Open Receiver Setup to review the application endpoint, run the reversible control test, and enable CommsPlan tuning."
             )
             btn.setAccessibleName(f"Receiver Setup: {application}: {status_label}")
             btn.clicked.connect(self._open_selected_receiver_setup)
@@ -20435,7 +20905,7 @@ class SettingsTab(QWidget):
                 int(profile.get("sdr_control_enabled", 0) or 0)
                 and receiver_control_verification_matches(profile)
             )
-            summary = f"{application} · {'FIO tuning ready' if fio_ready else 'Manual tuning'}"
+            summary = f"{application} · {'CommsPlan tuning ready' if fio_ready else 'Manual tuning'}"
             if target:
                 summary += f" · {target}"
             if host and port:
@@ -20480,7 +20950,7 @@ class SettingsTab(QWidget):
         if self._radio_software_enabled(profile, "js8call"):
             software.append("JS8Call")
         if self._radio_software_enabled(profile, "js8spotter"):
-            software.append("FIO Spotter")
+            software.append("CommsPlan Spotter")
         if self._radio_software_enabled(profile, "commstat"):
             software.append("CommStat")
         if self._radio_software_enabled(profile, "varac"):
@@ -20934,7 +21404,7 @@ class SettingsTab(QWidget):
                 "and Save folder do not isolate message files."
             )
         else:
-            consequence = "Do not run concurrent local instances until FIO verifies this message-storage namespace."
+            consequence = "Do not run concurrent local instances until CommsPlan verifies this message-storage namespace."
         return (
             f"Message storage root: {root}. {consequence} "
             "The Save folder is separate; changing it does not relocate ALL.TXT, DIRECTED.TXT, or inbox.db3."
@@ -21042,6 +21512,15 @@ class SettingsTab(QWidget):
         self._refresh_device_assignment_scope_label()
 
     def _radio_software_state_from_profile(self, profile: Dict[str, Any]) -> Dict[str, Any]:
+        def _guard_flag(key):
+            value = profile.get(key)
+            if value is None:
+                settings = getattr(self, "settings", None)
+                value = settings.get(key, True) if settings is not None else True
+            if isinstance(value, str):
+                return value.strip().lower() not in {"", "0", "false", "no", "off"}
+            return bool(value)
+
         profile_id = int(profile.get("id", 0) or 0) if isinstance(profile, dict) else 0
         message_paths = {
             "flmsg": str(profile.get("flmsg_message_path", "") or "").strip(),
@@ -21084,12 +21563,9 @@ class SettingsTab(QWidget):
             "varac_bbs_announce_enabled": bool(int(profile.get("varac_bbs_announce_enabled", 0) or 0) == 1),
             "varac_bbs_auto_archive_enabled": bool(int(profile.get("varac_bbs_auto_archive_enabled", 0) or 0) == 1),
             "varac_bbs_auto_archive_days": str(profile.get("varac_bbs_auto_archive_days", 14) or 14),
-            "varac_guard_allow_bbs_allowed_callsigns": bool(
-                int(profile.get("varac_guard_allow_bbs_allowed_callsigns", 1) or 1) == 1
-            ),
-            "varac_guard_allow_operator_trusted": bool(
-                int(profile.get("varac_guard_allow_operator_trusted", 1) or 1) == 1
-            ),
+            "varac_guard_allow_bbs_allowed_callsigns": _guard_flag("varac_guard_allow_bbs_allowed_callsigns"),
+            "varac_guard_allow_operator_trusted": _guard_flag("varac_guard_allow_operator_trusted"),
+            "varac_guard_access_policy_v1": str(profile.get("varac_guard_access_policy_v1", "") or ""),
             "varac_bbs_vault_enabled": bool(int(profile.get("varac_bbs_vault_enabled", 0) or 0) == 1),
             "varac_bbs_vault_managed_root": str(profile.get("varac_bbs_vault_managed_root", "") or "").strip(),
             "varac_bbs_vault_default_location_id": str(
@@ -21183,6 +21659,7 @@ class SettingsTab(QWidget):
             "varac_guard_allow_operator_trusted": bool(
                 self.varac_guard_allow_trusted_chk.isChecked() if hasattr(self, "varac_guard_allow_trusted_chk") else True
             ),
+            "varac_guard_access_policy_v1": self._varac_guard_access_policy_json(),
             "varac_bbs_vault_enabled": bool(self.varac_bbs_vault_enabled_chk_main.isChecked()),
             "varac_bbs_vault_managed_root": self._computed_varac_bbs_vault_default_root(),
             "varac_bbs_vault_default_location_id": (
@@ -21274,6 +21751,7 @@ class SettingsTab(QWidget):
                 self.varac_guard_allow_bbs_chk.setChecked(bool(state.get("varac_guard_allow_bbs_allowed_callsigns", True)))
             if hasattr(self, "varac_guard_allow_trusted_chk"):
                 self.varac_guard_allow_trusted_chk.setChecked(bool(state.get("varac_guard_allow_operator_trusted", True)))
+            self._set_varac_guard_access_policy(state.get("varac_guard_access_policy_v1", ""))
             self.varac_bbs_vault_enabled_chk_main.setChecked(bool(state.get("varac_bbs_vault_enabled", False)))
             root_txt = compute_default_managed_root(self.varac_bbs_dir_edit.text().strip())
             self._set_varac_bbs_vault_root_text(root_txt)
@@ -21641,6 +22119,7 @@ class SettingsTab(QWidget):
                 "varac_bbs_auto_archive_days": _num("varac_bbs_auto_archive_days", 14),
                 "varac_guard_allow_bbs_allowed_callsigns": bool(state.get("varac_guard_allow_bbs_allowed_callsigns", True)),
                 "varac_guard_allow_operator_trusted": bool(state.get("varac_guard_allow_operator_trusted", True)),
+                "varac_guard_access_policy_v1": _txt("varac_guard_access_policy_v1"),
                 "varac_bbs_vault_enabled": bool(state.get("varac_bbs_vault_enabled", False)),
                 "varac_bbs_vault_managed_root": _txt("varac_bbs_vault_managed_root"),
                 "varac_bbs_vault_default_location_id": _txt("varac_bbs_vault_default_location_id", DEFAULT_LOCATION_ID)
@@ -21771,7 +22250,7 @@ class SettingsTab(QWidget):
             return (
                 "Upgrade Existing Station",
                 "The station upgrade was previously paused.",
-                "Complete the station upgrade before using this version of FIO.",
+                "Complete the station upgrade before using this version of CommsPlan.",
                 "warning",
             )
         if mode == STARTUP_MIGRATION_ERROR:
@@ -21779,11 +22258,11 @@ class SettingsTab(QWidget):
             detail = "Your current settings were left unchanged. Resolve the issue, then retry the station upgrade."
             if warning:
                 detail = f"{detail} Latest note: {warning}"
-            return ("Upgrade Existing Station", "FIO could not prepare the station upgrade.", detail, "warning")
+            return ("Upgrade Existing Station", "CommsPlan could not prepare the station upgrade.", detail, "warning")
         return (
             "Upgrade Existing Station",
-            "FIO found an existing single-radio station.",
-            "Back up and upgrade the station before using this version of FIO.",
+            "CommsPlan found an existing single-radio station.",
+            "Back up and upgrade the station before using this version of CommsPlan.",
             "warning",
         )
 
@@ -21922,7 +22401,7 @@ class SettingsTab(QWidget):
         warnings = tuple(getattr(upgrade_preview, "warnings", ()) or ()) + tuple(
             getattr(discovery_proposal, "warnings", ()) or ()
         )
-        summary = str(getattr(upgrade_preview, "summary", "") or "FIO can preview the station upgrade.").strip()
+        summary = str(getattr(upgrade_preview, "summary", "") or "CommsPlan can preview the station upgrade.").strip()
         lines = [
             f"Apps found: {app_text}.",
             f"Suggested ports: {port_text or 'default local ports; no active radio apps found to validate yet'}.",
@@ -22045,8 +22524,8 @@ class SettingsTab(QWidget):
             name = self._radio_name_by_id(profile_id) or f"Radio {profile_id}"
             active_names.append(f"{name} ({profile_id})")
         lines = [
-            "FreqInOut Multi-Rig Summary",
-            f"FIO version: {__version__}",
+            "CommsPlan Multi-Rig Summary",
+            f"CommsPlan version: {__version__}",
             f"Platform: {platform.platform()}",
             f"Python: {sys.version.replace(chr(10), ' ')}",
             f"Architecture: {platform.machine()}",
@@ -22188,8 +22667,8 @@ class SettingsTab(QWidget):
         dialog.resize(620, 520)
         layout = QVBoxLayout(dialog)
         intro = QLabel(
-            "FIO found your existing single-radio station. Review the radio identity and detected software below. "
-            "FIO will create and verify a backup before upgrading the station."
+            "CommsPlan found your existing single-radio station. Review the radio identity and detected software below. "
+            "CommsPlan will create and verify a backup before upgrading the station."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
@@ -22227,14 +22706,14 @@ class SettingsTab(QWidget):
         display_name_user_edited = False
         last_catalog_display_name = ""
 
-        role_group = QGroupBox("Software FIO found in Configuration")
+        role_group = QGroupBox("Software CommsPlan found in Configuration")
         role_layout = QVBoxLayout(role_group)
         role_layout.setSpacing(4)
         role_checks: Dict[str, QCheckBox] = {}
         role_labels = [
             ("fast_light", "FLRig / FLDigi (Fast Light)"),
             ("js8call", "JS8Call"),
-            ("js8spotter", "FIO Spotter"),
+            ("js8spotter", "CommsPlan Spotter"),
             ("varac", "VarAC"),
             ("flamp", "FLAMP"),
             ("flmsg", "FLMsg"),
@@ -22291,7 +22770,7 @@ class SettingsTab(QWidget):
 
         buttons = QDialogButtonBox()
         setup_btn = buttons.addButton("Back Up and Upgrade Station", QDialogButtonBox.AcceptRole)
-        exit_btn = buttons.addButton("Exit FIO", QDialogButtonBox.RejectRole)
+        exit_btn = buttons.addButton("Exit CommsPlan", QDialogButtonBox.RejectRole)
         layout.addWidget(buttons)
 
         def _accept_setup() -> None:
@@ -22395,7 +22874,7 @@ class SettingsTab(QWidget):
         if failed_backup_items or not primary_backup_ok:
             detail_parts = [f"{item.original_path}: {item.error or item.status}" for item in failed_backup_items]
             if not primary_backup_ok:
-                detail_parts.insert(0, "Primary FIO configuration backup did not complete.")
+                detail_parts.insert(0, "Primary CommsPlan configuration backup did not complete.")
             detail = "\n".join(detail_parts)
             self._set_multi_rig_setup_preview_text(
                 f"Station upgrade is blocked because the backup did not complete.\n{detail}".strip(),
@@ -22451,14 +22930,14 @@ class SettingsTab(QWidget):
             self._publish_settings_action_feedback(
                 status="failed",
                 summary="Station upgrade failed after backup.",
-                detail="FIO could not complete the station upgrade. Your current settings were left unchanged.",
+                detail="CommsPlan could not complete the station upgrade. Your current settings were left unchanged.",
                 action_type="configure_automatically",
                 source_surface="settings.configure_automatically.multirig.apply",
             )
             QMessageBox.warning(
                 self,
                 "Upgrade Existing Station",
-                "FIO could not complete the station upgrade. Your current settings were left unchanged.",
+                "CommsPlan could not complete the station upgrade. Your current settings were left unchanged.",
             )
             return False
         self._refresh_multi_radio_tables(refresh_section_titles=False)
@@ -22471,7 +22950,7 @@ class SettingsTab(QWidget):
         self._publish_settings_action_feedback(
             status="succeeded",
             summary="Station upgrade is complete.",
-            detail=f"FIO created the first runtime radio after backing up settings to {backup_result.backup_dir}",
+            detail=f"CommsPlan created the first runtime radio after backing up settings to {backup_result.backup_dir}",
             action_type="configure_automatically",
             source_surface="settings.configure_automatically.multirig.apply",
         )
@@ -22689,7 +23168,7 @@ class SettingsTab(QWidget):
 
     def _build_readiness_summary_text(self) -> str:
         report = self._current_station_readiness_report()
-        lines = [readiness_report_detail_text(report, title="FreqInOut Multi-Rig Readiness Summary")]
+        lines = [readiness_report_detail_text(report, title="CommsPlan Multi-Rig Readiness Summary")]
         lines.extend(
             [
                 (
@@ -22758,7 +23237,7 @@ class SettingsTab(QWidget):
                 self.operating_profiles_guidance_title_label,
                 self.operating_profiles_guidance_status_label,
                 title="Focused Operating Model Guidance",
-                text="Add an operating model to define which FIO features and scheduler behavior apply to an assigned radio schedule.",
+                text="Add an operating model to define which CommsPlan features and scheduler behavior apply to an assigned radio schedule.",
                 level="info",
             )
             return
@@ -22784,14 +23263,14 @@ class SettingsTab(QWidget):
                 text = (
                 f"{name} is currently assigned to {len(assigned_rows)} radio"
                     f"{'s' if len(assigned_rows) != 1 else ''}: {', '.join(assigned_devices)}. "
-                    f"FIO features: {shell_summary}."
+                    f"CommsPlan features: {shell_summary}."
                 )
                 level = "success"
             else:
                 text = (
                     f"{name} is ready to use. "
                     f"Workflow preset: {self._scheduler_mode_label(profile.get('scheduler_mode', 'full'))}. "
-                    f"FIO features: {shell_summary}."
+                    f"CommsPlan features: {shell_summary}."
                 )
                 level = "info"
         self._set_guidance_card_state(
@@ -22832,7 +23311,7 @@ class SettingsTab(QWidget):
         focused_id = self._current_device_assignment_focus_id()
         active_swap = dict(self.active_profile_swap or {})
         if not focused_id:
-            text = "Operating Model Assignment connects radios to the FIO behavior model they should use. Select a row to review whether that radio is using its normal model or a temporary override."
+            text = "Operating Model Assignment connects radios to the CommsPlan behavior model they should use. Select a row to review whether that radio is using its normal model or a temporary override."
             if active_swap:
                 text = (
                     "A temporary model swap is active. Review the focused assignment rows and use Restore Swap when the temporary Station Default handoff is no longer needed."
@@ -23103,39 +23582,46 @@ class SettingsTab(QWidget):
         self.edit_device_profile_btn.setStyleSheet(button_style("info" if can_edit else "muted", theme))
         if hasattr(self, "selector_edit_apps_btn"):
             self.selector_edit_apps_btn.setEnabled(can_edit)
-            self.selector_edit_apps_btn.setText("Receiver Setup…" if observer_selected else "Edit Apps")
+            self.selector_edit_apps_btn.setText("Receiver Setup…" if observer_selected else "Change Software…")
             self.selector_edit_apps_btn.setToolTip(
-                "Review the receiver endpoint, test reversible tuning, and enable FIO tuning."
+                "Review the receiver endpoint, test reversible tuning, and enable CommsPlan tuning."
                 if observer_selected
-                else "Choose or change the software used by the selected radio."
+                else "Add or remove software used by the selected radio."
             )
             self.selector_edit_apps_btn.setAccessibleName(
-                "Open selected receiver setup" if observer_selected else "Edit selected radio apps"
+                "Open selected receiver setup" if observer_selected else "Change selected radio software"
             )
             self.selector_edit_apps_btn.setStyleSheet(button_style("info" if can_edit else "muted", theme))
         if hasattr(self, "selector_software_details_btn"):
             self.selector_software_details_btn.setEnabled(can_edit)
             self.selector_software_details_btn.setVisible(not observer_selected)
             self.selector_software_details_btn.setStyleSheet(button_style("info" if can_edit else "muted", theme))
+        if hasattr(self, "selector_manage_connections_btn"):
+            self.selector_manage_connections_btn.setEnabled(can_edit)
+            self.selector_manage_connections_btn.setStyleSheet(button_style("info" if can_edit else "muted", theme))
         if hasattr(self, "profile_edit_apps_btn"):
             self.profile_edit_apps_btn.setEnabled(can_edit)
             self.profile_edit_apps_btn.setVisible(count == 1)
-            self.profile_edit_apps_btn.setText("Receiver Setup…" if observer_selected else "Edit Apps")
+            self.profile_edit_apps_btn.setText("Receiver Setup…" if observer_selected else "Change Software…")
             self.profile_edit_apps_btn.setToolTip(
-                "Review the receiver endpoint, test reversible tuning, and enable FIO tuning."
+                "Review the receiver endpoint, test reversible tuning, and enable CommsPlan tuning."
                 if observer_selected
-                else "Open the selected radio's app choices so software can be added or removed."
+                else "Add or remove software used by the selected radio."
             )
             self.profile_edit_apps_btn.setAccessibleName(
                 "Open selected receiver setup from profile"
                 if observer_selected
-                else "Edit selected radio apps from profile"
+                else "Change selected radio software from profile"
             )
             self.profile_edit_apps_btn.setStyleSheet(button_style("info" if can_edit else "muted", theme))
         if hasattr(self, "profile_software_details_btn"):
             self.profile_software_details_btn.setEnabled(can_edit)
             self.profile_software_details_btn.setVisible(count == 1 and not observer_selected)
             self.profile_software_details_btn.setStyleSheet(button_style("info" if can_edit else "muted", theme))
+        if hasattr(self, "profile_manage_connections_btn"):
+            self.profile_manage_connections_btn.setEnabled(can_edit)
+            self.profile_manage_connections_btn.setVisible(count == 1)
+            self.profile_manage_connections_btn.setStyleSheet(button_style("info" if can_edit else "muted", theme))
         self.activate_device_profile_btn.setEnabled(can_activate)
         self.activate_device_profile_btn.setStyleSheet(button_style("info" if can_activate else "muted", theme))
         if hasattr(self, "selector_activate_device_profile_btn"):
@@ -23366,7 +23852,7 @@ class SettingsTab(QWidget):
             return
         if not self.varac_cluster_members:
             label.setText(
-                "Assign device profiles to VarAC clusters here. Each membership should make clear which FIO radio/profile owns the VarAC instance. "
+                "Assign device profiles to VarAC clusters here. Each membership should make clear which CommsPlan radio/profile owns the VarAC instance. "
                 "Use distinct instance numbers and device-local paths for separate running instances."
             )
             return
@@ -23704,7 +24190,7 @@ class SettingsTab(QWidget):
         if int(profile.get("use_net_control_tabs", 1) or 0) != 1:
             bits.append("NetCtrl Off")
         if not bits:
-            return "All FIO features"
+            return "All CommsPlan features"
         return ", ".join(bits)
 
     def _selected_operating_profile_ids(self) -> List[int]:
@@ -23770,7 +24256,7 @@ class SettingsTab(QWidget):
             None,
         )
         hint = (
-            "Operating models define which FIO features and scheduler behavior apply when a built Frequency Plan "
+            "Operating models define which CommsPlan features and scheduler behavior apply when a built Frequency Plan "
             "or schedule is assigned to a radio. They are assigned separately from schedules."
         )
         if isinstance(primary_assignment, dict):
@@ -24741,7 +25227,7 @@ class SettingsTab(QWidget):
         scheduler_mode_combo.setCurrentIndex(mode_idx if mode_idx >= 0 else 0)
         self._fit_combo_to_contents(scheduler_mode_combo, minimum=220)
         scheduler_mode_combo.setToolTip(
-            "Choose the default FIO feature preset for this operating model. The checkboxes below show exactly what the preset includes."
+            "Choose the default CommsPlan feature preset for this operating model. The checkboxes below show exactly what the preset includes."
         )
         form.addRow("Workflow Preset:", scheduler_mode_combo)
 
@@ -25729,7 +26215,7 @@ class SettingsTab(QWidget):
             browse_btn = QPushButton("Browse")
             browse_btn.setMinimumWidth(86)
             browse_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-            browse_btn.setToolTip(f"Choose {title.lower()} if FIO did not detect the right location.")
+            browse_btn.setToolTip(f"Choose {title.lower()} if CommsPlan did not detect the right location.")
             row = QHBoxLayout()
             row.setContentsMargins(0, 0, 0, 0)
             row.setSpacing(8)
@@ -25785,7 +26271,7 @@ class SettingsTab(QWidget):
         # not insert, remove, or renumber steps locally when the radio role
         # changes; only the role-specific content and descriptive title adapt.
         guided_wizard_steps: Tuple[Tuple[str, str], ...] = tuple(
-            (step_id, "FIO Behavior" if step_id == "model" else label)
+            (step_id, "CommsPlan Behavior" if step_id == "model" else label)
             for step_id, label in guided_setup_wizard_view("radio").steps
         )
         guided_wizard_max_index_seen = (
@@ -25845,7 +26331,7 @@ class SettingsTab(QWidget):
         readiness_title.setFont(readiness_title_font)
         readiness_card_layout.addWidget(readiness_title)
         readiness_intro = QLabel(
-            "FreqInOut checks this radio as you edit it so the next setup step is easier to spot before you save."
+            "CommsPlan checks this radio as you edit it so the next setup step is easier to spot before you save."
         )
         readiness_intro.setObjectName("readinessIntro")
         readiness_intro.setWordWrap(True)
@@ -25913,7 +26399,7 @@ class SettingsTab(QWidget):
             receiver_stack_layout,
             "Receiver application:",
             receiver_application_combo,
-            "Select the receive-only application FIO should launch for this profile.",
+            "Select the receive-only application CommsPlan should launch for this profile.",
         )
         existing_receiver_launch_target = str(
             existing_receiver_launch_item.get("launch_path_override", "")
@@ -25932,9 +26418,9 @@ class SettingsTab(QWidget):
             receiver_stack_layout,
             "Launch target:",
             receiver_launch_path_wrap,
-            "Use the suggested SDR++ command, or choose its executable/application bundle. FIO stores it only in this receiver's launch recipe.",
+            "Use the suggested SDR++ command, or choose its executable/application bundle. CommsPlan stores it only in this receiver's launch recipe.",
         )
-        receiver_launch_enabled_chk = QCheckBox("Launch this receiver application with FIO")
+        receiver_launch_enabled_chk = QCheckBox("Launch this receiver application with CommsPlan")
         receiver_launch_enabled_chk.setObjectName("guidedReceiverLaunchEnabled")
         receiver_launch_enabled_chk.setChecked(
             bool(
@@ -26119,7 +26605,7 @@ class SettingsTab(QWidget):
         inventory_review_status.setWordWrap(True)
         inventory_review_status.setTextInteractionFlags(Qt.TextSelectableByMouse)
         inventory_review_why = QLabel(
-            "FIO checks this same reviewed inventory again before making any change."
+            "CommsPlan checks this same reviewed inventory again before making any change."
         )
         inventory_review_why.setObjectName("guidedReviewedInventoryWhy")
         inventory_review_why.setWordWrap(True)
@@ -26152,7 +26638,7 @@ class SettingsTab(QWidget):
         app_config_review_toggle_btn = QPushButton("Show Details")
         app_config_review_toggle_btn.setObjectName("guidedAppConfigReviewToggle")
         app_config_review_toggle_btn.setStyleSheet(button_style("secondary", theme))
-        app_config_review_toggle_btn.setToolTip("Show the app configuration details FIO reviewed for this radio.")
+        app_config_review_toggle_btn.setToolTip("Show the app configuration details CommsPlan reviewed for this radio.")
         app_config_apply_btn = QPushButton("Review App Setup")
         app_config_apply_btn.setObjectName("guidedAppConfigApply")
         app_config_apply_btn.setStyleSheet(button_style("primary", theme))
@@ -26218,7 +26704,7 @@ class SettingsTab(QWidget):
             identity_form,
             "Radio Model:",
             radio_model_wrap,
-            "Choose the actual rig model when possible so FreqInOut can offer smarter setup guidance.",
+            "Choose the actual rig model when possible so CommsPlan can offer smarter setup guidance.",
         )
 
         model_hint_label = QLabel()
@@ -26277,7 +26763,7 @@ class SettingsTab(QWidget):
             identity_form,
             "Primary Rig Control:",
             backend_combo,
-            "This determines how FreqInOut primarily controls or follows the rig. It does not limit the rest of the software stack assigned to this radio.",
+            "This determines how CommsPlan primarily controls or follows the rig. It does not limit the rest of the software stack assigned to this radio.",
         )
 
         deploy_combo = QComboBox()
@@ -26308,7 +26794,7 @@ class SettingsTab(QWidget):
             identity_form,
             "Setup Type:",
             setup_type_combo,
-            "Start here. FIO will show only the radio, app, and control fields that fit this setup.",
+            "Start here. CommsPlan will show only the radio, app, and control fields that fit this setup.",
         )
 
         software_row = QGridLayout()
@@ -26320,13 +26806,13 @@ class SettingsTab(QWidget):
         use_flmsg_chk = QCheckBox("FLMsg")
         use_flamp_chk = QCheckBox("FLAmp")
         use_js8call_chk = QCheckBox("JS8Call")
-        use_js8spotter_chk = QCheckBox("FIO Spotter")
+        use_js8spotter_chk = QCheckBox("CommsPlan Spotter")
         use_js8spotter_chk.setToolTip(
-            "Use FIO's built-in Spotter compose, decode, Expect, and message-viewer workflows."
+            "Use CommsPlan's built-in Spotter compose, decode, Expect, and message-viewer workflows."
         )
         use_external_js8spotter_chk = QCheckBox("External JS8Spotter")
         use_external_js8spotter_chk.setToolTip(
-            "Track or launch the separate JS8Spotter app. Built-in FIO Spotter does not require this."
+            "Track or launch the separate JS8Spotter app. Built-in CommsPlan Spotter does not require this."
         )
         use_commstat_chk = QCheckBox("CommStat")
         use_varac_chk = QCheckBox("VarAC")
@@ -26384,7 +26870,7 @@ class SettingsTab(QWidget):
         )
         configure_auto_btn.setVisible(False)
         configure_auto_status = QLabel(
-            "Choose software above, then let FIO prepare a complete plan."
+            "Choose software above, then let CommsPlan prepare a complete plan."
         )
         configure_auto_status.setObjectName("guidedConfigureAutomaticallyStatus")
         configure_auto_status.setAccessibleName("Automatic software preparation status")
@@ -26396,7 +26882,7 @@ class SettingsTab(QWidget):
 
         # Add Radio starts by collecting intent, then prepares a complete
         # proposal in the background.  Do not make an operator enter native
-        # application details before FIO has had an opportunity to discover
+        # application details before CommsPlan has had an opportunity to discover
         # and derive them.  The durable ownership/completion/launch controls
         # remain below as draft projections, but are deliberately withheld
         # until a prepared plan is available for review.
@@ -26406,7 +26892,7 @@ class SettingsTab(QWidget):
         software_responsibility_layout.setContentsMargins(8, 8, 8, 8)
         software_responsibility_layout.setSpacing(8)
         software_responsibility_intro = QLabel(
-            "FIO prepares each selected software family automatically. Ready families stay compact; "
+            "CommsPlan prepares each selected software family automatically. Ready families stay compact; "
             "only a choice or safety issue that needs your attention expands here."
         )
         software_responsibility_intro.setWordWrap(True)
@@ -26447,7 +26933,7 @@ class SettingsTab(QWidget):
             "receiver": "Receiver application",
             "js8call": "JS8Call family",
             "fast_light": "Fast Light",
-            "fio_spotter": "FIO Spotter",
+            "fio_spotter": "CommsPlan Spotter",
             "external_spotter": "External JS8Spotter",
             "commstat": "CommStat",
             "varac": "VarAC",
@@ -26456,10 +26942,10 @@ class SettingsTab(QWidget):
             "receiver": "Owns receive display and, after separate verification, receiver tuning.",
             "js8call": "Owns decode/import identity, API endpoint, profile, and message paths.",
             "fast_light": "Owns FLDigi/FLRig relationships and FLMsg/FLAmp file workflows.",
-            "fio_spotter": "Built into FIO; maps watches, compose, decode, and Inbox activity to this radio without a separate install or forms-folder choice.",
-            "external_spotter": "Optional external Spotter application; separate from built-in FIO Spotter.",
+            "fio_spotter": "Built into CommsPlan; maps watches, compose, decode, and Inbox activity to this radio without a separate install or forms-folder choice.",
+            "external_spotter": "Optional external Spotter application; separate from built-in CommsPlan Spotter.",
             "commstat": "Binds the one station-shared CommStat process to this radio's selected or new JS8Call endpoint.",
-            "varac": "Owns a radio-scoped VarAC node. Choose standalone, create a cluster, or join a cluster before FIO prepares its plan.",
+            "varac": "Owns a radio-scoped VarAC node. Choose standalone, create a cluster, or join a cluster before CommsPlan prepares its plan.",
         }
 
         for family_key, family_title in software_family_titles.items():
@@ -26479,11 +26965,11 @@ class SettingsTab(QWidget):
             source_combo.setObjectName(f"guidedSoftwareSource_{family_key}")
             source_combo.setAccessibleName(f"{family_title} instance source")
             if family_key == "fio_spotter":
-                source_combo.addItem("Included with FIO", "built_in")
+                source_combo.addItem("Included with CommsPlan", "built_in")
             elif family_key == "commstat":
                 source_combo.addItem("Use the station-shared CommStat service", "station_shared")
             else:
-                source_combo.addItem("Create a new FIO-managed instance", "create")
+                source_combo.addItem("Create a new CommsPlan-managed instance", "create")
                 source_combo.addItem("Use an existing instance unchanged", "existing")
                 source_combo.addItem("Set up manually or connect remotely", "manual")
                 if family_key == "fast_light":
@@ -26498,11 +26984,11 @@ class SettingsTab(QWidget):
             management_combo.setObjectName(f"guidedSoftwareManagement_{family_key}")
             management_combo.setAccessibleName(f"{family_title} setup responsibility")
             if family_key == "fio_spotter":
-                management_combo.addItem("Managed inside FIO", "fio_builtin")
+                management_combo.addItem("Managed inside CommsPlan", "fio_builtin")
             elif family_key == "commstat":
-                management_combo.addItem("FIO manages the endpoint binding", "shared_binding")
+                management_combo.addItem("CommsPlan manages the endpoint binding", "shared_binding")
             else:
-                management_combo.addItem("FIO manages identity and launch", "fio_identity_launch")
+                management_combo.addItem("CommsPlan manages identity and launch", "fio_identity_launch")
                 management_combo.addItem("Operator completes native app setup", "operator_native")
             _configure_combo_width(management_combo, minimum=230)
             if family_key in {"fio_spotter", "commstat"}:
@@ -26519,11 +27005,11 @@ class SettingsTab(QWidget):
             launch_combo.setObjectName(f"guidedSoftwareLaunch_{family_key}")
             launch_combo.setAccessibleName(f"{family_title} launch policy")
             if family_key == "fio_spotter":
-                launch_combo.addItem("Available inside FIO", "built_in")
+                launch_combo.addItem("Available inside CommsPlan", "built_in")
             elif family_key == "commstat":
                 launch_combo.addItem("Station-shared process; no radio launch", "station_shared")
             else:
-                launch_combo.addItem("Launch with FIO", "fio")
+                launch_combo.addItem("Launch with CommsPlan", "fio")
                 launch_combo.addItem("Operator starts this application", "operator")
             _configure_combo_width(launch_combo, minimum=220)
             if family_key in {"fio_spotter", "commstat"}:
@@ -26539,7 +27025,7 @@ class SettingsTab(QWidget):
             if family_key == "fio_spotter":
                 detail_btn.setText("Show Details / mapping…")
                 detail_btn.setToolTip(
-                    "Review the JS8 transport used by built-in FIO Spotter. No external install or MCF folder is required."
+                    "Review the JS8 transport used by built-in CommsPlan Spotter. No external install or MCF folder is required."
                 )
             elif family_key == "commstat":
                 detail_btn.setText("Show Details / JS8 binding…")
@@ -26566,7 +27052,7 @@ class SettingsTab(QWidget):
             prepared_state.setAccessibleName(f"{family_title} preparation status")
             card_layout.addWidget(prepared_state, 3, 0, 1, 3)
             # Details is the only ready-state control.  Completion,
-            # management, and launch are FIO-derived policy and stay in the
+            # management, and launch are CommsPlan-derived policy and stay in the
             # correction editor rather than expanding every ready card.
             technical_widgets: List[QWidget] = [detail_btn]
             choice_widgets: List[QWidget] = [
@@ -26587,7 +27073,7 @@ class SettingsTab(QWidget):
                 varac_arrangement_combo.setAccessibleName("VarAC arrangement")
                 _configure_combo_width(varac_arrangement_combo, minimum=260)
                 varac_arrangement_hint = QLabel(
-                    "Choose the arrangement before FIO prepares VarAC. Existing configuration is never changed until final review."
+                    "Choose the arrangement before CommsPlan prepares VarAC. Existing configuration is never changed until final review."
                 )
                 varac_arrangement_hint.setObjectName("guidedVaracArrangementHint")
                 varac_arrangement_hint.setWordWrap(True)
@@ -26784,7 +27270,7 @@ class SettingsTab(QWidget):
                 why = str(presentation.get("why") or "").strip()
                 varac_arrangement_hint.setText(
                     " ".join(part for part in (summary, why) if part)
-                    or "Choose the arrangement before FIO prepares VarAC. Existing configuration is never changed until final review."
+                    or "Choose the arrangement before CommsPlan prepares VarAC. Existing configuration is never changed until final review."
                 )
 
         _refresh_varac_arrangement_presentation(preserve_selection=False)
@@ -26819,7 +27305,7 @@ class SettingsTab(QWidget):
             software_form,
             "Radio Apps Base Folder:",
             radio_apps_base_wrap,
-            "Optional. Point FIO at the common folder where radio-owned tools such as external JS8Spotter or VarAC are installed. Station-shared CommStat is configured separately.",
+            "Optional. Point CommsPlan at the common folder where radio-owned tools such as external JS8Spotter or VarAC are installed. Station-shared CommStat is configured separately.",
         )
 
         app_setup_plan_group = QGroupBox("Setup Status")
@@ -26908,7 +27394,7 @@ class SettingsTab(QWidget):
             combo = QComboBox()
             combo.setObjectName(f"guidedAutoAppChoice_{app_id}")
             combo.setVisible(False)
-            combo.setToolTip("FIO found more than one installed app. Choose the one this radio should use.")
+            combo.setToolTip("CommsPlan found more than one installed app. Choose the one this radio should use.")
             _configure_combo_width(combo, minimum=420)
             app_choice_combos[app_id] = combo
             browse_btn = QPushButton("Browse")
@@ -26916,7 +27402,7 @@ class SettingsTab(QWidget):
             browse_btn.setMinimumWidth(86)
             browse_btn.setMaximumWidth(110)
             browse_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-            browse_btn.setToolTip("Choose a different app or folder if FIO did not find it.")
+            browse_btn.setToolTip("Choose a different app or folder if CommsPlan did not find it.")
             app_choice_browse_buttons[app_id] = browse_btn
             choice_row = QHBoxLayout()
             choice_row.setContentsMargins(0, 0, 0, 0)
@@ -26938,11 +27424,11 @@ class SettingsTab(QWidget):
         js8_profile_choice_combo = QComboBox()
         js8_profile_choice_combo.setObjectName("guidedAutoJs8ProfileChoice")
         js8_profile_choice_combo.setVisible(False)
-        js8_profile_choice_combo.setToolTip("FIO found more than one JS8Call profile. Choose the profile this radio uses.")
+        js8_profile_choice_combo.setToolTip("CommsPlan found more than one JS8Call profile. Choose the profile this radio uses.")
         _configure_combo_width(js8_profile_choice_combo, minimum=260)
         js8_profile_choice_label = _make_help_label(
             "Which JS8Call profile belongs to this radio?",
-            "Choose the JS8Call profile/port pair that belongs to this radio. FIO will fill the TCP port, profile folder, and DIRECTED.TXT path.",
+            "Choose the JS8Call profile/port pair that belongs to this radio. CommsPlan will fill the TCP port, profile folder, and DIRECTED.TXT path.",
         )
         js8_profile_choice_label.setVisible(False)
         row_labels[js8_profile_choice_combo] = js8_profile_choice_label
@@ -27059,11 +27545,11 @@ class SettingsTab(QWidget):
         )
         _add_form_row(connection_form, "JS8Call App:", js8_install_wrap, "Optional JS8Call executable or app path associated with this radio.")
 
-        js8_launch_enabled_chk = QCheckBox("Launch this JS8Call instance with FIO")
+        js8_launch_enabled_chk = QCheckBox("Launch this JS8Call instance with CommsPlan")
         js8_launch_enabled_chk.setObjectName("guidedObserverJs8LaunchEnabled")
         js8_launch_enabled_chk.setChecked(False)
         js8_launch_enabled_chk.setToolTip(
-            "Start only this radio-owned, receive-only JS8Call instance with FIO. "
+            "Start only this radio-owned, receive-only JS8Call instance with CommsPlan. "
             "This does not grant Compose, Expect, QSY, PTT, or scheduler authority."
         )
         _add_full_width_row(connection_form, js8_launch_enabled_chk)
@@ -27084,18 +27570,18 @@ class SettingsTab(QWidget):
 
         js8_forms_edit = QLineEdit(str((profile_seed or {}).get("js8_forms_path", "") or ""))
         # Retain the legacy value in the draft/payload for compatibility, but
-        # do not expose it in Guided Add Radio.  FIO Spotter is built in and
+        # do not expose it in Guided Add Radio.  CommsPlan Spotter is built in and
         # resolves its bundled form catalog internally.
         js8_forms_edit.setObjectName("guidedLegacySpotterFormsPath")
         js8_forms_edit.setVisible(False)
 
         operating_model_group, operating_model_form = _make_section(
-            "FIO Behavior",
-            "Choose what FIO may do with this radio. Timing and Frequency Plan choices remain in the Schedule step.",
+            "CommsPlan Behavior",
+            "Choose what CommsPlan may do with this radio. Timing and Frequency Plan choices remain in the Schedule step.",
         )
         operating_model_combo = QComboBox()
         operating_model_combo.setObjectName("guidedOperatingModel")
-        operating_model_combo.setAccessibleName("FIO Behavior for this radio")
+        operating_model_combo.setAccessibleName("CommsPlan Behavior for this radio")
         operating_model_inventory = [
             dict(row)
             for row in (getattr(self, "operating_profiles", ()) or ())
@@ -27156,22 +27642,22 @@ class SettingsTab(QWidget):
                         existing_assignment.get("operating_profile_id", 0) or 0
                     )
         operating_model_combo.setToolTip(
-            "Choose the FIO features and safety boundary for this radio. Schedule timing is configured later."
+            "Choose the CommsPlan features and safety boundary for this radio. Schedule timing is configured later."
         )
         _add_form_row(
             operating_model_form,
             "Behavior:",
             operating_model_combo,
-            "FIO saves the selected feature and safety behavior with this radio without choosing its schedule.",
+            "CommsPlan saves the selected feature and safety behavior with this radio without choosing its schedule.",
         )
         operating_model_capabilities = QLabel()
         operating_model_capabilities.setObjectName("guidedOperatingModelCapabilities")
-        operating_model_capabilities.setAccessibleName("Resolved FIO Behavior")
+        operating_model_capabilities.setAccessibleName("Resolved CommsPlan Behavior")
         operating_model_capabilities.setWordWrap(True)
         _add_full_width_row(operating_model_form, operating_model_capabilities)
         operating_model_why_label = QLabel()
         operating_model_why_label.setObjectName("guidedOperatingModelWhy")
-        operating_model_why_label.setAccessibleName("Why this FIO Behavior matters")
+        operating_model_why_label.setAccessibleName("Why this CommsPlan Behavior matters")
         operating_model_why_label.setWordWrap(True)
         _add_full_width_row(operating_model_form, operating_model_why_label)
 
@@ -27233,9 +27719,9 @@ class SettingsTab(QWidget):
                 if int(row.get(field, 0) or 0) == 1
             ]
             return (
-                "Custom FIO operations — " + ", ".join(enabled_features)
+                "Custom CommsPlan operations — " + ", ".join(enabled_features)
                 if enabled_features
-                else "Custom limited FIO operations"
+                else "Custom limited CommsPlan operations"
             )
 
         def _guided_fio_behavior_features(row: Mapping[str, Any]) -> str:
@@ -27250,19 +27736,19 @@ class SettingsTab(QWidget):
                 )
                 if int(row.get(field, 0) or 0) == 1
             ]
-            return ", ".join(features) if features else "No optional FIO workspaces"
+            return ", ".join(features) if features else "No optional CommsPlan workspaces"
 
         def _update_guided_radio_role_summary() -> None:
             observer_mode = str(device_class_combo.currentData() or "").strip().lower() == "observer"
             if observer_mode:
                 radio_role_resolved_label.setText("Resolved role: Receive-only SDR")
                 radio_role_why_label.setText(
-                    "Why: FIO keeps transmit, PTT, Compose sending, Expect replies, and transceiver QSY unavailable for this radio."
+                    "Why: CommsPlan keeps transmit, PTT, Compose sending, Expect replies, and transceiver QSY unavailable for this radio."
                 )
             elif str(device_class_combo.currentData() or "").strip().lower() == "tx_rx":
                 radio_role_resolved_label.setText("Resolved role: Transceiver")
                 radio_role_why_label.setText(
-                    "Why: This radio can receive and transmit, subject to its FIO Behavior, verified control, and RF Guard."
+                    "Why: This radio can receive and transmit, subject to its CommsPlan Behavior, verified control, and RF Guard."
                 )
             else:
                 radio_role_resolved_label.setText("Resolved role: Existing advanced role")
@@ -27278,7 +27764,7 @@ class SettingsTab(QWidget):
                     "Resolved behavior: unavailable. Restore or create a compatible behavior in Configuration > Main."
                 )
                 operating_model_why_label.setText(
-                    "Why: FIO needs an explicit feature and safety boundary before this radio can be saved."
+                    "Why: CommsPlan needs an explicit feature and safety boundary before this radio can be saved."
                 )
                 return
             behavior_label = _guided_fio_behavior_label(selected)
@@ -27288,14 +27774,14 @@ class SettingsTab(QWidget):
                     f"Resolved behavior: {behavior_label} · {feature_text} · receive/import only"
                 )
                 operating_model_why_label.setText(
-                    "Why: This defines FIO's receive-side features and safety boundary. Receive timing and retuning belong in Schedule."
+                    "Why: This defines CommsPlan's receive-side features and safety boundary. Receive timing and retuning belong in Schedule."
                 )
             else:
                 operating_model_capabilities.setText(
                     f"Resolved behavior: {behavior_label} · {feature_text}"
                 )
                 operating_model_why_label.setText(
-                    "Why: This controls which FIO features are available. When the radio operates belongs in Schedule."
+                    "Why: This controls which CommsPlan features are available. When the radio operates belongs in Schedule."
                 )
 
         def _refresh_guided_operating_model_choices(
@@ -27337,7 +27823,7 @@ class SettingsTab(QWidget):
                 operating_model_combo.setCurrentIndex(selected_index)
             operating_model_combo.blockSignals(False)
             operating_model_combo.setEnabled(operating_model_combo.count() > 0)
-            operating_model_combo.setAccessibleName("FIO Behavior for this radio")
+            operating_model_combo.setAccessibleName("CommsPlan Behavior for this radio")
             _refresh_guided_operating_model_summary()
 
         _refresh_guided_operating_model_choices(preserve_current=False)
@@ -27345,7 +27831,7 @@ class SettingsTab(QWidget):
 
         js8spotter_launch_edit = QLineEdit(str((profile_seed or {}).get("spotter_launch_path", "") or ""))
         js8spotter_launch_wrap = _make_browse_row(js8spotter_launch_edit, title="Select external JS8Spotter app", mode="folder")
-        _add_form_row(connection_form, "External JS8Spotter App:", js8spotter_launch_wrap, "Optional. Built-in FIO Spotter does not require the separate JS8Spotter application.")
+        _add_form_row(connection_form, "External JS8Spotter App:", js8spotter_launch_wrap, "Optional. Built-in CommsPlan Spotter does not require the separate JS8Spotter application.")
 
         commstat_launch_edit = QLineEdit(str((profile_seed or {}).get("commstat_launch_path", "") or ""))
         # CommStat is one station-shared process.  Keep the legacy launch path
@@ -27446,16 +27932,16 @@ class SettingsTab(QWidget):
             receiver_application_combo.setCurrentIndex(receiver_application_index)
         _configure_combo_width(sdr_application_combo, minimum=260)
         sdr_form.addRow(
-            _make_help_label("Receiver application:", "The application that owns this receiver hardware. Choosing it does not claim that FIO can tune it."),
+            _make_help_label("Receiver application:", "The application that owns this receiver hardware. Choosing it does not claim that CommsPlan can tune it."),
             sdr_application_combo,
         )
 
-        # Application support and FIO's adapter are intentionally separate.
+        # Application support and CommsPlan's adapter are intentionally separate.
         # Selecting the adapter records intent only; an explicit worker-owned
         # reversible tune/readback test is still required before enablement.
         sdr_adapter_combo = QComboBox()
         sdr_adapter_combo.setObjectName("guidedReceiverAdapter")
-        sdr_adapter_combo.addItem("Manual tuning (no FIO control API)", "manual")
+        sdr_adapter_combo.addItem("Manual tuning (no CommsPlan control API)", "manual")
         sdr_adapter_combo.addItem("SDR++ RigCTL (selected VFO)", "sdrpp_rigctl")
         existing_sdr_adapter = str((profile_seed or {}).get("sdr_adapter", "manual") or "manual").strip().lower()
         existing_sdr_adapter = existing_sdr_adapter.replace("-", "_") or "manual"
@@ -27484,8 +27970,8 @@ class SettingsTab(QWidget):
         _configure_combo_width(sdr_adapter_combo, minimum=320)
         sdr_form.addRow(
             _make_help_label(
-                "FIO control adapter:",
-                "This is FIO's application bridge, not the SDR hardware driver. SDR++ RigCTL controls the VFO currently selected inside SDR++.",
+                "CommsPlan control adapter:",
+                "This is CommsPlan's application bridge, not the SDR hardware driver. SDR++ RigCTL controls the VFO currently selected inside SDR++.",
             ),
             sdr_adapter_combo,
         )
@@ -27514,7 +28000,7 @@ class SettingsTab(QWidget):
         sdr_endpoint_wrap = QWidget()
         sdr_endpoint_wrap.setLayout(sdr_endpoint_row)
         sdr_form.addRow(
-            _make_help_label("Application endpoint:", "Optional saved application address. A host or port by itself is not proof that FIO can control the receiver."),
+            _make_help_label("Application endpoint:", "Optional saved application address. A host or port by itself is not proof that CommsPlan can control the receiver."),
             sdr_endpoint_wrap,
         )
 
@@ -27527,10 +28013,10 @@ class SettingsTab(QWidget):
         )
         sdr_form.addRow(sdr_verification_summary)
 
-        sdr_control_enabled_chk = QCheckBox("Enable FIO tuning after verified evidence")
+        sdr_control_enabled_chk = QCheckBox("Enable CommsPlan tuning after verified evidence")
         sdr_control_enabled_chk.setObjectName("guidedReceiverControlEnabled")
         sdr_control_enabled_chk.setToolTip(
-            "FIO tuning can be enabled only after the selected application adapter has completed a successful capability and tune/readback verification."
+            "CommsPlan tuning can be enabled only after the selected application adapter has completed a successful capability and tune/readback verification."
         )
         sdr_control_enabled_chk.setChecked(bool(int((profile_seed or {}).get("sdr_control_enabled", 0) or 0)))
         sdr_form.addRow(sdr_control_enabled_chk)
@@ -27558,7 +28044,7 @@ class SettingsTab(QWidget):
             connection_form,
             "Observer / SDR:",
             sdr_wrap,
-            "Choose the receiver application and save any optional connection details. FIO keeps this receiver manually tuned until a verified adapter is available.",
+            "Choose the receiver application and save any optional connection details. CommsPlan keeps this receiver manually tuned until a verified adapter is available.",
         )
 
         port_prompt_group = QGroupBox("Enter App Ports")
@@ -27578,7 +28064,7 @@ class SettingsTab(QWidget):
             prompt_edit.setValidator(QIntValidator(1, 65535, prompt_edit))
             prompt_edit.setPlaceholderText("Port number")
             prompt_edit.setVisible(False)
-            prompt_edit.setToolTip("This is the number the app uses to talk to FIO.")
+            prompt_edit.setToolTip("This is the number the app uses to talk to CommsPlan.")
             _configure_port_edit(prompt_edit)
             port_prompt_fields[field_key] = prompt_edit
             label_widget = _make_help_label(prompt_text, "Enter the port number configured in that app for this radio.")
@@ -27615,7 +28101,7 @@ class SettingsTab(QWidget):
         body_layout.addWidget(optional_body)
 
         rf_guard_intro = QLabel(
-            "Start with the bands this antenna path can safely use. FIO checks those bands against the "
+            "Start with the bands this antenna path can safely use. CommsPlan checks those bands against the "
             "assigned Frequency Plan before the radio is activated."
         )
         rf_guard_intro.setWordWrap(True)
@@ -27658,7 +28144,7 @@ class SettingsTab(QWidget):
             optional_form,
             "Supported Bands:",
             band_grid_widget,
-            "Choose the bands this radio and antenna can safely use. FIO checks this before assigning or applying a schedule.",
+            "Choose the bands this radio and antenna can safely use. CommsPlan checks this before assigning or applying a schedule.",
         )
 
         antenna_band_mode_combo = QComboBox()
@@ -27672,7 +28158,7 @@ class SettingsTab(QWidget):
             optional_form,
             "Unsupported Band:",
             antenna_band_mode_combo,
-            "Choose whether FIO should warn or block if a plan tries to use a band that is not checked above.",
+            "Choose whether CommsPlan should warn or block if a plan tries to use a band that is not checked above.",
         )
 
         rf_guard_plan_check_card = QFrame()
@@ -27703,7 +28189,7 @@ class SettingsTab(QWidget):
             optional_form,
             "Shared Antenna:",
             antenna_group_edit,
-            "Use the same name on radios that share one antenna, switch position, tuner, or feed line. FIO treats those radios as competing for that path.",
+            "Use the same name on radios that share one antenna, switch position, tuner, or feed line. CommsPlan treats those radios as competing for that path.",
         )
 
         ptt_group_edit = QLineEdit(str((profile_seed or {}).get("ptt_group", "") or ""))
@@ -27735,7 +28221,7 @@ class SettingsTab(QWidget):
             optional_form,
             "Same-Band Action:",
             band_overlap_mode_combo,
-            "Choose what FIO should do when another radio in this guard group is scheduled on the same band.",
+            "Choose what CommsPlan should do when another radio in this guard group is scheduled on the same band.",
         )
 
         advanced_frequency_group_edit = QLineEdit(str((profile_seed or {}).get("advanced_frequency_guard_group", "") or ""))
@@ -27758,7 +28244,7 @@ class SettingsTab(QWidget):
             optional_form,
             "Advanced Guard Action:",
             advanced_frequency_mode_combo,
-            "Choose what FIO should do when another radio in this advanced guard group is too close in frequency.",
+            "Choose what CommsPlan should do when another radio in this advanced guard group is too close in frequency.",
         )
 
         advanced_frequency_window_spin = QSpinBox()
@@ -27908,7 +28394,7 @@ class SettingsTab(QWidget):
                 # now makes the refresh automatic rather than assigning that
                 # recovery task to the operator.
                 configure_auto_status.setText(
-                    "Updating — software choices changed. FIO will refresh the plan automatically before you continue."
+                    "Updating — software choices changed. CommsPlan will refresh the plan automatically before you continue."
                 )
             for family_key, card in software_responsibility_cards.items():
                 selected = _guided_software_family_selected(family_key)
@@ -27928,7 +28414,7 @@ class SettingsTab(QWidget):
                 # A completed card is deliberately a compact status row plus
                 # its non-mutating Details correction surface.  Before a
                 # plan exists, expose only the source (and VarAC topology),
-                # not a wall of policy fields that FIO can derive itself.
+                # not a wall of policy fields that CommsPlan can derive itself.
                 for widget in software_card_choice_widgets[family_key]:
                     widget.setVisible(False)
                 for widget in software_card_decision_widgets[family_key]:
@@ -27954,7 +28440,7 @@ class SettingsTab(QWidget):
                 elif software_preparation_in_progress or (
                     family_key == "varac" and varac_native_preparation_in_progress
                 ):
-                    state_label.setText("Preparing — FIO is checking this software and deriving its isolated configuration.")
+                    state_label.setText("Preparing — CommsPlan is checking this software and deriving its isolated configuration.")
                 elif prepared:
                     if family_key == "varac":
                         native = managed_draft.get("varac_native_presentation")
@@ -27964,12 +28450,12 @@ class SettingsTab(QWidget):
                             software_detail_buttons[family_key].setText("Review Details (optional)…")
                             if bool(native.get("apply_requires_stopped_process")):
                                 state_label.setText(
-                                    "Ready with warning — FIO prepared the complete VarAC cluster bundle. "
+                                    "Ready with warning — CommsPlan prepared the complete VarAC cluster bundle. "
                                     "Close VarAC and VARA before final Save; Review Details is optional."
                                 )
                             else:
                                 state_label.setText(
-                                    "Ready — FIO prepared the complete VarAC, VARA, file, port, and structured launch bundle. Review Details is optional."
+                                    "Ready — CommsPlan prepared the complete VarAC, VARA, file, port, and structured launch bundle. Review Details is optional."
                                 )
                         elif native_state == "standalone ready" and not bool(
                             native.get("writer_required", True)
@@ -27977,26 +28463,26 @@ class SettingsTab(QWidget):
                             software_detail_buttons[family_key].setText("Review Details (optional)…")
                             state_label.setText(
                                 "Ready with warning — standalone VarAC is selected. "
-                                "FIO prepared the distinct identity and retained discovered node-local paths; "
+                                "CommsPlan prepared the distinct identity and retained discovered node-local paths; "
                                 "native standalone files remain operator-owned. You may continue or choose "
                                 "Create/Join cluster here."
                             )
                         elif native_state == "preparing":
-                            state_label.setText("Preparing — FIO is deriving the complete VarAC and VARA bundle.")
+                            state_label.setText("Preparing — CommsPlan is deriving the complete VarAC and VARA bundle.")
                         else:
                             native_why = str(native.get("why") or "").strip()
                             state_label.setText(
                                 "Blocked — "
-                                + (native_why or "FIO could not prepare a qualified VarAC bundle safely.")
+                                + (native_why or "CommsPlan could not prepare a qualified VarAC bundle safely.")
                             )
                     elif family_key in {"js8call", "fast_light"} and managed_recipe_ready:
                         software_detail_buttons[family_key].setText("Review Details (optional)…")
                         software_detail_buttons[family_key].setToolTip(
-                            "FIO has prepared this complete managed instance. Review its exact identity, files, "
+                            "CommsPlan has prepared this complete managed instance. Review its exact identity, files, "
                             "connections, and launch recipe if you want to learn or make a correction."
                         )
                         state_label.setText(
-                            "Ready — FIO prepared the complete managed instance. Review Details is optional."
+                            "Ready — CommsPlan prepared the complete managed instance. Review Details is optional."
                         )
                     elif family_key in {"js8call", "fast_light"}:
                         recipe = managed_draft.get("launch_recipe")
@@ -28007,7 +28493,7 @@ class SettingsTab(QWidget):
                             software_detail_buttons[family_key].setText("Review Details (optional)…")
                             state_label.setText(
                                 "Ready with warnings — "
-                                + (recovery or "FIO prepared an isolated launch plan; verify the noted assumption after launch.")
+                                + (recovery or "CommsPlan prepared an isolated launch plan; verify the noted assumption after launch.")
                             )
                         elif managed_recipe_status == "launch_pending":
                             software_detail_buttons[family_key].setText("Review Details (optional)…")
@@ -28028,7 +28514,7 @@ class SettingsTab(QWidget):
                             software_detail_buttons[family_key].setText("Review Details…")
                             state_label.setText(
                                 "Needs attention — "
-                                + (recovery or "FIO could not prepare a safe isolated plan. Review the details, then FIO will refresh the plan automatically.")
+                                + (recovery or "CommsPlan could not prepare a safe isolated plan. Review the details, then CommsPlan will refresh the plan automatically.")
                             )
                     else:
                         state_label.setText(
@@ -28165,7 +28651,7 @@ class SettingsTab(QWidget):
             return "", ""
 
         def _publish_prepared_managed_instance_drafts() -> Tuple[str, ...]:
-            """Retain FIO-owned managed recipes without opening the technical editor."""
+            """Retain CommsPlan-owned managed recipes without opening the technical editor."""
 
             retained_raw = getattr(dlg, "_guided_software_instance_drafts", {})
             retained = {
@@ -28246,7 +28732,7 @@ class SettingsTab(QWidget):
                     continue
                 # These endpoints belong to the managed recipe.  Keep the
                 # Connections review truthful without asking the operator to
-                # copy FIO's allocated ports into a separate form.
+                # copy CommsPlan's allocated ports into a separate form.
                 if family == "js8call":
                     js8_host_edit.setText(str(draft.get("host") or "127.0.0.1"))
                     js8_port_edit.setText(str(draft.get("port") or ""))
@@ -28497,7 +28983,7 @@ class SettingsTab(QWidget):
                     varac_native_presentation={
                         "state": "standalone_ready",
                         "why": (
-                            "Standalone VarAC is selected. FIO prepared the distinct radio identity "
+                            "Standalone VarAC is selected. CommsPlan prepared the distinct radio identity "
                             "and retained discovered node-local paths; native standalone VarAC files "
                             "remain operator-owned. Choose Create cluster or Join cluster here to use "
                             "the qualified native cluster writer."
@@ -28521,14 +29007,14 @@ class SettingsTab(QWidget):
             fingerprint = native_draft_fingerprint(seed)
             seed["varac_native_presentation"] = {
                 "state": "preparing",
-                "why": "FIO is deriving the complete VarAC and VARA bundle in the background.",
+                "why": "CommsPlan is deriving the complete VarAC and VARA bundle in the background.",
             }
             retained_raw = getattr(dlg, "_guided_software_instance_drafts", {})
             setattr(dlg, "_guided_software_instance_drafts", {**dict(retained_raw or {}), "varac": seed})
             self._varac_native_generation = int(getattr(self, "_varac_native_generation", 0)) + 1
             generation = self._varac_native_generation
             varac_native_preparation_in_progress = True
-            software_prepared_state_labels["varac"].setText("Preparing — FIO is deriving the complete VarAC and VARA bundle.")
+            software_prepared_state_labels["varac"].setText("Preparing — CommsPlan is deriving the complete VarAC and VARA bundle.")
             worker = _VarACNativePrepareWorker(
                 draft=seed,
                 db_path=self.multi_radio_store.db_path,
@@ -28563,7 +29049,7 @@ class SettingsTab(QWidget):
                 varac_native_preparation_in_progress = False
                 current["varac_native_presentation"] = {
                     "state": "blocked",
-                    "why": "FIO could not prepare VarAC: " + str(detail),
+                    "why": "CommsPlan could not prepare VarAC: " + str(detail),
                     "writer_qualified": False,
                     "generation": generation,
                     "draft_fingerprint": fingerprint,
@@ -28574,7 +29060,7 @@ class SettingsTab(QWidget):
                     {**dict(current_raw or {}), "varac": current},
                 )
                 configure_auto_status.setText(
-                    "Blocked — FIO could not prepare VarAC: " + str(detail)
+                    "Blocked — CommsPlan could not prepare VarAC: " + str(detail)
                 )
                 _update_software_responsibility_cards()
                 _apply_guided_wizard_visibility(connection_group.isVisible())
@@ -28664,13 +29150,13 @@ class SettingsTab(QWidget):
             )
             if not selected:
                 software_preparation_pending = False
-                configure_auto_status.setText("Choose software above; FIO will prepare it automatically.")
+                configure_auto_status.setText("Choose software above; CommsPlan will prepare it automatically.")
                 return
             if use_varac_chk.isChecked() and not str(
                 _selected_varac_arrangement().get("cluster_path") or ""
             ).strip():
                 software_preparation_pending = False
-                configure_auto_status.setText("Needs choice — choose the VarAC arrangement before FIO can prepare it.")
+                configure_auto_status.setText("Needs choice — choose the VarAC arrangement before CommsPlan can prepare it.")
                 _update_software_responsibility_cards()
                 return
             software_preparation_pending = True
@@ -28682,7 +29168,7 @@ class SettingsTab(QWidget):
                     )
                 configure_auto_status.setText("Updating — finishing the current check, then refreshing your changed software plan.")
                 return
-            configure_auto_status.setText("Preparing automatically — FIO is checking the selected software in the background.")
+            configure_auto_status.setText("Preparing automatically — CommsPlan is checking the selected software in the background.")
             software_preparation_timer.start()
 
         def _invalidate_prepared_software_plan() -> None:
@@ -28706,7 +29192,7 @@ class SettingsTab(QWidget):
                 prepared_software_families = ()
                 prepared_software_context = ()
                 configure_auto_status.setText(
-                    "Updating — software choices changed. FIO will refresh the plan automatically."
+                    "Updating — software choices changed. CommsPlan will refresh the plan automatically."
                 )
             software_preparation_pending = True
             software_preparation_failed = False
@@ -28824,7 +29310,7 @@ class SettingsTab(QWidget):
                 return
             if family == "fio_spotter":
                 configure_auto_status.setText(
-                    "FIO Spotter is built in. Review its selected JS8 transport on Connections; "
+                    "CommsPlan Spotter is built in. Review its selected JS8 transport on Connections; "
                     "no separate install, launch identity, or MCF forms folder is required."
                 )
                 _set_guided_wizard_step("connection")
@@ -29044,7 +29530,7 @@ class SettingsTab(QWidget):
                 editor_layout = QVBoxLayout(editor_dialog)
                 handoff_note = QLabel(
                     "Review or correct the prepared plan for this inactive radio draft. "
-                    "FIO prepared source, identity, connections, files, launch, conflicts, and review "
+                    "CommsPlan prepared source, identity, connections, files, launch, conflicts, and review "
                     "together. Apply returns to Add Radio; nothing is saved until Review & Save."
                 )
                 handoff_note.setWordWrap(True)
@@ -29395,14 +29881,14 @@ class SettingsTab(QWidget):
                 endpoint_detail = f" Saved application endpoint: {endpoint}{':' + port if port else ''}."
             target_detail = f" Selected receiver: {target}." if target else ""
             setup = {
-                "SDR++": "In SDR++, select the receiver and VFO, enable the RigCTL Server module, enable tuning, and confirm its bind address and port. FIO opens only short-lived receive-control connections.",
-                "SDRangel": "Open SDRangel, select the receiver hardware and device set, then tune there. Do not treat an HTTP address as verified FIO control.",
+                "SDR++": "In SDR++, select the receiver and VFO, enable the RigCTL Server module, enable tuning, and confirm its bind address and port. CommsPlan opens only short-lived receive-control connections.",
+                "SDRangel": "Open SDRangel, select the receiver hardware and device set, then tune there. Do not treat an HTTP address as verified CommsPlan control.",
                 "SDRconnect": "Open SDRconnect, select the receiver and VFO, then tune there. A later verified setup will respect its application control ownership.",
                 "Gqrx": "Open Gqrx, select the receiver source, then tune there. Its remote-control address remains optional technical information until verified.",
-                "KiwiSDR": "Open the receiver in its normal browser/application workflow, then tune it manually. FIO does not own that listening session.",
+                "KiwiSDR": "Open the receiver in its normal browser/application workflow, then tune it manually. CommsPlan does not own that listening session.",
             }.get(
                 application,
-                "Tune this receiver manually in its normal application. Record the hardware in Radio Model above so FIO can give accurate compatibility guidance later.",
+                "Tune this receiver manually in its normal application. Record the hardware in Radio Model above so CommsPlan can give accurate compatibility guidance later.",
             )
             sdr_manual_guidance.setText(
                 setup + " You can save this profile now; manual tuning remains available even when no API is configured."
@@ -29446,12 +29932,12 @@ class SettingsTab(QWidget):
             evidence_summary = _verification_evidence_summary(evidence) if evidence_matches else ""
 
             if adapter == "manual":
-                verification_text = "Manual tuning — no FIO control adapter is selected."
+                verification_text = "Manual tuning — no CommsPlan control adapter is selected."
             elif adapter == "sdrpp_rigctl":
                 if receiver_test_in_progress:
                     verification_text = "Testing SDR++ control in the background; the selected VFO will move briefly and then be restored."
                 elif effective_state == "verified" and evidence_matches:
-                    verification_text = f"FIO tuning ready — tune/readback and restoration passed ({evidence_summary or 'verified evidence'})."
+                    verification_text = f"CommsPlan tuning ready — tune/readback and restoration passed ({evidence_summary or 'verified evidence'})."
                 elif receiver_verification_state == "failed":
                     verification_text = "The last control test failed. Tune this receiver manually, correct the setup, and try again."
                 elif receiver_verification_state == "verified" and evidence_present:
@@ -29498,23 +29984,23 @@ class SettingsTab(QWidget):
             if not can_enable:
                 sdr_control_enabled_chk.setChecked(False)
             sdr_control_enabled_chk.setToolTip(
-                "Enable scheduled FIO tuning for this receive-only endpoint."
+                "Enable scheduled CommsPlan tuning for this receive-only endpoint."
                 if can_enable
-                else "FIO tuning remains disabled until reversible tune/readback and restoration pass for this exact configuration."
+                else "CommsPlan tuning remains disabled until reversible tune/readback and restoration pass for this exact configuration."
             )
             if can_enable:
                 sdr_manual_status.setText(
-                    "FIO tuning ready. Manual tuning remains available whenever automatic receiver control is disabled."
+                    "CommsPlan tuning ready. Manual tuning remains available whenever automatic receiver control is disabled."
                     + target_detail
                     + endpoint_detail
                 )
                 sdr_manual_guidance.setText(
                     setup
-                    + " Control is verified. Select Enable FIO tuning, then continue through Review and save this radio."
+                    + " Control is verified. Select Enable CommsPlan tuning, then continue through Review and save this radio."
                 )
             else:
                 sdr_manual_status.setText(
-                    "Manual tuning — FIO is not controlling this receiver. Saved application details are configuration, not proof of control."
+                    "Manual tuning — CommsPlan is not controlling this receiver. Saved application details are configuration, not proof of control."
                     + target_detail
                     + endpoint_detail
                 )
@@ -29554,7 +30040,7 @@ class SettingsTab(QWidget):
             changed = target.text().strip() != str(chosen).strip()
             target.setText(chosen)
             configure_auto_status.setText(
-                f"Using selected {app_label} location. FIO is refreshing the launch plan automatically."
+                f"Using selected {app_label} location. CommsPlan is refreshing the launch plan automatically."
                 if changed
                 else f"Using selected {app_label} location."
             )
@@ -29617,7 +30103,7 @@ class SettingsTab(QWidget):
             if changed:
                 target.setText(path_text)
             configure_auto_status.setText(
-                f"Using selected {label} app for this radio. FIO is refreshing the launch plan automatically."
+                f"Using selected {label} app for this radio. CommsPlan is refreshing the launch plan automatically."
                 if changed and reprepare
                 else f"Using selected {label} app for this radio."
             )
@@ -31033,13 +31519,13 @@ class SettingsTab(QWidget):
                         rf_guard_plan_check_title.setText("Plan Check: Choose Frequency Plan")
                         rf_guard_plan_check_detail.setText(
                             f"This {'receiver' if observer_mode else 'radio'} supports {self._human_join(supported)}. "
-                            "Choose the Frequency Plan on the Schedule step so FIO can warn before assignment."
+                            "Choose the Frequency Plan on the Schedule step so CommsPlan can warn before assignment."
                         )
                     else:
                         rf_guard_plan_check_title.setText("Plan Check")
                         rf_guard_plan_check_detail.setText(
                             f"This {'receiver' if observer_mode else 'radio'} supports {self._human_join(supported)}. "
-                            "FIO will compare these bands with the selected Frequency Plan before assignment."
+                            "CommsPlan will compare these bands with the selected Frequency Plan before assignment."
                         )
                 else:
                     rf_guard_plan_check_title.setText("Plan Check")
@@ -31079,7 +31565,7 @@ class SettingsTab(QWidget):
                     (
                         SCHEDULE_EXISTING_PLAN,
                         "Use an existing plan for receive activity",
-                        "Verified receiver control may retune automatically; otherwise FIO uses the plan for reminders.",
+                        "Verified receiver control may retune automatically; otherwise CommsPlan uses the plan for reminders.",
                     ),
                     (
                         SCHEDULE_NONE,
@@ -31345,7 +31831,7 @@ class SettingsTab(QWidget):
                         ):
                             return False
                     # Confidence and launch readiness are not safety blocks.
-                    # Save the isolated FIO identity as Ready with warnings or
+                    # Save the isolated CommsPlan identity as Ready with warnings or
                     # launch setup pending; reserve a disabled Save for an
                     # explicit no-damage boundary reported by preparation.
                     safety_status = str(
@@ -31413,7 +31899,7 @@ class SettingsTab(QWidget):
                 or software_preparation_pending
                 or (use_varac_chk.isChecked() and varac_native_preparation_in_progress)
             ):
-                return False, "FIO is preparing the current software choices."
+                return False, "CommsPlan is preparing the current software choices."
             if use_varac_chk.isChecked() and not str(
                 _selected_varac_arrangement().get("cluster_path") or ""
             ).strip():
@@ -31426,7 +31912,7 @@ class SettingsTab(QWidget):
                 not software_plan_prepared
                 or _guided_software_plan_context() != prepared_software_context
             ):
-                return False, "FIO must prepare the current software choices before continuing."
+                return False, "CommsPlan must prepare the current software choices before continuing."
             if _detected_app_choice_needs_operator_selection():
                 return False, "Choose the highlighted detected application or profile before continuing."
             retained = getattr(dlg, "_guided_software_instance_drafts", {})
@@ -31443,7 +31929,7 @@ class SettingsTab(QWidget):
                     continue
                 draft = retained.get(family)
                 if not isinstance(draft, Mapping):
-                    return False, f"FIO still needs to prepare the {software_family_titles[family]} draft."
+                    return False, f"CommsPlan still needs to prepare the {software_family_titles[family]} draft."
                 if (
                     family == "varac"
                     and str(draft.get("mode") or "").strip().lower() == "managed"
@@ -31456,7 +31942,7 @@ class SettingsTab(QWidget):
                         str(native.get("state") or "").replace("_", " ").strip().lower() != "ready"
                         or not bool(native.get("writer_qualified"))
                     ):
-                        return False, "FIO must finish preparing the qualified VarAC bundle before continuing."
+                        return False, "CommsPlan must finish preparing the qualified VarAC bundle before continuing."
                 state = str(
                     draft.get("safety_status")
                     or draft.get("save_status")
@@ -31474,7 +31960,7 @@ class SettingsTab(QWidget):
                     and str(draft.get("launch_recipe_status") or "").strip().lower()
                     not in {"qualified_managed", "ready_with_warnings", "launch_pending"}
                 ):
-                    return False, f"FIO needs a safe launch plan for {software_family_titles[family]}."
+                    return False, f"CommsPlan needs a safe launch plan for {software_family_titles[family]}."
             return True, ""
 
         def _move_guided_wizard(delta: int) -> None:
@@ -31508,10 +31994,10 @@ class SettingsTab(QWidget):
                     )
                 elif manual_review_required:
                     accent = QColor(theme.get("info", theme.get("accent", "#1565C0")))
-                    detail_intro = "Save Radio records these selections in FIO. Review any app choices before saving."
+                    detail_intro = "Save Radio records these selections in CommsPlan. Review any app choices before saving."
                 else:
                     accent = QColor(theme.get("success", "#2E7D32"))
-                    detail_intro = "Final Save updates the reviewed FIO radio and software identity without an external native-file write."
+                    detail_intro = "Final Save updates the reviewed CommsPlan radio and software identity without an external native-file write."
                 bg = QColor(accent)
                 bg.setAlpha(22)
                 border = QColor(accent)
@@ -31697,10 +32183,10 @@ class SettingsTab(QWidget):
                     str(device_class_combo.currentData() or "").strip().lower() == "observer"
                     and js8_launch_enabled_chk.isChecked()
                 ):
-                    js8_label += " (receive-only; launch with FIO)"
+                    js8_label += " (receive-only; launch with CommsPlan)"
                 app_labels.append(js8_label)
             if use_js8spotter_chk.isChecked():
-                app_labels.append("FIO Spotter")
+                app_labels.append("CommsPlan Spotter")
             if use_external_js8spotter_chk.isChecked():
                 app_labels.append("External JS8Spotter")
             if use_commstat_chk.isChecked():
@@ -31711,7 +32197,7 @@ class SettingsTab(QWidget):
                 receiver_app = str(receiver_application_combo.currentData() or "").strip()
                 if receiver_app:
                     app_labels.append(
-                        receiver_app + (" (launch with FIO)" if receiver_launch_enabled_chk.isChecked() else "")
+                        receiver_app + (" (launch with CommsPlan)" if receiver_launch_enabled_chk.isChecked() else "")
                     )
             backend_value = str(backend_combo.currentData() or "manual").strip().lower()
             backend_label = self._device_backend_label(backend_value)
@@ -31815,9 +32301,9 @@ class SettingsTab(QWidget):
             schedule_line = _current_guided_schedule_decision().review_text
 
             if not policy.fio_frequency_control_allowed:
-                frequency_line = "Monitor/import only. FIO will not offer scheduler or QSY controls."
+                frequency_line = "Monitor/import only. CommsPlan will not offer scheduler or QSY controls."
             elif backend_value in {"manual", "none"}:
-                frequency_line = "Manual/external control. FIO will not tune this radio until a control endpoint is selected."
+                frequency_line = "Manual/external control. CommsPlan will not tune this radio until a control endpoint is selected."
             else:
                 frequency_line = f"{backend_label} controls scheduler and QSY actions."
 
@@ -31946,10 +32432,10 @@ class SettingsTab(QWidget):
                 )
                 if family_key == "fio_spotter":
                     launch_plan_lines.append(
-                        "FIO Spotter — Launch policy: available inside FIO; Effective command: built in; "
+                        "CommsPlan Spotter — Launch policy: available inside CommsPlan; Effective command: built in; "
                         f"Working directory: not applicable; Dependencies: JS8Call TCP "
                         f"{js8_host_edit.text().strip() or '127.0.0.1'}:{js8_port_edit.text().strip() or 'not set'}; "
-                        "Readiness policy: follows FIO and transport health."
+                        "Readiness policy: follows CommsPlan and transport health."
                     )
                     continue
                 if family_key == "commstat":
@@ -32017,7 +32503,7 @@ class SettingsTab(QWidget):
             if varac_stop_before_save:
                 responsibility_lines.append(
                     "VarAC apply prerequisite — Close VarAC and VARA before Save. "
-                    "The reviewed plan is complete; FIO will recheck the live process state before writing anything."
+                    "The reviewed plan is complete; CommsPlan will recheck the live process state before writing anything."
                 )
             if not launch_plan_lines:
                 launch_plan_lines.append("No external launch item selected.")
@@ -32076,7 +32562,7 @@ class SettingsTab(QWidget):
                 if observer_mode
                 else [
                     f"Frequency control: {frequency_line}",
-                    "PTT/transmit remain subject to the selected FIO Behavior, RF Guard, and final preflight.",
+                    "PTT/transmit remain subject to the selected CommsPlan Behavior, RF Guard, and final preflight.",
                     *(
                         ["VarAC remains application-owned for QSY and scheduled transmit when selected."]
                         if _guided_software_family_selected("varac")
@@ -32097,7 +32583,7 @@ class SettingsTab(QWidget):
                             else "Existing advanced role"
                         ),
                         f"Setup: {setup_label}",
-                        f"Use in FIO: {enabled_text}; {active_text}",
+                        f"Use in CommsPlan: {enabled_text}; {active_text}",
                     ],
                     tone="info",
                 ),
@@ -32106,7 +32592,7 @@ class SettingsTab(QWidget):
                     [
                         "Software: " + (", ".join(app_labels) if app_labels else "Monitor only"),
                         f"Frequency Control: {frequency_line}",
-                        f"FIO Behavior: {selected_fio_behavior}",
+                        f"CommsPlan Behavior: {selected_fio_behavior}",
                         *(
                             [
                                 "Safety: no Compose/Expect sending, QSY, PTT, or scheduler authority",
@@ -32199,7 +32685,7 @@ class SettingsTab(QWidget):
             wizard_view = guided_setup_wizard_view(guided_wizard_step_id)
             stable_step_labels = {
                 "radio": "Radio",
-                "model": "FIO Behavior",
+                "model": "CommsPlan Behavior",
                 "software": "Software",
                 "connection": "Connections",
                 "guard": "Safety",
@@ -32289,7 +32775,7 @@ class SettingsTab(QWidget):
                 "It never grants or checks PTT and does not imply transmit protection."
                 if observer_mode
                 else (
-                    "Start with the bands this antenna path can safely use. FIO checks those bands against the "
+                    "Start with the bands this antenna path can safely use. CommsPlan checks those bands against the "
                     "assigned Frequency Plan before the radio is activated."
                 )
             )
@@ -32323,11 +32809,11 @@ class SettingsTab(QWidget):
             detail_by_step = {
                 "radio": "Choose the radio model, station name, role, and setup type.",
                 "model": (
-                    "Choose FIO's receive-side features and confirm the safety boundary; timing belongs in Schedule."
+                    "Choose CommsPlan's receive-side features and confirm the safety boundary; timing belongs in Schedule."
                     if observer_mode
-                    else "Choose which FIO features and controls are available; timing belongs in Schedule."
+                    else "Choose which CommsPlan features and controls are available; timing belongs in Schedule."
                 ),
-                "software": "Select the software for this radio. FIO prepares it automatically and asks only for choices it cannot safely infer.",
+                "software": "Select the software for this radio. CommsPlan prepares it automatically and asks only for choices it cannot safely infer.",
                 "connection": (
                     "Review receiver control and receive/decode companion identities separately."
                     if observer_mode
@@ -32462,14 +32948,14 @@ class SettingsTab(QWidget):
             )
             if _detected_app_choice_needs_operator_selection() or managed_recipe_attention:
                 attention_status = (
-                    "Needs attention — FIO prepared what it could. Review the highlighted family before continuing."
+                    "Needs attention — CommsPlan prepared what it could. Review the highlighted family before continuing."
                 )
                 if managed_recipe_attention:
                     attention_status = f"{attention_status} {managed_recipe_attention[0]}"
                 configure_auto_status.setText(attention_status)
             else:
                 configure_auto_status.setText(
-                    "Ready — FIO prepared the selected software plan. Review only the details that need attention."
+                    "Ready — CommsPlan prepared the selected software plan. Review only the details that need attention."
                 )
             configure_auto_status.setToolTip("\n".join(review.detail_lines))
             _update_software_responsibility_cards()
@@ -32508,7 +32994,7 @@ class SettingsTab(QWidget):
                 _selected_varac_arrangement().get("cluster_path") or ""
             ).strip():
                 configure_auto_status.setText(
-                    "Needs choice — choose the VarAC arrangement before FIO prepares its plan."
+                    "Needs choice — choose the VarAC arrangement before CommsPlan prepares its plan."
                 )
                 _update_software_responsibility_cards()
                 return
@@ -32523,9 +33009,9 @@ class SettingsTab(QWidget):
             software_preparation_request_context = _guided_software_plan_context()
             configure_auto_btn.setVisible(False)
             guided_wizard_next_btn.setEnabled(False)
-            guided_wizard_next_btn.setToolTip("FIO is preparing the current software choices.")
+            guided_wizard_next_btn.setToolTip("CommsPlan is preparing the current software choices.")
             configure_auto_status.setText(
-                "Discovery in progress — preparing in the background. You can continue reviewing this radio while FIO checks installed apps and profiles."
+                "Discovery in progress — preparing in the background. You can continue reviewing this radio while CommsPlan checks installed apps and profiles."
             )
             _update_software_responsibility_cards()
             selected_families = set()
@@ -32589,7 +33075,7 @@ class SettingsTab(QWidget):
                         _schedule_automatic_software_preparation()
                     return
                 if result.get("cancelled"):
-                    configure_auto_status.setText("Preparation cancelled. Existing settings were not changed; FIO will refresh the current choices.")
+                    configure_auto_status.setText("Preparation cancelled. Existing settings were not changed; CommsPlan will refresh the current choices.")
                     _schedule_automatic_software_preparation()
                     return
                 try:
@@ -32665,7 +33151,7 @@ class SettingsTab(QWidget):
                 use_js8call_chk.setChecked(True)
                 configure_auto_status.setText(
                     "JS8Call was selected because CommStat binds to a radio-owned JS8 TCP endpoint. "
-                    "FIO will not create another CommStat install or launch identity."
+                    "CommsPlan will not create another CommStat install or launch identity."
                 )
             _update_commstat_binding_summary()
             _mark_custom_mix_from_software_edit()
@@ -32775,8 +33261,8 @@ class SettingsTab(QWidget):
             use_flmsg_chk.setEnabled(True)
             use_flamp_chk.setEnabled(True)
             use_js8call_chk.setEnabled(True)
-            # Built-in FIO Spotter is useful to an observer for decode, forms,
-            # watches, and Inbox projection.  The receive-only FIO Behavior
+            # Built-in CommsPlan Spotter is useful to an observer for decode, forms,
+            # watches, and Inbox projection.  The receive-only CommsPlan Behavior
             # removes Compose/Expect transmit authority; do not hide the safe
             # receive-side integration merely because the radio cannot transmit.
             use_js8spotter_chk.setEnabled(True)
@@ -32858,10 +33344,10 @@ class SettingsTab(QWidget):
                 if enabled
             ]
             managed_recipe_summary.setText(
-                "Resolved by FIO: "
+                "Resolved by CommsPlan: "
                 + ", ".join(managed_families)
                 + ". Application, profile, data-root, and command details are owned by the managed recipe and shown exactly in Review. "
-                "Use Software > Configure details > Advanced only when FIO reports an unsupported recipe."
+                "Use Software > Configure details > Advanced only when CommsPlan reports an unsupported recipe."
                 if managed_families
                 else ""
             )
@@ -32905,14 +33391,14 @@ class SettingsTab(QWidget):
                 )
                 use_js8spotter_chk.setEnabled(True)
                 use_js8spotter_chk.setToolTip(
-                    "Enable FIO Spotter receive, decode, forms, watches, and Inbox projection for this SDR. "
-                    "The receive-only FIO Behavior keeps Compose and Expect sending unavailable."
+                    "Enable CommsPlan Spotter receive, decode, forms, watches, and Inbox projection for this SDR. "
+                    "The receive-only CommsPlan Behavior keeps Compose and Expect sending unavailable."
                 )
                 _set_row_visible(radio_apps_base_wrap, setup_started and use_js8call_chk.isChecked())
                 _set_row_visible(configure_auto_wrap, setup_started and use_js8call_chk.isChecked())
                 _set_row_visible(software_hint_label, setup_started)
                 software_hint_label.setText(
-                    "Choose receive-only JS8Call, Fast Light, FIO Spotter, or CommStat capabilities for this SDR. "
+                    "Choose receive-only JS8Call, Fast Light, CommsPlan Spotter, or CommStat capabilities for this SDR. "
                     "VarAC, FLRig, CAT, PTT, Compose sending, and automatic-send authority remain unavailable."
                 )
             else:
@@ -32952,7 +33438,7 @@ class SettingsTab(QWidget):
                 ).strip()
                 receiver_control_title.setText(f"Receiver control — {receiver_application_name}")
                 receiver_control_detail.setText(
-                    "Adapter, stable target/VFO, host, port, matching verification evidence, and FIO-tuning opt-in. "
+                    "Adapter, stable target/VFO, host, port, matching verification evidence, and CommsPlan-tuning opt-in. "
                     "Test control applies only to this receiver application."
                 )
                 companion_connection_title.setText("Receive/decode companion — JS8Call")
@@ -32961,7 +33447,7 @@ class SettingsTab(QWidget):
                 )
                 connection_status_label.setText(
                     "Configure the distinct JS8Call app, profile, message files, and API port owned by this SDR. "
-                    "The instance remains receive/import only in FIO."
+                    "The instance remains receive/import only in CommsPlan."
                 )
             elif observer_mode:
                 receiver_application_name = str(
@@ -32969,7 +33455,7 @@ class SettingsTab(QWidget):
                 ).strip()
                 receiver_control_title.setText(f"Receiver control — {receiver_application_name}")
                 receiver_control_detail.setText(
-                    "Adapter, stable target/VFO, host, port, matching verification evidence, and FIO-tuning opt-in."
+                    "Adapter, stable target/VFO, host, port, matching verification evidence, and CommsPlan-tuning opt-in."
                 )
                 companion_connection_title.setText("Receive/decode companions")
                 companion_connection_detail.setText(
@@ -32990,10 +33476,10 @@ class SettingsTab(QWidget):
                 connection_status_label.setText("Review the endpoint fields below for the selected software stack.")
             else:
                 receiver_control_title.setText("Control responsibility")
-                receiver_control_detail.setText("No FIO frequency-control endpoint is required for this setup.")
+                receiver_control_detail.setText("No CommsPlan frequency-control endpoint is required for this setup.")
                 companion_connection_title.setText("Application companions")
                 companion_connection_detail.setText("No application connection is required for the current selections.")
-                connection_status_label.setText("No FIO frequency-control endpoint is required for this setup type.")
+                connection_status_label.setText("No CommsPlan frequency-control endpoint is required for this setup type.")
             optional_body.setVisible(guard_fields_visible)
             optional_toggle.setVisible(False)
             optional_toggle.setArrowType(Qt.DownArrow if guard_fields_visible else Qt.RightArrow)
@@ -33071,7 +33557,7 @@ class SettingsTab(QWidget):
                     js8_port_edit.setText(_default_instance_port("js8call"))
                 connection_status_label.setText(
                     "Configure the distinct JS8Call app, profile, message files, and API port owned by this SDR. "
-                    "The instance remains receive/import only in FIO."
+                    "The instance remains receive/import only in CommsPlan."
                 )
             _mark_custom_mix_from_software_edit()
 
@@ -33393,7 +33879,7 @@ class SettingsTab(QWidget):
                 elif _selected_guided_operating_model_id() <= 0:
                     _set_guided_wizard_step("model")
                     guided_wizard_detail_label.setText(
-                        "Choose a compatible FIO Behavior before saving this radio."
+                        "Choose a compatible CommsPlan Behavior before saving this radio."
                     )
                 else:
                     _set_guided_wizard_step("review")
@@ -33788,7 +34274,7 @@ class SettingsTab(QWidget):
                 QMessageBox.warning(
                     self,
                     "Radio setup not saved",
-                    "FIO could not save the complete radio and receive-only launch setup. "
+                    "CommsPlan could not save the complete radio and receive-only launch setup. "
                     "Nothing from this guided save will be retained. Review the receiver launch choice and try again.",
                 )
                 return False
@@ -33860,7 +34346,7 @@ class SettingsTab(QWidget):
             QMessageBox.warning(
                 self,
                 "Schedule Assignment",
-                "The radio profile was saved, but FIO could not assign the selected Frequency Plan.",
+                "The radio profile was saved, but CommsPlan could not assign the selected Frequency Plan.",
             )
             return False
         self._refresh_multi_radio_tables()
@@ -33966,7 +34452,7 @@ class SettingsTab(QWidget):
                 model = self.multi_radio_store.ensure_receive_only_operating_profile()
                 model_id = int(model.get("id", 0) or 0)
             if model_id <= 0:
-                raise ValueError("Select an enabled FIO Behavior before saving this radio.")
+                raise ValueError("Select an enabled CommsPlan Behavior before saving this radio.")
             self.multi_radio_store.set_device_operating_profile(
                 radio_id,
                 model_id,
@@ -33977,8 +34463,8 @@ class SettingsTab(QWidget):
         except (ValueError, KeyError) as exc:
             QMessageBox.warning(
                 self,
-                "FIO Behavior Assignment",
-                "The radio profile was saved, but its selected FIO Behavior could not be assigned. "
+                "CommsPlan Behavior Assignment",
+                "The radio profile was saved, but its selected CommsPlan Behavior could not be assigned. "
                 f"Its runtime state was not changed. Open Operating Model Assignment to retry. {exc}",
             )
             self._refresh_multi_radio_tables()
@@ -33987,8 +34473,8 @@ class SettingsTab(QWidget):
             log.exception("Failed assigning the guided Operating Model.")
             QMessageBox.warning(
                 self,
-                "FIO Behavior Assignment",
-                "The radio profile was saved, but its selected FIO Behavior could not be assigned. "
+                "CommsPlan Behavior Assignment",
+                "The radio profile was saved, but its selected CommsPlan Behavior could not be assigned. "
                 "Its runtime state was not changed; open Operating Model Assignment to retry.",
             )
             self._refresh_multi_radio_tables()
@@ -34318,6 +34804,9 @@ class SettingsTab(QWidget):
                 ).strip(),
                 "application_variant": str(draft.get("variant") or "").strip(),
                 "application_version": str(draft.get("version") or "").strip(),
+                "settings_identity_mode": str(
+                    draft.get("settings_identity_mode") or "isolated"
+                ).strip().lower(),
             }
             if family == "js8call":
                 evidence["external_spotter_launch_at_startup"] = bool(
@@ -34478,7 +34967,7 @@ class SettingsTab(QWidget):
                     "Native application configuration applied and read back; run Health for live endpoint readiness."
                     if str(draft.get("native_configuration_status") or "").strip()
                     == "native_applied_readback_verified"
-                    else "Saved in FIO; complete the application action if shown, then run Health before operational use."
+                    else "Saved in CommsPlan; complete the application action if shown, then run Health before operational use."
                 ),
                 "evidence": evidence,
             }
@@ -34624,7 +35113,7 @@ class SettingsTab(QWidget):
                             existing_manifest, Mapping
                         ):
                             raise ValueError(
-                                "FIO could not mirror the converted VarAC member into Software Administration."
+                                "CommsPlan could not mirror the converted VarAC member into Software Administration."
                             )
                         self._sync_converted_varac_identity(
                             radio_id=existing_radio_id,
@@ -34645,7 +35134,7 @@ class SettingsTab(QWidget):
                 QMessageBox.warning(
                     self,
                     "Guided Add Radio — Nothing Saved",
-                    "FIO could not save the complete reviewed radio and software setup, so the "
+                    "CommsPlan could not save the complete reviewed radio and software setup, so the "
                     "database transaction was rolled back. Existing assignments remain unchanged. "
                     "Review the named setting in Add Radio > Software and try again. "
                     f"Technical detail: {exc}",
@@ -34735,7 +35224,7 @@ class SettingsTab(QWidget):
             QMessageBox.warning(
                 self,
                 "Software Identity Review",
-                "FIO could not verify that Add Radio and Software Administration describe the same "
+                "CommsPlan could not verify that Add Radio and Software Administration describe the same "
                 "software identities. Nothing was saved; review the software step and try again. "
                 f"{exc}",
             )
@@ -34920,7 +35409,7 @@ class SettingsTab(QWidget):
                 QMessageBox.warning(
                     self,
                     "Receiver Activation",
-                    "The receiver setup was saved safely, but FIO could not activate it. Use Configuration > Radios > Use Radio to retry.",
+                    "The receiver setup was saved safely, but CommsPlan could not activate it. Use Configuration > Radios > Use Radio to retry.",
                 )
                 self._refresh_multi_radio_tables()
                 return False
@@ -35098,7 +35587,7 @@ class SettingsTab(QWidget):
             publisher,
             {
                 "state": "preparing",
-                "why": "FIO is checking the exact VarAC version, source files, distinct VARA runtimes, ports, and target state in the background.",
+                "why": "CommsPlan is checking the exact VarAC version, source files, distinct VARA runtimes, ports, and target state in the background.",
                 "arrangement": str(draft.get("cluster_path") or ""),
                 "generation": generation,
             },
@@ -35134,7 +35623,7 @@ class SettingsTab(QWidget):
                 publisher,
                 {
                     "state": "needs attention",
-                    "why": f"FIO could not prepare the native VarAC plan: {detail}",
+                    "why": f"CommsPlan could not prepare the native VarAC plan: {detail}",
                     "generation": generation,
                 },
             )
@@ -35210,7 +35699,7 @@ class SettingsTab(QWidget):
         self.varac_native_apply_requested.emit(raw_payload)
         self._publish_varac_native_presentation(
             publisher,
-            {**dict(prepared.presentation), "state": "preparing", "why": "FIO is backing up, applying, and reading back the reviewed native configuration."},
+            {**dict(prepared.presentation), "state": "preparing", "why": "CommsPlan is backing up, applying, and reading back the reviewed native configuration."},
         )
         worker = _VarACNativeApplyWorker(
             action="apply",
@@ -35370,8 +35859,8 @@ class SettingsTab(QWidget):
             QMessageBox.warning(
                 self,
                 "App Configuration Recovery",
-                "FIO could not restore the native application backup automatically. "
-                "The backup remains available in the FIO backup folder; review Health before using this radio.",
+                "CommsPlan could not restore the native application backup automatically. "
+                "The backup remains available in the CommsPlan backup folder; review Health before using this radio.",
             )
 
         self._start_guided_native_config_job(
@@ -35437,7 +35926,7 @@ class SettingsTab(QWidget):
             QMessageBox.warning(
                 self,
                 "Guided Add Radio",
-                "FIO could not open Guided Add Radio. Check the log for details, then try Configuration > Radios again.",
+                "CommsPlan could not open Guided Add Radio. Check the log for details, then try Configuration > Radios again.",
             )
             return
         if not created:
@@ -35463,7 +35952,7 @@ class SettingsTab(QWidget):
                     QMessageBox.warning(
                         self,
                         "App Configuration",
-                        "FIO could not safely apply and verify the reviewed native application configuration. "
+                        "CommsPlan could not safely apply and verify the reviewed native application configuration. "
                         "The backup was restored and the radio was not saved.",
                     )
                     return
@@ -35478,7 +35967,7 @@ class SettingsTab(QWidget):
                 QMessageBox.warning(
                     self,
                     "App Configuration",
-                    "FIO could not prepare the reviewed application configuration. "
+                    "CommsPlan could not prepare the reviewed application configuration. "
                     f"The radio was not saved. {detail}",
                 )
 
@@ -35502,7 +35991,7 @@ class SettingsTab(QWidget):
         VarAC cluster draft carries a fingerprinted request that resolves to
         the immutable preparation retained by this SettingsTab.  The external
         writer runs here, after the outer review was accepted, and its session
-        is handed to the existing split external/FIO transaction for commit or
+        is handed to the existing split external/CommsPlan transaction for commit or
         rollback.
         """
 
@@ -35612,7 +36101,7 @@ class SettingsTab(QWidget):
                 QMessageBox.warning(
                     self,
                     "VarAC Configuration",
-                    "FIO could not safely apply and verify the reviewed VarAC configuration. "
+                    "CommsPlan could not safely apply and verify the reviewed VarAC configuration. "
                     f"The backup was restored and the radio was not saved. {detail}",
                 )
                 return
@@ -35691,7 +36180,7 @@ class SettingsTab(QWidget):
                                 # VarAC owns the managed member's VARA child.
                                 # Retain this component for exact runtime
                                 # attribution/readiness, but never enqueue it
-                                # as an independent FIO startup process.
+                                # as an independent CommsPlan startup process.
                                 "launch_at_startup": False,
                                 "readiness": {
                                     "kind": "process",
@@ -35754,7 +36243,7 @@ class SettingsTab(QWidget):
             QMessageBox.warning(
                 self,
                 "VarAC Configuration",
-                "FIO could not start the reviewed VarAC transaction. Nothing was saved or written. "
+                "CommsPlan could not start the reviewed VarAC transaction. Nothing was saved or written. "
                 f"{detail}",
             )
 
@@ -35824,12 +36313,12 @@ class SettingsTab(QWidget):
                     transaction.complete()
         except Exception:
             succeeded = False
-            log.exception("Guided Add Radio transaction failed; all FIO changes were rolled back.")
+            log.exception("Guided Add Radio transaction failed; all CommsPlan changes were rolled back.")
             self._rollback_guided_native_config(native_result)
             QMessageBox.warning(
                 self,
                 "Guided Add Radio",
-                "FIO could not save the complete reviewed radio setup. Nothing was changed.",
+                "CommsPlan could not save the complete reviewed radio setup. Nothing was changed.",
             )
         finally:
             self._guided_save_ui_deferred = prior_ui_deferred
@@ -35928,7 +36417,7 @@ class SettingsTab(QWidget):
                     QMessageBox.warning(
                         self,
                         "Receiver Activation",
-                        "FIO could not activate the complete receiver setup. Nothing was saved; review the setup and try again.",
+                        "CommsPlan could not activate the complete receiver setup. Nothing was saved; review the setup and try again.",
                     )
                     self._refresh_multi_radio_tables()
                     self._rollback_guided_native_config(native_result)
@@ -35969,7 +36458,7 @@ class SettingsTab(QWidget):
                 QMessageBox.warning(
                     self,
                     "Radio Activation",
-                    "FIO could not activate the complete radio setup. Nothing was saved; review the setup and try again.",
+                    "CommsPlan could not activate the complete radio setup. Nothing was saved; review the setup and try again.",
                 )
                 self._refresh_multi_radio_tables()
                 self._rollback_guided_native_config(native_result)
@@ -36031,7 +36520,7 @@ class SettingsTab(QWidget):
                     QMessageBox.warning(
                         self,
                         "App Configuration",
-                        "FIO could not safely apply and verify the reviewed native application configuration. "
+                        "CommsPlan could not safely apply and verify the reviewed native application configuration. "
                         "The backup was restored and the radio changes were not saved.",
                     )
                     return
@@ -36043,7 +36532,7 @@ class SettingsTab(QWidget):
                 QMessageBox.warning(
                     self,
                     "App Configuration",
-                    "FIO could not prepare the reviewed application configuration. "
+                    "CommsPlan could not prepare the reviewed application configuration. "
                     f"The radio changes were not saved. {detail}",
                 )
 
@@ -36102,12 +36591,12 @@ class SettingsTab(QWidget):
                     transaction.complete()
         except Exception:
             succeeded = False
-            log.exception("Guided Edit Radio transaction failed; all FIO changes were rolled back.")
+            log.exception("Guided Edit Radio transaction failed; all CommsPlan changes were rolled back.")
             self._rollback_guided_native_config(native_result)
             QMessageBox.warning(
                 self,
                 "Radio Details",
-                "FIO could not save the complete reviewed radio setup. Nothing was changed.",
+                "CommsPlan could not save the complete reviewed radio setup. Nothing was changed.",
             )
         finally:
             self._guided_save_ui_deferred = prior_ui_deferred
@@ -36319,13 +36808,13 @@ class SettingsTab(QWidget):
         names = [str(row.get("name") or f"Radio {row.get('id')}") for row in selected]
         if len(names) == 1:
             prompt = (
-                f"Remove {names[0]} from FIO?\n\n"
-                "This removes the radio profile and radio-scoped settings saved in FIO. "
+                f"Remove {names[0]} from CommsPlan?\n\n"
+                "This removes the radio profile and radio-scoped settings saved in CommsPlan. "
                 "It does not delete FLRig, JS8Call, FLDigi, VarAC, or other external app files."
             )
         else:
             prompt = (
-                f"Remove {len(names)} radios from FIO?\n\n"
+                f"Remove {len(names)} radios from CommsPlan?\n\n"
                 + "\n".join(f"- {name}" for name in names)
                 + "\n\nExternal app files and profiles are not deleted."
             )
@@ -36802,6 +37291,49 @@ class SettingsTab(QWidget):
             self.custom_tools_table.selectRow(self.custom_tools_table.rowCount() - 1)
         self._mark_settings_dirty()
 
+    def _add_script_custom_tool(self) -> None:
+        """Add one picker-selected script to the shared tool catalog.
+
+        The resulting catalog entry is reconciled into the currently selected
+        radio's draft by the same path as existing custom tools.  Other radio
+        bundles keep their saved command snapshots and operator checkboxes.
+        """
+        start = str(getattr(self, "_last_script_picker_dir", "") or "")
+        selected, _filter = QFileDialog.getOpenFileName(
+            self,
+            "Select script to add to Launch Control",
+            start,
+            "Scripts (*.sh *.bash *.py *.ps1 *.bat *.cmd);;All Files (*)",
+        )
+        selected = str(selected or "").strip()
+        if not selected:
+            return
+        script_path = Path(selected).expanduser()
+        if not script_path.is_file():
+            QMessageBox.warning(self, "Add Script", "Select an existing script file.")
+            return
+        self._last_script_picker_dir = str(script_path.parent)
+        name = script_path.stem.strip() or script_path.name
+        issue = self._validate_custom_tool(name, "script")
+        if issue:
+            QMessageBox.warning(
+                self,
+                "Add Script",
+                issue,
+            )
+            return
+        command = self.launch_orchestrator.format_script_launch_command(str(script_path))
+        self._custom_tool_items_cache.append({"name": name, "command": command})
+        self._launch_items_cache = self.launch_orchestrator.build_default_items(
+            self._launch_items_cache,
+            custom_tools=self._custom_tool_items_cache,
+        )
+        self._refresh_custom_tools_table()
+        self._refresh_launch_control_table()
+        if self.custom_tools_table.rowCount() > 0:
+            self.custom_tools_table.selectRow(self.custom_tools_table.rowCount() - 1)
+        self._mark_settings_dirty()
+
     def _edit_custom_tool(self) -> None:
         if not hasattr(self, "custom_tools_table"):
             return
@@ -37057,27 +37589,59 @@ class SettingsTab(QWidget):
         return "JS8Call_API" if app_name == "JS8Call" else app_name
 
     @staticmethod
-    def _launch_control_status_text(info: object) -> str:
-        if not isinstance(info, dict):
-            return "Unknown"
-        if bool(info.get("running", False)):
-            reachable = info.get("reachable", None)
-            if reachable is True:
+    def _launch_control_status_text(info: object, status_key: str = "") -> str:
+        if not isinstance(info, dict) or "running" not in info:
+            return "Status unavailable"
+        if not bool(info.get("running", False)):
+            return "Not running"
+
+        status_key = str(status_key or "").strip()
+        if status_key in SettingsTab._CONTROL_LAUNCH_STATUS_KEYS:
+            if bool(info.get("stale", True)):
+                return "Running, status stale"
+            if info.get("radio_readback_ready") is True and info.get("reachable") is True:
                 return "Running, connected"
-            if reachable is False and "reachable" in info:
-                return "Running, not connected"
-            return "Running"
-        return "Not running"
+            return "Running, radio unverified"
+
+        if bool(info.get("stale", False)):
+            return "Running, status stale"
+        reachable = info.get("reachable", None)
+        if reachable is True:
+            return "Running, connected"
+        if reachable is False and "reachable" in info:
+            return "Running, not connected"
+        return "Running"
 
     def _launch_control_status_snapshot(self) -> Dict[str, Dict[str, object]]:
+        selected_radio_id = None
         try:
-            snapshot = self._selected_radio_status_snapshot(force=False)
-            if snapshot:
+            selected_radio_id = self._selected_launch_radio_id()
+        except Exception:
+            selected_radio_id = None
+        try:
+            snapshot = self._selected_radio_status_snapshot(
+                force=False,
+                verify_control_readback=bool(selected_radio_id),
+            )
+            if snapshot or selected_radio_id:
                 return snapshot
         except Exception:
-            pass
+            if selected_radio_id:
+                return {}
         try:
-            return self._software_status_probe.status_snapshot(force=False)
+            fallback = self._software_status_probe.status_snapshot(force=False)
+            if not isinstance(fallback, dict):
+                return {}
+            # The shared probe is not scoped to the selected radio endpoint;
+            # it cannot provide control readback proof for a launch row.
+            return {
+                key: (
+                    {**row, "radio_readback_ready": False}
+                    if key in self._CONTROL_LAUNCH_STATUS_KEYS and isinstance(row, dict)
+                    else row
+                )
+                for key, row in fallback.items()
+            }
         except Exception:
             return {}
 
@@ -37159,7 +37723,7 @@ class SettingsTab(QWidget):
             status="in_progress",
             summary=f"Starting {app_name}.",
             detail=(
-                "FreqInOut is starting the selected configured application."
+                "CommsPlan is starting the selected configured application."
                 + (
                     " Configuration review warning (launch allowed): " + warning
                     if warning
@@ -37244,7 +37808,7 @@ class SettingsTab(QWidget):
 
             status_key = self._launch_control_status_key(name)
             status_text = (
-                self._launch_control_status_text(snapshot.get(status_key, {}))
+                self._launch_control_status_text(snapshot.get(status_key, {}), status_key)
                 if bool(item.get("monitor_health", True))
                 else "Monitoring off"
             )
@@ -37329,7 +37893,7 @@ class SettingsTab(QWidget):
         text = (
             f"Selected radio: {radio_name}. Frequency control: {backend_label}. "
             f"Software: {bundle}. Endpoints: {endpoint}. "
-            f"Automatic launch when FIO opens: {'enabled' if launch_enabled else 'off'}."
+            f"Automatic launch when CommsPlan opens: {'enabled' if launch_enabled else 'off'}."
         )
         self._set_guidance_card_state(
             self.launch_guidance_card,
@@ -37349,7 +37913,7 @@ class SettingsTab(QWidget):
             self.launch_hint_label.setText(
                 "Configured apps and shared custom tools appear here. Monitor Health only controls health reporting. "
                 "Launch at Startup selects apps for automatic startup and for Start Startup Apps; the radio-level "
-                "automatic switch applies only when FIO opens. A row's Start button starts that app now."
+                "automatic switch applies only when CommsPlan opens. A row's Start button starts that app now."
                 + active_text
             )
 
@@ -37423,7 +37987,7 @@ class SettingsTab(QWidget):
                     else:
                         snapshot = self._launch_control_status_snapshot()
                         status_key = self._launch_control_status_key(name_item.text())
-                        status_item.setText(self._launch_control_status_text(snapshot.get(status_key, {})))
+                        status_item.setText(self._launch_control_status_text(snapshot.get(status_key, {}), status_key))
         self._mark_settings_dirty()
         self._update_launch_control_buttons()
         self._refresh_section_titles()
@@ -37489,7 +38053,7 @@ class SettingsTab(QWidget):
             status="in_progress",
             summary="Launch sequence started.",
             detail=(
-                "FreqInOut is starting the selected startup applications for the selected radio."
+                "CommsPlan is starting the selected startup applications for the selected radio."
                 + (
                     " Configuration review warning (launch allowed): " + warning
                     if warning
@@ -37814,6 +38378,7 @@ class SettingsTab(QWidget):
             tuple(visible_keys),
             self._selected_radio_status_endpoint_sig(),
             identity_sig,
+            bool(getattr(self, "_status_identity_pending", False)),
         )
         now_ts = time.time()
         if (
@@ -37823,8 +38388,12 @@ class SettingsTab(QWidget):
             < float(self._running_status_refresh_interval_sec)
         ):
             return
-        snapshot = self._selected_radio_status_snapshot(force=force)
-        if not snapshot:
+        snapshot = self._selected_radio_status_snapshot(
+            force=force,
+            instance_identities=identities,
+            verify_control_readback=bool(selected_radio_id),
+        )
+        if not snapshot and not selected_radio_id:
             snapshot = self._status_service.software_status_snapshot()
         self._last_running_status_sig = status_sig
         self._last_running_status_refresh_ts = now_ts
@@ -37852,14 +38421,14 @@ class SettingsTab(QWidget):
             info = snapshot.get(program_name, {})
             state = str(info.get("state", "idle"))
             tooltip = str(info.get("tooltip", "Not running"))
-            lbl.setStyleSheet(led_style(state, theme))
-            lbl.setToolTip(tooltip)
+            set_widget_value(lbl, "styleSheet", led_style(state, theme))
+            set_widget_value(lbl, "toolTip", tooltip)
         if hasattr(self, "launch_control_table"):
             for row, name in enumerate(getattr(self, "_launch_visible_names", [])):
                 if row >= self.launch_control_table.rowCount():
                     continue
                 status_key = self._launch_control_status_key(name)
-                status_text = self._launch_control_status_text(snapshot.get(status_key, {}))
+                status_text = self._launch_control_status_text(snapshot.get(status_key, {}), status_key)
                 status_item = self.launch_control_table.item(row, 4)
                 if status_item is not None and status_item.text() != status_text:
                     with QSignalBlocker(self.launch_control_table):
@@ -37902,19 +38471,30 @@ class SettingsTab(QWidget):
         except Exception:
             radio_id = None
         if not radio_id:
+            self._status_identity_pending = False
             return identities
         scoped_items = self._radio_scoped_launch_items()
-        try:
-            plan = self.launch_orchestrator.preview_radio_recipe_plan(
-                radio_id,
-                bundle_override={"launch_enabled": True, "items": scoped_items},
-            )
-            planned_items = [instance.as_queue_item() for instance in plan.instances]
-        except Exception:
-            # Keep status available while an incomplete recipe is being
-            # repaired.  The fallback can still distinguish recipes whose
-            # canonical launch arguments are already present.
-            planned_items = scoped_items
+        signature = (radio_id, repr(scoped_items), repr(self._launch_bundle_source_profile()),
+                     int(getattr(self, "_status_identity_epoch", 0)))
+        cache = getattr(self, "_status_recipe_read_cache", None)
+        if cache is None:
+            cache = LatestReadCache("fio-settings-recipe-status")
+            self._status_recipe_read_cache = cache
+
+        def capture_reader():
+            # Capture only cached plain values; the worker never touches an
+            # editor, GUI-owned SettingsManager or LaunchOrchestrator QObject.
+            import copy
+            settings_data = copy.deepcopy(getattr(self.settings, "_data", {}))
+            items = copy.deepcopy(scoped_items)
+            db_path = self.settings.db_path
+            lifecycle = getattr(self.launch_orchestrator, "hardware_lifecycle", None)
+            return lambda: LaunchOrchestrator.read_status_recipe_items(db_path, settings_data, radio_id, items, lifecycle)
+
+        planned_items = cache.read(signature, capture_reader)
+        self._status_identity_pending = planned_items is None
+        if planned_items is None:
+            return identities
         for item in planned_items:
             name = str(item.get("name") or "").strip()
             if not name:
@@ -37938,25 +38518,30 @@ class SettingsTab(QWidget):
                 }
         return identities
 
-    def _selected_radio_status_snapshot(self, force: bool = False) -> Dict[str, Dict[str, object]]:
+    def _selected_radio_status_snapshot(
+        self,
+        force: bool = False,
+        *,
+        instance_identities=None,
+        verify_control_readback: bool = False,
+    ) -> Dict[str, Dict[str, object]]:
         try:
             js8_host, js8_port, flrig_port, fldigi_host, fldigi_port = self._selected_radio_status_endpoint_sig()
             try:
-                instance_identities = self._selected_radio_process_identities()
+                if instance_identities is None:
+                    instance_identities = self._selected_radio_process_identities()
             except Exception:
                 instance_identities = {}
+            if getattr(self, "_status_identity_pending", False):
+                return {key: {"state": "idle", "running": False, "reachable": False, "stale": True,
+                              "tooltip": "Checking the selected radio's launch identity…"}
+                        for key, _label in self._current_visible_status_items()}
             status_service = getattr(self, "_status_service", None)
             if status_service is None or not hasattr(status_service, "status_snapshot"):
-                return self._software_status_probe.status_snapshot(
-                    force=force,
-                    host_override=js8_host or None,
-                    port_override=js8_port,
-                    flrig_port_override=flrig_port,
-                    fldigi_host_override=fldigi_host or None,
-                    fldigi_port_override=fldigi_port,
-                    instance_identities=instance_identities,
-                )
-            return status_service.status_snapshot(
+                return {key: {"state": "idle", "running": False, "reachable": False, "stale": True,
+                              "tooltip": "Software status worker is unavailable."}
+                        for key, _label in self._current_visible_status_items()}
+            status_kwargs = dict(
                 force=force,
                 host_override=js8_host or None,
                 port_override=js8_port,
@@ -37965,6 +38550,32 @@ class SettingsTab(QWidget):
                 fldigi_port_override=fldigi_port,
                 instance_identities=instance_identities,
             )
+            if verify_control_readback:
+                profile = self._selected_settings_radio_profile()
+                if not isinstance(profile, dict):
+                    return {}
+                control_backend = str(profile.get("control_backend", "") or "").strip().lower()
+                status_kwargs.update(
+                    verify_control_readback=True,
+                    control_backend=control_backend,
+                    control_probe_only=False,
+                )
+                if control_backend == "flrig":
+                    status_kwargs.update(
+                        flrig_host_override=str(profile.get("flrig_host", "") or "").strip() or "127.0.0.1",
+                        flrig_port_override=self._int_override_from_text(profile.get("flrig_port", "")) or 12345,
+                    )
+                elif control_backend == "rigctld":
+                    status_kwargs.update(
+                        rigctld_host_override=str(profile.get("rig_host", "") or "").strip() or "127.0.0.1",
+                        rigctld_port_override=self._int_override_from_text(profile.get("rig_port", "")) or 4532,
+                    )
+                elif control_backend == "js8call":
+                    status_kwargs.update(
+                        host_override=str(profile.get("js8_host", "") or "").strip() or "127.0.0.1",
+                        port_override=self._int_override_from_text(profile.get("js8_port", "")) or 2442,
+                    )
+            return status_service.status_snapshot(**status_kwargs)
         except Exception:
             return {}
 
@@ -38256,17 +38867,21 @@ class SettingsTab(QWidget):
                     return
             fldigi_mode = fldigi_mode_combo.currentText().strip()
             vfo = vfo_combo.currentText().strip().upper() or "A"
-            self._upsert_operating_group(
-                name,
-                mode,
-                band,
-                self._format_freq_storage(freq_val),
-                auto_tune=auto_tune_chk.isChecked(),
-                vfo=vfo,
-                fldigi_mode=fldigi_mode,
-                fldigi_offset=offset_txt,
-                use_condition_levels=use_condition_levels_chk.isChecked(),
-            )
+            try:
+                self._upsert_operating_group(
+                    name,
+                    mode,
+                    band,
+                    self._format_freq_storage(freq_val),
+                    auto_tune=auto_tune_chk.isChecked(),
+                    vfo=vfo,
+                    fldigi_mode=fldigi_mode,
+                    fldigi_offset=offset_txt,
+                    use_condition_levels=use_condition_levels_chk.isChecked(),
+                )
+            except ValueError as exc:
+                QMessageBox.warning(self, "Duplicate Frequency", str(exc))
+                return
             dlg.accept()
 
         ok_btn.clicked.connect(on_accept)
@@ -38346,10 +38961,8 @@ class SettingsTab(QWidget):
         parts = text.split(".")
         try:
             if len(parts) == 3 and all(part.strip().isdigit() for part in parts):
-                mhz = int(parts[0])
-                khz = int((parts[1] + "000")[:3])
-                hz = int((parts[2] + "000")[:3])
-                return mhz + ((khz * 1000) + hz) / 1_000_000.0
+                grouped_hz = _settings_frequency_hz(text)
+                return grouped_hz / 1_000_000.0 if grouped_hz is not None else None
             return float(text)
         except Exception:
             return None
@@ -38389,12 +39002,44 @@ class SettingsTab(QWidget):
         fastlight_unsigned_suffix: str | None = None,
         fastlight_form_family: str | None = None,
         operating_group_key: str | None = None,
+        operating_group_frequency_key: str | None = None,
     ):
-        # replace existing entry with same group+mode+band
         name = name.strip().upper()
         band = str(band or "").strip().upper()
         mode = normalize_operating_group_mode(mode, band)
-        freq_display = self._format_freq_storage(freq_mhz)
+        frequency_hz = _settings_frequency_hz(freq_mhz)
+        if frequency_hz is None:
+            raise ValueError(f"Frequency {freq_mhz} is not a positive whole-Hz value.")
+        freq_display = f"{frequency_hz // 1_000_000}.{frequency_hz % 1_000_000:06d}"
+        self.operating_groups = list(_settings_operating_group_frequency_rows(self.operating_groups))
+        variant_key = str(operating_group_frequency_key or "").strip()
+        group_key = str(operating_group_key or "").strip()
+        if not group_key:
+            group_key = next((
+                str(row.get("operating_group_key", "") or "").strip()
+                for row in self.operating_groups
+                if str(row.get("group", "")).strip().upper() == name
+            ), "")
+        if not group_key:
+            group_key = str(ensure_operating_group_keys([{"group": name}])[0]["operating_group_key"])
+        target = None
+        if variant_key:
+            matches = [row for row in self.operating_groups
+                       if row.get("operating_group_frequency_key") == variant_key]
+            if len(matches) != 1:
+                raise ValueError("The selected configured frequency variant is missing or duplicated.")
+            target = matches[0]
+            group_key = str(target.get("operating_group_key", "") or group_key)
+        candidate_identity = frequency_identity({
+            "operating_group_key": group_key,
+            "band": band,
+            "mode": mode,
+            "frequency": freq_display,
+        })
+        duplicate = next((row for row in self.operating_groups if
+                          row is not target and frequency_identity(row) == candidate_identity), None)
+        if duplicate is not None:
+            raise ValueError(f"{name} {band} {mode} already has {self._format_freq(duplicate.get('frequency'))} configured.")
         cond_level: int | None
         if condition_level is None:
             cond_level = None
@@ -38405,57 +39050,33 @@ class SettingsTab(QWidget):
                 cond_level = 5
             if cond_level < 1 or cond_level > 5:
                 cond_level = 5
-        updated = False
-        for g in self.operating_groups:
-            if g.get("group") == name and g.get("mode") == mode and g.get("band") == band:
-                g["frequency"] = freq_display
-                g["auto_tune"] = bool(auto_tune)
-                g["vfo"] = vfo
-                g["fldigi_mode"] = fldigi_mode
-                g["fldigi_offset"] = fldigi_offset
-                g["use_condition_levels"] = bool(use_condition_levels)
-                if fastlight_filename_delimiter is not None:
-                    g["fastlight_filename_delimiter"] = str(fastlight_filename_delimiter or "group_default").strip()
-                if fastlight_custom_delimiter is not None:
-                    g["fastlight_custom_delimiter"] = str(fastlight_custom_delimiter or "").strip()
-                if fastlight_signed_suffix is not None:
-                    g["fastlight_signed_suffix"] = str(fastlight_signed_suffix or "group_default").strip()
-                if fastlight_unsigned_suffix is not None:
-                    g["fastlight_unsigned_suffix"] = str(fastlight_unsigned_suffix or "group_default").strip()
-                if fastlight_form_family is not None:
-                    g["fastlight_form_family"] = str(fastlight_form_family or "group_default").strip().upper()
-                if cond_level is not None:
-                    g["condition_level"] = cond_level
-                elif "condition_level" not in g:
-                    g["condition_level"] = 5
-                updated = True
-                break
-        if not updated:
-            self.operating_groups.append(
-                {
-                    "group": name,
-                    "operating_group_key": str(operating_group_key or "").strip(),
-                    "mode": mode,
-                    "band": band,
-                    "frequency": freq_display,
-                    "vfo": vfo,
-                    "fldigi_mode": fldigi_mode,
-                    "fldigi_offset": fldigi_offset,
-                    "auto_tune": bool(auto_tune),
-                    "use_condition_levels": bool(use_condition_levels),
-                    "condition_level": 5 if cond_level is None else cond_level,
-                    "fastlight_filename_delimiter": str(fastlight_filename_delimiter or "group_default").strip(),
-                    "fastlight_custom_delimiter": str(fastlight_custom_delimiter or "").strip(),
-                    "fastlight_signed_suffix": str(fastlight_signed_suffix or "group_default").strip(),
-                    "fastlight_unsigned_suffix": str(fastlight_unsigned_suffix or "group_default").strip(),
-                    "fastlight_form_family": str(fastlight_form_family or "group_default").strip().upper(),
-                }
-            )
-        self.operating_groups = list(ensure_operating_group_keys(self.operating_groups))
+        existing_values = target or next((row for row in self.operating_groups
+                                           if str(row.get("operating_group_key", "") or "") == group_key), {})
+        row_values = {
+            "group": name, "operating_group_key": group_key,
+            "operating_group_frequency_key": variant_key or new_operating_group_frequency_key(),
+            "mode": mode, "band": band, "frequency": freq_display,
+            "vfo": vfo, "fldigi_mode": fldigi_mode, "fldigi_offset": fldigi_offset,
+            "auto_tune": bool(auto_tune), "use_condition_levels": bool(use_condition_levels),
+            "condition_level": (cond_level if cond_level is not None else int(existing_values.get("condition_level", 5) or 5)),
+            "fastlight_filename_delimiter": str(existing_values.get("fastlight_filename_delimiter", "group_default") if fastlight_filename_delimiter is None else fastlight_filename_delimiter or "group_default").strip(),
+            "fastlight_custom_delimiter": str(existing_values.get("fastlight_custom_delimiter", "") if fastlight_custom_delimiter is None else fastlight_custom_delimiter or "").strip(),
+            "fastlight_signed_suffix": str(existing_values.get("fastlight_signed_suffix", "group_default") if fastlight_signed_suffix is None else fastlight_signed_suffix or "group_default").strip(),
+            "fastlight_unsigned_suffix": str(existing_values.get("fastlight_unsigned_suffix", "group_default") if fastlight_unsigned_suffix is None else fastlight_unsigned_suffix or "group_default").strip(),
+            "fastlight_form_family": str(existing_values.get("fastlight_form_family", "group_default") if fastlight_form_family is None else fastlight_form_family or "group_default").strip().upper(),
+        }
+        if target is None:
+            target = row_values
+            self.operating_groups.append(target)
+        else:
+            target.update(row_values)
+        self.operating_groups = list(_settings_operating_group_frequency_rows(self.operating_groups))
         # Condition-level participation is group-scoped (not per band/mode row).
         for g in self.operating_groups:
-            if str(g.get("group", "")).strip().upper() == name:
+            if str(g.get("operating_group_key", "") or "") == group_key:
                 g["use_condition_levels"] = bool(use_condition_levels)
+                if cond_level is not None:
+                    g["condition_level"] = cond_level
                 if fastlight_filename_delimiter is not None:
                     g["fastlight_filename_delimiter"] = str(fastlight_filename_delimiter or "group_default").strip()
                 if fastlight_custom_delimiter is not None:
@@ -38794,7 +39415,27 @@ class SettingsTab(QWidget):
         name = str(name or "").strip().upper()
         band = str(band or "").strip().upper()
         mode = normalize_operating_group_mode(mode, band)
-        freq_display = self._format_freq_storage(freq_mhz)
+        frequency_hz = _settings_frequency_hz(freq_mhz)
+        if frequency_hz is None:
+            return
+        freq_display = f"{frequency_hz // 1_000_000}.{frequency_hz % 1_000_000:06d}"
+        self.operating_groups = list(_settings_operating_group_frequency_rows(self.operating_groups))
+        group_key = next((str(row.get("operating_group_key", "") or "") for row in self.operating_groups
+                          if str(row.get("group", "")).strip().upper() == name), "")
+        if not group_key:
+            group_key = str(ensure_operating_group_keys([{"group": name}])[0]["operating_group_key"])
+        family_policy = next((g for g in self.operating_groups
+                              if str(g.get("operating_group_key", "") or "") == group_key), {})
+        candidate_identity = frequency_identity({
+            "operating_group_key": group_key,
+            "band": band,
+            "mode": mode,
+            "frequency": freq_display,
+        })
+        exact_matches = [g for g in self.operating_groups if frequency_identity(g) == candidate_identity]
+        if len(exact_matches) > 1:
+            # Keep imported integrity conflicts visible for operator repair.
+            return
         vfo_val = str(vfo or "A").strip().upper()
         if vfo_val not in ("A", "B"):
             vfo_val = "A"
@@ -38803,9 +39444,7 @@ class SettingsTab(QWidget):
             cond_level = 5
         for g in self.operating_groups:
             if (
-                str(g.get("group", "")).strip().upper() == name
-                and normalize_operating_group_mode(g.get("mode", ""), g.get("band", "")) == mode
-                and str(g.get("band", "")).strip().upper() == band
+                exact_matches and g is exact_matches[0]
             ):
                 next_fastlight_filename_delimiter = (
                     str(g.get("fastlight_filename_delimiter") or "group_default").strip()
@@ -38848,10 +39487,22 @@ class SettingsTab(QWidget):
                         "fastlight_form_family": next_fastlight_form_family,
                     }
                 )
+                if not str(g.get("operating_group_frequency_key", "") or "").strip():
+                    g["operating_group_frequency_key"] = new_operating_group_frequency_key()
+                for sibling in self.operating_groups:
+                    if str(sibling.get("operating_group_key", "") or "") == group_key:
+                        for field in (
+                            "use_condition_levels", "condition_level", "fastlight_filename_delimiter",
+                            "fastlight_custom_delimiter", "fastlight_signed_suffix",
+                            "fastlight_unsigned_suffix", "fastlight_form_family",
+                        ):
+                            sibling[field] = g.get(field)
                 return
         self.operating_groups.append(
             {
                 "group": name,
+                "operating_group_key": group_key,
+                "operating_group_frequency_key": new_operating_group_frequency_key(),
                 "mode": mode,
                 "band": band,
                 "frequency": freq_display,
@@ -38860,14 +39511,23 @@ class SettingsTab(QWidget):
                 "fldigi_offset": fldigi_offset,
                 "auto_tune": bool(auto_tune),
                 "use_condition_levels": bool(use_condition_levels),
-                "condition_level": cond_level,
-                "fastlight_filename_delimiter": str(fastlight_filename_delimiter or "group_default").strip(),
-                "fastlight_custom_delimiter": str(fastlight_custom_delimiter or "").strip(),
-                "fastlight_signed_suffix": str(fastlight_signed_suffix or "group_default").strip(),
-                "fastlight_unsigned_suffix": str(fastlight_unsigned_suffix or "group_default").strip(),
-                "fastlight_form_family": str(fastlight_form_family or "group_default").strip().upper(),
+                "condition_level": cond_level if condition_level is not None else int(family_policy.get("condition_level", 5) or 5),
+                "fastlight_filename_delimiter": str(family_policy.get("fastlight_filename_delimiter", "group_default") if fastlight_filename_delimiter is None else fastlight_filename_delimiter or "group_default").strip(),
+                "fastlight_custom_delimiter": str(family_policy.get("fastlight_custom_delimiter", "") if fastlight_custom_delimiter is None else fastlight_custom_delimiter or "").strip(),
+                "fastlight_signed_suffix": str(family_policy.get("fastlight_signed_suffix", "group_default") if fastlight_signed_suffix is None else fastlight_signed_suffix or "group_default").strip(),
+                "fastlight_unsigned_suffix": str(family_policy.get("fastlight_unsigned_suffix", "group_default") if fastlight_unsigned_suffix is None else fastlight_unsigned_suffix or "group_default").strip(),
+                "fastlight_form_family": str(family_policy.get("fastlight_form_family", "group_default") if fastlight_form_family is None else fastlight_form_family or "group_default").strip().upper(),
             }
         )
+        added = self.operating_groups[-1]
+        for sibling in self.operating_groups:
+            if str(sibling.get("operating_group_key", "") or "") == group_key:
+                for field in (
+                    "use_condition_levels", "condition_level", "fastlight_filename_delimiter",
+                    "fastlight_custom_delimiter", "fastlight_signed_suffix",
+                    "fastlight_unsigned_suffix", "fastlight_form_family",
+                ):
+                    sibling[field] = added.get(field)
 
     def _select_operating_group(self, group: str) -> None:
         group_name = str(group or "").strip().upper()
@@ -38895,13 +39555,18 @@ class SettingsTab(QWidget):
         self.operating_groups = sorted(
             [
                 {
+                    **g,
                     "group": str(g.get("group", "")).upper(),
+                    "operating_group_key": str(g.get("operating_group_key", "") or "").strip(),
+                    "operating_group_frequency_key": str(g.get("operating_group_frequency_key", "") or "").strip(),
+                    "aliases": g.get("aliases", ()),
+                    "alias": g.get("alias", ""),
                     "mode": normalize_operating_group_mode(g.get("mode", ""), g.get("band", "")),
                     "band": str(g.get("band", "")).strip().upper(),
                     "frequency": g.get("frequency", ""),
-                    "vfo": (g.get("vfo") or "A").strip().upper() or "A",
-                    "fldigi_mode": (g.get("fldigi_mode") or "").strip(),
-                    "fldigi_offset": (g.get("fldigi_offset") or "").strip(),
+                    "vfo": str(g.get("vfo") or "A").strip().upper() or "A",
+                    "fldigi_mode": str(g.get("fldigi_mode") or "").strip(),
+                    "fldigi_offset": str(g.get("fldigi_offset") or "").strip(),
                     "auto_tune": bool(g.get("auto_tune", False)),
                     "use_condition_levels": bool(g.get("use_condition_levels", False)),
                     "condition_level": g.get("condition_level", 5),
@@ -38913,8 +39578,11 @@ class SettingsTab(QWidget):
                 }
                 for g in self.operating_groups
             ],
-            key=lambda g: (str(g.get("group", "")).lower(), str(g.get("band", "")).lower()),
+            key=lambda g: (str(g.get("group", "")).lower(), str(g.get("band", "")).lower(),
+                           str(g.get("mode", "")).lower(), _settings_frequency_hz(g.get("frequency")) or 0,
+                           str(g.get("operating_group_frequency_key", ""))),
         )
+        self.operating_groups = list(_settings_operating_group_frequency_rows(self.operating_groups))
 
         group_list = getattr(self, "op_group_list", None)
         selected_group = self._current_operating_group_name()
@@ -38966,6 +39634,7 @@ class SettingsTab(QWidget):
 
     def _refresh_operating_group_config_table(self) -> None:
         table = self.op_groups_table
+        integrity_issues = _settings_operating_group_integrity_issues(self.operating_groups)
         selected_group = self._current_operating_group_name()
         table.setRowCount(0)
         self._op_group_rows_by_group = {}
@@ -38987,10 +39656,21 @@ class SettingsTab(QWidget):
             sel_layout.setAlignment(Qt.AlignCenter)
             sel_layout.addWidget(sel_chk)
             table.setCellWidget(row, 0, sel_wrap)
-            table.setItem(row, 1, QTableWidgetItem(str(g.get("group", "")).upper()))
+            group_item = QTableWidgetItem(str(g.get("group", "")).upper())
+            frequency_key = str(g.get("operating_group_frequency_key", "") or "")
+            group_item.setData(Qt.UserRole, frequency_key)
+            issue = integrity_issues.get(frequency_key, "")
+            if issue:
+                group_item.setToolTip(issue)
+            table.setItem(row, 1, group_item)
             table.setItem(row, 2, QTableWidgetItem(str(g.get("mode", ""))))
             table.setItem(row, 3, QTableWidgetItem(str(g.get("band", ""))))
             table.setItem(row, 4, QTableWidgetItem(self._format_freq(g.get("frequency", ""))))
+            if issue:
+                for column in (2, 3, 4):
+                    cell = table.item(row, column)
+                    if cell is not None:
+                        cell.setToolTip(issue)
             table.setItem(row, 5, QTableWidgetItem(str(g.get("vfo", "A")).upper()))
             table.setItem(row, 6, QTableWidgetItem(str(g.get("fldigi_mode", ""))))
             table.setItem(row, 7, QTableWidgetItem(str(g.get("fldigi_offset", ""))))
@@ -39237,7 +39917,15 @@ class SettingsTab(QWidget):
             cond_enabled = bool(cond_widget.findChild(QCheckBox).isChecked()) if isinstance(cond_widget, QWidget) and cond_widget.findChild(QCheckBox) else False
             policy = self._operating_group_policy_for(group)
             preferred_family = str(policy.get("fastlight_form_family", "group_default") or "group_default").strip().upper()
-            original_key = (group.strip().upper(), mode, band.strip().upper())
+            group_item = table.item(row, 1)
+            frequency_key = str(group_item.data(Qt.UserRole) or "") if group_item is not None else ""
+            source = next((g for g in self.operating_groups
+                           if g.get("operating_group_frequency_key") == frequency_key), None)
+            original_key = {
+                "operating_group_key": str(source.get("operating_group_key", "") or "") if source else "",
+                "operating_group_frequency_key": frequency_key,
+                "group": group,
+            } if source else None
         if preferred_family and preferred_family != "GROUP_DEFAULT":
             self.op_group_detail_summary_label.setToolTip(
                 f"Compose will prefer the {preferred_family} custom form family for this operating group."
@@ -39296,40 +39984,46 @@ class SettingsTab(QWidget):
             except Exception:
                 QMessageBox.warning(self, "Validation", "FLDigi Offset must be an integer.")
                 return
-        old_group = str(old_key[0]).strip().upper() if isinstance(old_key, tuple) and old_key else ""
+        old_group = str(old_key.get("group", "")).strip().upper() if isinstance(old_key, dict) else ""
         if old_group and old_group != new_name:
-            for g in self.operating_groups:
-                if str(g.get("group", "")).strip().upper() == old_group:
-                    g["group"] = new_name
-        if isinstance(old_key, tuple):
-            old_group_key = new_name if old_group and old_group != new_name else str(old_key[0]).strip().upper()
-            old_mode_key = str(old_key[1] or "").strip()
-            old_band_key = str(old_key[2] or "").strip().upper()
-            self.operating_groups = [
-                g
-                for g in self.operating_groups
-                if not (
-                    str(g.get("group", "")).strip().upper() == old_group_key
-                    and normalize_operating_group_mode(g.get("mode", ""), g.get("band", "")) == old_mode_key
-                    and str(g.get("band", "")).strip().upper() == old_band_key
-                )
-            ]
-        self._upsert_operating_group(
-            new_name,
-            new_mode,
-            new_band,
-            new_freq_txt,
-            auto_tune=self.op_group_auto_tune_chk.isChecked(),
-            vfo=self.op_group_vfo_combo.currentText().strip().upper() or "A",
-            fldigi_mode=self.op_group_fldigi_mode_combo.currentText().strip(),
-            fldigi_offset=offset_txt,
-            use_condition_levels=self.op_group_condition_levels_chk.isChecked(),
-            fastlight_filename_delimiter=self._combo_data_text(self.op_group_fastlight_delim_combo),
-            fastlight_custom_delimiter=self.op_group_fastlight_custom_delim_edit.text().strip(),
-            fastlight_signed_suffix=self._combo_data_text(self.op_group_fastlight_signed_combo),
-            fastlight_unsigned_suffix=self._combo_data_text(self.op_group_fastlight_unsigned_combo),
-            fastlight_form_family=self._combo_data_text(self.op_group_fastlight_form_family_combo),
-        )
+            old_group_key = str(old_key.get("operating_group_key", "") or "")
+            conflicting_keys = {
+                str(g.get("operating_group_key", "") or "") for g in self.operating_groups
+                if str(g.get("group", "")).strip().upper() == new_name
+                and str(g.get("operating_group_key", "") or "") != old_group_key
+            }
+            if conflicting_keys:
+                QMessageBox.warning(self, "Group Name", f"{new_name} already identifies a different Operating Group.")
+                return
+        try:
+            self._upsert_operating_group(
+                new_name,
+                new_mode,
+                new_band,
+                new_freq_txt,
+                auto_tune=self.op_group_auto_tune_chk.isChecked(),
+                vfo=self.op_group_vfo_combo.currentText().strip().upper() or "A",
+                fldigi_mode=self.op_group_fldigi_mode_combo.currentText().strip(),
+                fldigi_offset=offset_txt,
+                use_condition_levels=self.op_group_condition_levels_chk.isChecked(),
+                fastlight_filename_delimiter=self._combo_data_text(self.op_group_fastlight_delim_combo),
+                fastlight_custom_delimiter=self.op_group_fastlight_custom_delim_edit.text().strip(),
+                fastlight_signed_suffix=self._combo_data_text(self.op_group_fastlight_signed_combo),
+                fastlight_unsigned_suffix=self._combo_data_text(self.op_group_fastlight_unsigned_combo),
+                fastlight_form_family=self._combo_data_text(self.op_group_fastlight_form_family_combo),
+                operating_group_key=(str(old_key.get("operating_group_key", "")) if isinstance(old_key, dict) else None),
+                operating_group_frequency_key=(str(old_key.get("operating_group_frequency_key", "")) if isinstance(old_key, dict) else None),
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Duplicate Frequency", str(exc))
+            return
+        if old_group and old_group != new_name:
+            old_group_key = str(old_key.get("operating_group_key", "") or "")
+            self.operating_groups = _settings_rename_operating_group_family(
+                self.operating_groups, old_group_key, new_name, old_group
+            )
+            self._refresh_operating_groups_table()
+            self._persist_operating_groups_quiet()
 
     def _update_op_group_action_buttons(self):
         theme = resolve_theme(self.settings)
@@ -39401,10 +40095,12 @@ class SettingsTab(QWidget):
                 band_key = str(g.get("band", "")).strip().upper()
                 mode_key = normalize_operating_group_mode(g.get("mode", ""), band_key)
                 level = int(g.get("condition_level", 5) or 5)
-                freq_val = self._parse_freq_mhz(g.get("frequency", ""))
+                frequency_hz = _settings_frequency_hz(g.get("frequency", ""))
             except Exception:
+                result.append(dict(g))
                 continue
-            if not group or not mode_key or not band_key or freq_val is None:
+            if not group or not mode_key or not band_key or frequency_hz is None:
+                result.append(dict(g))
                 continue
             if level < 1 or level > 5:
                 level = 5
@@ -39415,9 +40111,10 @@ class SettingsTab(QWidget):
                 {
                     "group": group,
                     "operating_group_key": str(g.get("operating_group_key", "") or "").strip(),
+                    "operating_group_frequency_key": str(g.get("operating_group_frequency_key", "") or "").strip(),
                     "mode": mode_key,
                     "band": band_key,
-                    "frequency": self._format_freq_storage(freq_val),
+                    "frequency": f"{frequency_hz // 1_000_000}.{frequency_hz % 1_000_000:06d}",
                     "vfo": vfo_val,
                     "fldigi_mode": str(g.get("fldigi_mode", "") or "").strip(),
                     "fldigi_offset": str(g.get("fldigi_offset", "") or "").strip(),
@@ -39431,7 +40128,7 @@ class SettingsTab(QWidget):
                     "fastlight_form_family": str(g.get("fastlight_form_family", "group_default") or "group_default").strip().upper(),
                 }
             )
-        return list(ensure_operating_group_keys(result))
+        return list(_settings_operating_group_frequency_rows(result))
 
     def _selected_op_rows(self) -> List[int]:
         rows: List[int] = []
@@ -39454,7 +40151,16 @@ class SettingsTab(QWidget):
             QMessageBox.warning(self, "Edit Group", "Please select only one Operating Group to edit.")
             return
         row = rows[0]
-        group = self.op_groups_table.item(row, 1).text().strip() if self.op_groups_table.item(row, 1) else ""
+        group_item = self.op_groups_table.item(row, 1)
+        group = group_item.text().strip() if group_item else ""
+        frequency_key = str(group_item.data(Qt.UserRole) or "") if group_item else ""
+        source_rows = [g for g in self.operating_groups
+                       if g.get("operating_group_frequency_key") == frequency_key]
+        if len(source_rows) != 1:
+            QMessageBox.warning(self, "Edit Group", "The selected frequency variant is unavailable. Refresh Settings and try again.")
+            return
+        source_row = source_rows[0]
+        logical_group_key = str(source_row.get("operating_group_key", "") or "")
         mode = self.op_groups_table.item(row, 2).text().strip() if self.op_groups_table.item(row, 2) else "Digi"
         band = self.op_groups_table.item(row, 3).text().strip() if self.op_groups_table.item(row, 3) else ""
         freq_txt = self.op_groups_table.item(row, 4).text().strip() if self.op_groups_table.item(row, 4) else ""
@@ -39663,23 +40369,37 @@ class SettingsTab(QWidget):
             fldigi_mode = fldigi_mode_combo.currentText().strip()
             vfo = vfo_combo.currentText().strip().upper() or "A"
             # Remove old entry, then insert updated
-            self.operating_groups = [
-                g
-                for g in self.operating_groups
-                if not (g.get("group") == group and g.get("mode") == mode and g.get("band") == band)
-            ]
-            self._upsert_operating_group(
-                new_name,
-                new_mode,
-                new_band,
-                new_freq_txt,
-                auto_tune=auto_tune_chk.isChecked(),
-                vfo=vfo,
-                fldigi_mode=fldigi_mode,
-                fldigi_offset=offset_txt,
-                use_condition_levels=use_condition_levels_chk.isChecked(),
-                condition_level=cond_level_val,
-            )
+            if new_name.strip().upper() != group.strip().upper():
+                conflicts = {str(g.get("operating_group_key", "") or "") for g in self.operating_groups
+                             if str(g.get("group", "")).strip().upper() == new_name.strip().upper()
+                             and str(g.get("operating_group_key", "") or "") != logical_group_key}
+                if conflicts:
+                    QMessageBox.warning(self, "Group Name", f"{new_name.upper()} already identifies a different Operating Group.")
+                    return
+            try:
+                self._upsert_operating_group(
+                    new_name,
+                    new_mode,
+                    new_band,
+                    new_freq_txt,
+                    auto_tune=auto_tune_chk.isChecked(),
+                    vfo=vfo,
+                    fldigi_mode=fldigi_mode,
+                    fldigi_offset=offset_txt,
+                    use_condition_levels=use_condition_levels_chk.isChecked(),
+                    condition_level=cond_level_val,
+                    operating_group_key=logical_group_key,
+                    operating_group_frequency_key=frequency_key,
+                )
+            except ValueError as exc:
+                QMessageBox.warning(self, "Duplicate Frequency", str(exc))
+                return
+            if new_name.strip().upper() != group.strip().upper():
+                self.operating_groups = _settings_rename_operating_group_family(
+                    self.operating_groups, logical_group_key, new_name, group
+                )
+                self._refresh_operating_groups_table()
+                self._persist_operating_groups_quiet()
             dlg.accept()
 
         ok_btn.clicked.connect(on_accept)
@@ -39693,17 +40413,50 @@ class SettingsTab(QWidget):
             return
         to_remove = set()
         for r in rows:
-            group = self.op_groups_table.item(r, 1).text().strip() if self.op_groups_table.item(r, 1) else ""
-            mode = self.op_groups_table.item(r, 2).text().strip() if self.op_groups_table.item(r, 2) else ""
-            band = self.op_groups_table.item(r, 3).text().strip() if self.op_groups_table.item(r, 3) else ""
-            if group and mode and band:
-                to_remove.add((group, mode, band))
+            item = self.op_groups_table.item(r, 1)
+            frequency_key = str(item.data(Qt.UserRole) or "") if item else ""
+            if frequency_key:
+                to_remove.add(frequency_key)
         if not to_remove:
+            return
+        duplicate_keys = {
+            key for key in to_remove
+            if sum(1 for group_row in self.operating_groups
+                   if str(group_row.get("operating_group_frequency_key", "") or "") == key) != 1
+        }
+        if duplicate_keys:
+            QMessageBox.warning(
+                self,
+                "Frequency Identity Conflict",
+                "One or more selected rows share a persisted frequency-row key. Repair the Settings identity conflict before deleting them.",
+            )
+            return
+        selected = [g for g in self.operating_groups
+                    if str(g.get("operating_group_frequency_key", "") or "") in to_remove]
+        reference_detail = self._operating_group_delete_reference_summary(to_remove)
+        selected_detail = ", ".join(
+            f"{g.get('group', 'Group')} {g.get('band', '')} {g.get('mode', '')} {self._format_freq(g.get('frequency', ''))}"
+            for g in selected
+        )
+        confirmation = (
+            f"Delete {len(to_remove)} configured frequency variant(s)?\n\n"
+            f"Selected: {selected_detail or 'frequency variant'}\n\n"
+            f"{reference_detail}\n\n"
+            "Saved SOP and Plan references keep their existing frequency-row key and will remain unresolved until an operator selects a replacement."
+        )
+        answer = QMessageBox.question(
+            self,
+            "Delete Operating Group Frequencies",
+            confirmation,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
             return
         self.operating_groups = [
             g
             for g in self.operating_groups
-            if (g.get("group"), g.get("mode"), g.get("band")) not in to_remove
+            if str(g.get("operating_group_frequency_key", "") or "") not in to_remove
         ]
         self._refresh_operating_groups_table()
         try:
@@ -39713,7 +40466,50 @@ class SettingsTab(QWidget):
             self._emit_operating_groups_changed()
         except Exception:
             log.exception("Failed to persist Operating Group deletions; will remain in-memory only.")
-        QMessageBox.information(self, "Delete Groups", f"Deleted {len(to_remove)} HF Operating Group(s).")
+        QMessageBox.information(self, "Delete Groups", f"Deleted {len(to_remove)} configured frequency variant(s).")
+
+    def _operating_group_delete_reference_summary(self, frequency_keys: set[str]) -> str:
+        """Count named references from cached Settings data without opening stores."""
+        try:
+            data = self.settings.all()
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+
+        def rows_with_keys(value, depth=0):
+            if depth > 8:
+                return []
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except Exception:
+                    return []
+            found = []
+            if isinstance(value, dict):
+                if str(value.get("operating_group_frequency_key") or "") in frequency_keys:
+                    found.append(value)
+                for child in value.values():
+                    found.extend(rows_with_keys(child, depth + 1))
+            elif isinstance(value, list):
+                for child in value:
+                    found.extend(rows_with_keys(child, depth + 1))
+            return found
+
+        sources = (
+            ("hf_schedule", "HF schedule"),
+            ("daily_schedule", "Daily Schedule backup"),
+            ("net_schedule", "Net schedule"),
+            ("sop_frequency_variant_references", "SOP/Plan source JSON"),
+        )
+        counts = []
+        for key, label in sources:
+            count = len(rows_with_keys(data.get(key)))
+            if count:
+                counts.append(f"{label}: {count}")
+        if not counts:
+            return "Cached HF, Net, and SOP/Plan Settings contain no references to the selected variants."
+        return "Cached references: " + "; ".join(counts) + "."
 
     # ---------- Local Net Profiles ---------- #
 
@@ -40537,7 +41333,7 @@ class SettingsTab(QWidget):
                 )
             self.gpg_signing_passphrase_edit.setPlaceholderText("Select a signing key first")
             return
-        self.gpg_signing_passphrase_edit.setPlaceholderText("Stored in OS credential store, not FIO settings")
+        self.gpg_signing_passphrase_edit.setPlaceholderText("Stored in OS credential store, not CommsPlan settings")
         if not store_ok:
             self.gpg_signing_status_label.setText(store_msg)
             return
@@ -42170,6 +42966,30 @@ class SettingsTab(QWidget):
         self.varac_bbs_archive_dir_edit.setText(fn)
         self._mark_settings_dirty()
         self._refresh_section_titles()
+
+    def _update_varac_guard_access_mode(self, *_args):
+        selected = self.varac_guard_access_mode_combo.currentIndex() == 1
+        self.varac_guard_access_editor.setVisible(selected)
+        self.varac_guard_allow_trusted_chk.setText(
+            "Allow selected groups and callsigns" if selected else "Allow Operator History TRUSTED"
+        )
+        self.varac_guard_allow_trusted_chk.setToolTip(
+            "Allow the reviewed selected access list." if selected
+            else "Allow all callsigns marked TRUSTED in HF Operators."
+        )
+
+    def _set_varac_guard_access_policy(self, value):
+        if not hasattr(self, "varac_guard_access_editor"):
+            return
+        selected = bool(str(value or "").strip())
+        self.varac_guard_access_editor.set_policy(value)
+        self.varac_guard_access_mode_combo.setCurrentIndex(1 if selected else 0)
+        self._update_varac_guard_access_mode()
+
+    def _varac_guard_access_policy_json(self):
+        if not hasattr(self, "varac_guard_access_mode_combo") or self.varac_guard_access_mode_combo.currentIndex() == 0:
+            return ""
+        return json.dumps(self.varac_guard_access_editor.policy(), sort_keys=True, separators=(",", ":"))
 
     def _choose_varac_guard_quarantine_dir(self):
         start = (

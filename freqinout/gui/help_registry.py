@@ -15,7 +15,7 @@ class HelpContext:
 DEFAULT_HELP_CONTEXT = HelpContext(
     key="help.overview",
     anchor="help",
-    title="FreqInOut Help",
+    title="CommsPlan Help",
     summary="Browse the guide and jump to the section that matches the task you are working on.",
 )
 
@@ -67,7 +67,7 @@ HELP_CONTEXTS: Dict[str, HelpContext] = {
     "tab.bbs": HelpContext(
         key="tab.bbs",
         anchor="fio-bbs",
-        title="FIO BBS Help",
+        title="CommsPlan BBS Help",
         summary="Configure serving radios, location access and retention, publication, the visitor view, and visitor helpers for the station BBS.",
     ),
     "messages.compose-setup": HelpContext(
@@ -86,7 +86,7 @@ HELP_CONTEXTS: Dict[str, HelpContext] = {
         key="tab.station-health",
         anchor="station-health",
         title="Station Health Help",
-        summary="External station software responsiveness, backoff status, and what FIO is waiting on.",
+        summary="External station software responsiveness, backoff status, and what CommsPlan is waiting on.",
     ),
     "tab.ncs-fldigi": HelpContext(
         key="tab.ncs-fldigi",
@@ -163,14 +163,14 @@ HELP_CONTEXTS: Dict[str, HelpContext] = {
     "settings.freqinout": HelpContext(
         key="settings.freqinout",
         anchor="settings-freqinout-details",
-        title="FreqInOut Settings Help",
+        title="CommsPlan Settings Help",
         summary="Theme, text size, software used, scheduler behavior examples, timers, operating status, and setup readiness.",
     ),
     "settings.software_used": HelpContext(
         key="settings.software_used",
         anchor="settings-freqinout-details",
         title="Software Used Help",
-        summary="Choose only the station programs you actually use so FIO shows useful readiness guidance.",
+        summary="Choose only the station programs you actually use so CommsPlan shows useful readiness guidance.",
     ),
     "settings.software": HelpContext(
         key="settings.software",
@@ -230,7 +230,7 @@ HELP_CONTEXTS: Dict[str, HelpContext] = {
         key="settings.launch-control",
         anchor="settings-launch-control",
         title="Launch Control Help",
-        summary="Which station tools FIO may start, startup behavior, launch order, and dependency pacing.",
+        summary="Which station tools CommsPlan may start, startup behavior, launch order, and dependency pacing.",
     ),
     "settings.custom-tools": HelpContext(
         key="settings.custom-tools",

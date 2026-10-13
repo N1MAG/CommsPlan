@@ -14,6 +14,7 @@ from freqinout.core.js8_spotter_forms import FORM_TOKEN_RE
 from freqinout.core.js8_spotter_status import classify_spotter_status
 from freqinout.core.commstat_sitrep import resolve_commstat_reported_for_state
 from freqinout.core.message_search_values import searchable_text_values
+from freqinout.core.commstat_brevity import intelligence_values
 
 
 TOPIC_TAXONOMY: tuple[str, ...] = (
@@ -384,6 +385,7 @@ def analyze_commstat_fields(
     remarks: object = "",
     brevity_code: object = "",
     brevity_summary: object = "",
+    brevity_models: object = (),
     transport: object = "",
     reach: object = "",
     source_family: object = "CommStat",
@@ -433,6 +435,7 @@ def analyze_commstat_fields(
             ("title", title_text),
             ("body", body_text),
             ("remarks", remarks),
+            ("brevity", " ".join(intelligence_values(brevity_models) if isinstance(brevity_models, (list, tuple)) else [])),
             ("status", status_text),
             ("alert", alert_text),
             ("subtype", subtype),

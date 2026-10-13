@@ -25,7 +25,7 @@ class ContextHelpDialog(QDialog):
         layout.setSpacing(10)
 
         header = QHBoxLayout()
-        self.title_label = QLabel("<h3>FreqInOut Help</h3>")
+        self.title_label = QLabel("<h3>CommsPlan Help</h3>")
         header.addWidget(self.title_label)
         header.addStretch()
         self.open_full_guide_btn = QPushButton("Open Full Guide")
@@ -56,7 +56,7 @@ class ContextHelpDialog(QDialog):
         context = get_help_context(context_key)
         self._current_context = context
         self.title_label.setText(f"<h3>{context.title}</h3>")
-        self.summary_label.setText(context.summary or "Review the focused guide section for this part of FreqInOut.")
+        self.summary_label.setText(context.summary or "Review the focused guide section for this part of CommsPlan.")
         self._show_anchor(context.anchor)
         self.show()
         self.raise_()

@@ -1,0 +1,109 @@
+CommsPlan, formerly FreqInOut — macOS replacement preview
+
+Native upgrades are not yet release-qualified. This document describes the
+manual replacement and recovery procedure to rehearse with a disposable station.
+The disk image does not discover, back up or remove an existing installation.
+Copying CommsPlan.app alone can leave two apps installed with the same bundle ID.
+
+BEFORE REPLACEMENT
+
+1. Identify your actual FreqInOut installation and profile. Record their full
+   paths, application version, architecture and package checksum. Keep the old
+   installer. Do not assume a profile location if FREQINOUT_CONFIG_DIR is set.
+   Do not use the source-only migration assistant with a frozen application.
+
+2. In Terminal, inspect the selected old app's identity without launching it:
+   /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "/FULL/PATH/FreqInOut.app/Contents/Info.plist"
+   It must report org.n1mag.freqinout. A matching name or bundle ID alone does
+   not prove an official historical release. Stop if the selected app/version
+   is uncertain or multiple installations/profile locations are ambiguous.
+   Inventory indexed copies with:
+   mdfind 'kMDItemCFBundleIdentifier == "org.n1mag.freqinout"'
+   Spotlight can omit unindexed disks/folders. Also review your Applications
+   folders, custom installation locations and mounted volumes manually. Inspect
+   each candidate by full path. Stop until ambiguous active copies are resolved;
+   a backup copy outside Applications must never be selected as the active app.
+
+3. Quit FreqInOut, CommsPlan and companion applications normally. Confirm their
+   processes exited in Activity Monitor. Keep them closed throughout copying.
+   Do not force quit during station writes. The disk image cannot enforce this.
+
+4. Create and verify a cold backup of the entire selected station profile in
+   a separate location, including both databases, settings and attachments.
+   Verify the backup can be restored into a NEW profile with the old version.
+   Retain external companion data and the same macOS account/keychain. The
+   profile backup does not include keychain secrets. Native 2.0.4 preparation is
+   available in the candidate via --migration-preparation; follow the companion
+   CommsPlan-migration.md guide with a retained, digest-matching historical DMG
+   and NEW JSON reports. Its profile/package verification is preparation only;
+   no native upgrade is qualified yet. Stop without a verified recovery copy.
+
+5. Copy the complete old application to a separate recovery folder outside
+   Applications. Check its bundle identity/version and verify the copied bundle
+   against the original. Preserve signatures, executable permissions and links.
+   Retain both the application copy and its original installer/checksum.
+   For the app copy, replace the example paths below with confirmed physical
+   paths. Use a NEW recovery directory; every destination shown must be absent.
+   Do not treat an interrupted ".partial" directory as a complete copy:
+
+   mkdir "/FULL/PATH/NEW_RECOVERY"
+   ditto --rsrc --extattr --acl "/FULL/PATH/FreqInOut.app" "/FULL/PATH/NEW_RECOVERY/FreqInOut.app.partial"
+
+   Generate separate file hash inventories from each bundle root:
+   (cd "/FULL/PATH/FreqInOut.app" && find . -type f -exec shasum -a 256 {} \; | LC_ALL=C sort) > "/FULL/PATH/NEW_RECOVERY/original.sha256"
+   (cd "/FULL/PATH/NEW_RECOVERY/FreqInOut.app.partial" && find . -type f -exec shasum -a 256 {} \; | LC_ALL=C sort) > "/FULL/PATH/NEW_RECOVERY/copy.sha256"
+   diff "/FULL/PATH/NEW_RECOVERY/original.sha256" "/FULL/PATH/NEW_RECOVERY/copy.sha256"
+
+   All commands must succeed without read/hash errors and diff must report no
+   differences. These hashes cover regular file bytes; also compare symbolic
+   link targets and executable permissions and check both bundles' code-signature
+   status. An unsigned app does not become signed by copying it. Stop if the
+   copy changes signature status or bundle metadata. After these checks only:
+   mv -n "/FULL/PATH/NEW_RECOVERY/FreqInOut.app.partial" "/FULL/PATH/NEW_RECOVERY/FreqInOut.app"
+   Confirm the final path exists and the .partial path no longer exists. Keep
+   the inventory files beside it. Never use an existing destination for a retry.
+
+REPLACE AND VERIFY
+
+6. Check the CommsPlan package checksum/architecture. Inspect the app in this
+   mounted image: bundle ID org.n1mag.freqinout; executable and name CommsPlan;
+   version matches the selected release. Use the release's signing instructions;
+   an unsigned package remains unsigned after replacement.
+
+7. Move the selected old application out of its active Applications location
+   into a NEW, separately named subfolder of the recovery folder. Do not replace
+   the verified application backup made in step 5. Copy CommsPlan.app
+   from this image into the selected Applications location. If a CommsPlan.app
+   already exists there, STOP and inventory it; do not overwrite blindly. Do
+   not remove other apps by filename or bundle ID. Do not start the old copy.
+
+8. Launch the installed CommsPlan explicitly by its full path, using the same
+   OS account and selected profile. Do not rely on an old Dock pin or Spotlight
+   to select between retained copies. For an explicit profile override, launch
+   the installed Contents/MacOS/CommsPlan executable from an environment with
+   FREQINOUT_CONFIG_DIR set to the confirmed profile ROOT. Review startup
+   automation and isolate radios/companions for the preview rehearsal.
+
+9. A 1.2.8 station still requires the existing informed station-upgrade dialog.
+   A completed 2.0.4 station must retain its multi-rig configuration. Verify
+   callsign, radios/bindings, companion paths, schedules/groups, messages,
+   attachments, preferences and credential access. An installer or shell opening
+   successfully is not proof of station continuity. Stop on missing data.
+
+10. After station verification, remove the old Dock shortcut and pin the
+    installed CommsPlan. Confirm that it opens the intended executable/profile.
+    Retain the old application and verified station backup for recovery; do not
+    launch the old application against a station upgraded by the newer app.
+
+INTERRUPTION OR FAILED VERIFICATION
+
+Keep every partial copy and the original backup for review. Do not merge app
+bundles, overwrite the sole recovery copy, or infer completion from a filename.
+Close all apps. Restore the pre-upgrade station into a NEW profile directory,
+verify it, then launch the matching historical app by its full path with that
+explicit restored profile. A newer database must not be opened in 1.2.8; restoring
+only the old application does not roll back station conversion. Re-establish
+the original active app location only after the selected copies are verified.
+
+Native process refusal, replacement interruption, rollback, Dock/LaunchServices
+and keychain continuity still require qualification on Intel and Apple Silicon.

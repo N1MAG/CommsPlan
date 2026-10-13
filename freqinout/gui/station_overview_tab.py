@@ -8,7 +8,6 @@ from PySide6.QtWidgets import (
     QAbstractScrollArea,
     QFrame,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
     QScrollArea,
     QSizePolicy,
@@ -27,6 +26,7 @@ from freqinout.core.station_runtime_manager import (
     StationRuntimeManager,
     apply_endpoint_operational_summary,
 )
+from freqinout.gui.responsive_geometry import ResponsiveContentTable
 from freqinout.gui.bounded_snapshot_worker import SnapshotWorkerController
 from freqinout.gui.theme import active_app_theme, led_style, resolve_theme
 
@@ -102,6 +102,8 @@ class StationOverviewTab(QWidget):
 
         self.summary_label = QLabel("No active station runtimes.")
         self.summary_label.setWordWrap(True)
+        self.summary_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.summary_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
         layout.addWidget(self.summary_label)
 
         self.alerts_label = QLabel("")
@@ -123,11 +125,11 @@ class StationOverviewTab(QWidget):
         overview_layout.setContentsMargins(0, 0, 0, 0)
         overview_layout.setSpacing(8)
 
-        self.control_center_table = QTableWidget(0, 6)
+        self.control_center_table = ResponsiveContentTable(0, 6, column_em_limits=(18, 14, 24, 36, 28, 12))
         self.control_center_table.setObjectName("stationControlCenterTable")
         self.control_center_table.setAccessibleName("Station Control Center table")
         self.control_center_table.setHorizontalHeaderLabels(
-            ["Radio / SDR", "Now", "Control State", "Next Schedule Action", "Health", "Actions"]
+            ["Radio / SDR", "Now", "Control State", "Operating Model", "Health", "Actions"]
         )
         self.control_center_table.verticalHeader().setVisible(False)
         self.control_center_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -141,13 +143,6 @@ class StationOverviewTab(QWidget):
         self.control_center_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.control_center_table.cellClicked.connect(self._on_control_center_cell_clicked)
         self.control_center_table.cellDoubleClicked.connect(self._on_control_center_cell_clicked)
-        header = self.control_center_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.Stretch)
-        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
         self.control_center_empty_label = QLabel(
             "No active station runtimes. Activate one or more device profiles in Configuration to populate Station Control Center."
         )
@@ -161,6 +156,9 @@ class StationOverviewTab(QWidget):
         self._update_control_center_empty_state()
 
         self.cards_container = QWidget(self)
+        # Legacy test markers have no visible layout role. An unhidden child
+        # otherwise paints at (0, 0) and covers the summary's leading text.
+        self.cards_container.hide()
         self.cards_layout = QVBoxLayout(self.cards_container)
         self.cards_layout.setContentsMargins(0, 0, 0, 0)
         self.cards_layout.setSpacing(0)
@@ -556,14 +554,10 @@ class StationOverviewTab(QWidget):
         return label
 
     @staticmethod
-    def _next_schedule_text(snapshot: DeviceRuntimeSnapshot) -> str:
-        if snapshot.device_class == "observer":
-            return snapshot.observer_follow_summary or "Receive-only monitor"
-        if not snapshot.assigned_operating_profile_name:
-            return "No assigned plan"
-        if not snapshot.scheduler_enabled:
-            return "Scheduler disabled"
-        return f"Assigned plan: {snapshot.assigned_operating_profile_name}"
+    def _operating_model_text(snapshot: DeviceRuntimeSnapshot) -> str:
+        return snapshot.assigned_operating_profile_name or (
+            "Receive-only" if snapshot.device_class == "observer" else "Unassigned"
+        )
 
     @staticmethod
     def _health_text(snapshot: DeviceRuntimeSnapshot) -> str:
@@ -588,7 +582,7 @@ class StationOverviewTab(QWidget):
             radio,
             now or "Unavailable",
             self._control_state_text(snapshot),
-            self._next_schedule_text(snapshot),
+            self._operating_model_text(snapshot),
             self._health_text(snapshot),
             "Read-only",
         )
@@ -605,10 +599,12 @@ class StationOverviewTab(QWidget):
                     item.setTextAlignment(Qt.AlignCenter)
                 else:
                     item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+                item.setToolTip(str(value or ""))
                 if col_idx == self.CONTROL_CENTER_HEALTH_COLUMN:
-                    item.setToolTip("Open Health Details for this radio or SDR.")
+                    item.setToolTip(str(value or "") + "\nOpen Health Details for this radio or SDR.")
                 table.setItem(row_idx, col_idx, item)
         table.resizeRowsToContents()
+        table.request_column_fit()
         self._update_control_center_empty_state()
 
     def _update_control_center_empty_state(self) -> None:
@@ -671,7 +667,13 @@ class StationOverviewTab(QWidget):
             badge = QLabel("Station Default")
             badge.setStyleSheet(_state_badge_style("ok", theme))
             header.addWidget(badge, 0, Qt.AlignRight)
-        header_badge = QLabel("Active")
+        badge_text = ("Monitor" if snapshot.device_class == "observer" else
+                      "Manual" if snapshot.control_backend == "manual" else
+                      "Connected" if snapshot.control_ready is True else
+                      "Unavailable" if snapshot.control_ready is False else "Not verified")
+        header_badge = QLabel(badge_text)
+        header_badge.setObjectName("stationRuntimeConnectionBadge")
+        header_badge.setToolTip("Cached radio-control connection evidence; companion applications have separate status below.")
         header_badge.setStyleSheet(_state_badge_style(snapshot.overall_state, theme))
         header.addWidget(header_badge, 0, Qt.AlignRight)
         layout.addLayout(header)

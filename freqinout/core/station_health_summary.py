@@ -78,10 +78,10 @@ def _operator_error_text(key: str, value: object) -> str:
     lower = text.lower()
     if "settingsmanager used from a different thread" in lower:
         if key_norm == "scheduler:fldigi-busy-check":
-            return "An old FLDigi receive-activity check could not finish cleanly. FIO is not currently blocked by this check."
+            return "An old FLDigi receive-activity check could not finish cleanly. CommsPlan is not currently blocked by this check."
         return "A background check could not finish cleanly because an internal settings handle was used from the wrong worker thread."
     if key_norm == "scheduler:fldigi-busy-check" and "could not verify fldigi receive activity" in lower:
-        return "FIO could not confirm FLDigi receive activity during an earlier schedule check. The schedule was allowed to continue."
+        return "CommsPlan could not confirm FLDigi receive activity during an earlier schedule check. The schedule was allowed to continue."
     return text
 
 
@@ -90,11 +90,12 @@ def _is_fldigi_busy_check_key(key: str) -> bool:
 
 
 def _is_scheduler_hold_key(key: str) -> bool:
-    return str(key or "").strip().lower().replace("_", "-") in {
+    return ":".join(str(key or "").strip().lower().replace("_", "-").split(":")[:2]) in {
         "scheduler:fldigi-busy",
         "scheduler:js8-busy",
         "scheduler:varac-busy",
         "scheduler:flrig-ptt",
+        "scheduler:manual-qsy",
     }
 
 
@@ -224,15 +225,19 @@ def _background_job_label(value: object) -> str:
 
 
 def _scope_from_metadata(metadata: Mapping[str, object]) -> str:
-    for key in ("scope", "radio_name", "radio", "profile_name", "device_name"):
+    for key in ("radio_name", "radio", "profile_name", "device_name"):
         text = str(metadata.get(key, "") or "").strip()
         if text:
             return text
+    explicit_scope = str(metadata.get("scope") or "").strip()
+    if explicit_scope and explicit_scope != "Station-wide":
+        return explicit_scope
     for key in ("radio_id", "device_profile_id", "profile_id"):
         value = metadata.get(key)
         if value not in (None, ""):
-            return f"Radio {value}"
-    return "Station-wide"
+            return "Radio " + str(value).removeprefix("radio_")
+    identity = str(metadata.get("radio_profile_id") or "")
+    return identity.replace("radio_", "Radio ") if identity else "Station-wide"
 
 
 def _item_from_snapshot(
@@ -278,13 +283,13 @@ def _item_from_snapshot(
     if js8_diagnostic_only:
         severity = "info"
         state = "Diagnostic"
-        action = "Native JS8Call diagnostic differs from the existing JS8 path; FIO is still using the existing path."
+        action = "Native JS8Call diagnostic differs from the existing JS8 path; CommsPlan is still using the existing path."
         warning = False
         backoff = False
-    elif js8_mode == "api_basic":
-        severity = "info"
-        state = "Ready (basic)"
-        action = "JS8Call API is reachable; FIO will keep compatibility fallbacks available."
+    elif js8_mode in {"api_basic", "api_full"} and not last_error and not slow:
+        severity = "info" if js8_mode == "api_basic" else "ok"
+        state = "Ready (basic)" if js8_mode == "api_basic" else "OK"
+        action = "JS8Call API is reachable; CommsPlan will keep compatibility fallbacks available."
         warning = False
         backoff = False
     elif fldigi_busy_check:
@@ -293,10 +298,16 @@ def _item_from_snapshot(
         action = "No schedule move is waiting on this FLDigi activity check."
         warning = False
         backoff = False
+    elif active_scheduler_hold and str(key).startswith("scheduler:manual-qsy"):
+        severity = "info"
+        state = "Hold"
+        action = "Manual QSY holds this radio until Resume Schedule or its timer expires."
+        warning = False
+        backoff = False
     elif backoff:
         severity = "warning" if warning else "info"
         state = "Retry waiting"
-        action = "Waiting before retry to keep FIO responsive"
+        action = "Waiting before retry to keep CommsPlan responsive"
     elif expired_transient and warning:
         severity = "ok"
         state = "OK"
@@ -315,7 +326,7 @@ def _item_from_snapshot(
     elif stale_ok:
         severity = "info"
         state = "Not recent"
-        action = "Last known check was OK; FIO has not needed a fresh check recently"
+        action = "Last known check was OK; CommsPlan has not needed a fresh check recently"
         warning = False
     elif warning and ingest_source_health and not last_error:
         severity = "info"
@@ -325,12 +336,17 @@ def _item_from_snapshot(
     elif warning:
         severity = "warning"
         state = "Warning"
-        action = "Waiting for the next normal check"
+        action = ("Recent checks are slow: " + _format_duration_ms(snapshot.get("last_duration_ms"))
+                  if slow else "The last check failed; waiting for the next retry")
     else:
         severity = "ok"
         state = "OK"
         action = "Normal"
     action_override = str(metadata.get("action", "") or "").strip()
+    if service == "js8call" and js8_mode in {"api_basic", "api_full"} and not last_error and slow:
+        action_override = "JS8Call API is reachable, but its recent checks are slow. " + _format_duration_ms(snapshot.get("last_duration_ms"))
+    if service == "js8call" and warning and last_error:
+        action_override = "JS8Call status check failed: " + _shorten_error(last_error)
     if action_override and not fldigi_busy_check and (not scheduler_hold or active_scheduler_hold):
         action = action_override
     scope = ""
@@ -913,7 +929,7 @@ def _js8_registry_status_endpoint(status: Mapping[str, object]) -> str:
 def _scheduler_event_is_issue(item: Mapping[str, object]) -> bool:
     event_type = str(item.get("event_type", "") or "").strip().lower()
     code = str(item.get("code", "") or "").strip().lower()
-    if code in {"fldigi_busy_check_failed", "fldigi_busy_check_queued"}:
+    if code in {"fldigi_busy_check_failed", "fldigi_busy_check_queued", "already_applied", "matching_readback_adopted", "post_apply_on_schedule"}:
         return False
     if code in {"rf_safety_guard_block", "rf_safety_guard_warning", "coordination_conflict"}:
         return True
@@ -937,7 +953,7 @@ def _scheduler_event_is_success(item: Mapping[str, object]) -> bool:
 
 
 def _summarize_scheduler_events(events: List[Dict[str, object]], *, issue_limit: int = 24) -> List[Dict[str, object]]:
-    latest_success: Optional[Dict[str, object]] = None
+    latest_success: Dict[str, Dict[str, object]] = {}
     issues: List[Dict[str, object]] = []
     for raw in events:
         if not isinstance(raw, Mapping):
@@ -947,12 +963,14 @@ def _summarize_scheduler_events(events: List[Dict[str, object]], *, issue_limit:
             item["_station_health_kind"] = "issue"
             issues.append(item)
             continue
-        if latest_success is None and _scheduler_event_is_success(item):
+        metadata = item.get("metadata") if isinstance(item.get("metadata"), Mapping) else {}
+        identity = str(item.get("radio_profile_id") or metadata.get("radio_profile_id") or "unattributed")
+        if identity not in latest_success and _scheduler_event_is_success(item):
             item["_station_health_kind"] = "latest_success"
-            latest_success = item
-    out: List[Dict[str, object]] = []
-    if latest_success is not None:
-        out.append(latest_success)
+            latest_success[identity] = item
+    # Bounded input/history; keep each radio's latest success instead of one
+    # radio hiding its peers' successful schedule transitions.
+    out: List[Dict[str, object]] = list(latest_success.values())
     out.extend(issues[: max(0, int(issue_limit or 24))])
     return out
 

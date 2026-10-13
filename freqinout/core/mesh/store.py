@@ -31,7 +31,7 @@ from freqinout.core.message_projection_queue import DirtyProjectionItem, enqueue
 from freqinout.core.observation_projection import Observation
 from freqinout.core.observation_store import delete_observations_by_source_refs, upsert_observation
 from freqinout.core.source_connection import source_connection_from_mesh_health
-from freqinout.core.sqlite_utils import connect_sqlite
+from freqinout.core.sqlite_utils import connect_sqlite, connect_sqlite_readonly
 
 SOCIAL_TOPIC = "Social"
 ATTENTION_SEVERITIES = {"caution", "watch", "warning", "urgent", "emergency", "priority", "critical"}
@@ -452,12 +452,50 @@ def upsert_mesh_messages(db_path: str | Path, messages: Sequence[MeshMessage], *
 
 
 def upsert_mesh_node(db_path: str | Path, node: MeshNode, *, updated_utc: str | None = None) -> str:
+    return _upsert_retained_mesh_node(db_path, node, updated_utc=updated_utc)[0]
+
+
+def _merge_retained_mesh_node(node: MeshNode, previous: Mapping[str, Any]) -> MeshNode:
+    """Preserve sparse contact updates without borrowing outgoing-route evidence."""
+    old = _node_row_to_dict(previous)
+    changes: dict[str, Any] = {}
+    for name in ("public_key_or_hash", "long_name", "short_name", "callsign", "role", "grid"):
+        changes[name] = getattr(node, name) or old.get(name) or ""
+    for name in ("snr", "rssi", "battery_percent"):
+        changes[name] = getattr(node, name) if getattr(node, name) is not None else old.get(name)
+    # Coordinates form one advertised point, never a mixture of two updates.
+    if node.lat is None or node.lon is None:
+        changes.update(lat=old.get("lat"), lon=old.get("lon"))
+    if node.last_heard is None and old.get("last_heard_utc"):
+        try:
+            changes["last_heard"] = datetime.fromisoformat(old["last_heard_utc"])
+        except ValueError:
+            pass
+    # Only explicit outgoing-route updates clear the legacy receive fields.
+    # Other sparse updates preserve genuine receive evidence.
+    if "outgoing_route" not in node.raw:
+        for name in ("hop_count", "direct_receive"):
+            changes[name] = getattr(node, name) if getattr(node, name) is not None else old.get(name)
+        for name in ("route_type", "via_node", "path_hops"):
+            changes[name] = getattr(node, name) or old.get(name) or (() if name == "path_hops" else "")
+    raw = dict(old.get("raw_payload") or {})
+    raw.update(node.raw)
+    changes["raw"] = raw
+    return replace(node, **changes)
+
+
+def _upsert_retained_mesh_node(db_path: str | Path, node: MeshNode, *, updated_utc: str | None = None) -> tuple[str, MeshNode]:
     stamp = str(updated_utc or utc_now().isoformat()).strip()
     source_ref = mesh_node_source_ref(node)
-    conn = connect_sqlite(db_path)
+    conn = connect_sqlite(db_path, row_factory=sqlite3.Row)
     try:
         ensure_mesh_schema(conn)
         with conn:
+            if not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")
+            previous = conn.execute("SELECT * FROM mesh_nodes WHERE source_ref=?", (source_ref,)).fetchone()
+            if previous is not None:
+                node = _merge_retained_mesh_node(node, previous)
             conn.execute(
                 """
                 INSERT INTO mesh_nodes (
@@ -512,19 +550,10 @@ def upsert_mesh_node(db_path: str | Path, node: MeshNode, *, updated_utc: str | 
                     END,
                     last_heard_utc=excluded.last_heard_utc,
                     hop_count=excluded.hop_count,
-                    route_type=CASE
-                        WHEN excluded.route_type IS NOT NULL AND excluded.route_type <> '' THEN excluded.route_type
-                        ELSE mesh_nodes.route_type
-                    END,
+                    route_type=excluded.route_type,
                     direct_receive=excluded.direct_receive,
-                    via_node=CASE
-                        WHEN excluded.via_node IS NOT NULL AND excluded.via_node <> '' THEN excluded.via_node
-                        ELSE mesh_nodes.via_node
-                    END,
-                    path_hops_json=CASE
-                        WHEN excluded.path_hops_json IS NOT NULL AND excluded.path_hops_json <> '[]' THEN excluded.path_hops_json
-                        ELSE mesh_nodes.path_hops_json
-                    END,
+                    via_node=excluded.via_node,
+                    path_hops_json=excluded.path_hops_json,
                     snr=excluded.snr,
                     rssi=excluded.rssi,
                     battery_percent=excluded.battery_percent,
@@ -539,7 +568,7 @@ def upsert_mesh_node(db_path: str | Path, node: MeshNode, *, updated_utc: str | 
                 """,
                 _mesh_node_values(source_ref, node, stamp),
             )
-        return source_ref
+        return source_ref, node
     finally:
         conn.close()
 
@@ -761,6 +790,7 @@ def list_mesh_channel_policies(
     adapter_id: str = "",
     transport: str = "",
     review_state: str = "",
+    read_only: bool = False,
 ) -> list[MeshChannelPolicy]:
     clauses: list[str] = []
     params: list[Any] = []
@@ -774,9 +804,11 @@ def list_mesh_channel_policies(
         clauses.append("review_state=?")
         params.append(_clean(review_state))
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
-    conn = connect_sqlite(db_path, row_factory=sqlite3.Row)
+    conn = (connect_sqlite_readonly(db_path, timeout=0.25, row_factory=sqlite3.Row)
+            if read_only else connect_sqlite(db_path, row_factory=sqlite3.Row))
     try:
-        ensure_mesh_schema(conn)
+        if not read_only:
+            ensure_mesh_schema(conn)
         rows = conn.execute(
             f"""
             SELECT
@@ -881,7 +913,7 @@ def upsert_mesh_health(db_path: str | Path, snapshot: MeshHealthSnapshot, *, upd
         conn.close()
 
 
-def list_mesh_health(db_path: str | Path, *, transport: str = "") -> list[dict[str, Any]]:
+def list_mesh_health(db_path: str | Path, *, transport: str = "", read_only: bool = False) -> list[dict[str, Any]]:
     """Return retained health rows without mutating the database.
 
     Schema ownership belongs to startup/migration and mesh-ingest writers.  This
@@ -895,7 +927,8 @@ def list_mesh_health(db_path: str | Path, *, transport: str = "") -> list[dict[s
         params.append(_clean(transport))
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
 
-    conn = connect_sqlite(db_path, row_factory=sqlite3.Row)
+    conn = (connect_sqlite_readonly(db_path, timeout=0.25, row_factory=sqlite3.Row)
+            if read_only else connect_sqlite(db_path, row_factory=sqlite3.Row))
     try:
         rows = conn.execute(
             f"""
@@ -1060,8 +1093,8 @@ def store_mesh_message_with_channel_policy(
 
 
 def project_mesh_node_to_observation(db_path: str | Path, node: MeshNode) -> Observation:
-    source_ref = upsert_mesh_node(db_path, node)
-    observation = observation_from_mesh_node(node, source_ref=source_ref)
+    source_ref, retained = _upsert_retained_mesh_node(db_path, node)
+    observation = observation_from_mesh_node(retained, source_ref=source_ref)
     upsert_observation(db_path, observation)
     return observation
 
@@ -1476,6 +1509,7 @@ def list_mesh_nodes(
     adapter_id: str = "",
     callsign: str = "",
     limit: int = 200,
+    read_only: bool = False,
 ) -> list[dict[str, Any]]:
     clauses: list[str] = []
     params: list[Any] = []
@@ -1491,9 +1525,11 @@ def list_mesh_nodes(
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
     params.append(max(1, int(limit or 200)))
 
-    conn = connect_sqlite(db_path, row_factory=sqlite3.Row)
+    conn = (connect_sqlite_readonly(db_path, timeout=0.25, row_factory=sqlite3.Row)
+            if read_only else connect_sqlite(db_path, row_factory=sqlite3.Row))
     try:
-        ensure_mesh_schema(conn)
+        if not read_only:
+            ensure_mesh_schema(conn)
         rows = conn.execute(
             f"""
             SELECT

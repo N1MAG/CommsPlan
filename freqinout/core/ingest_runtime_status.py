@@ -891,6 +891,9 @@ def _family_sort_key(family: str) -> int:
 def _runtime_source_title(row: RuntimeIngestStatusRow) -> str:
     label = str(row.label or "").strip()
     if label:
+        metadata = row.metadata if isinstance(row.metadata, Mapping) else {}
+        if metadata.get("attribution") in {"shared", "unverified"}:
+            return f"{label} · {str(row.source_id)[-8:]}"
         return label
     kind = _runtime_source_kind(row)
     radio = str(row.radio_id or "").strip()

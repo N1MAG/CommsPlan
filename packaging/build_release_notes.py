@@ -43,18 +43,22 @@ def build_release_notes(
     windows_suffix = "" if windows_signed else "-unsigned"
     macos_suffix = "" if macos_signed else "-unsigned"
     notes = [
-        f"# FreqInOut {version}",
+        f"# CommsPlan {version}",
         "",
         "Choose the package for your computer from **Assets** below. Technical users "
         "can instead use GitHub's automatically generated **Source code (zip)** or "
         "**Source code (tar.gz)** archive, or pull the tagged source manually.",
         "",
+        "CommsPlan, formerly FreqInOut, retains existing station data and technical "
+        "profile/package identities. Follow the guided upgrade instructions for your "
+        "installation before replacing an existing app.",
+        "",
         "## Downloads",
         "",
-        f"- Windows 10/11 x86-64: `FreqInOut-{version}-windows-x86_64-setup{windows_suffix}.exe`",
-        f"- Debian/Ubuntu-family Linux amd64: `FreqInOut-{version}-linux-amd64.deb`",
-        f"- Apple Silicon macOS: `FreqInOut-{version}-macos-arm64{macos_suffix}.dmg`",
-        f"- Intel macOS: `FreqInOut-{version}-macos-x86_64{macos_suffix}.dmg`",
+        f"- Windows 10/11 x86-64: `CommsPlan-{version}-windows-x86_64-setup{windows_suffix}.exe`",
+        f"- Debian/Ubuntu-family Linux amd64: `CommsPlan-{version}-linux-amd64.deb`",
+        f"- Apple Silicon macOS: `CommsPlan-{version}-macos-arm64{macos_suffix}.dmg`",
+        f"- Intel macOS: `CommsPlan-{version}-macos-x86_64{macos_suffix}.dmg`",
         "- Manual/source installation: use the source archive below or check out "
         f"tag `v{version}`",
         "",
@@ -83,7 +87,7 @@ def build_release_notes(
                 "**Open Anyway** in Privacy & Security."
             )
         notes.append(
-            "- The installed application name remains **FreqInOut**. Confirm the "
+            "- The installed application name is **CommsPlan**. Confirm the "
             "checksum before bypassing an operating-system trust prompt."
         )
 

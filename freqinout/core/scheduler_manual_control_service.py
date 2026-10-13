@@ -190,7 +190,14 @@ class SchedulerManualControlService:
         existing = self.get_state(radio_profile_id)
         preserved_hold = hold_until_utc
         if preserved_hold is None and existing.state in {"manual_hold", "manual_qsy"}:
-            preserved_hold = existing.hold_until_utc
+            try:
+                deadline = datetime.fromisoformat(str(existing.hold_until_utc).replace("Z", "+00:00"))
+                if deadline.tzinfo is None:
+                    deadline = deadline.replace(tzinfo=timezone.utc)
+                if deadline > datetime.now(timezone.utc):
+                    preserved_hold = existing.hold_until_utc
+            except (ValueError, TypeError):
+                pass
         return self.save_state(
             SchedulerManualControlState(
                 radio_profile_id=existing.radio_profile_id,
@@ -261,6 +268,32 @@ class SchedulerManualControlService:
                 created_at_utc=existing.created_at_utc,
             )
         )
+
+    def resume_expired_hold(self, expected: SchedulerManualControlState) -> bool:
+        """Clear only the expired version; a newer operator intent wins atomically."""
+        if expected.state not in {"manual_hold", "manual_qsy"} or not expected.hold_until_utc:
+            return False
+        deadline = datetime.fromisoformat(expected.hold_until_utc.replace("Z", "+00:00"))
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) < deadline:
+            return False
+        with self.store.connect() as conn:
+            cur = conn.execute(
+                """UPDATE scheduler_manual_control_states
+                      SET state='on_schedule', manual_target_json='{}', hold_until_utc=NULL,
+                          reason_code='hold_expired', operator_source='scheduler',
+                          latest_event_id=NULL, updated_utc=?
+                    WHERE radio_profile_id=? AND state=? AND hold_until_utc=?
+                      AND manual_target_json=? AND updated_utc=?
+                      AND reason_code=? AND operator_source=? AND latest_event_id IS ?""",
+                (_utc_now_iso(), _radio_device_id(expected.radio_profile_id), expected.state,
+                 expected.hold_until_utc, _manual_target_to_json(expected.manual_target),
+                 expected.updated_at_utc, expected.reason_code, expected.operator_source,
+                 expected.latest_event_id),
+            )
+            conn.commit()
+            return bool(cur.rowcount)
 
     def save_state(self, state: SchedulerManualControlState) -> SchedulerManualControlState:
         device_id = _radio_device_id(state.radio_profile_id)

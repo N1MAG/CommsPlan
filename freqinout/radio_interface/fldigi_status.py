@@ -108,8 +108,9 @@ class FldigiLogStatusClient:
         status_cache_ttl_seconds: float = 1.0,
         path_cache_ttl_seconds: float = 3.0,
         max_read_bytes: int = 1_048_576,
+        settings: Optional[object] = None,
     ) -> None:
-        self.settings = SettingsManager()
+        self.settings = settings if settings is not None else SettingsManager()
         self.hold_seconds = int(hold_seconds)
         self.flmsg_hold_seconds = int(flmsg_hold_seconds)
         self.flamp_hold_seconds = int(flamp_hold_seconds)

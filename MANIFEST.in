@@ -9,14 +9,20 @@ include FreqInOut.spec
 include build_executable.py
 include installer.iss
 include install_freqinout.py
+include install-commsplan.sh
 include install_FreqInOut_linux.sh
 include uninstall_FreqInOut_linux.sh
 include start-freqinout.sh
 include start-freqinout.cmd
+include start-commsplan.sh
+include start-commsplan.cmd
+include start-commsplan-migration.py
 include start-multi-rig.sh
 include start-multi-rig.cmd
 include docs/guide.html
 include docs/Installation.md
+include docs/CommsPlan-migration.md
+include docs/CommsPlan-macos-upgrade.txt
 include docs/FreqInOut-linux-installer.md
 include packaging/build-requirements.txt
 include packaging/build_linux_deb.py
@@ -28,7 +34,7 @@ include packaging/verify_release_inputs.py
 recursive-include docs/images/readme-2.0 *.jpg
 recursive-include freqinout *.py *.qml
 recursive-include freqinout/resources/spotter_forms *.txt
-recursive-include assets *.png *.ico *.svg
+recursive-include assets *.png *.ico *.icns *.svg
 recursive-include config/leaflet *.css *.js *.geojson
 recursive-include config/net_resources *.json
 recursive-include config/propagation *.db *.json

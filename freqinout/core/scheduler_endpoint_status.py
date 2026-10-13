@@ -75,6 +75,9 @@ class EndpointStatusSnapshot:
     js8_busy: bool = False
     js8_frequency_hz: Optional[int] = None
     js8_offset_hz: Optional[int] = None
+    fldigi_available: bool = False
+    fldigi_mode: Optional[str] = None
+    fldigi_offset_hz: Optional[int] = None
     varac_status_fields: FrozenFields = ()
     error_fields: FrozenFields = ()
     stale: bool = True
@@ -85,6 +88,11 @@ class EndpointStatusSnapshot:
     invalidated: bool = False
     closed: bool = False
     source: str = ""
+    activity_collected_monotonic: float = 0.0
+    activity_known: bool = False
+    # Presentation-only history; safety consumers continue to use fields above.
+    # Individual observation times prevent partial reads from renewing companions.
+    display_observation_fields: FrozenFields = ()
 
     def __post_init__(self) -> None:
         if int(self.generation) < 0:
@@ -98,6 +106,7 @@ class EndpointStatusSnapshot:
         object.__setattr__(self, "vfo", _as_vfo(self.vfo))
         object.__setattr__(self, "varac_status_fields", tuple(self.varac_status_fields or ()))
         object.__setattr__(self, "error_fields", tuple(self.error_fields or ()))
+        object.__setattr__(self, "display_observation_fields", tuple(self.display_observation_fields or ()))
         object.__setattr__(self, "source", str(self.source or "").strip())
 
     @property
@@ -139,6 +148,9 @@ class EndpointStatusSnapshot:
             "js8_busy": self.js8_busy,
             "js8_frequency_hz": self.js8_frequency_hz,
             "js8_offset_hz": self.js8_offset_hz,
+            "fldigi_available": self.fldigi_available,
+            "fldigi_mode": self.fldigi_mode,
+            "fldigi_offset_hz": self.fldigi_offset_hz,
             "varac_status": self.varac_status,
             "errors": self.errors,
             "stale": self.stale,
@@ -149,6 +161,9 @@ class EndpointStatusSnapshot:
             "invalidated": self.invalidated,
             "closed": self.closed,
             "source": self.source,
+            "activity_collected_monotonic": self.activity_collected_monotonic,
+            "activity_known": self.activity_known,
+            "display_observations": thaw_fields(self.display_observation_fields),
         }
 
 
@@ -327,6 +342,7 @@ class _EndpointStatusLane:
                 invalidated=True,
                 timed_out=False,
                 error_fields=(),
+                display_observation_fields=(),
             )
 
     def publish(
@@ -351,6 +367,11 @@ class _EndpointStatusLane:
             # cannot overwrite the inline endpoint read.
             self._token += 1
             self._completion = None
+            # Keep physical I/O serialized, but detach publication ownership.
+            # A later refresh queues behind this read instead of coalescing
+            # against a completion that can no longer publish fresh status.
+            self._future = None
+            self._started_monotonic = 0.0
             now_mono = self._monotonic_clock()
             error_fields = _error_fields(raw.get("errors"))
             if error_fields:
@@ -369,6 +390,7 @@ class _EndpointStatusLane:
                     backoff_until_monotonic=self._backoff_until,
                     error_fields=error_fields,
                     source=source,
+                    display_observation_fields=self._display_observations_from_raw_locked(raw, now_mono),
                 )
                 return self._snapshot
             self._failure_count = 0
@@ -388,7 +410,9 @@ class _EndpointStatusLane:
             self._closed = True
             self._token += 1
             future = self._future
-            self._snapshot = self._replace_snapshot_locked(closed=True, stale=True, inflight=False)
+            self._snapshot = self._replace_snapshot_locked(
+                closed=True, stale=True, inflight=False, display_observation_fields=(),
+            )
             if cancel_futures and future is not None and not future.done():
                 try:
                     future.cancel()
@@ -436,12 +460,17 @@ class _EndpointStatusLane:
         completion: Optional[StatusCompletion] = None
         snapshot: Optional[EndpointStatusSnapshot] = None
         with self._lock:
-            if self._future is done:
+            owns_request = self._future is done
+            if owns_request:
                 self._future = None
             if self._closed:
                 return
             if token != self._token:
-                self._snapshot = self._replace_snapshot_locked(inflight=False)
+                if owns_request:
+                    # Timeout/invalidation fenced this request, with no newer
+                    # owner. Retire its inflight marker without touching a
+                    # replacement poll or authoritative publish.
+                    self._snapshot = self._replace_snapshot_locked(inflight=False)
                 return
             now_mono = self._monotonic_clock()
             if error_fields:
@@ -459,6 +488,7 @@ class _EndpointStatusLane:
                     failure_count=self._failure_count,
                     backoff_until_monotonic=self._backoff_until,
                     error_fields=error_fields,
+                    display_observation_fields=self._display_observations_from_raw_locked(raw, now_mono),
                 )
             else:
                 self._failure_count = 0
@@ -493,6 +523,8 @@ class _EndpointStatusLane:
         collected_monotonic: float,
         source: str,
     ) -> EndpointStatusSnapshot:
+        previous = self._snapshot
+        has_activity = any(key in raw for key in ("js8_busy", "varac_status"))
         return EndpointStatusSnapshot(
             endpoint_key=self.endpoint_key,
             generation=generation,
@@ -502,11 +534,14 @@ class _EndpointStatusLane:
             ptt_active=bool(raw.get("ptt_active", False)),
             ptt_known=bool(raw.get("ptt_known", False)),
             vfo=_as_vfo(raw.get("vfo")),
-            js8_busy=bool(raw.get("js8_busy", False)),
+            js8_busy=bool(raw.get("js8_busy", previous.js8_busy)),
             js8_frequency_hz=_as_positive_int(raw.get("js8_frequency_hz")),
             js8_offset_hz=self._optional_int(raw.get("js8_offset_hz")),
+            fldigi_available=bool(raw.get("fldigi_available", False)),
+            fldigi_mode=str(raw.get("fldigi_mode") or "").strip().upper() or None,
+            fldigi_offset_hz=self._optional_int(raw.get("fldigi_offset_hz")),
             varac_status_fields=freeze_fields(
-                raw.get("varac_status") if isinstance(raw.get("varac_status"), Mapping) else {}
+                raw.get("varac_status") if isinstance(raw.get("varac_status"), Mapping) else previous.varac_status
             ),
             error_fields=(),
             stale=False,
@@ -517,7 +552,50 @@ class _EndpointStatusLane:
             invalidated=False,
             closed=False,
             source=source,
+            activity_collected_monotonic=collected_monotonic if has_activity else previous.activity_collected_monotonic,
+            activity_known=bool(raw.get("activity_known", False)) if has_activity else previous.activity_known,
+            display_observation_fields=self._display_observations_from_raw_locked(raw, collected_monotonic),
         )
+
+    def _display_observations_from_raw_locked(
+        self, raw: Mapping[str, object], collected_monotonic: float,
+    ) -> FrozenFields:
+        """Keep bounded successful field history without changing safety evidence."""
+        observations = thaw_fields(self._snapshot.display_observation_fields)
+        errors = raw.get("errors") if isinstance(raw.get("errors"), Mapping) else {}
+        fields = (
+            "frequency_hz", "ptt_active", "vfo", "js8_frequency_hz",
+            "js8_offset_hz", "js8_busy", "fldigi_available", "fldigi_mode",
+            "fldigi_offset_hz", "varac_status",
+        )
+        for key in fields:
+            if key not in raw or raw[key] is None or raw[key] == "":
+                continue
+            if any(str(error).lower() in {"poll", "timeout"} for error in errors):
+                continue
+            domain = ("fldigi" if key.startswith("fldigi") else "js8" if key.startswith("js8")
+                      else "varac" if key == "varac_status" else "rig")
+            if any(domain in str(error).lower() for error in errors):
+                continue
+            if key in {"js8_busy", "varac_status"} and "companion_busy" in errors:
+                continue
+            if key == "ptt_active" and not raw.get("ptt_known"):
+                continue
+            if key in {"fldigi_mode", "fldigi_offset_hz"} and not raw.get("fldigi_available"):
+                continue
+            value = raw[key]
+            if key.endswith("frequency_hz"):
+                value = _as_positive_int(value)
+                if value is None:
+                    continue
+            if key.endswith("offset_hz"):
+                value = self._optional_int(value)
+                if value is None:
+                    continue
+            if key == "varac_status" and not isinstance(value, Mapping):
+                continue
+            observations[key] = {"value": value, "collected_monotonic": collected_monotonic}
+        return freeze_fields(observations)
 
     def _backoff_for_failure_locked(self) -> float:
         return bounded_exponential_backoff(
@@ -527,32 +605,9 @@ class _EndpointStatusLane:
         )
 
     def _replace_snapshot_locked(self, **values: object) -> EndpointStatusSnapshot:
-        previous = self._snapshot
-        payload = {
-            "endpoint_key": previous.endpoint_key,
-            "generation": previous.generation,
-            "collected_wall_time": previous.collected_wall_time,
-            "collected_monotonic": previous.collected_monotonic,
-            "frequency_hz": previous.frequency_hz,
-            "ptt_active": previous.ptt_active,
-            "ptt_known": previous.ptt_known,
-            "vfo": previous.vfo,
-            "js8_busy": previous.js8_busy,
-            "js8_frequency_hz": previous.js8_frequency_hz,
-            "js8_offset_hz": previous.js8_offset_hz,
-            "varac_status_fields": previous.varac_status_fields,
-            "error_fields": previous.error_fields,
-            "stale": previous.stale,
-            "inflight": previous.inflight,
-            "timed_out": previous.timed_out,
-            "backoff_until_monotonic": previous.backoff_until_monotonic,
-            "failure_count": previous.failure_count,
-            "invalidated": previous.invalidated,
-            "closed": previous.closed,
-            "source": previous.source,
-        }
-        payload.update(values)
-        return EndpointStatusSnapshot(**payload)
+        # Preserve companion fields and their original freshness when changing
+        # lane lifecycle flags; a status refresh cannot manufacture new reads.
+        return replace(self._snapshot, **values)
 
 
 class EndpointStatusRegistry:

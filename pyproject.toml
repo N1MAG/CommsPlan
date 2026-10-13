@@ -5,8 +5,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "freqinout"
-version = "2.0.4"
-description = "HF Radio Frequency and Net Control Utility"
+version = "2.0.5"
+description = "CommsPlan HF radio operations console"
 readme = "README.md"
 authors = [{ name = "Bill Daniel" }]
 license = { text = "GPL-3.0-only" }
@@ -27,6 +27,7 @@ dependencies = [
 ]
 
 [project.scripts]
+commsplan = "freqinout.main:main"
 freqinout = "freqinout.main:main"
 
 [project.optional-dependencies]

@@ -190,7 +190,7 @@ class SdrppRigctlReceiverControl:
                     raise ReceiverControlError("SDR++ receiver control closed during command.") from exc
                 raise ReceiverControlError(f"SDR++ RigCTL command failed: {exc}") from exc
             if sent <= 0:
-                raise ReceiverControlError("SDR++ RigCTL closed while FIO was sending a receive-only command.")
+                raise ReceiverControlError("SDR++ RigCTL closed while CommsPlan was sending a receive-only command.")
             offset += sent
 
     def _read_lines(
@@ -222,7 +222,7 @@ class SdrppRigctlReceiverControl:
                 if len(lines) >= minimum_lines and maximum_lines == minimum_lines:
                     return tuple(lines)
             if len(data) >= _MAX_LINE_BYTES or len(data) + sum(len(item) for item in lines) >= _MAX_RESPONSE_BYTES:
-                raise ReceiverControlError("SDR++ RigCTL response exceeded FIO's safe size limit.")
+                raise ReceiverControlError("SDR++ RigCTL response exceeded CommsPlan's safe size limit.")
             try:
                 sock.settimeout(self._socket_timeout(deadline))
                 chunk = sock.recv(min(1024, _MAX_RESPONSE_BYTES - len(data)))
@@ -238,7 +238,7 @@ class SdrppRigctlReceiverControl:
                 raise ReceiverControlError("SDR++ RigCTL closed before returning a complete response.")
             data.extend(chunk)
             if len(data) > _MAX_RESPONSE_BYTES:
-                raise ReceiverControlError("SDR++ RigCTL response exceeded FIO's safe size limit.")
+                raise ReceiverControlError("SDR++ RigCTL response exceeded CommsPlan's safe size limit.")
 
     @staticmethod
     def _require_rprt_ok(lines: Sequence[str], operation: str) -> None:
@@ -662,7 +662,7 @@ def receiver_control_client_from_profile(
     if device_class != "observer":
         return ManualReceiverControl(identity, guidance="Only an observer / SDR profile can use receive-only application control.")
     if adapter != SDRPP_RIGCTL_ADAPTER_ID:
-        return ManualReceiverControl(identity, guidance="FIO has no enabled receive-only adapter for this SDR configuration; tune it manually.")
+        return ManualReceiverControl(identity, guidance="CommsPlan has no enabled receive-only adapter for this SDR configuration; tune it manually.")
     host = _clean(profile.get("sdr_host"))
     target = _clean(profile.get("sdr_target"))
     try:
@@ -672,7 +672,7 @@ def receiver_control_client_from_profile(
     if not host or not target or not port:
         return ManualReceiverControl(
             identity,
-            guidance="Configure SDR++ RigCTL host, port, and the selected SDR++ VFO label before enabling FIO tuning.",
+            guidance="Configure SDR++ RigCTL host, port, and the selected SDR++ VFO label before enabling CommsPlan tuning.",
         )
     return SdrppRigctlReceiverControl(
         identity,

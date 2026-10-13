@@ -137,52 +137,58 @@ def normalize_meshcore_node(
     adapter_id: str,
     transport: str = "meshcore",
 ) -> MeshNode | None:
-    node_id = _single_line(
-        raw.get("node_id")
-        or raw.get("nodeId")
-        or raw.get("id")
-        or raw.get("pubKeyPrefix")
-        or raw.get("pub_key_prefix")
-        or raw.get("publicKey")
-        or raw.get("public_key")
-    )
-    public_key = _single_line(raw.get("publicKey") or raw.get("public_key"))
+    node_id = _identity_string(_first_non_none(
+        raw.get("node_id"), raw.get("nodeId"), raw.get("id"),
+        raw.get("pubKeyPrefix"), raw.get("pub_key_prefix"),
+        raw.get("publicKey"), raw.get("public_key"),
+    ))
+    public_key = _identity_string(_first_non_none(raw.get("publicKey"), raw.get("public_key")))
     if public_key:
         node_id = node_id or public_key[:12]
     if not node_id:
         return None
     position = _mapping_value(raw, "position", "location", "gps")
-    lat = _coerce_float(
-        raw.get("lat")
-        or raw.get("latitude")
-        or raw.get("advLat")
-        or (position.get("lat") or position.get("latitude") if position else None)
-    )
-    lon = _coerce_float(
-        raw.get("lon")
-        or raw.get("lng")
-        or raw.get("longitude")
-        or raw.get("advLon")
-        or (position.get("lon") or position.get("lng") or position.get("longitude") if position else None)
-    )
-    if raw.get("advLat") is not None and abs(lat or 0) > 180:
+    lat_key, lat_value = _first_mapping_item(raw, ("lat", "latitude")) or (
+        _first_mapping_item(position, ("lat", "latitude"))
+        if position else None
+    ) or (
+        None if any(key in raw for key in ("lat", "latitude"))
+        else _first_mapping_item(raw, ("advLat", "adv_lat"))
+    ) or ("", None)
+    lon_key, lon_value = _first_mapping_item(raw, ("lon", "lng", "longitude")) or (
+        _first_mapping_item(position, ("lon", "lng", "longitude"))
+        if position else None
+    ) or (
+        None if any(key in raw for key in ("lon", "lng", "longitude"))
+        else _first_mapping_item(raw, ("advLon", "adv_lon"))
+    ) or ("", None)
+    lat = _coerce_float(lat_value)
+    lon = _coerce_float(lon_value)
+    adv_lat_selected = lat_key in {"advLat", "adv_lat"}
+    adv_lon_selected = lon_key in {"advLon", "adv_lon"}
+    if adv_lat_selected and abs(lat or 0) > 180:
         lat = (lat or 0) / 1_000_000
-    if raw.get("advLon") is not None and abs(lon or 0) > 180:
+    if adv_lon_selected and abs(lon or 0) > 180:
         lon = (lon or 0) / 1_000_000
-    if lat == 0 and lon == 0:
+    explicit_lat_lon = any(key in raw for key in ("lat", "latitude")) or any(
+        key in position for key in ("lat", "latitude")
+    ) or any(key in raw for key in ("advLat", "adv_lat"))
+    explicit_lon = any(key in raw for key in ("lon", "lng", "longitude")) or any(
+        key in position for key in ("lon", "lng", "longitude")
+    ) or any(key in raw for key in ("advLon", "adv_lon"))
+    if lat == 0 and lon == 0 and not (explicit_lat_lon and explicit_lon):
         lat = None
         lon = None
-    name = _single_line(
-        raw.get("name")
-        or raw.get("advName")
-        or raw.get("adv_name")
-        or raw.get("longName")
-        or raw.get("long_name")
-    )
+    name = _single_line(_first_non_none(
+        raw.get("name"), raw.get("advName"), raw.get("adv_name"),
+        raw.get("longName"), raw.get("long_name"),
+    ))
     short_name = _single_line(raw.get("shortName") or raw.get("short_name"))
     callsign = _single_line(raw.get("callsign") or raw.get("callSign") or _callsign_from_name(name))
-    hop_count = _meshcore_path_len_to_hops(raw.get("hop_count") or raw.get("hopCount") or raw.get("outPathLen") or raw.get("pathLen"))
-    direct_receive = _coerce_bool(raw.get("direct_receive") or raw.get("directReceive"))
+    hop_count = _meshcore_path_len_to_hops(_first_non_none(
+        raw.get("hop_count"), raw.get("hopCount"), raw.get("pathLen"), raw.get("path_len")
+    ))
+    direct_receive = _coerce_bool(_first_non_none(raw.get("direct_receive"), raw.get("directReceive")))
     if direct_receive is None and hop_count is not None:
         direct_receive = hop_count == 0
     route_type = _single_line(raw.get("route_type") or raw.get("routeType"))
@@ -197,7 +203,10 @@ def normalize_meshcore_node(
         public_key_or_hash=public_key,
         callsign=callsign,
         role=_single_line(raw.get("role") or raw.get("type")),
-        last_heard=_coerce_datetime(raw.get("last_heard") or raw.get("lastHeard") or raw.get("lastAdvert") or raw.get("last_seen")),
+        last_heard=_coerce_datetime(_first_non_none(
+            raw.get("last_heard"), raw.get("lastHeard"), raw.get("last_advert"),
+            raw.get("lastAdvert"), raw.get("last_seen"),
+        )),
         hop_count=hop_count,
         route_type=route_type,
         direct_receive=direct_receive,
@@ -205,11 +214,11 @@ def normalize_meshcore_node(
         path_hops=_string_tuple(raw.get("path_hops") or raw.get("pathHops")),
         snr=_coerce_float(raw.get("snr")),
         rssi=_coerce_float(raw.get("rssi")),
-        battery_percent=_coerce_float(raw.get("battery_percent") or raw.get("batteryPercent") or raw.get("battery")),
+        battery_percent=_coerce_float(_first_non_none(raw.get("battery_percent"), raw.get("batteryPercent"), raw.get("battery"))),
         lat=lat,
         lon=lon,
         grid=_single_line(raw.get("grid") or raw.get("locator") or raw.get("maidenhead")).upper(),
-        raw=raw,
+        raw=_node_raw_with_outgoing_route(raw),
     )
 
 
@@ -391,6 +400,8 @@ def _normalize_channel_message(
         hop_count=hop_count,
         route_type="direct" if hop_count == 0 else ("mesh" if hop_count is not None else ""),
         direct_receive=True if hop_count == 0 else (False if hop_count is not None else None),
+        snr=_coerce_float(_first_non_none(value.get("snr"), value.get("snr_db"))),
+        rssi=_coerce_float(_first_non_none(value.get("rssi"), value.get("rssi_dbm"))),
         raw=raw,
     )
 
@@ -442,6 +453,8 @@ def _normalize_contact_message(
         hop_count=hop_count,
         route_type="direct" if hop_count == 0 else ("mesh" if hop_count is not None else ""),
         direct_receive=True if hop_count == 0 else (False if hop_count is not None else None),
+        snr=_coerce_float(_first_non_none(value.get("snr"), value.get("snr_db"))),
+        rssi=_coerce_float(_first_non_none(value.get("rssi"), value.get("rssi_dbm"))),
         raw=raw,
     )
 
@@ -522,6 +535,91 @@ def _meshcore_path_len_to_hops(value: object) -> int | None:
     if raw == -1:
         return 0
     return meshcore_companion_path_len_to_hops(raw)
+
+
+def _first_non_none(*values: object) -> object | None:
+    """Return the first present value without treating numeric zero as absent."""
+    return next((value for value in values if value is not None), None)
+
+
+def _identity_string(value: object) -> str:
+    if isinstance(value, memoryview):
+        value = value.tobytes()
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).hex()
+    return _single_line(value)
+
+
+def _first_mapping_item(mapping: Mapping[str, object], keys: Sequence[str]) -> tuple[str, object] | None:
+    for key in keys:
+        if key in mapping and mapping[key] is not None:
+            return key, mapping[key]
+    return None
+
+
+def _node_raw_with_outgoing_route(raw: Mapping[str, object]) -> dict[str, object]:
+    enriched = dict(raw)
+    if not any(key in raw for key in ("outPathLen", "out_path_len")):
+        return enriched
+    path_len = _first_non_none(raw.get("outPathLen"), raw.get("out_path_len"))
+    route: dict[str, object] = {
+        "known": False,
+        "hop_count": None,
+        "hash_size": None,
+        "path_hops": (),
+        "updated_utc": "",
+    }
+    encoded = _coerce_int(path_len)
+    # 0xFF/-1 is OUT_PATH_UNKNOWN for a contact's outgoing route. This differs
+    # from the same byte in a received message, where it denotes direct receive.
+    if encoded is not None and encoded not in {-1, 0xFF} and 0 <= encoded <= 0xFF:
+        hop_count = encoded & 0x3F
+        hash_size = (encoded >> 6) + 1
+        expected_bytes = hop_count * hash_size
+        if hash_size <= 3 and expected_bytes <= 64:
+            path_value = _first_non_none(raw.get("outPath"), raw.get("out_path"))
+            path_bytes = b"" if expected_bytes == 0 else _path_bytes(path_value)
+            if path_bytes is not None and len(path_bytes) >= expected_bytes:
+                hops = tuple(
+                    path_bytes[offset : offset + hash_size].hex()
+                    for offset in range(0, expected_bytes, hash_size)
+                )
+                route.update(
+                    known=True,
+                    hop_count=hop_count,
+                    hash_size=hash_size,
+                    path_hops=hops,
+                )
+    updated = _first_non_none(
+        raw.get("updated_utc"), raw.get("updatedUtc"), raw.get("last_mod"),
+        raw.get("lastMod"), raw.get("lastmod"), raw.get("last_advert"), raw.get("lastAdvert"),
+    )
+    stamp = _coerce_datetime(updated)
+    if stamp is not None:
+        route["updated_utc"] = stamp.astimezone(timezone.utc).isoformat()
+    enriched["outgoing_route"] = route
+    return enriched
+
+
+def _path_bytes(value: object) -> bytes | None:
+    if isinstance(value, memoryview):
+        return value.tobytes()
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value)
+    if isinstance(value, Sequence) and not isinstance(value, str):
+        try:
+            return bytes(int(part) for part in value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+    text = _single_line(value).lower().replace("0x", "").replace(":", "").replace(" ", "")
+    if not text:
+        return b""
+    if len(text) % 2:
+        return None
+    try:
+        return bytes.fromhex(text)
+    except ValueError:
+        return None
 
 
 def _string_tuple(value: object) -> tuple[str, ...]:

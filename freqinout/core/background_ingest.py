@@ -110,6 +110,31 @@ class _DeviceProfileVaultSettings:
                 log.debug("BackgroundIngest: failed to persist VarAC vault profile state: %s", exc)
 
 
+class _DeviceProfileGuardSettings(_DeviceProfileVaultSettings):
+    """Keep inbound guard policy/path/state scoped to one active radio."""
+    @property
+    def db_path(self):
+        return self.fallback_settings.db_path
+
+    def get(self, key, default=None):
+        if key in {"varac_guard_state_v1", "varac_guard_last_summary"}:
+            return self.fallback_settings.get(f"{key}:radio:{self.profile['id']}", default)
+        if key in {"varac_guard_allow_bbs_allowed_callsigns", "varac_guard_allow_operator_trusted"}:
+            value = self.profile.get(key)
+            if value is None:
+                return self.fallback_settings.get(key, default)
+            return str(value).strip().casefold() not in {"", "0", "false", "off", "no"}
+        if key == "varac_guard_access_policy_v1":
+            return self.profile.get(key) or ""
+        return super().get(key, default)
+
+    def set(self, key, value):
+        if key in {"varac_guard_state_v1", "varac_guard_last_summary"}:
+            self.fallback_settings.set(f"{key}:radio:{self.profile['id']}", value)
+            return
+        super().set(key, value)
+
+
 class BackgroundIngestController(QObject):
     """
     Background, non-UI data ingest to keep DBs warm for fast tab activation.
@@ -822,21 +847,21 @@ class BackgroundIngestController(QObject):
             self._source_skip_reasons.pop(key, None)
 
     def _ingest_js8_links(self, *, force: bool = False) -> None:
-        decision = self._source_backed_refresh_decision(
-            job_name="js8_links",
-            family="js8call",
-            source_types=("file",),
-            force=force,
-            max_quiet_sec=900.0,
-        )
-        if not decision.should_run:
-            self._job_refresh_decisions["js8_links"] = decision.as_dict()
-            self._record_job_skip("js8_links", decision.reason)
-            self._job_refresh_skip_reasons["js8_links"] = decision.reason
-            log.debug("BackgroundIngest: skipping JS8 links ingest; refresh fingerprint %s", decision.reason)
-            return
-
         def job() -> None:
+            decision = self._source_backed_refresh_decision(
+                job_name="js8_links",
+                family="js8call",
+                source_types=("file",),
+                force=force,
+                max_quiet_sec=900.0,
+            )
+            if not decision.should_run:
+                self._job_refresh_decisions["js8_links"] = decision.as_dict()
+                self._record_job_skip("js8_links", decision.reason)
+                self._job_refresh_skip_reasons["js8_links"] = decision.reason
+                log.debug("BackgroundIngest: skipping JS8 links ingest; refresh fingerprint %s", decision.reason)
+                return
+
             self._run_js8_links_job()
             self._job_refresh_fingerprints["js8_links"] = decision.fingerprint
             self._job_refresh_last_run_ts["js8_links"] = time.time()
@@ -953,28 +978,25 @@ class BackgroundIngestController(QObject):
         return inventory
 
     def _ingest_messages(self, *, include_observation_backfill: bool = True, force: bool = False) -> None:
-        decision = self._message_ingest_refresh_decision(
-            include_observation_backfill=include_observation_backfill,
-            force=force,
-        )
-        if not decision.should_run:
-            self._job_refresh_decisions["messages"] = decision.as_dict()
-            self._record_job_skip("messages", decision.reason)
-            self._job_refresh_skip_reasons["messages"] = decision.reason
-            log.debug("BackgroundIngest: skipping messages ingest; refresh fingerprint %s", decision.reason)
-            return
-
         def job() -> None:
+            decision = self._message_ingest_refresh_decision(
+                include_observation_backfill=include_observation_backfill,
+                force=force,
+            )
+            if not decision.should_run:
+                self._job_refresh_decisions["messages"] = decision.as_dict()
+                self._record_job_skip("messages", decision.reason)
+                self._job_refresh_skip_reasons["messages"] = decision.reason
+                log.debug("BackgroundIngest: skipping messages ingest; refresh fingerprint %s", decision.reason)
+                return
+
             self._run_messages_job(include_observation_backfill=include_observation_backfill)
             self._job_refresh_fingerprints["messages"] = decision.fingerprint
             self._job_refresh_last_run_ts["messages"] = time.time()
             self._job_refresh_decisions["messages"] = decision.as_dict()
             self._job_refresh_skip_reasons.pop("messages", None)
 
-        self._submit_job(
-            "messages",
-            job,
-        )
+        self._submit_job("messages", job)
 
     def _message_ingest_refresh_decision(
         self,
@@ -1006,27 +1028,27 @@ class BackgroundIngestController(QObject):
         )
 
     def _ingest_dynamic_expect(self, *, force: bool = False) -> None:
-        sources = tuple(
-            source
-            for source in self._runtime_ingest_inventory().sources_for_family("js8call")
-            if source.source_type == "file"
-            and str(source.metadata.get("role", "") or "") == "directed"
-        )
-        fingerprint = ingest_sources_fingerprint(
-            sources,
-            families=("js8call",),
-            source_types=("file",),
-        )
-        decision = plan_ingest_refresh(
-            fingerprint,
-            previous_fingerprint=self._job_refresh_fingerprints.get("dynamic_expect"),
-            last_run_ts=float(self._job_refresh_last_run_ts.get("dynamic_expect", 0.0) or 0.0),
-            force=force,
-        )
-        if not decision.should_run:
-            return
-
         def job() -> None:
+            sources = tuple(
+                source
+                for source in self._runtime_ingest_inventory().sources_for_family("js8call")
+                if source.source_type == "file"
+                and str(source.metadata.get("role", "") or "") == "directed"
+            )
+            fingerprint = ingest_sources_fingerprint(
+                sources,
+                families=("js8call",),
+                source_types=("file",),
+            )
+            decision = plan_ingest_refresh(
+                fingerprint,
+                previous_fingerprint=self._job_refresh_fingerprints.get("dynamic_expect"),
+                last_run_ts=float(self._job_refresh_last_run_ts.get("dynamic_expect", 0.0) or 0.0),
+                force=force,
+            )
+            if not decision.should_run:
+                return
+
             self._run_dynamic_expect_job()
             self._job_refresh_fingerprints["dynamic_expect"] = decision.fingerprint
             self._job_refresh_last_run_ts["dynamic_expect"] = time.time()
@@ -1668,21 +1690,21 @@ class BackgroundIngestController(QObject):
                 pass
 
     def _ingest_varac(self, *, force: bool = False) -> None:
-        decision = self._source_backed_refresh_decision(
-            job_name="varac",
-            family="varac",
-            source_types=("sqlite",),
-            force=force,
-            max_quiet_sec=600.0,
-        )
-        if not decision.should_run:
-            self._job_refresh_decisions["varac"] = decision.as_dict()
-            self._record_job_skip("varac", decision.reason)
-            self._job_refresh_skip_reasons["varac"] = decision.reason
-            log.debug("BackgroundIngest: skipping VarAC ingest; refresh fingerprint %s", decision.reason)
-            return
-
         def job() -> None:
+            decision = self._source_backed_refresh_decision(
+                job_name="varac",
+                family="varac",
+                source_types=("sqlite",),
+                force=force,
+                max_quiet_sec=600.0,
+            )
+            if not decision.should_run:
+                self._job_refresh_decisions["varac"] = decision.as_dict()
+                self._record_job_skip("varac", decision.reason)
+                self._job_refresh_skip_reasons["varac"] = decision.reason
+                log.debug("BackgroundIngest: skipping VarAC ingest; refresh fingerprint %s", decision.reason)
+                return
+
             self._run_varac_job()
             self._job_refresh_fingerprints["varac"] = decision.fingerprint
             self._job_refresh_last_run_ts["varac"] = time.time()
@@ -1990,9 +2012,28 @@ class BackgroundIngestController(QObject):
     def _run_varac_guard_job(self) -> None:
         worker_settings = self._new_worker_settings()
         try:
-            result = run_varac_guard(worker_settings)
-            if int(result.scanned_events or 0) > 0:
-                log.debug("BackgroundIngest: VarAC guard %s", result.summary)
+            profiles = self._active_varac_profiles()
+            # Preserve legacy station behavior when no active radio source exists.
+            if not profiles:
+                run_varac_guard(worker_settings)
+                return
+            store = MultiRadioStore(worker_settings.db_path)
+            from freqinout.core.varac_bbs_sync import _station_values
+            try:
+                station_callsigns = ",".join(_station_values(store)["allowed_callsigns"])
+            except Exception:
+                station_callsigns = None
+            for profile in profiles:
+                if not str(profile.get("varac_incoming_path") or "").strip():
+                    continue  # never act on another radio's fallback inbound folder
+                if station_callsigns is not None:
+                    profile = dict(profile, varac_bbs_allowed_callsigns=station_callsigns)
+                try:
+                    result = run_varac_guard(_DeviceProfileGuardSettings(profile, worker_settings, store))
+                    if int(result.scanned_events or 0) > 0:
+                        log.debug("BackgroundIngest: VarAC guard [%s] %s", profile.get("name"), result.summary)
+                except Exception as exc:
+                    log.debug("BackgroundIngest: VarAC guard [%s] failed: %s", profile.get("name"), exc)
         except Exception as e:
             log.debug("BackgroundIngest: VarAC guard failed: %s", e)
         finally:

@@ -49,6 +49,7 @@ from freqinout.core.guided_launch_recipes import (
     recipe_draft_updates,
     recipe_resolution_from_mapping,
     resolve_guided_launch_recipe,
+    settings_identity_mode_from_mapping,
 )
 from freqinout.core.varac_native_preparation import native_draft_fingerprint
 from freqinout.gui.current_page_stack import CurrentPageStack
@@ -69,10 +70,10 @@ _FAMILY_DETAILS = {
 }
 _FAMILY_FIELDS = {
     "js8call": frozenset(
-        {"instance_name", "ownership", "variant", "version", "rig_name", "host", "port", "udp_port", "application_path", "configuration_path", "storage_path", "launch_command", "launch_at_startup", "notes"}
+        {"instance_name", "ownership", "settings_identity_mode", "variant", "version", "rig_name", "host", "port", "udp_port", "offset_hz", "application_path", "configuration_path", "storage_path", "launch_command", "launch_at_startup", "notes"}
     ),
     "fast_light": frozenset(
-        {"instance_name", "ownership", "host", "port", "secondary_port", "arq_port", "application_path", "secondary_application_path", "flmsg_application_path", "flamp_application_path", "configuration_path", "secondary_configuration_path", "storage_path", "secondary_storage_path", "launch_command", "launch_at_startup", "advanced_tx_requested", "advanced_tx_acknowledged", "notes"}
+        {"instance_name", "ownership", "settings_identity_mode", "host", "port", "secondary_port", "arq_port", "application_path", "secondary_application_path", "flmsg_application_path", "flamp_application_path", "configuration_path", "secondary_configuration_path", "storage_path", "secondary_storage_path", "launch_command", "launch_at_startup", "advanced_tx_requested", "advanced_tx_acknowledged", "notes"}
     ),
     "varac": frozenset(
         {"instance_name", "ownership", "application_path", "configuration_path", "storage_path", "secondary_storage_path", "outbox_path", "working_directory", "cluster_path", "cluster_id", "cluster_name", "cluster_shared_database", "cluster_instance_number", "existing_standalone_node_id", "existing_standalone_device_profile_id", "existing_standalone_member_number", "email_gateway_sender_choice", "cluster_gateway", "cluster_ptt_lock", "launch_command", "launch_at_startup", "notes"}
@@ -80,18 +81,21 @@ _FAMILY_FIELDS = {
 }
 _FAMILY_FIELD_LABELS = {
     "js8call": {
+        "settings_identity_mode": "How should this radio use JS8Call settings?",
         "variant": "JS8Call variant",
         "version": "Verified application version",
         "rig_name": "JS8Call rig name",
         "host": "JS8Call API host",
         "port": "JS8Call TCP API port",
         "udp_port": "JS8Call UDP port",
+        "offset_hz": "Default audio offset (Hz)",
         "application_path": "JS8Call application",
         "configuration_path": "JS8Call profile/configuration folder",
         "storage_path": "JS8Call application-data folder",
         "launch_command": "Custom launch command (advanced)",
     },
     "fast_light": {
+        "settings_identity_mode": "How should this radio use the Fast Light applications?",
         "host": "Local service host",
         "port": "FLRig XML-RPC port",
         "secondary_port": "FLDigi XML-RPC port",
@@ -280,6 +284,7 @@ class SoftwareInstanceDraft:
     radio_role: str = "tx_rx"
     mode: str = "managed"
     ownership: str = "fio-managed"
+    settings_identity_mode: str = "isolated"
     variant: str = ""
     version: str = ""
     writer_platform: str = ""
@@ -287,6 +292,7 @@ class SoftwareInstanceDraft:
     host: str = "127.0.0.1"
     port: int = 0
     udp_port: int = 0
+    offset_hz: int = 0
     secondary_port: int = 0
     arq_port: int = 0
     rig_name: str = ""
@@ -415,6 +421,7 @@ class SoftwareInstanceDraft:
             "ownership": self.ownership,
             "management_mode": management_mode,
             "provenance": provenance,
+            "settings_identity_mode": self.settings_identity_mode,
             "variant": self.variant,
             "version": self.version,
             "writer_platform": self.writer_platform,
@@ -447,6 +454,7 @@ class SoftwareInstanceDraft:
             "host": self.host,
             "port": int(self.port or 0),
             "udp_port": int(self.udp_port or 0),
+            "offset_hz": int(self.offset_hz or 0),
             "secondary_port": int(self.secondary_port or 0),
             "arq_port": int(self.arq_port or 0),
             "rig_name": self.rig_name,
@@ -502,6 +510,7 @@ class SoftwareInstanceDraft:
                     "js8_variant_version": self.version,
                     "js8_tcp_port": int(self.port or 0),
                     "js8_udp_port": int(self.udp_port or 0),
+                    "js8_offset_hz": int(self.offset_hz or 0),
                     "js8_application_path": self.application_path,
                     "js8_profile_path": self.configuration_path,
                     "js8_data_path": self.storage_path,
@@ -617,6 +626,7 @@ def normalize_instance_draft(value: Mapping[str, Any] | SoftwareInstanceDraft) -
         radio_role=_text(row.get("radio_role") or row.get("device_class") or "tx_rx").lower(),
         mode=mode,
         ownership=ownership,
+        settings_identity_mode=settings_identity_mode_from_mapping(row, family_key=family),
         variant=_text(row.get("variant") or row.get("variant_family") or row.get("js8_variant_family")),
         version=_text(row.get("version") or row.get("variant_version") or row.get("js8_variant_version")),
         writer_platform=_text(row.get("writer_platform") or row.get("js8_writer_platform")),
@@ -624,6 +634,7 @@ def normalize_instance_draft(value: Mapping[str, Any] | SoftwareInstanceDraft) -
         host=_text(row.get("host") or "127.0.0.1"),
         port=_int(row.get("port") or row.get("js8_tcp_port") or row.get("flrig_port")) or 0,
         udp_port=_int(row.get("udp_port") or row.get("js8_udp_port")) or 0,
+        offset_hz=_int(row.get("offset_hz") or row.get("js8_offset_hz")) or 0,
         secondary_port=_int(row.get("secondary_port") or row.get("fldigi_port")) or 0,
         arq_port=_int(row.get("arq_port") or row.get("fldigi_arq_port")) or 0,
         rig_name=_text(row.get("rig_name") or row.get("js8_rig_name")),
@@ -799,7 +810,21 @@ def instance_conflicts(
     ):
         if port and not 1 <= port <= 65535:
             conflicts.append(InstanceConflict("port_invalid", "error", f"{port_name} port is invalid", "Use a port from 1 through 65535."))
-    if current.family_key == "js8call" and current.mode == "managed" and not current.rig_name:
+    if current.family_key == "js8call" and current.offset_hz and not 1800 <= current.offset_hz <= 2700:
+        conflicts.append(
+            InstanceConflict(
+                "js8_offset_invalid",
+                "error",
+                "JS8Call default offset is outside the supported range",
+                "Use an audio offset from 1800 through 2700 Hz.",
+            )
+        )
+    if (
+        current.family_key == "js8call"
+        and current.mode == "managed"
+        and current.settings_identity_mode == "isolated"
+        and not current.rig_name
+    ):
         severity = "error" if current.launch_at_startup else "warning"
         conflicts.append(InstanceConflict("rig_name_required", severity, "JS8 rig name is not set", "Each independently launched JS8Call instance needs a unique --rig-name."))
     if current.mode == "managed" and not current.application_path:
@@ -852,7 +877,11 @@ def instance_conflicts(
             if observer_mode
             else not current.configuration_path or not current.secondary_configuration_path
         )
-        if current.launch_at_startup and missing_launch_profile:
+        if (
+            current.launch_at_startup
+            and current.settings_identity_mode == "isolated"
+            and missing_launch_profile
+        ):
             conflicts.append(
                 InstanceConflict(
                     "fast_light_profile_required",
@@ -914,7 +943,7 @@ def instance_conflicts(
             and current.mode != "managed"
             and not current.launch_command
         ):
-            conflicts.append(InstanceConflict("cluster_launch_required", "error", "Cluster launch command is required", "Use an instance-specific VarAC launch command so FIO cannot start the default node by mistake."))
+            conflicts.append(InstanceConflict("cluster_launch_required", "error", "Cluster launch command is required", "Use an instance-specific VarAC launch command so CommsPlan cannot start the default node by mistake."))
         if current.cluster_path == "standalone" and (current.cluster_id or current.cluster_instance_number):
             conflicts.append(InstanceConflict("standalone_cluster_fields", "error", "Standalone VarAC has cluster fields", "Clear cluster identity and instance number or choose a cluster setup path."))
         if current.launch_at_startup and not current.working_directory:
@@ -932,6 +961,24 @@ def instance_conflicts(
         if current.imported_id and existing_id == current.imported_id:
             continue
         existing_name = _text(row.get("name") or row.get("instance_name"))
+        existing_family = _text(row.get("family_key") or row.get("family")).casefold()
+        if not existing_family:
+            existing_family = current.family_key
+        if (
+            current.family_key in {"js8call", "fast_light"}
+            and existing_family == current.family_key
+            and current.settings_identity_mode == "default"
+            and settings_identity_mode_from_mapping(row, family_key=current.family_key) == "default"
+        ):
+            family_label = "JS8Call" if current.family_key == "js8call" else "Fast Light"
+            conflicts.append(
+                InstanceConflict(
+                    "duplicate_default_settings_identity",
+                    "error",
+                    f"{family_label} default settings are already assigned",
+                    f"{existing_name or 'Another configured instance'} already uses the existing default {family_label} settings. Choose isolated settings for this radio or edit the current owner.",
+                )
+            )
         if wanted_name and existing_name.casefold() == wanted_name:
             conflicts.append(InstanceConflict("duplicate_name", "error", "Name already in use", f"{existing_name} already identifies another {current.family_key or 'software'} instance."))
         host, port = _endpoint(row)
@@ -948,7 +995,7 @@ def instance_conflicts(
                 conflicts.append(InstanceConflict("duplicate_secondary_endpoint", "error", "FLDigi endpoint already in use", f"{current.host}:{current.secondary_port} is already assigned to {existing_name or 'another instance'}."))
         existing_path = _text(row.get("application_path") or row.get("install_path") or row.get("path"))
         if wanted_path and existing_path and existing_path.casefold() == wanted_path:
-            conflicts.append(InstanceConflict("duplicate_path", "warning", "Application path is shared", "Two instances may share an executable, but verify that their profiles and data folders are separate."))
+            conflicts.append(InstanceConflict("duplicate_path", "warning", "Application path is shared", "Sharing an executable is expected. Confirm that this radio's selected settings identity and endpoints are correct."))
         current_paths = {
             path.casefold()
             for path in (
@@ -1038,6 +1085,7 @@ class SoftwareInstanceAssistant(QWidget):
         unsaved_radio_label: str = "",
         radio_role: str = "tx_rx",
         initial_draft: Mapping[str, Any] | SoftwareInstanceDraft | None = None,
+        editing_existing: bool = False,
         launch_recipe_resolution: GuidedLaunchRecipeResolution | Mapping[str, Any] | None = None,
         varac_native_presentation: VarACNativePresentation | Mapping[str, Any] | None = None,
         managed_root: str = "",
@@ -1060,6 +1108,7 @@ class SoftwareInstanceAssistant(QWidget):
         self._radios = tuple(dict(row) for row in radios if isinstance(row, Mapping))
         self._varac_clusters = tuple(dict(row) for row in varac_clusters if isinstance(row, Mapping))
         self._selected_radio_id = _int(selected_radio_id)
+        self._editing_existing = bool(editing_existing)
         self._unsaved_owner_key = _text(unsaved_owner_key)
         self._assistant_draft_owner_key = self._unsaved_owner_key or f"assistant-{uuid.uuid4().hex}"
         self._unsaved_radio_label = _text(unsaved_radio_label) or "Unsaved radio draft"
@@ -1124,6 +1173,13 @@ class SoftwareInstanceAssistant(QWidget):
                 }
             )
             self._set_draft(seeded)
+        if self._editing_existing:
+            self.title_label.setText("Edit software configuration")
+            self.guidance_label.setText(
+                "Edit this saved instance, review conflicts and affected launch details, then save it as one transaction."
+            )
+        if self._editing_existing and self._replacement_instance is not None:
+            self.replacement_checkbox.setChecked(True)
         if launch_recipe_resolution is not None:
             self.set_launch_recipe_resolution(launch_recipe_resolution)
         # A workspace-launched operation is intentionally scoped to exactly
@@ -1374,16 +1430,20 @@ class SoftwareInstanceAssistant(QWidget):
             return resolution.summary
         if draft.source_locked:
             return (
-                "Imported settings remain source-locked. FIO will not alter their "
+                "Imported settings remain source-locked. CommsPlan will not alter their "
                 "identity, endpoints, profiles, data paths, or launch details."
             )
         if draft.family_key == "varac":
             return (
-                "The selected arrangement remains a reviewed intent; FIO does not "
+                "The selected arrangement remains a reviewed intent; CommsPlan does not "
                 "create or join a cluster until the radio transaction is confirmed."
             )
         if draft.mode == "managed":
-            return "FIO will allocate a distinct local identity and retain existing configuration as review evidence."
+            if draft.settings_identity_mode == "default":
+                return (
+                    "CommsPlan will use the application's existing default settings and will not add a native profile selector."
+                )
+            return "CommsPlan will allocate a distinct local identity and retain existing configuration as review evidence."
         return "This source remains operator-managed until a reviewed, supported action is explicitly confirmed."
 
     def _prepared_existing_impact(self, draft: SoftwareInstanceDraft) -> str:
@@ -1703,11 +1763,11 @@ class SoftwareInstanceAssistant(QWidget):
         draft = self.draft()
         family = dict(SUPPORTED_INSTANCE_FAMILIES).get(draft.family_key, draft.family_key)
         mode = {
-            "managed": "New FIO-guided instance",
+            "managed": "New CommsPlan-guided instance",
             "discover": "Imported configuration",
             "remote": "Manual or remote configuration",
         }.get(draft.mode, draft.mode.replace("-", " ").title())
-        launch = "Launch with FIO" if draft.launch_at_startup else "Operator starts application"
+        launch = "Launch with CommsPlan" if draft.launch_at_startup else "Operator starts application"
         readiness = "Ready"
         if self._launch_recipe_resolution is not None:
             readiness = self._launch_recipe_resolution.status.replace("_", " ").title()
@@ -1735,7 +1795,7 @@ class SoftwareInstanceAssistant(QWidget):
         self.prepared_why_label.setText(f"Why: {self._prepared_why(draft)}")
         self.prepared_impact_label.setText(self._prepared_existing_impact(draft))
         self.prepared_safety_label.setText(
-            "Safety: FIO does not change an existing application, assignment, or "
+            "Safety: CommsPlan does not change an existing application, assignment, or "
             "third-party configuration until you review and explicitly confirm the final action."
         )
         self._update_varac_native_presentation(draft)
@@ -1839,7 +1899,7 @@ class SoftwareInstanceAssistant(QWidget):
         layout.addWidget(QLabel("Choose how this instance will be used. You can import a detected configuration or enter it manually."))
         self.source_buttons: dict[str, QRadioButton] = {}
         for key, text in (
-            ("managed", "Set up a new local instance (FIO-guided)"),
+            ("managed", "Set up a new local instance (CommsPlan-guided)"),
             ("discover", "Find or import an existing installation"),
             ("remote", "Connect to a manual or remote instance"),
         ):
@@ -1905,13 +1965,14 @@ class SoftwareInstanceAssistant(QWidget):
             "Identity: give this instance a distinct name and confirm who manages it.",
             (
                 ("instance_name", "Instance name", "A distinct name for this application instance"),
+                ("settings_identity_mode", "Settings use", "Choose existing default or separate settings"),
                 ("variant", "JS8Call variant", "Choose the exact installed JS8Call family"),
                 ("version", "Verified application version", "Exact version, for example 2.2.0"),
             ),
         )
         ownership = QComboBox()
         ownership.addItem(
-            "FIO-managed identity and launch (native settings only when exactly qualified)",
+            "CommsPlan-managed identity and launch (native settings only when exactly qualified)",
             "fio-managed",
         )
         ownership.addItem("Operator-managed (observe/import only)", "operator-managed")
@@ -1922,6 +1983,12 @@ class SoftwareInstanceAssistant(QWidget):
         ownership_label = QLabel("Ownership")
         self._field_labels["ownership"] = ownership_label
         self._active_form.addRow(ownership_label, ownership)
+        self.settings_identity_help_label = QLabel()
+        self.settings_identity_help_label.setObjectName("softwareInstanceSettingsIdentityHelp")
+        self.settings_identity_help_label.setAccessibleName("Settings identity explanation and preview")
+        self.settings_identity_help_label.setWordWrap(True)
+        self.settings_identity_help_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._active_form.insertRow(2, "What this means", self.settings_identity_help_label)
 
     def _build_connections_page(self) -> None:
         self._new_form_page(
@@ -1931,6 +1998,7 @@ class SoftwareInstanceAssistant(QWidget):
                 ("host", "FLRig/JS8 host", "127.0.0.1"),
                 ("port", "FLRig or JS8 TCP port", "TCP port"),
                 ("udp_port", "JS8 UDP port", "UDP port"),
+                ("offset_hz", "Default audio offset", "1800 through 2700 Hz"),
                 ("secondary_port", "FLDigi XML-RPC port", "TCP port"),
                 ("arq_port", "FLDigi ARQ port", "TCP port"),
             ),
@@ -1938,7 +2006,7 @@ class SoftwareInstanceAssistant(QWidget):
 
     def _build_files_page(self) -> None:
         self._new_form_page(
-            "Files: choose application executables and operator-owned paths. For a qualified FIO-managed JS8Call or Fast Light recipe, FIO derives profile and data roots from the stable instance identity and shows them in Launch and Review; unsupported recipes expose the Advanced path fields for recovery.",
+            "Files: choose application executables and operator-owned paths. For a qualified CommsPlan-managed JS8Call or Fast Light recipe, CommsPlan derives profile and data roots from the stable instance identity and shows them in Launch and Review; unsupported recipes expose the Advanced path fields for recovery.",
             (
                 ("application_path", "Application / FLRig path", "Path to the application or launcher"),
                 ("secondary_application_path", "FLDigi path", "Fast Light FLDigi application (optional)"),
@@ -2094,9 +2162,9 @@ class SoftwareInstanceAssistant(QWidget):
                 + (
                     "Operator starts this application"
                     if component.operator_starts
-                    else "Launch at FIO startup"
+                    else "Launch at CommsPlan startup"
                     if component.launch_at_startup
-                    else "Available for manual launch from FIO"
+                    else "Available for manual launch from CommsPlan"
                 )
             )
         return lines
@@ -2242,6 +2310,20 @@ class SoftwareInstanceAssistant(QWidget):
         self._update_prepared_presentation()
 
     def _add_line(self, key: str, label: str, placeholder: str) -> None:
+        if key == "settings_identity_mode":
+            combo = QComboBox()
+            combo.setObjectName("softwareInstanceSettingsIdentityMode")
+            combo.setAccessibleName("How this radio uses application settings")
+            combo.addItem("Use my current application settings", "default")
+            combo.addItem("Keep this radio's settings separate", "isolated")
+            combo.setCurrentIndex(1)
+            combo.currentIndexChanged.connect(self._on_settings_identity_changed)
+            self._field_widgets[key] = combo
+            label_widget = QLabel(label)
+            label_widget.setWordWrap(True)
+            self._field_labels[key] = label_widget
+            self._active_form.addRow(label_widget, combo)
+            return
         if key == "variant":
             combo = QComboBox()
             combo.setAccessibleName(label)
@@ -2361,7 +2443,7 @@ class SoftwareInstanceAssistant(QWidget):
             self.guidance_label.setText(
                 f"Set up one distinct {title.lower()} for the selected radio. "
                 + detail
-                + " Existing settings are evidence for review. FIO does not claim to write third-party application configuration unless a supported, explicit apply is provided."
+                + " Existing settings are evidence for review. CommsPlan does not claim to write third-party application configuration unless a supported, explicit apply is provided."
             )
             if getattr(self, "_family_locked", False):
                 self.family_scope_label.setText(
@@ -2652,8 +2734,89 @@ class SoftwareInstanceAssistant(QWidget):
                 widget = self._field_widgets.get(key)
                 if isinstance(widget, QCheckBox):
                     widget.setChecked(False)
+        default_identity = self._settings_identity_mode() == "default"
+        if self._family_key == "js8call" and default_identity:
+            rig_widget = self._field_widgets.get("rig_name")
+            rig_label = self._field_labels.get("rig_name")
+            if rig_widget is not None:
+                rig_widget.setVisible(False)
+            if rig_label is not None:
+                rig_label.setVisible(False)
+        self._sync_settings_identity_presentation()
         self.varac_cluster_why_label.setVisible(self._family_key == "varac")
         self._apply_launch_recipe_presentation()
+
+    def _settings_identity_mode(self) -> str:
+        widget = self._field_widgets.get("settings_identity_mode")
+        if isinstance(widget, QComboBox):
+            value = str(widget.currentData() or "").strip().lower()
+            if value in {"default", "isolated"}:
+                return value
+        return "isolated"
+
+    def _on_settings_identity_changed(self, _index: int) -> None:
+        if not self._loading_draft and not self._launch_recipe_resolution_supplied:
+            self._launch_recipe_resolution = None
+        self._sync_settings_identity_presentation()
+        self._sync_family_fields()
+        self._refresh_review_if_needed()
+
+    def _sync_settings_identity_presentation(self) -> None:
+        if not hasattr(self, "settings_identity_help_label"):
+            return
+        combo = self._field_widgets.get("settings_identity_mode")
+        supported = self._family_key in {"js8call", "fast_light"}
+        managed = any(
+            key == "managed" and button.isChecked()
+            for key, button in self.source_buttons.items()
+        )
+        shown = supported and managed
+        self.settings_identity_help_label.setVisible(shown)
+        if combo is not None:
+            combo.setVisible(shown)
+        label = self._field_labels.get("settings_identity_mode")
+        if label is not None:
+            label.setVisible(shown)
+        if not shown or not isinstance(combo, QComboBox):
+            return
+        if self._family_key == "js8call":
+            combo.setItemText(0, "Use my current JS8Call setup")
+            combo.setItemText(1, "Keep this radio's JS8Call setup separate")
+            if self._settings_identity_mode() == "default":
+                detail = (
+                    "Uses JS8Call's normal settings without a --rig-name selector. "
+                    "Best for the primary or only radio. Only one configured JS8Call instance can use this choice."
+                )
+            else:
+                detail = (
+                    "Uses a named JS8Call identity with separate settings and data. "
+                    "Required when multiple JS8Call radios run at the same time."
+                )
+        else:
+            combo.setItemText(0, "Use my current Fast Light setup")
+            combo.setItemText(1, "Keep this radio's Fast Light setup separate")
+            if self._settings_identity_mode() == "default":
+                detail = (
+                    "Uses the existing FLRig, FLDigi, FLMsg, and FLAmp settings without separate configuration folders. "
+                    "Best for the primary or only radio.\n"
+                    f"FLRig: existing settings · port {self._line_value('port') or 'not set'}\n"
+                    f"FLDigi: existing settings · port {self._line_value('secondary_port') or 'not set'}\n"
+                    "FLMsg/FLAmp: existing NBEMS workspace. Only one configured Fast Light instance can use this choice."
+                )
+            else:
+                detail = (
+                    "Uses separate settings folders, ports, logs, and message folders for this radio. "
+                    f"FLRig: separate settings · port {self._line_value('port') or 'not set'}\n"
+                    f"FLDigi: separate settings · port {self._line_value('secondary_port') or 'not set'}\n"
+                    "FLMsg/FLAmp: separate NBEMS workspace. Required when multiple radios run Fast Light applications simultaneously."
+                )
+        self.settings_identity_help_label.setText(detail)
+
+    def _line_value(self, key: str) -> str:
+        widget = self._field_widgets.get(key)
+        if isinstance(widget, QLineEdit):
+            return widget.text().strip()
+        return ""
 
     def _set_source_locked(self, locked: bool) -> None:
         """Keep imported identity fields immutable until the operator clones."""
@@ -2761,6 +2924,7 @@ class SoftwareInstanceAssistant(QWidget):
             if discover else
             "You can change these values later in Software Administration. Nothing is saved on this step."
         )
+        self._sync_settings_identity_presentation()
         self._update_prepared_presentation()
 
     def _import_selected_discovery(self) -> None:
@@ -2834,7 +2998,7 @@ class SoftwareInstanceAssistant(QWidget):
             elif _bool(row.get("provenance_unverified")):
                 evidence_lines.insert(
                     0,
-                    "Configuration provenance unverified. The durable radio link makes this existing bundle usable, but FIO does not claim native ownership.",
+                    "Configuration provenance unverified. The durable radio link makes this existing bundle usable, but CommsPlan does not claim native ownership.",
                 )
             item.setToolTip("\n".join(evidence_lines))
             self.discovery_list.addItem(item)
@@ -2993,6 +3157,7 @@ class SoftwareInstanceAssistant(QWidget):
             radio_role=self._radio_role,
             mode=next((key for key, button in self.source_buttons.items() if button.isChecked()), "managed"),
             ownership=str(self._field_widgets["ownership"].currentData() or "fio-managed"),
+            settings_identity_mode=value("settings_identity_mode") or "isolated",
             variant=value("variant"),
             version=value("version"),
             writer_platform=self._writer_platform,
@@ -3000,6 +3165,7 @@ class SoftwareInstanceAssistant(QWidget):
             host=value("host"),
             port=number("port"),
             udp_port=number("udp_port"),
+            offset_hz=number("offset_hz"),
             secondary_port=number("secondary_port"),
             arq_port=number("arq_port"),
             rig_name=value("rig_name"),
@@ -3079,7 +3245,7 @@ class SoftwareInstanceAssistant(QWidget):
                         "varac_native_prepare_required",
                         "error",
                         "Prepare VarAC before Review & Save",
-                        "Native VarAC configuration must be prepared and ready before FIO can review the final apply plan.",
+                        "Native VarAC configuration must be prepared and ready before CommsPlan can review the final apply plan.",
                     )
                 )
             if not native.writer_qualified:
@@ -3161,10 +3327,12 @@ class SoftwareInstanceAssistant(QWidget):
         if draft.family_key == "js8call":
             lines.extend(
                 (
+                    "Settings: Existing default JS8Call setup" if draft.settings_identity_mode == "default" else "Settings: Separate JS8Call setup for this radio",
                     f"Variant/version: {draft.variant or 'Not verified'} · {draft.version or 'Not verified'}",
-                    f"Rig name: {draft.rig_name or 'Not set'}",
+                    f"Rig name: {draft.rig_name}" if draft.settings_identity_mode == "isolated" and draft.rig_name else "Rig name: Not used (default JS8Call settings)" if draft.settings_identity_mode == "default" else "Rig name: Not set",
                     f"TCP API: {endpoint}",
                     f"UDP: {draft.host}:{draft.udp_port}" if draft.udp_port else "UDP: Not configured",
+                    f"Default audio offset: {draft.offset_hz} Hz" if draft.offset_hz else "Default audio offset: Not configured",
                 )
             )
             if not qualified_managed:
@@ -3176,6 +3344,11 @@ class SoftwareInstanceAssistant(QWidget):
                     )
                 )
         elif draft.family_key == "fast_light":
+            lines.append(
+                "Settings: Existing default Fast Light setup"
+                if draft.settings_identity_mode == "default"
+                else "Settings: Separate Fast Light setup for this radio"
+            )
             if draft.radio_role == "observer":
                 lines.extend(
                     (
@@ -3263,14 +3436,14 @@ class SoftwareInstanceAssistant(QWidget):
                     f"Arguments: {list(arguments) if arguments else 'None'}",
                     f"Working directory: {draft.working_directory or 'Not set'}",
                     f"Environment: {dict(native.launch_environment) if native.launch_environment else 'None'}",
-                    f"Launch at FIO startup: {'Yes' if draft.launch_at_startup else 'No'}",
+                    f"Launch at CommsPlan startup: {'Yes' if draft.launch_at_startup else 'No'}",
                 )
             )
         else:
             lines.extend(
                 (
                     f"Launch command: {draft.launch_command or 'Use configured application path'}",
-                    f"Launch at FIO startup: {'Yes' if draft.launch_at_startup else 'No'}",
+                    f"Launch at CommsPlan startup: {'Yes' if draft.launch_at_startup else 'No'}",
                 )
             )
         if draft.family_key == "varac" and self._varac_native_presentation.writer_qualified:
@@ -3319,7 +3492,13 @@ class SoftwareInstanceAssistant(QWidget):
         draft = self.draft()
         # Nested Software Administration returns a non-mutating canonical
         # bundle to Add Radio.  The parent owns the one final native apply.
-        final_action = "Save as draft" if self._unsaved_owner_key else "Add instance"
+        final_action = (
+            "Save as draft"
+            if self._unsaved_owner_key
+            else "Save configuration"
+            if self._editing_existing
+            else "Add instance"
+        )
         self.next_button.setText(final_action if self._step == last_step else "Next")
         blocked_for_radio = not self._selected_radio_id and not self._unsaved_owner_key
         blocked_for_replacement = self._replacement_instance is not None and not self._replacement_confirmed

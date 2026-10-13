@@ -222,7 +222,7 @@ def preflight_js8_send(
             issues.append(
                 JS8SendIssue(
                     "selected_target_present",
-                    f"JS8Call has selected target '{selected_call}'. Clear it or confirm before FIO sends.",
+                    f"JS8Call has selected target '{selected_call}'. Clear it or confirm before CommsPlan sends.",
                 )
             )
     except Exception as exc:

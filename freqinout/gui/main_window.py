@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import datetime
+from dataclasses import replace
 import json
+import math
 import re
 import sqlite3
 import sys
@@ -23,6 +25,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QCheckBox,
     QComboBox,
+    QSpinBox,
     QGroupBox,
     QMessageBox,
     QProgressDialog,
@@ -38,10 +41,12 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtGui import QPixmap, QIcon, QFontMetrics, QAction, QShortcut, QKeySequence
 from PySide6.QtWidgets import QApplication
-from PySide6.QtCore import QMetaObject, QSize, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QMetaObject, QSize, Qt, QThread, QTimer, Signal, Slot, QSettings
 from pathlib import Path
 
 from freqinout.core.logger import log
+from freqinout.core.product_identity import DISPLAY_NAME
+from freqinout.core.radio_operator_controls import SETTINGS_KEY as OPERATOR_CONTROLS_KEY, radio_choices, validated_timer_policy, POLICY_MODES, POLICY_INTERVALS
 from freqinout.core.logger import set_log_level
 from freqinout.core.config_paths import get_config_dir
 from freqinout.core.resource_catalog_migration import resource_catalog_authority_state
@@ -56,6 +61,12 @@ from freqinout.core.navigation_intent import NavigationIntent
 from freqinout.core.perf_metrics import emit_span, span as perf_span
 from freqinout.core.plan_context_service import PlanContextService
 from freqinout.core.settings_manager import SettingsManager
+from freqinout.core.operating_group_frequency import (
+    ensure_operating_group_frequency_keys,
+    format_frequency_mhz,
+    normalize_frequency_hz,
+    resolve_operating_group_frequency,
+)
 from freqinout.core.shared_state import ActionFeedbackEvent, ActionFeedbackService
 from freqinout.core.station_command_state import (
     manual_qsy_meta_for_radio as station_command_manual_qsy_meta_for_radio,
@@ -73,7 +84,12 @@ from freqinout.core.station_runtime_manager import (
     StationRuntimeManager,
     apply_endpoint_operational_summary,
 )
+from freqinout.core.hardware_lifecycle import shared_hardware_lifecycle_service
 from freqinout.core.scheduler_engine import SchedulerEngine
+from freqinout.gui.endpoint_display import (
+    project_endpoint_display, application_display_text, varac_display_text, display_activity_text,
+    fldigi_receive_active,
+)
 from freqinout.core.receiver_qualification_service import (
     QUALIFICATION_REQUEST_ID_FIELD,
     ReceiverQualificationCoordinator,
@@ -82,6 +98,7 @@ from freqinout.core.scheduler_coordination import EndpointResult
 from freqinout.core.background_ingest import BackgroundIngestController
 from freqinout.core.message_projection_maintenance import MessageProjectionMaintenanceService
 from freqinout.core.dependency_status_service import get_dependency_status_service, shutdown_dependency_status_service
+from freqinout.core.dependency_health import get_dependency_health_registry
 from freqinout.core.station_readiness import (
     build_station_readiness_report,
     format_readiness_issue,
@@ -158,7 +175,24 @@ from freqinout.gui.station_overview_tab import StationOverviewTab
 from freqinout.gui.station_health_tab import StationHealthTab
 from freqinout.gui.station_bbs_tab import StationBbsTab
 from freqinout.gui.fio_spotter_tab import FioSpotterTab
+from freqinout.gui.responsive_geometry import WindowScreenFitController, restore_full_window_geometry, save_full_window_geometry
+from freqinout.core.latest_read_cache import LatestReadCache
+from freqinout.gui.widget_updates import set_widget_value
+from freqinout.gui.radio_control_panel import (
+    RadioCardCallbacks,
+    RadioCardDisplay,
+    ResponsiveAwarenessRail,
+    RadioControlDockWindow,
+    RadioControlPanel,
+)
 from freqinout.gui.station_command_presenter import (
+    application_readback_text,
+    authority_text,
+    planned_transition_text,
+    compact_card_next_text,
+    radio_activity_state_text,
+    sop_action_text,
+    relevant_sop_actions,
     countdown_text as station_command_countdown_text,
     frequency_controls_available,
     next_action_state,
@@ -169,6 +203,7 @@ from freqinout.gui.station_command_presenter import (
     source_chip_text,
     timed_qsy_text,
 )
+from freqinout.core.sop_awareness import SopAwarenessCache, detached_sop_reader
 from freqinout.gui.qsy_helper import (
     build_qsy_options,
     load_operating_groups,
@@ -220,15 +255,26 @@ class ElidedLabel(QLabel):
 
     def _update_elided_text(self) -> None:
         width = max(24, int(self.width() or self.sizeHint().width() or 120) - 12)
-        text = QFontMetrics(self.font()).elidedText(self._full_text, Qt.ElideRight, width)
+        text = self.fontMetrics().elidedText(self._full_text, Qt.ElideRight, width)
         super().setText(text)
         if text != self._full_text and not self.toolTip():
             super().setToolTip(self._full_text)
 
 
+class ReadbackLabel(ElidedLabel):
+    """Prefer natural readback width while allowing compact-row elision."""
+
+    def sizeHint(self):
+        hint = super().sizeHint()
+        return QSize(self.fontMetrics().horizontalAdvance(self._full_text) + 14, hint.height())
+
+    def minimumSizeHint(self):
+        return self.sizeHint()
+
+
 class MainWindow(QMainWindow):
     """
-    Main application window for FreqInOut.
+    Main application window for CommsPlan.
 
     Tabs:
       - Settings
@@ -255,7 +301,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         # A packaged Windows process can expose the native QMainWindow surface
         # while its long constructor is still establishing child geometry,
-        # even though FIO has not called show() yet.  Keep that surface out of
+        # even though CommsPlan has not called show() yet.  Keep that surface out of
         # the compositor until main.py deliberately presents the finished
         # shell.  Other platforms retain their existing lifecycle.
         self._startup_surface_shielded = sys.platform == "win32"
@@ -356,6 +402,14 @@ class MainWindow(QMainWindow):
             ),
         )
         self.station_runtime_manager.sync_with_store(include_varac_sync_status=False)
+        self.hardware_lifecycle_service = shared_hardware_lifecycle_service(self.multi_radio_store)
+        self.hardware_lifecycle_service.add_listener(
+            self.station_runtime_manager.set_hardware_lifecycle_snapshot
+        )
+        cached_hardware = self.hardware_lifecycle_service.latest()
+        if cached_hardware is not None:
+            self.station_runtime_manager.set_hardware_lifecycle_snapshot(cached_hardware)
+        self.hardware_lifecycle_service.request_refresh()
         self._runtime_profile_signature: tuple[object, ...] | None = None
         self._active_runtime_profile = self._load_runtime_active_device_profile()
         try:
@@ -375,7 +429,7 @@ class MainWindow(QMainWindow):
         self._mesh_runtime_restart_pending = False
         self._mesh_runtime_stopping = False
         self._mesh_manager_dialog: QDialog | None = None
-        self.setWindowTitle(f"FreqInOut de N1MAG (v{__version__})")
+        self.setWindowTitle(f"{DISPLAY_NAME} de N1MAG (v{__version__})")
         self._set_window_icon()
 
         # Central widget with sidebar navigation + stacked pages
@@ -489,7 +543,7 @@ class MainWindow(QMainWindow):
             "Station Overview": self._create_station_overview_tab,
             "Station Health": self._create_station_health_tab,
             "Managed BBS": self._create_station_bbs_tab,
-            "FIO Spotter": self._create_fio_spotter_tab,
+            "CommsPlan Spotter": self._create_fio_spotter_tab,
             "Resources": self._create_resources_tab,
             "Shortwave": self._create_shortwave_tab,
             "HF Operators": self._create_operator_history_tab,
@@ -504,7 +558,7 @@ class MainWindow(QMainWindow):
             ("ControlFreq", self.controlfreq_tab),
             ("Station Overview", self._placeholder_widget("Station Overview")),
             ("Managed BBS", self._placeholder_widget("Managed BBS")),
-            ("FIO Spotter", self._placeholder_widget("FIO Spotter")),
+            ("CommsPlan Spotter", self._placeholder_widget("CommsPlan Spotter")),
             ("Resources", self._placeholder_widget("Resources")),
             ("Shortwave", self._placeholder_widget("Shortwave")),
             ("FreqPlanner", self._placeholder_widget("FreqPlanner")),
@@ -558,7 +612,7 @@ class MainWindow(QMainWindow):
             ("Inbox", "Messages"),
             ("Compose", "Messages"),
             ("BBS", "Managed BBS"),
-            ("FIO Spotter", "FIO Spotter"),
+            ("CommsPlan Spotter", "CommsPlan Spotter"),
             ("FLDigi / SSB", "NCS-FLDigi/SSB"),
             ("JS8Call", "NCS-JS8"),
             ("VHF/UHF", "NCS-Local"),
@@ -653,6 +707,7 @@ class MainWindow(QMainWindow):
         self._map_nav_index = None
         self._station_health_nav_index = None
         self._station_health_alert_signature: tuple[object, ...] | None = None
+        self._station_health_alert_inputs_signature: tuple[object, ...] | None = None
         self._ncs_nav_indices: dict[str, int] = {}
         self._ncs_net_active: dict[str, bool] = self._active_ncs_session_flags_from_settings()
         self._nav_group_headers: dict[str, QPushButton] = {}
@@ -1033,11 +1088,41 @@ class MainWindow(QMainWindow):
         self.station_command_radio_summary_widget = QWidget()
         self.station_command_radio_summary_widget.setObjectName("stationCommandRadioSummary")
         self.station_command_radio_summary_widget.setMinimumWidth(0)
-        self.station_command_radio_summary_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.station_command_radio_summary_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.station_command_radio_summary_layout = QVBoxLayout(self.station_command_radio_summary_widget)
         self.station_command_radio_summary_layout.setContentsMargins(0, 0, 0, 0)
         self.station_command_radio_summary_layout.setSpacing(6)
         self.station_command_radio_summary_scroll.setWidget(self.station_command_radio_summary_widget)
+        # The approved multi-radio card surface is retained independently of
+        # the legacy selected-radio widgets below.  Its callbacks stay scoped
+        # to the existing guarded command handlers; card publication itself is
+        # cache-only and does not touch a runtime endpoint.
+        self.radio_control_panel = RadioControlPanel(
+            callbacks=RadioCardCallbacks(
+                select=self._on_station_command_summary_radio_clicked,
+                qsy=self._on_radio_card_qsy,
+                hold=self._on_radio_card_hold,
+                resume=self._on_radio_card_resume,
+                sop=self._on_radio_card_sop,
+                net=self._on_radio_card_net,
+                sources=self._on_radio_card_sources,
+                policy=self._on_radio_card_policy,
+                advanced=self._on_radio_card_advanced,
+                health=self._on_radio_card_health,
+                plan=self._on_radio_card_plan,
+                launch=self._on_radio_card_launch,
+                js8_offset=self._on_radio_card_js8_offset,
+                navigation=self._on_radio_card_navigation,
+                dock=self._on_radio_card_dock,
+            ),
+            theme=resolve_theme(self.settings),
+            parent=self.station_command_radio_summary_widget,
+        )
+        self.radio_control_panel.setVisible(False)
+        self.radio_control_panel.full_requested.connect(self._restore_radio_control_panel_from_dock)
+        self.radio_control_panel.minimized_changed.connect(self._on_radio_control_panel_minimized_changed)
+        self.radio_control_panel.geometry_changed.connect(self._schedule_station_command_summary_geometry)
+        self._radio_control_panel_dock_window = None
         self.station_command_radio_prev_btn = QPushButton("Prev", self.station_command_bar)
         self.station_command_radio_prev_btn.setObjectName("stationCommandRadioPagePrev")
         self.station_command_radio_prev_btn.setToolTip("Show previous radios.")
@@ -1107,6 +1192,11 @@ class MainWindow(QMainWindow):
         self._sop_next_due_minutes = None
         self._sop_next_action_label = ""
         self._sop_next_action_count = 0
+        self._sop_awareness = SopAwarenessCache()
+        self._sop_awareness_timer = QTimer(self)
+        self._sop_awareness_timer.setInterval(1000)
+        self._sop_awareness_timer.timeout.connect(self._refresh_sop_awareness)
+        self._sop_awareness_timer.start()
         self._active_tab_index = None
         # Every queued screen-local callback is bound to this generation.
         # A later navigation invalidates it before it can mutate a hidden page.
@@ -1408,8 +1498,29 @@ class MainWindow(QMainWindow):
             self.launch_orchestrator.sequence_finished.connect(self._on_launch_sequence_finished)
         except Exception:
             pass
+        self.launch_orchestrator.set_schedule_handoff_provider(self.scheduler.launch_schedule_apply_status)
         QTimer.singleShot(1200, self._start_launch_control_startup)
-        self._notify_startup_status("Opening FIO...")
+        self._window_preferences = QSettings(str(self.settings.config_dir / "window-state.ini"), QSettings.IniFormat)
+        restore_full_window_geometry(self, self._window_preferences)
+        self._screen_fit_controller = WindowScreenFitController(self, self._reflow_screen_geometry)
+        self._notify_startup_status("Opening CommsPlan...")
+
+    def _reflow_screen_geometry(self) -> None:
+        if getattr(self, "_shutting_down", False):
+            return
+        self._reflow_adaptive_station_shell()
+        self._schedule_station_command_summary_geometry()
+
+    def _schedule_station_command_summary_geometry(self) -> None:
+        timer = getattr(self, "_station_command_summary_geometry_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(lambda: self._sync_station_command_radio_summary_height(card_mode=True)
+                                  if not getattr(self, "_shutting_down", False) else None)
+            self._station_command_summary_geometry_timer = timer
+        if not timer.isActive():
+            timer.start(0)
 
     def release_startup_surface_shield(self) -> None:
         """Allow the completed Windows shell to be mapped exactly once."""
@@ -1993,6 +2104,13 @@ class MainWindow(QMainWindow):
         except Exception as e:
             log.debug("MainWindow: fldigi_tab refresh failed: %s", e)
 
+        try:
+            tab = getattr(self, "controlfreq_tab", None)
+            if tab is not None and hasattr(tab, "on_operator_roster_changed"):
+                tab.on_operator_roster_changed()
+        except Exception as exc:
+            log.debug("MainWindow: Ops roster invalidation failed: %s", exc)
+
     def _on_operator_history_local_update(self) -> None:
         """
         Lightweight fanout for updates that originated inside Operators tab.
@@ -2013,6 +2131,13 @@ class MainWindow(QMainWindow):
                 self.fldigi_tab._load_known_operators()
         except Exception as e:
             log.debug("MainWindow: fldigi_tab local refresh failed: %s", e)
+
+        try:
+            tab = getattr(self, "controlfreq_tab", None)
+            if tab is not None and hasattr(tab, "on_operator_roster_changed"):
+                tab.on_operator_roster_changed()
+        except Exception as exc:
+            log.debug("MainWindow: Ops roster invalidation failed: %s", exc)
 
     def on_peer_schedule_data_changed(self) -> None:
         try:
@@ -2861,11 +2986,36 @@ class MainWindow(QMainWindow):
         if not self._ui_refresh_allowed():
             self._mark_ui_refresh_dirty("hold_state_tick")
             return
+        timed_cards = self._refresh_radio_card_hold_state() if getattr(self, "radio_control_panel", None) is not None else False
         snapshot = suspend_snapshot(self.settings, allow_reload=False)
         if snapshot.get("until") and not snapshot.get("active"):
             resume_schedule_hold(self, self.settings)
-            return
-        self._dispatch_hold_snapshot(snapshot)
+        else:
+            self._dispatch_hold_snapshot(snapshot)
+        # Legacy dispatch may stop this shared timer. Either owner can need it.
+        timer = getattr(self, "_hold_state_timer", None)
+        if timer is not None and (timed_cards or snapshot.get("active")) and not timer.isActive():
+            timer.start()
+
+    def _refresh_radio_card_hold_state(self) -> bool:
+        """Existing timer projects worker-published manual state, never legacy DB."""
+        panel = getattr(self, "radio_control_panel", None)
+        if panel is None:
+            return False
+        timed = False
+        for ident, card in panel.cards.items():
+            try:
+                state = self._station_command_manual_control_state_for_radio(ident)
+                held = str(getattr(state, "state", "")) in {"manual_hold", "manual_qsy", "manual_suspend"}
+                hold = self._station_command_hold_snapshot_for_radio(ident)
+                seconds = hold.get("remaining_sec") if hold.get("active") else None
+                minutes = max(0, int(math.ceil(float(seconds) / 60))) if seconds is not None else None
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                timed = timed or card.property("radioCardHoldRemainingMinutes") is not None
+                continue
+            timed = timed or minutes is not None
+            card.update_hold_state(held, minutes)
+        return timed
 
     def on_hold_duration_default_changed(self) -> None:
         snapshot = self._hold_state_snapshot if isinstance(self._hold_state_snapshot, dict) else None
@@ -3180,19 +3330,45 @@ class MainWindow(QMainWindow):
         self._hide_sidebar_schedule_controls()
         self._auto_collapse_inactive_nav_groups()
 
-    def _get_next_sop_action_minutes(self):
+    def _refresh_sop_awareness(self) -> None:
+        cache = getattr(self, "_sop_awareness", None)
+        manager = getattr(getattr(self, "sop_tab", None), "manager", None)
+        if cache is not None and manager is not None and not getattr(self, "_shutting_down", False):
+            cache.refresh(lambda: detached_sop_reader(manager))
+            dashboard = getattr(self, "controlfreq_tab", None)
+            if dashboard is not None:
+                dashboard.set_sop_attention_snapshot(cache.attention_snapshot())
+
+    def _station_command_sop_rows(self, selected=None):
+        cache = getattr(self, "_sop_awareness", None)
+        rows = cache.rows() if cache is not None else ()
+        if selected is None:
+            choices = getattr(self, "_station_command_last_choices", [])
+            selected = next((item for item in choices if self._station_command_snapshot_id(item) ==
+                             int(getattr(self, "_station_command_selected_profile_id", 0) or 0)), None)
+        if selected is None:
+            return []
+        radio_id = self._station_command_snapshot_id(selected)
+        profile = self._station_command_health_profile(selected, radio_id) or {}
+        refs = self._station_command_assigned_plan_refs_for_radio(radio_id)
+        groups = {str(row.get("group_name") or row.get("group") or "").strip().upper()
+                  for row in refs if isinstance(row, Mapping)}
+        group, _band = self._station_command_assigned_plan_group_band(selected)
+        if group:
+            groups.add(group.upper())
+        softwares = {label for flag, label in (("use_js8call", "JS8CALL"), ("use_fldigi", "FLDIGI"),
+                     ("use_varac", "VARAC")) if profile.get(flag)}
+        return relevant_sop_actions(rows, radio_id=radio_id,
+            operating_profile_id=int(profile.get("assigned_operating_profile_id") or 0),
+            groups=groups, softwares=softwares)
+
+    def _get_next_sop_action_minutes(self, selected=None):
+        """Read published reminders only; never query SOP data from the shell."""
         try:
-            now = datetime.datetime.now(datetime.timezone.utc).timestamp()
-            # Refresh every 30s to avoid querying SOP DB on every 2s status timer tick.
-            if (now - float(self._sop_next_due_cache_ts or 0.0)) < 30:
-                return self._sop_next_due_minutes
-            self._sop_next_due_cache_ts = now
             self._sop_next_due_minutes = None
             self._sop_next_action_label = ""
             self._sop_next_action_count = 0
-            if not hasattr(self, "sop_tab") or not hasattr(self.sop_tab, "manager"):
-                return None
-            rows = self.sop_tab.manager.build_upcoming_actions(horizon_hours=3, only_active=True)
+            rows = self._station_command_sop_rows(selected)
             if not rows:
                 return None
             self._sop_next_action_label = str(rows[0].get("action_label") or "SOP Action").strip()
@@ -3209,6 +3385,9 @@ class MainWindow(QMainWindow):
             return None
 
     def _invalidate_sop_status_cache(self) -> None:
+        cache = getattr(self, "_sop_awareness", None)
+        if cache is not None:
+            cache.invalidate()
         self._sop_next_due_cache_ts = 0.0
         self._sop_next_due_minutes = None
         self._sop_next_action_label = ""
@@ -3501,6 +3680,11 @@ class MainWindow(QMainWindow):
     def _on_mesh_runtime_error(self, message: str) -> None:
         text = str(message or "").strip()
         if text:
+            stamp = time.monotonic()
+            previous = getattr(self, "_mesh_runtime_error_signature", None)
+            if previous is not None and previous[0] == text and stamp - previous[1] < 30.0:
+                return
+            self._mesh_runtime_error_signature = (text, stamp)
             log.warning("Local Mesh runtime: %s", text)
 
     @Slot(object)
@@ -3563,6 +3747,9 @@ class MainWindow(QMainWindow):
             pass
 
     def _on_mesh_runtime_event(self, event) -> None:
+        tab = getattr(self, "stations_map_tab", None)
+        if tab is not None and hasattr(tab, "on_mesh_data_changed"):
+            tab.on_mesh_data_changed(event)
         try:
             if hasattr(self, "controlfreq_tab") and hasattr(self.controlfreq_tab, "refresh_view"):
                 self.controlfreq_tab.refresh_view()
@@ -3602,9 +3789,25 @@ class MainWindow(QMainWindow):
             )
 
     def _on_app_about_to_quit(self):
+        preferences = getattr(self, "_window_preferences", None)
+        if preferences is not None and not self._shutting_down:
+            save_full_window_geometry(self, preferences)
         if self._shutting_down:
             return
         self._shutting_down = True
+        dock = getattr(self, "_radio_control_panel_dock_window", None)
+        if dock is not None:
+            dock.setEnabled(False)
+            dock.hide()
+        audit_cache = getattr(self, "_condition_audit_read_cache", None)
+        if audit_cache is not None:
+            audit_cache.close()
+        awareness = getattr(self, "_sop_awareness", None)
+        if awareness is not None:
+            awareness.close()
+        awareness_timer = getattr(self, "_sop_awareness_timer", None)
+        if awareness_timer is not None:
+            awareness_timer.stop()
         self._mesh_runtime_restart_pending = False
         self._close_transient_shutdown_ui()
         map_window = getattr(self, "map_window", None)
@@ -3749,6 +3952,9 @@ class MainWindow(QMainWindow):
             log.debug("MainWindow shutdown: transient widget close failed: %s", e)
 
     def closeEvent(self, event):
+        preferences = getattr(self, "_window_preferences", None)
+        if preferences is not None and not getattr(self, "_shutdown_close_pending", False):
+            save_full_window_geometry(self, preferences)
         if not self._allow_final_close:
             event.ignore()
             if not self._shutdown_close_pending:
@@ -3861,6 +4067,7 @@ class MainWindow(QMainWindow):
                     QTimer.singleShot(0, self._reflow_adaptive_station_shell)
                 self._schedule_station_command_bar_refresh("resize", force=False)
             self._schedule_station_command_layout(force=False)
+            self._schedule_station_command_summary_geometry()
         except Exception:
             pass
         try:
@@ -3950,8 +4157,10 @@ class MainWindow(QMainWindow):
             if isinstance(label, QLabel):
                 try:
                     display_value = now_utc.strftime("%H:%MZ") if bool(label.property("compactClock")) else value
-                    label.setText(display_value)
-                    label.setToolTip(value)
+                    if label.property("clockSeconds") is False:
+                        display_value = re.sub(r"(\d{2}:\d{2}):\d{2}", r"\1", display_value)
+                    set_widget_value(label, "text", display_value)
+                    set_widget_value(label, "toolTip", display_value)
                 except RuntimeError:
                     # Responsive shell rebuilds replace these child labels.
                     pass
@@ -4088,8 +4297,8 @@ class MainWindow(QMainWindow):
             ("Ops", "Ops Center", "ControlFreq", "ops.svg"),
             ("Map", "Map", "Map", "map.svg"),
             ("Msgs", "Messages", "Messages", "messages.svg"),
-            ("BBS", "FIO BBS", "Managed BBS", "bbs.svg"),
-            ("Spotter", "FIO Spotter", "FIO Spotter", "spotter.svg"),
+            ("BBS", "CommsPlan BBS", "Managed BBS", "bbs.svg"),
+            ("Spotter", "CommsPlan Spotter", "CommsPlan Spotter", "spotter.svg"),
             ("Net Ctrl", "Net Control", "NCS", "net-control.svg"),
             ("Calls", "Operators", "Operators", "operators.svg"),
             ("Resources", "Tools and Resources", "Resources", "resources.svg"),
@@ -4304,17 +4513,32 @@ class MainWindow(QMainWindow):
             self._off_schedule_prompt = None
             self._off_schedule_prompt_key = None
 
+    def _dismiss_radio_off_schedule_prompt(self, radio_id: int) -> None:
+        """Cancel only the named radio's obsolete review, including deferred UI."""
+        getattr(self, "_pending_off_schedule_prompts", {}).pop(int(radio_id), None)
+        key = getattr(self, "_off_schedule_prompt_key", None)
+        if key and key[0] == int(radio_id):
+            self._dismiss_off_schedule_prompt()
+        getattr(self, "_station_command_off_schedule_by_radio", {}).pop(int(radio_id), None)
+
+    def _show_next_off_schedule_prompt(self) -> None:
+        if getattr(self, "_off_schedule_prompt", None) is not None or self._shutting_down:
+            return
+        pending = getattr(self, "_pending_off_schedule_prompts", {})
+        if pending:
+            radio_id = next(iter(pending))
+            payload = pending.pop(radio_id)
+            self._on_off_schedule_detected(payload)
+            if pending and getattr(self, "_off_schedule_prompt", None) is None:
+                QTimer.singleShot(0, self._show_next_off_schedule_prompt)
+
     def _on_off_schedule_cleared(self) -> None:
-        self._dismiss_off_schedule_prompt()
-        try:
-            self._station_command_off_schedule_by_radio = {}
-        except Exception:
-            pass
-        try:
-            self._station_command_radio_summary_signature = None
-            self._refresh_station_command_bar(force=False)
-        except Exception:
-            pass
+        # This compatibility signal represents only the primary prompt loop.
+        radio_id = int(getattr(getattr(self, "station_runtime_manager", None), "_primary_device_id", 0) or 0)
+        if radio_id > 0:
+            self._dismiss_radio_off_schedule_prompt(radio_id)
+        self._station_command_radio_summary_signature = None
+        self._refresh_station_command_bar(force=False)
 
     def _dismiss_varac_wait_prompt(self) -> None:
         if hasattr(self, "_varac_wait_prompt") and self._varac_wait_prompt is not None:
@@ -4334,7 +4558,7 @@ class MainWindow(QMainWindow):
 
     def _build_prompt_hold_duration_combo(self, parent) -> QComboBox:
         combo = QComboBox(parent)
-        combo.setToolTip("How long FIO should leave this radio off schedule.")
+        combo.setToolTip("How long CommsPlan should leave this radio off schedule.")
         refresh_hold_duration_combo(combo, self.settings, getattr(self, "_active_runtime_profile", None))
         combo.addItem("Indefinite", 0)
         return combo
@@ -4402,9 +4626,18 @@ class MainWindow(QMainWindow):
         except Exception:
             target_radio_id = 0
         radio_id = target_radio_id
+        entry = payload.get("entry") or {}
+        target_radio_id = target_radio_id or (self._station_command_scheduler_entry_radio_id(entry) if isinstance(entry, Mapping) else 0)
+        radio_id = target_radio_id
+        scheduler = getattr(self, "scheduler", None)
+        if target_radio_id <= 0 or scheduler is None:
+            return
+        source = str(payload.get("source") or entry.get("source_type") or "HF").upper()
+        if (scheduler._net_corrections_suppressed(target_radio_id) or source == "NET"
+                or not scheduler._automatic_source_enabled(target_radio_id, source)
+                or scheduler._radio_manual_control_blocks_off_schedule_prompt(target_radio_id)):
+            return
         try:
-            entry = payload.get("entry") if isinstance(payload, Mapping) else {}
-            radio_id = target_radio_id or (self._station_command_scheduler_entry_radio_id(entry) if isinstance(entry, Mapping) else 0)
             if radio_id > 0:
                 state = getattr(self, "_station_command_off_schedule_by_radio", None)
                 if not isinstance(state, dict):
@@ -4415,12 +4648,15 @@ class MainWindow(QMainWindow):
                 self._refresh_station_command_bar(force=False)
         except Exception:
             pass
-        target_radio_id = target_radio_id or radio_id
         prompt_key = (int(target_radio_id or 0), tuple(str(item) for item in items))
         active_key = getattr(self, "_off_schedule_prompt_key", None)
         if getattr(self, "_off_schedule_prompt", None) is not None and active_key == prompt_key:
             return
-        self._dismiss_off_schedule_prompt()
+        if getattr(self, "_off_schedule_prompt", None) is not None:
+            pending = getattr(self, "_pending_off_schedule_prompts", {})
+            pending[target_radio_id] = dict(payload)
+            self._pending_off_schedule_prompts = pending
+            return
         msg = QMessageBox(self)
         radio_name = self._radio_name_for_device_profile_id(target_radio_id)
         msg.setWindowTitle(f"{radio_name} Off Schedule")
@@ -4448,34 +4684,9 @@ class MainWindow(QMainWindow):
         self._attach_prompt_hold_duration_row(msg, hold_combo)
         self._off_schedule_prompt = msg
         self._off_schedule_prompt_key = prompt_key
-        auto_applied = {"done": False}
-
-        def _auto_apply():
-            if auto_applied["done"]:
-                return
-            auto_applied["done"] = True
-            try:
-                self.scheduler.resolve_off_schedule("apply", items=items, target_device_profile_id=target_radio_id)
-            except Exception:
-                pass
-            try:
-                msg.done(0)
-            except Exception:
-                pass
-
-        timer = QTimer(msg)
-        timer.setSingleShot(True)
-        timer.timeout.connect(_auto_apply)
-        timer.start(120000)
-
+        # A review is never accepted by an unattended timeout. In particular,
+        # an old dialog cannot retune a radio after the operator takes control.
         msg.exec()
-        try:
-            timer.stop()
-        except Exception:
-            pass
-        if auto_applied["done"]:
-            self._off_schedule_prompt = None
-            return
         clicked = msg.clickedButton()
         if clicked == apply_btn:
             try:
@@ -4502,8 +4713,10 @@ class MainWindow(QMainWindow):
                 self.on_hold_state_changed(force_reload=True)
             except Exception:
                 pass
-        self._off_schedule_prompt = None
-        self._off_schedule_prompt_key = None
+        if getattr(self, "_off_schedule_prompt", None) is msg:
+            self._off_schedule_prompt = None
+            self._off_schedule_prompt_key = None
+        QTimer.singleShot(0, self._show_next_off_schedule_prompt)
 
     def _on_varac_wait_detected(self, payload: dict) -> None:
         if self._shutting_down:
@@ -4708,14 +4921,14 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self.settings_tab.start_guided_add_radio)
 
     def open_station_bbs(self) -> None:
-        """Open the top-level, station-owned FIO BBS service."""
+        """Open the top-level, station-owned CommsPlan BBS service."""
         idx = self._screen_index_by_label.get("Managed BBS", -1)
         if idx >= 0:
             self._set_screen(idx)
 
     def open_fio_spotter(self) -> None:
-        """Open the primary FIO Spotter service workspace."""
-        idx = self._screen_index_by_label.get("FIO Spotter", -1)
+        """Open the primary CommsPlan Spotter service workspace."""
+        idx = self._screen_index_by_label.get("CommsPlan Spotter", -1)
         if idx >= 0:
             self._set_screen(idx)
 
@@ -4988,6 +5201,8 @@ class MainWindow(QMainWindow):
         grid_filter: str = "",
         fema_region_filter: str = "",
         action_filter: str = "",
+        traffic_message_ids: Sequence[str] | None = None,
+        traffic_count_at_click: int = 0,
         compose_intent: Mapping[str, object] | None = None,
     ) -> None:
         idx = self._screen_index_by_label.get("Messages", -1)
@@ -5014,8 +5229,12 @@ class MainWindow(QMainWindow):
             "action_filter": str(action_filter or "").strip().lower(),
             "compose_intent": normalized_intent,
         }
+        if traffic_message_ids is not None:
+            self._messages_nav_filter_context.update(
+                traffic_message_ids=tuple(dict.fromkeys(str(value) for value in traffic_message_ids))[:200],
+                traffic_count_at_click=max(0, int(traffic_count_at_click)),
+            )
         self._set_screen(idx)
-        QTimer.singleShot(0, self._apply_messages_nav_context)
 
     def open_hf_operator(self, callsign: str = "") -> None:
         """Open HF Operators and apply an optional cached reader identity."""
@@ -5040,9 +5259,9 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, apply_focus)
 
     def open_fio_spotter_watch(self, candidate: Mapping[str, object]) -> None:
-        """Open FIO Spotter and stage one unsaved source-neutral watch."""
+        """Open CommsPlan Spotter and stage one unsaved source-neutral watch."""
 
-        idx = self._screen_index_by_label.get("FIO Spotter", -1)
+        idx = self._screen_index_by_label.get("CommsPlan Spotter", -1)
         if idx < 0:
             return
         payload = dict(candidate or {})
@@ -5058,9 +5277,9 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def present_main_window(self) -> None:
-        """Bring the existing FIO workspace forward without changing its placement.
+        """Bring the existing CommsPlan workspace forward without changing its placement.
 
-        Map is a persistent peer window, so returning to FIO must activate this
+        Map is a persistent peer window, so returning to CommsPlan must activate this
         window in place rather than reconstructing it or forcing a normal/maximized
         transition.  Clearing only a minimized state preserves the operator's
         chosen normal, maximized, or full-screen presentation.
@@ -5076,7 +5295,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             # Window activation is a best-effort platform request. Navigation
             # remains complete even if a compositor declines foreground focus.
-            log.debug("MainWindow: failed bringing FIO workspace to front: %s", exc)
+            log.debug("MainWindow: failed bringing CommsPlan workspace to front: %s", exc)
 
     def _apply_pending_map_focus(self) -> None:
         pending = getattr(self, "_pending_map_focus", None)
@@ -5209,7 +5428,7 @@ class MainWindow(QMainWindow):
             elif hasattr(tab, "show_inbox_with_context"):
                 context = dict(getattr(self, "_messages_nav_filter_context", {}) or {})
                 context.pop("compose_intent", None)
-                has_context = False
+                has_context = context.get("traffic_message_ids") is not None
                 for key, value in context.items():
                     if key == "source_family" and str(value or "").strip().lower() in {"", "message"}:
                         continue
@@ -5541,7 +5760,7 @@ class MainWindow(QMainWindow):
                     service.publish(
                         scope="global",
                         status="info",
-                        summary=f"No FIO results for '{str(query or '').strip()}'.",
+                        summary=f"No CommsPlan results for '{str(query or '').strip()}'.",
                         detail="Try a radio name, schedule, group, frequency, setting, message action, or setup issue.",
                         source_surface="quick_search",
                     )
@@ -5574,7 +5793,7 @@ class MainWindow(QMainWindow):
     def _open_command_palette(self) -> None:
         query, accepted = QInputDialog.getText(
             self,
-            "Find in FIO",
+            "Find in CommsPlan",
             "Screen, setting, radio, schedule, action, or issue:",
         )
         if accepted and str(query or "").strip():
@@ -6078,6 +6297,11 @@ class MainWindow(QMainWindow):
                 self.settings_tab.settings_saved.connect(self.freq_planner_tab.on_settings_saved)
             except Exception:
                 pass
+            self._connect_lazy_screen_signal(
+                "freq_planner.scheduler",
+                self.freq_planner_tab.schedule_saved,
+                self.scheduler.force_refresh,
+            )
             return self.freq_planner_tab
 
     def _create_message_viewer_tab(self) -> QWidget:
@@ -6202,6 +6426,11 @@ class MainWindow(QMainWindow):
                 getattr(tab, "net_status_changed", None),
                 self._on_ncs_net_status_changed,
             )
+            self._connect_lazy_screen_signal(
+                "fldigi_ncs.net_session_status",
+                getattr(tab, "net_session_status_changed", None),
+                self._on_ncs_scoped_net_status_changed,
+            )
             return tab
 
     def _create_js8_ncs_tab(self) -> QWidget:
@@ -6217,6 +6446,11 @@ class MainWindow(QMainWindow):
                 "js8_ncs.net_status",
                 getattr(tab, "net_status_changed", None),
                 self._on_ncs_net_status_changed,
+            )
+            self._connect_lazy_screen_signal(
+                "js8_ncs.net_session_status",
+                getattr(tab, "net_session_status_changed", None),
+                self._on_ncs_scoped_net_status_changed,
             )
             return tab
 
@@ -6498,7 +6732,7 @@ class MainWindow(QMainWindow):
         elif visible:
             tooltip = "Map open — click to bring the separate Map window to front."
         else:
-            tooltip = "Open Map in a separate window and keep working in FIO."
+            tooltip = "Open Map in a separate window and keep working in CommsPlan."
         for spec, button in zip(getattr(self, "_nav_specs", ()), getattr(self, "nav_buttons", ())):
             if tuple(spec) == ("Map", "Map"):
                 button.setToolTip(tooltip)
@@ -6722,6 +6956,8 @@ class MainWindow(QMainWindow):
     def _on_operating_groups_changed(self) -> None:
         """Refresh only consumers of HF operating-group configuration."""
 
+        self._station_command_group_qsy_lookup_cache = None
+        self._station_command_group_qsy_rows_cache = None
         self._on_settings_saved_for_lazy_tabs()
         for label, tab in (
             ("operating_groups.hf_schedule", getattr(self, "hf_schedule_tab", None)),
@@ -6930,11 +7166,11 @@ class MainWindow(QMainWindow):
 
         self._first_run_onboarding_presented = True
         dialog = QMessageBox(self)
-        dialog.setWindowTitle("Welcome to FreqInOut")
-        dialog.setAccessibleName("Welcome to FreqInOut station setup")
+        dialog.setWindowTitle("Welcome to CommsPlan")
+        dialog.setAccessibleName("Welcome to CommsPlan station setup")
         dialog.setAttribute(Qt.WA_DeleteOnClose, True)
         dialog.setIcon(QMessageBox.Information)
-        dialog.setText("No existing FreqInOut station was found.")
+        dialog.setText("No existing CommsPlan station was found.")
         dialog.setInformativeText(
             "Start by setting up the first radio. Nothing is changed until you review and save it."
         )
@@ -7252,6 +7488,9 @@ class MainWindow(QMainWindow):
         signature = self._runtime_state_signature_for(profile, policy)
         if not force and signature == self._runtime_profile_signature:
             return
+        if signature != self._runtime_profile_signature:
+            self._station_command_qsy_requests = {}
+            self._station_command_qsy_dispositions = {}
         self._active_runtime_profile = profile
         self._active_runtime_policy = policy
         self._runtime_profile_signature = signature
@@ -7376,6 +7615,11 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _station_command_frequency_controls_available(snapshot: object | None) -> bool:
         if snapshot is None:
+            return False
+        if str(MainWindow._station_command_value(snapshot, "device_class", "")).lower() == "observer":
+            return False
+        active = MainWindow._station_command_value(snapshot, "runtime_active", None)
+        if active is not None and not MainWindow._station_command_bool(active, default=False):
             return False
         profile = dict(snapshot) if isinstance(snapshot, Mapping) else {}
         for key in (
@@ -7660,14 +7904,6 @@ class MainWindow(QMainWindow):
             return "SUNDAY"
 
     @staticmethod
-    def _station_command_day_index(day: str) -> int | None:
-        days = ("SUNDAY", "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY")
-        try:
-            return days.index(day)
-        except ValueError:
-            return None
-
-    @staticmethod
     def _station_command_ref_mapping(ref: object) -> Mapping[str, object] | None:
         return ref if isinstance(ref, Mapping) else None
 
@@ -7695,34 +7931,19 @@ class MainWindow(QMainWindow):
             cls._station_command_next_day_name(row_day) == today and minute < end
         )
 
-    @classmethod
-    def _station_command_ref_start_delta_minutes(
-        cls,
-        ref: Mapping[str, object],
-        now_utc: datetime.datetime,
-    ) -> int | None:
-        start = cls._station_command_hhmm_to_minutes(
-            ref.get("start_utc") or ref.get("start") or ref.get("start_local")
-        )
-        if start is None:
-            return None
-        row_day = cls._station_command_day_name(ref.get("day_utc") or ref.get("day") or "ALL")
-        minute = now_utc.hour * 60 + now_utc.minute
-        if row_day == "ALL":
-            delta = start - minute
-            return delta if delta >= 0 else delta + 1440
-        row_index = cls._station_command_day_index(row_day)
-        if row_index is None:
-            return None
-        today_index = int(now_utc.strftime("%w"))
-        days_until = (row_index - today_index) % 7
-        delta = days_until * 1440 + start - minute
-        return delta if delta >= 0 else delta + (7 * 1440)
-
     def _station_command_assigned_plan_group_band(self, snapshot: object) -> tuple[str, str]:
         ident = self._station_command_snapshot_id(snapshot)
         if ident <= 0:
             return "", ""
+        lane = self._station_command_lane_for_radio(ident)
+        if isinstance(lane, Mapping):
+            lane_group, lane_band = self._station_command_entry_group_band(
+                lane.get("current_entry") if isinstance(lane.get("current_entry"), Mapping) else None
+            )
+            # A worker lane is authoritative even when its current entry is
+            # empty.  Do not let saved recurrence rows replace or reinterpret
+            # the worker's current state.
+            return lane_group, lane_band
         refs = self._station_command_assigned_plan_refs_for_radio(ident)
         now_utc = datetime.datetime.now(datetime.timezone.utc)
         for ref in refs:
@@ -7748,84 +7969,25 @@ class MainWindow(QMainWindow):
             return lane_group, lane_band
         return "", ""
 
-    def _station_command_assigned_plan_next_group_band(self, snapshot: object) -> tuple[str, str]:
-        ident = self._station_command_snapshot_id(snapshot)
-        if ident <= 0:
-            return "", ""
-        refs = self._station_command_assigned_plan_refs_for_radio(ident)
-        if not refs:
-            lane_group, lane_band = self._station_command_lane_next_group_band(ident)
-            if lane_group:
-                return lane_group, lane_band
-            return "", ""
-        now_utc = datetime.datetime.now(datetime.timezone.utc)
-        current_group, current_band = self._station_command_assigned_plan_group_band(snapshot)
-        current_key = (current_group.strip().upper(), current_band.strip().upper())
-        best_changed: tuple[int, str, str] | None = None
-        best_any: tuple[int, str, str] | None = None
-        for ref in refs:
-            ref = self._station_command_ref_mapping(ref)
-            if ref is None:
-                continue
-            group = self._station_command_group_display_name(ref.get("group_name") or ref.get("group"))
-            band = str(ref.get("band") or "").strip().upper()
-            if not group:
-                continue
-            delta = self._station_command_ref_start_delta_minutes(ref, now_utc)
-            if delta is None:
-                continue
-            candidate = (delta, group, band)
-            if best_any is None or candidate[0] < best_any[0]:
-                best_any = candidate
-            if (group.strip().upper(), band.strip().upper()) != current_key:
-                if best_changed is None or candidate[0] < best_changed[0]:
-                    best_changed = candidate
-        best = best_changed or best_any
-        if best is None:
-            return "", ""
-        return best[1], best[2]
-
     def _station_command_next_minutes(self, snapshot: object) -> int | None:
         """Return the next meaningful plan transition for one radio."""
-        ident = self._station_command_snapshot_id(snapshot)
-        refs = self._station_command_assigned_plan_refs_for_radio(ident) if ident > 0 else []
-        if refs:
-            now_utc = datetime.datetime.now(datetime.timezone.utc)
-            current_group, current_band = self._station_command_assigned_plan_group_band(snapshot)
-            current_key = (current_group.strip().upper(), current_band.strip().upper())
-            changed: list[int] = []
-            any_start: list[int] = []
-            for raw_ref in refs:
-                ref = self._station_command_ref_mapping(raw_ref)
-                if ref is None:
-                    continue
-                delta = self._station_command_ref_start_delta_minutes(ref, now_utc)
-                if delta is None:
-                    continue
-                any_start.append(delta)
-                group = self._station_command_group_display_name(ref.get("group_name") or ref.get("group"))
-                band = str(ref.get("band") or "").strip().upper()
-                if (group.strip().upper(), band) != current_key:
-                    changed.append(delta)
-            candidates = changed or any_start
-            if candidates:
-                return min(candidates)
-        next_change = getattr(getattr(self, "scheduler", None), "next_change_utc", None)
-        if next_change is None:
+        transition = self._station_command_next_transition(snapshot)
+        if not isinstance(transition, Mapping) or transition.get("state") != "ready":
             return None
-        try:
-            if next_change.tzinfo is None:
-                next_change = next_change.replace(tzinfo=datetime.timezone.utc)
-            delta = (next_change.astimezone(datetime.timezone.utc) - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
-            return max(0, int((delta + 59) // 60)) if delta >= 0 else -1
-        except Exception:
+        next_start = transition.get("start_utc")
+        if not isinstance(next_start, datetime.datetime):
             return None
+        seconds = (next_start - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+        return max(0, int((seconds + 59) // 60)) if seconds >= 0 else -1
 
     def _station_command_plan_cache(self) -> tuple[dict[int, dict[str, object]], dict[int, dict[str, object]]]:
         now = time.monotonic()
         cache = getattr(self, "_station_command_plan_cache_data", None)
         expires = float(getattr(self, "_station_command_plan_cache_expires", 0.0) or 0.0)
-        if isinstance(cache, tuple) and now < expires:
+        scheduler = getattr(self, "scheduler", None)
+        key_getter = getattr(scheduler, "schedule_display_cache_key", None)
+        revision = key_getter() if callable(key_getter) else None
+        if isinstance(cache, tuple) and ((revision is not None and revision == getattr(self, "_station_command_plan_cache_revision", None)) or (revision is None and now < expires)):
             return cache
         # The command bar is a render path.  Its former fallback opened the
         # settings database every 15 seconds (and after each forced refresh),
@@ -7862,17 +8024,20 @@ class MainWindow(QMainWindow):
             plans_by_id[plan_id] = {
                 "id": plan_id,
                 "name": str(lane.get("frequency_plan_name") or ""),
-                "schedule_refs_json": json.dumps(schedule_refs, sort_keys=True, default=str),
+                "schedule_refs_json": schedule_refs,
                 "frequency_refs_json": "[]",
             }
         cache = (assignments_by_radio, plans_by_id)
         self._station_command_plan_cache_data = cache
+        self._station_command_plan_cache_revision = revision
         self._station_command_plan_cache_expires = now + 15.0
         return cache
 
     def _invalidate_station_command_plan_cache(self) -> None:
         self._station_command_plan_cache_data = None
         self._station_command_plan_cache_expires = 0.0
+        self._station_command_group_qsy_lookup_cache = None
+        self._station_command_group_qsy_rows_cache = None
 
     def _station_command_assigned_plan_for_radio(self, device_profile_id: int) -> dict[str, object] | None:
         try:
@@ -7922,13 +8087,18 @@ class MainWindow(QMainWindow):
         now = time.monotonic()
         cache = getattr(self, "_station_command_lane_cache_data", None)
         expires = float(getattr(self, "_station_command_lane_cache_expires", 0.0) or 0.0)
-        if isinstance(cache, dict) and not force and now < expires:
-            return cache
         scheduler = getattr(self, "scheduler", None)
+        key_getter = getattr(scheduler, "schedule_display_cache_key", None)
+        revision = key_getter() if callable(key_getter) else None
+        if isinstance(cache, dict) and not force and ((revision is not None and revision == getattr(self, "_station_command_lane_cache_revision", None)) or (revision is None and now < expires)):
+            return cache
         lanes: dict[int, dict[str, object]] = {}
         if scheduler is not None and hasattr(scheduler, "active_schedule_lanes"):
             try:
-                for lane in scheduler.active_schedule_lanes(force=force):
+                display_getter = getattr(scheduler, "schedule_lane_display_snapshot", None)
+                rows = (display_getter() if callable(display_getter) else
+                        scheduler.active_schedule_lanes(force=force, request_refresh=False))
+                for lane in rows:
                     if not isinstance(lane, Mapping):
                         continue
                     try:
@@ -7941,6 +8111,7 @@ class MainWindow(QMainWindow):
                 log.debug("MainWindow: failed to load station command schedule lanes: %s", exc)
                 lanes = {}
         self._station_command_lane_cache_data = lanes
+        self._station_command_lane_cache_revision = revision
         self._station_command_lane_cache_expires = now + 15.0
         return lanes
 
@@ -7972,10 +8143,44 @@ class MainWindow(QMainWindow):
         entry = lane.get("current_entry") if isinstance(lane, Mapping) else None
         return self._station_command_entry_group_band(entry if isinstance(entry, Mapping) else None)
 
-    def _station_command_lane_next_group_band(self, device_profile_id: int) -> tuple[str, str]:
-        lane = self._station_command_lane_for_radio(device_profile_id)
-        entry = lane.get("next_entry") if isinstance(lane, Mapping) else None
-        return self._station_command_entry_group_band(entry if isinstance(entry, Mapping) else None)
+    def _station_command_next_transition(self, snapshot: object) -> dict[str, object]:
+        """Return one worker-published next transition for this radio.
+
+        The command bar consumes the worker's entry and boundary as one
+        transition record.  It must not replay schedule recurrence to choose a
+        destination independently from the countdown.
+        """
+        ident = MainWindow._station_command_snapshot_id(snapshot)
+        lane_getter = getattr(self, "_station_command_lane_for_radio", None)
+        lane = lane_getter(ident) if callable(lane_getter) and ident > 0 else None
+        if not isinstance(lane, Mapping):
+            return {"state": "no_next", "entry": {}, "start_utc": None}
+        if lane.get("schedule_projection_pending"):
+            return {"state": "pending", "entry": {}, "start_utc": None}
+
+        has_start = "next_entry_start_utc" in lane
+        raw_start = lane.get("next_entry_start_utc")
+        next_entry = lane.get("next_entry")
+        entry = dict(next_entry) if isinstance(next_entry, Mapping) else {}
+        if not has_start and not entry:
+            return {"state": "no_next", "entry": {}, "start_utc": None}
+        if not has_start:
+            # Compatibility for older lane providers that exposed only the
+            # entry.  The label remains available, but no time is invented.
+            return {"state": "legacy_entry_only", "entry": entry, "start_utc": None}
+        if raw_start is None or not isinstance(raw_start, datetime.datetime):
+            return {"state": "no_next", "entry": {}, "start_utc": None}
+        start_utc = raw_start
+        if start_utc.tzinfo is None:
+            start_utc = start_utc.replace(tzinfo=datetime.timezone.utc)
+        else:
+            start_utc = start_utc.astimezone(datetime.timezone.utc)
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        if start_utc < now_utc:
+            return {"state": "expired", "entry": entry, "start_utc": start_utc}
+        if not entry:
+            return {"state": "no_next", "entry": {}, "start_utc": start_utc}
+        return {"state": "ready", "entry": entry, "start_utc": start_utc}
 
     def _station_command_lane_schedule_rows(self, device_profile_id: int) -> list[dict[str, object]]:
         lane = self._station_command_lane_for_radio(device_profile_id)
@@ -8088,7 +8293,7 @@ class MainWindow(QMainWindow):
         manual_qsy_active = self._station_command_scheduler_manual_qsy_active()
         scheduler_suspended_manual = self._station_command_scheduler_suspended_manually()
         if qsy_btn is not None:
-            qsy_btn.setText("Manual QSY" if manual_qsy_active else "QSY Now")
+            qsy_btn.setText("QSY Now")
         suspend_btn.setText("Scheduler Suspended" if scheduler_suspended_manual else base_suspend)
         if isinstance(hold_snapshot, Mapping) and bool(hold_snapshot.get("active")):
             countdown = self._station_command_countdown_text(hold_snapshot.get("remaining_sec"))
@@ -8223,16 +8428,15 @@ class MainWindow(QMainWindow):
             target_id = 0
         if target_id > 0:
             try:
-                service = getattr(getattr(self, "scheduler", None), "_manual_control_service", None)
-                if service is not None:
-                    if value and hasattr(service, "suspend"):
-                        service.suspend(
-                            target_id,
-                            reason_code="operator_suspend",
+                scheduler = getattr(self, "scheduler", None)
+                if scheduler is not None:
+                    if value:
+                        scheduler._record_manual_suspend_state(
+                            target_device_profile_id=target_id,
                             operator_source="main_control_center",
                         )
-                    elif not value and hasattr(service, "resume"):
-                        service.resume(target_id)
+                    else:
+                        scheduler._record_manual_resume_state(target_id)
             except Exception as exc:
                 log.debug("MainWindow: failed to persist radio-scoped scheduler suspend: %s", exc)
             self._station_command_scheduler_suspended_manual = value
@@ -8318,6 +8522,170 @@ class MainWindow(QMainWindow):
             return " ".join(part for part in (group, band) if part).strip()
         return self._station_command_frequency_text(snapshot)
 
+    def _station_command_reported_dial(self, snapshot: object) -> tuple[str, bool, Optional[int]]:
+        """Format only already-published evidence; never probe a radio here."""
+        radio_id = self._station_command_snapshot_id(snapshot)
+        evidence = getattr(self, "_station_command_endpoint_status_cache", {}).get(radio_id, {})
+        fresh = bool(evidence.get("generation") and not evidence.get("stale", True)
+                     and not evidence.get("invalidated") and not evidence.get("closed"))
+        backend = str(self._station_command_value(snapshot, "control_backend", "")).lower()
+        value = evidence.get("js8_frequency_hz") if backend == "js8call" else evidence.get("frequency_hz")
+        if value is None:
+            fresh = False
+            value = self._station_command_value(snapshot, "current_frequency_hz", None)
+        try:
+            hz = int(value)
+            if hz <= 0:
+                raise ValueError()
+        except (ValueError, TypeError):
+            fresh = False
+            key = self._station_command_current_frequency_key(snapshot)
+            try:
+                hz = round(float(key) * 1_000_000)
+            except (ValueError, TypeError):
+                hz = None
+        if hz:
+            dial = f"{hz / 1_000_000:.6f}".rstrip("0")
+            if dial.endswith("."):
+                dial += "000"
+            elif len(dial.partition(".")[2]) < 3:
+                dial += "0" * (3 - len(dial.partition(".")[2]))
+            return f"{dial} MHz" + (" · stale" if not fresh else ""), fresh, hz
+        # Legacy detached snapshots can supply a preformatted readback only.
+        label = self._station_command_frequency_text(snapshot)
+        return (f"{label} · unverified" if label and "mhz" in label.lower()
+                else "Frequency unknown"), False, None
+
+    def _station_command_selected_context_text(self, snapshot: object) -> str:
+        dial, _fresh, _hz = self._station_command_reported_dial(snapshot)
+        name = self._station_command_snapshot_name(snapshot)
+        parent = getattr(self, "station_command_radio_summary_widget", None)
+        if parent is not None:
+            metrics = parent.fontMetrics()
+            name = metrics.elidedText(name, Qt.ElideRight, metrics.horizontalAdvance("M") * 18)
+        destination = self._station_command_now_text_for_summary(snapshot, self._station_command_snapshot_id(snapshot))
+        if self._station_command_manual_qsy_meta_for_radio(self._station_command_snapshot_id(snapshot)):
+            destination = f"Target {destination}" if destination else ""
+        # Keep the dial ahead of secondary group/band when space is limited.
+        return primary_context_text(name, dial) + (f" · {destination}" if destination and destination != dial else "")
+
+    def _station_command_display_evidence(self, snapshot: object) -> dict:
+        radio_id = self._station_command_snapshot_id(snapshot)
+        evidence = getattr(self, "_station_command_endpoint_status_cache", {}).get(radio_id, {})
+        return project_endpoint_display(evidence)
+
+    def _station_command_display_dial(self, snapshot: object) -> tuple[str, bool, Optional[int]]:
+        """Last-confirmed presentation only; never used to verify a command."""
+        evidence = self._station_command_display_evidence(snapshot)
+        backend = str(self._station_command_value(snapshot, "control_backend", "")).lower()
+        key = "js8_frequency_hz" if backend == "js8call" else "frequency_hz"
+        value = evidence.get(key)
+        try:
+            hz = int(value)
+            if hz <= 0:
+                raise ValueError()
+        except (TypeError, ValueError):
+            return "Frequency unavailable", False, None
+        current = evidence.get("display_field_states", {}).get(key) == "current"
+        dial = f"{hz / 1_000_000:.6f}".rstrip("0")
+        dial += "0" * max(0, 3 - len(dial.partition(".")[2]))
+        return f"{dial} MHz", current, hz
+
+    def _station_command_authority_text(self, snapshot: object) -> str:
+        radio_id = self._station_command_snapshot_id(snapshot)
+        state = self._station_command_manual_control_state_for_radio(radio_id)
+        kind = str(getattr(state, "state", "") or "")
+        hold = self._station_command_hold_snapshot_for_radio(radio_id)
+        if kind == "manual_hold" and getattr(getattr(state, "manual_target", None), "source_action", "") == "qsy":
+            kind = "manual_qsy"
+        if not kind:
+            if self._station_command_scheduler_manual_qsy_active_for_radio(radio_id):
+                kind = "manual_qsy"
+            elif self._station_command_scheduler_suspended_manually_for_radio(radio_id):
+                kind = "manual_suspend"
+            elif hold.get("active"):
+                kind = "manual_hold"
+        fallback = self._station_command_compact_state_text(self._station_command_state_text(snapshot))
+        return authority_text(kind, hold.get("remaining_sec"), fallback)
+
+    def _station_command_is_held(self, snapshot: object) -> bool:
+        radio_id = self._station_command_snapshot_id(snapshot)
+        state = self._station_command_manual_control_state_for_radio(radio_id)
+        return (str(getattr(state, "state", "")) in {"manual_qsy", "manual_hold", "manual_suspend"}
+                or self._station_command_scheduler_manual_qsy_active_for_radio(radio_id)
+                or self._station_command_scheduler_suspended_manually_for_radio(radio_id)
+                or bool(self._station_command_hold_snapshot_for_radio(radio_id).get("active"))
+                or not self._station_command_bool(self._station_command_value(snapshot, "scheduler_enabled", True), default=True))
+
+    def _station_command_qsy_progress_text(self, snapshot: object) -> str:
+        radio_id = self._station_command_snapshot_id(snapshot)
+        request = getattr(self, "_station_command_qsy_requests", {}).get(radio_id)
+        dial, fresh, observed = self._station_command_reported_dial(snapshot)
+        evidence = getattr(self, "_station_command_endpoint_status_cache", {}).get(radio_id, {})
+        display_state = self._station_command_display_evidence(snapshot).get("display_state")
+        readback_notice = ("" if display_state == "current" else
+                           "Readback delayed · last confirmed values" if display_state == "delayed" else
+                           "Radio readback unavailable")
+        if not request:
+            return readback_notice
+        disposition = str(request.get("disposition") or "queued")
+        target_hz = int(request.get("frequency_hz") or 0)
+        target = f"{target_hz / 1_000_000:.6f}".rstrip("0").rstrip(".")
+        requested = f"Requested {target} MHz"
+        if disposition == "manual":
+            return f"{requested} · tune manually"
+        if disposition == "blocked":
+            return "QSY blocked · review radio status"
+        scheduler = getattr(self, "scheduler", None)
+        getter = getattr(scheduler, "command_result_snapshot", None)
+        result = getter(radio_id) if callable(getter) else {}
+        if (result and result.get("source") == "QSY"
+                and result.get("frequency_hz") == request.get("frequency_hz")
+                and float(result.get("completed_monotonic") or 0) >= float(request.get("requested_monotonic") or 0)):
+            status = str(result.get("status") or "")
+            if status in {"rejected", "failed", "timed_out"}:
+                reason = str(result.get("reason_code") or "control unavailable").replace("execution_", "").replace("_", " ")
+                return f"QSY blocked · {reason}"
+        confirmed_at = request.get("dial_confirmed_monotonic")
+        if confirmed_at is not None:
+            # This is a brief historical acknowledgement of fresh raw proof,
+            # never a current readiness claim or input to a command guard.
+            # Ordinary inflight polls cannot reopen a completed dial request.
+            if readback_notice:
+                return readback_notice
+            if fresh and observed is not None and abs(observed - target_hz) > 10:
+                return ""
+            return "Dial confirmed" if time.monotonic() - confirmed_at <= 5.0 else ""
+        # Match the endpoint verification tolerance without granting mode/VFO
+        # verification or triggering a probe from this display path.
+        if (fresh and observed is not None and abs(observed - target_hz) <= 10
+                and float(evidence.get("collected_monotonic") or 0) >= float(request.get("requested_monotonic") or 0)):
+            request["dial_confirmed_monotonic"] = time.monotonic()
+            return "Dial confirmed"
+        if disposition == "pending_verification":
+            return f"{requested} · checking radio safety"
+        evidence_state = (" · readback delayed" if display_state == "delayed" else
+                          " · readback unavailable" if display_state in {"unavailable", "invalidated"} else "")
+        return f"{requested} · awaiting readback{evidence_state}"
+
+    def _station_command_remember_qsy_request(self, meta: Mapping[str, object], accepted: bool) -> None:
+        try:
+            radio_id = int(meta.get("target_device_profile_id") or getattr(self, "_station_command_selected_profile_id", 0) or 0)
+            target = round(float(meta.get("freq")) * 1_000_000)
+        except (TypeError, ValueError, OverflowError):
+            return
+        if target <= 0:
+            return
+        requests = getattr(self, "_station_command_qsy_requests", None)
+        if not isinstance(requests, dict):
+            requests = self._station_command_qsy_requests = {}
+        requests[radio_id] = {
+            "frequency_hz": target,
+            "requested_monotonic": float(getattr(self, "_station_command_qsy_submit_monotonic", time.monotonic())),
+            "disposition": (getattr(self, "_station_command_qsy_dispositions", {}).get(radio_id, "queued")
+                            if accepted else "blocked"),
+        }
+
     def _station_command_now_tooltip(self, snapshot: object) -> str:
         exact = self._station_command_frequency_text(snapshot)
         snapshot_id = self._station_command_snapshot_id(snapshot)
@@ -8387,31 +8755,42 @@ class MainWindow(QMainWindow):
                     str(self._station_command_value(snapshot, "observer_follow_summary", "") or "").strip()
                     or "Receive-only monitor"
                 )
-            plan = self._station_command_plan_name_for_snapshot(snapshot)
-            if not plan or plan == "Unassigned":
-                return "No assigned plan"
-            if not self._station_command_bool(
-                self._station_command_value(snapshot, "scheduler_enabled", True),
+            if not MainWindow._station_command_bool(
+                MainWindow._station_command_value(snapshot, "scheduler_enabled", True),
                 default=True,
             ):
                 return "Scheduler disabled"
-            next_group = self._station_command_group_display_name(
-                self._station_command_value(snapshot, "next_group", "")
-                or self._station_command_value(snapshot, "next_schedule_group", "")
+            transition_getter = getattr(self, "_station_command_next_transition", None)
+            transition = (
+                transition_getter(snapshot)
+                if callable(transition_getter)
+                else MainWindow._station_command_next_transition(self, snapshot)
             )
-            next_band = str(
-                self._station_command_value(snapshot, "next_band", "")
-                or self._station_command_value(snapshot, "next_schedule_band", "")
-                or ""
-            ).strip().upper()
-            next_label = " ".join(part for part in (next_group, next_band) if part).strip()
-            if next_label:
-                return next_label
-            plan_group, plan_band = self._station_command_assigned_plan_next_group_band(snapshot)
-            plan_label = " ".join(part for part in (plan_group, plan_band) if part).strip()
-            return plan_label or plan
+            if transition is not None:
+                state = str(transition.get("state") or "").strip().lower()
+                if state == "pending":
+                    return "Schedule updating"
+                if state == "expired":
+                    return "Next transition expired"
+                if state == "no_next":
+                    return "No next transition"
+                entry = transition.get("entry")
+                if isinstance(entry, Mapping):
+                    next_group, next_band = self._station_command_entry_group_band(entry)
+                    next_label = " ".join(part for part in (next_group, next_band) if part).strip()
+                    if next_label:
+                        return next_label
+                if state == "legacy_entry_only":
+                    return "Next transition unavailable"
+                return "No next transition"
+            return "No next transition"
         except Exception:
             return "none"
+
+    @staticmethod
+    def _station_command_qsy_frequency_text(meta: Mapping[str, object]) -> str:
+        raw = meta.get("frequency", meta.get("freq"))
+        return format_frequency_mhz(raw)
 
     @staticmethod
     def _station_command_qsy_label(meta: Mapping[str, object]) -> str:
@@ -8422,8 +8801,11 @@ class MainWindow(QMainWindow):
             parts.append(group)
         if band:
             parts.append(band)
+        freq = MainWindow._station_command_qsy_frequency_text(meta)
+        if freq:
+            parts.append(freq)
         if not parts:
-            freq = MainWindow._station_command_format_frequency(meta.get("freq"), suffix="")
+            freq = MainWindow._station_command_qsy_frequency_text(meta)
             if freq:
                 parts.append(freq)
         return " ".join(part for part in parts if part).strip() or "Frequency"
@@ -8431,7 +8813,7 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _station_command_qsy_tooltip(meta: Mapping[str, object]) -> str:
         label = MainWindow._station_command_qsy_label(meta)
-        freq = MainWindow._station_command_format_frequency(meta.get("freq"), suffix="")
+        freq = MainWindow._station_command_qsy_frequency_text(meta)
         mode = str(meta.get("mode") or "").strip()
         details = " ".join(part for part in (freq, mode) if part).strip()
         return f"{label}: {details}" if details else label
@@ -8445,12 +8827,9 @@ class MainWindow(QMainWindow):
             else self._station_command_manual_qsy_meta_for_selected()
         )
         if manual_meta:
-            try:
-                freq = self._station_command_parse_frequency(manual_meta.get("freq"))
-                if freq is not None:
-                    return f"{freq:.6f}"
-            except Exception:
-                pass
+            key = self._station_command_qsy_option_key(manual_meta)
+            if key:
+                return key
         if selected_id > 0:
             refs = self._station_command_assigned_plan_refs_for_radio(selected_id)
             has_assigned_refs = bool(refs)
@@ -8464,7 +8843,11 @@ class MainWindow(QMainWindow):
                         ref.get("frequency") or ref.get("freq") or ref.get("frequency_mhz")
                     )
                     if freq is not None:
-                        return f"{freq:.6f}"
+                        resolved_meta = self._station_command_qsy_meta_from_plan_ref(
+                            ref, self._station_command_operating_group_qsy_lookup()
+                        )
+                        key = self._station_command_qsy_option_key(resolved_meta) if resolved_meta else ""
+                        return key or self._station_command_qsy_option_key({"freq": freq})
                 except Exception:
                     pass
             for ref in refs:
@@ -8476,7 +8859,11 @@ class MainWindow(QMainWindow):
                         ref.get("frequency") or ref.get("freq") or ref.get("frequency_mhz")
                     )
                     if freq is not None:
-                        return f"{freq:.6f}"
+                        resolved_meta = self._station_command_qsy_meta_from_plan_ref(
+                            ref, self._station_command_operating_group_qsy_lookup()
+                        )
+                        key = self._station_command_qsy_option_key(resolved_meta) if resolved_meta else ""
+                        return key or self._station_command_qsy_option_key({"freq": freq})
                 except Exception:
                     pass
             if not refs:
@@ -8486,7 +8873,10 @@ class MainWindow(QMainWindow):
                     try:
                         freq = self._station_command_parse_frequency(entry.get("frequency"))
                         if freq is not None:
-                            return f"{freq:.6f}"
+                            resolved_meta = self._station_command_qsy_meta_from_plan_ref(
+                                entry, self._station_command_operating_group_qsy_lookup()
+                            )
+                            return self._station_command_qsy_option_key(resolved_meta) if resolved_meta else self._station_command_qsy_option_key({"freq": freq})
                     except Exception:
                         pass
         try:
@@ -8499,7 +8889,10 @@ class MainWindow(QMainWindow):
                         raise ValueError("scheduler entry belongs to another radio")
                 freq = self._station_command_parse_frequency(entry.get("frequency"))
                 if freq is not None:
-                    return f"{freq:.6f}"
+                    resolved_meta = self._station_command_qsy_meta_from_plan_ref(
+                        entry, self._station_command_operating_group_qsy_lookup()
+                    )
+                    return self._station_command_qsy_option_key(resolved_meta) if resolved_meta else self._station_command_qsy_option_key({"freq": freq})
         except Exception:
             pass
         if selected is not None and (selected_id <= 0 or not has_assigned_refs):
@@ -8508,10 +8901,41 @@ class MainWindow(QMainWindow):
                     self._station_command_value(selected, "current_frequency_label", "")
                 )
                 if freq is not None:
-                    return f"{freq:.6f}"
+                    return self._station_command_qsy_option_key({
+                        "freq": freq,
+                        "group": self._station_command_value(selected, "schedule_group", ""),
+                        "band": self._station_command_value(selected, "schedule_band", ""),
+                    })
             except Exception:
                 pass
         return ""
+
+    @staticmethod
+    def _station_command_qsy_option_key(meta: object) -> str:
+        if not isinstance(meta, Mapping):
+            return ""
+        row_key = str(meta.get("operating_group_frequency_key") or "").strip()
+        if row_key:
+            return "row:" + row_key
+        frequency = meta.get("freq", meta.get("frequency"))
+        try:
+            hz = normalize_frequency_hz(frequency)
+        except Exception:
+            hz = None
+        if hz is None:
+            parsed = parse_frequency_mhz(frequency)
+            hz = normalize_frequency_hz(parsed) if parsed is not None else None
+        if hz is None:
+            return ""
+        return "|".join((
+            str(meta.get("group") or meta.get("group_name") or "").strip().upper(),
+            str(meta.get("band") or "").strip().upper(),
+            str(meta.get("mode") or "").strip().upper(),
+            str(hz),
+            str(meta.get("vfo") or "").strip().upper(),
+            str(meta.get("fldigi_mode") or "").strip().upper(),
+            str(meta.get("fldigi_offset") or "").strip(),
+        ))
 
     def _refresh_station_command_frequency_combo(self, selected: object | None = None) -> bool:
         combo = getattr(self, "station_command_freq_combo", None)
@@ -8520,18 +8944,27 @@ class MainWindow(QMainWindow):
         if combo.view().isVisible() or combo.hasFocus():
             return selected_qsy_meta(combo) is not None
         current = selected_qsy_meta(combo)
-        current_key = ""
-        try:
-            if current:
-                current_key = f"{float(current.get('freq')):.6f}"
-        except Exception:
-            current_key = ""
+        current_key = self._station_command_qsy_option_key(current)
         preferred_key = self._station_command_preferred_qsy_key(selected)
         try:
-            meta_map = build_qsy_options(load_operating_groups(self.settings))
+            catalog_meta_map = build_qsy_options(load_operating_groups(self.settings))
         except Exception:
-            meta_map = {}
-        meta_map = self._station_command_alternate_qsy_options(meta_map, selected)
+            catalog_meta_map = {}
+        meta_map = self._station_command_alternate_qsy_options(catalog_meta_map, selected)
+        if isinstance(current, Mapping) and not current.get("operating_group_frequency_key"):
+            current_group = self._station_command_group_display_name(current.get("group") or current.get("group_name"))
+            current_band = str(current.get("band") or "").strip().upper()
+            current_hz = normalize_frequency_hz(current.get("frequency") or current.get("freq"))
+            current_mode = str(current.get("mode") or "").strip().upper()
+            candidates = [
+                key for key, meta in meta_map.items()
+                if self._station_command_group_display_name(meta.get("group")).upper() == current_group.upper()
+                and str(meta.get("band") or "").strip().upper() == current_band
+                and normalize_frequency_hz(meta.get("frequency") or meta.get("freq")) == current_hz
+                and (not current_mode or str(meta.get("mode") or "").strip().upper() == current_mode)
+            ]
+            if len(candidates) == 1:
+                current_key = candidates[0]
         previous_block = combo.blockSignals(True)
         try:
             combo.clear()
@@ -8550,14 +8983,16 @@ class MainWindow(QMainWindow):
             if select_key:
                 for index in range(combo.count()):
                     data = combo.itemData(index)
-                    try:
-                        if isinstance(data, Mapping) and f"{float(data.get('freq')):.6f}" == select_key:
-                            combo.setCurrentIndex(index)
-                            break
-                    except Exception:
-                        continue
-            if selected_qsy_meta(combo) is None and combo.count() > 1:
-                combo.setCurrentIndex(1)
+                    if isinstance(data, Mapping) and self._station_command_qsy_option_key(data) == select_key:
+                        combo.setCurrentIndex(index)
+                        break
+            if selected_qsy_meta(combo) is None and len(meta_map) == 1 and not preferred_key:
+                for index in range(combo.count()):
+                    if isinstance(combo.itemData(index), Mapping):
+                        combo.setCurrentIndex(index)
+                        break
+            if selected_qsy_meta(combo) is None:
+                combo.setCurrentIndex(-1)
         finally:
             combo.blockSignals(previous_block)
         return selected_qsy_meta(combo) is not None
@@ -8603,6 +9038,53 @@ class MainWindow(QMainWindow):
         set_hold_duration_default(self.settings, mins)
         self.on_hold_duration_default_changed()
 
+    def _save_station_command_js8_offset(
+        self,
+        radio_profile_id: int,
+        offset_hz: int,
+        *,
+        expected_instance_id: int | None = None,
+    ) -> bool:
+        """Persist a per-radio JS8 default; runtime applies it through safety gates."""
+
+        try:
+            saved = self.multi_radio_store.update_radio_js8_offset(
+                int(radio_profile_id),
+                int(offset_hz),
+                expected_instance_id=expected_instance_id,
+            )
+            manager = getattr(self, "station_runtime_manager", None)
+            if manager is not None and hasattr(manager, "update_runtime_js8_offset"):
+                manager.update_runtime_js8_offset(int(radio_profile_id), int(offset_hz))
+            cache = list(getattr(self, "_station_command_profile_cache", []) or [])
+            self._station_command_profile_cache = [
+                dict(saved)
+                if self._station_command_snapshot_id(item) == int(radio_profile_id)
+                else item
+                for item in cache
+            ]
+            if int(getattr(self, "_station_command_selected_profile_id", 0) or 0) == int(radio_profile_id):
+                self._active_runtime_profile = dict(saved)
+            scheduler = getattr(self, "scheduler", None)
+            if scheduler is not None and hasattr(scheduler, "force_refresh"):
+                scheduler.force_refresh()
+            self._publish_station_command_feedback(
+                action_type="js8_offset",
+                status="succeeded",
+                summary=f"JS8 offset saved: {int(offset_hz)} Hz.",
+                detail="CommsPlan will apply the per-radio default only when radio and JS8 activity safety checks permit it.",
+            )
+            self._refresh_station_command_bar(force=True)
+            return True
+        except Exception as exc:
+            self._publish_station_command_feedback(
+                action_type="js8_offset",
+                status="failed",
+                summary="JS8 offset was not changed.",
+                detail=str(exc),
+            )
+            return False
+
     def _station_command_selected_qsy_meta(self) -> dict | None:
         combo = getattr(self, "station_command_freq_combo", None)
         if not isinstance(combo, QComboBox):
@@ -8636,7 +9118,9 @@ class MainWindow(QMainWindow):
                 detail="Choose a frequency in the top command bar before using QSY Now.",
             )
             return
+        self._station_command_qsy_submit_monotonic = time.monotonic()
         ok = perform_qsy(self, meta)
+        self._station_command_remember_qsy_request(meta, ok)
         if ok:
             self._station_command_set_manual_qsy_meta(meta)
             try:
@@ -8648,9 +9132,9 @@ class MainWindow(QMainWindow):
         freq_label = self._station_command_qsy_label(meta)
         self._publish_station_command_feedback(
             action_type="qsy",
-            status="succeeded" if ok else "blocked",
-            summary=f"QSY sent: {freq_label}" if ok else f"QSY blocked: {freq_label}",
-            detail="Scheduler is suspended in manual QSY state until Resume Schedule or the next explicit schedule transition." if ok else "",
+            status="partial" if ok else "blocked",
+            summary=f"QSY requested: {freq_label}" if ok else f"QSY blocked: {freq_label}",
+            detail="Scheduler is suspended in manual QSY state until Resume Schedule or the configured timed hold expires." if ok else "",
         )
         self._refresh_station_command_controls_after_state_change()
 
@@ -8668,12 +9152,14 @@ class MainWindow(QMainWindow):
                 detail="Choose a frequency in the top command bar before using QSY Suspend.",
             )
             return
+        self._station_command_qsy_submit_monotonic = time.monotonic()
         mins = perform_qsy_with_hold(
             self,
             self.settings,
             meta,
             int(hold_minutes or self._selected_station_command_hold_minutes()),
         )
+        self._station_command_remember_qsy_request(meta, mins > 0)
         if mins > 0:
             self._station_command_set_manual_qsy_meta(meta)
             try:
@@ -8685,13 +9171,13 @@ class MainWindow(QMainWindow):
         freq_label = self._station_command_qsy_label(meta)
         self._publish_station_command_feedback(
             action_type="qsy",
-            status="succeeded" if mins > 0 else "blocked",
-            summary=f"QSY sent: {freq_label}" if mins > 0 else f"QSY Suspend blocked: {freq_label}",
+            status="partial" if mins > 0 else "blocked",
+            summary=f"Timed QSY requested: {freq_label}" if mins > 0 else f"Timed QSY blocked: {freq_label}",
             detail=f"Scheduler suspended for {mins} minutes." if mins > 0 else "",
         )
         self._refresh_station_command_controls_after_state_change()
 
-    def _on_station_command_timed_suspend_clicked(self, target_device_profile_id: int | None = None) -> None:
+    def _on_station_command_timed_suspend_clicked(self, target_device_profile_id: int | None = None, *, minutes: int | None = None) -> None:
         try:
             target_id = int(target_device_profile_id or getattr(self, "_station_command_selected_profile_id", 0) or 0) or None
         except Exception:
@@ -8700,7 +9186,7 @@ class MainWindow(QMainWindow):
             mins = suspend_schedule_hold(
                 self,
                 self.settings,
-                minutes=self._selected_station_command_hold_minutes(),
+                minutes=int(minutes) if minutes is not None else self._selected_station_command_hold_minutes(),
                 warn_rf_conflict=True,
                 target_device_profile_id=target_id,
             )
@@ -8760,11 +9246,12 @@ class MainWindow(QMainWindow):
                 target_device_profile_id=target_profile_id,
             )
         except TypeError:
-            ok = resume_schedule_hold(self, self.settings)
+            ok = False if target_profile_id is not None else resume_schedule_hold(self, self.settings)
         if ok:
             self._station_command_clear_manual_qsy_meta(target_profile_id)
             self._station_command_clear_pending_qsy_for_radio(target_profile_id)
             self._invalidate_station_command_lane_cache()
+            getattr(self, "_station_command_qsy_requests", {}).pop(int(target_profile_id or 0), None)
             self._station_command_set_scheduler_suspended_manual(False, target_device_profile_id=target_profile_id)
             self._station_command_timed_suspend_profile_id = 0
         self._publish_station_command_feedback(
@@ -8804,7 +9291,11 @@ class MainWindow(QMainWindow):
             ),
             None,
         )
-        if profile is None:
+        if profile is None or (
+            str(self._station_command_value(profile, "device_class", "")).lower() == "observer"
+            or (self._station_command_value(profile, "runtime_active", None) is not None
+                and not self._station_command_bool(self._station_command_value(profile, "runtime_active", None), default=False))
+        ):
             self._publish_station_command_feedback(
                 action_type="select_radio",
                 status="failed",
@@ -9530,47 +10021,78 @@ class MainWindow(QMainWindow):
         tooltip: str,
         theme: dict,
     ) -> None:
-        led = QLabel(self.station_command_health_widget)
-        led.setFixedSize(14, 14)
-        led.setCursor(Qt.PointingHandCursor)
-        led.mousePressEvent = lambda event, widget=led: self._on_station_command_health_clicked(event, anchor=widget)
-        led.setStyleSheet(led_style(state, theme))
-        led.setToolTip(tooltip)
-        text_label = QLabel(label_text, self.station_command_health_widget)
-        text_label.setCursor(Qt.PointingHandCursor)
-        text_label.mousePressEvent = lambda event, widget=text_label: self._on_station_command_health_clicked(event, anchor=widget)
-        text_label.setToolTip(tooltip)
-        text_label.setStyleSheet(
-            f"background: transparent; color: {theme.get('station_control_text', theme.get('text', '#222222'))};"
+        led = self.station_command_health_leds.get(key)
+        text_label = self.station_command_health_text_labels.get(key)
+        if led is None or text_label is None:
+            led = QLabel(self.station_command_health_widget)
+            led.setFixedSize(14, 14)
+            led.setCursor(Qt.PointingHandCursor)
+            led.mousePressEvent = lambda event, widget=led: self._on_station_command_health_clicked(event, anchor=widget)
+            text_label = QLabel(self.station_command_health_widget)
+            text_label.setCursor(Qt.PointingHandCursor)
+            text_label.mousePressEvent = lambda event, widget=text_label: self._on_station_command_health_clicked(event, anchor=widget)
+            self.station_command_health_leds[key] = led
+            self.station_command_health_text_labels[key] = text_label
+            self.station_command_health_layout.addWidget(led)
+            self.station_command_health_layout.addWidget(text_label)
+            self.station_command_health_layout.addStretch(1)
+
+        set_widget_value(led, "styleSheet", led_style(state, theme))
+        set_widget_value(led, "toolTip", tooltip)
+        set_widget_value(text_label, "text", label_text)
+        set_widget_value(text_label, "toolTip", tooltip)
+        set_widget_value(
+            text_label,
+            "styleSheet",
+            f"background: transparent; color: {theme.get('station_control_text', theme.get('text', '#222222'))};",
         )
-        self.station_command_health_leds[key] = led
-        self.station_command_health_text_labels[key] = text_label
-        self.station_command_health_layout.addWidget(led)
-        self.station_command_health_layout.addWidget(text_label)
 
     def _refresh_station_command_health(self, selected: object | None, selected_id: int) -> None:
         if not hasattr(self, "station_command_health_layout"):
             return
-        layout = self.station_command_health_layout
-        self._clear_station_command_health_layout(layout)
-        self.station_command_health_leds = {}
-        self.station_command_health_text_labels = {}
+        if not isinstance(getattr(self, "station_command_health_leds", None), dict):
+            self.station_command_health_leds = {}
+        if not isinstance(getattr(self, "station_command_health_text_labels", None), dict):
+            self.station_command_health_text_labels = {}
         profile = self._station_command_health_profile(selected, selected_id)
         subject = selected if selected is not None else profile
         items = self._station_command_health_items(subject)
         theme = resolve_theme(self.settings)
         summary = self._station_command_health_summary_for_profile(subject)
+        label_text = str(summary.get("label", "Checking") or "Checking")
+        state = str(summary.get("state", "idle") or "idle")
+        tooltip = str(summary.get("tooltip", "") or "Waiting for current cached radio-control evidence.")
+        has_items = bool(items)
+        widget = self.station_command_health_widget
+        font = widget.font()
+        font_signature = (font.toString(), int(widget.fontMetrics().height()))
+        theme_signature = tuple(sorted((str(key), repr(value)) for key, value in theme.items()))
+        # The rendered summary carries cached endpoint freshness through its
+        # state and tooltip. Include the selected radio, visibility, palette,
+        # and font so a presentation change cannot be hidden by this fast path.
+        signature = (
+            int(selected_id or 0),
+            has_items,
+            label_text,
+            state,
+            tooltip,
+            tuple((str(key), str(label)) for key, label in items),
+            theme_signature,
+            font_signature,
+        )
+        if signature == getattr(self, "_station_command_health_widget_signature", None):
+            return
         self._add_station_command_health_item(
             key="__summary__",
-            label_text=str(summary.get("label", "Checking") or "Checking"),
-            state=str(summary.get("state", "idle") or "idle"),
-            tooltip=str(summary.get("tooltip", "") or "Waiting for current cached radio-control evidence."),
+            label_text=label_text,
+            state=state,
+            tooltip=tooltip,
             theme=theme,
         )
-        layout.addStretch(1)
-        has_items = bool(items)
         self.station_command_health_label.setVisible(has_items)
-        self.station_command_health_widget.setVisible(has_items)
+        if widget.isHidden() == has_items:
+            widget.setVisible(has_items)
+        self._station_command_health_widget_signature = signature
 
     @staticmethod
     def _station_command_is_controllable_profile(profile: object) -> bool:
@@ -9596,6 +10118,7 @@ class MainWindow(QMainWindow):
             dict(profile) if isinstance(profile, Mapping) else profile
             for profile in profiles
             if self._station_command_is_controllable_profile(profile)
+            or str(self._station_command_value(profile, "device_class", "")).lower() == "observer"
         ]
 
     def _station_command_selected_snapshot(self, choices: list[object]) -> object | None:
@@ -10176,7 +10699,7 @@ class MainWindow(QMainWindow):
                     label.setToolTip(tooltip)
                 layout.addWidget(label)
         else:
-            empty = QLabel("No local mesh connection is configured for FIO.", dialog)
+            empty = QLabel("No local mesh connection is configured for CommsPlan.", dialog)
             empty.setWordWrap(True)
             layout.addWidget(empty)
 
@@ -10446,7 +10969,15 @@ class MainWindow(QMainWindow):
         layout.addWidget(rail)
         return max(0, total_width)
 
+    def _toggle_station_command_minimized(self) -> None:
+        self._station_command_minimized = not bool(getattr(self, "_station_command_minimized", False))
+        if self._station_command_minimized:
+            self._station_command_controls_expanded = False
+        self._station_command_radio_summary_signature = None
+        self._refresh_station_command_bar(force=True)
+
     def _toggle_adaptive_station_controls(self) -> None:
+        self._station_command_minimized = False
         self._station_command_controls_expanded = not bool(
             getattr(self, "_station_command_controls_expanded", False)
         )
@@ -10461,13 +10992,21 @@ class MainWindow(QMainWindow):
             selected_id = int(getattr(self, "_station_command_selected_profile_id", 0) or 0)
         except Exception:
             selected_id = 0
-        self._station_command_radio_summary_signature = None
         self._refresh_adaptive_station_command_shell(choices, selected_id)
 
     def _open_sop_from_station_command(self) -> None:
         index = getattr(self, "_screen_index_by_label", {}).get("SOP")
         if index is not None:
             self._set_screen(int(index))
+
+    def _run_station_quick_hold(self, radio_id: int) -> None:
+        resume = (self._station_command_scheduler_manual_qsy_active_for_radio(radio_id)
+                  or self._station_command_timed_suspend_active_for_radio(radio_id)
+                  or self._station_command_scheduler_suspended_manually_for_radio(radio_id))
+        if resume:
+            self._on_station_command_resume_clicked(radio_id)
+        else:
+            self._on_station_command_timed_suspend_clicked(radio_id)
 
     def _run_adaptive_qsy_action(
         self,
@@ -10513,10 +11052,7 @@ class MainWindow(QMainWindow):
             action.setToolTip(str(combo.itemData(index, Qt.ToolTipRole) or ""))
             enabled = has_options and isinstance(meta, Mapping)
             if enabled and not timed:
-                try:
-                    enabled = f"{float(meta.get('freq')):.6f}" != preferred_key
-                except Exception:
-                    enabled = False
+                enabled = self._station_command_qsy_option_key(meta) != preferred_key
             action.setEnabled(enabled)
             action.triggered.connect(
                 lambda _checked=False, idx=index, rid=ident, target_combo=combo, is_timed=timed: self._run_adaptive_qsy_action(
@@ -10574,7 +11110,7 @@ class MainWindow(QMainWindow):
         freq_combo.setToolTip(
             "Choose an assigned-plan operating destination for this radio."
             if frequency_control_available
-            else "This radio's frequency is controlled outside FIO."
+            else "This radio's frequency is controlled outside CommsPlan."
         )
         freq_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         freq_combo.setMinimumWidth(170)
@@ -10708,7 +11244,7 @@ class MainWindow(QMainWindow):
             suspend_menu.addAction(action)
         suspend_btn.setMenu(suspend_menu)
 
-        resume_btn = QPushButton("Resume", tray)
+        resume_btn = QPushButton("Resume schedule", tray)
         resume_btn.setObjectName("stationCommandControlsResume")
         resume_btn.setToolTip("Return this radio to scheduled control.")
         resume_active = bool(
@@ -10722,13 +11258,11 @@ class MainWindow(QMainWindow):
             lambda _checked=False, radio_id=ident: self._on_station_command_resume_clicked(radio_id)
         )
 
-        icon_root = Path(__file__).resolve().parents[2] / "assets" / "icons" / "navigation"
         health_summary = self._station_command_health_summary_for_profile(snapshot)
         health_state = str(health_summary.get("state", "warn") or "warn").strip().lower()
         health_btn = QToolButton(tray)
         health_btn.setObjectName("stationCommandControlsHealth")
-        health_btn.setIcon(QIcon(str(icon_root / "health.svg")))
-        health_btn.setIconSize(QSize(21, 21))
+        health_btn.setText("Health…")
         health_btn.setAccessibleName("Radio health")
         health_btn.setToolTip(
             f"Health: {health_summary.get('label', 'Review')}. Open radio health summary."
@@ -10737,14 +11271,13 @@ class MainWindow(QMainWindow):
         health_btn.clicked.connect(
             lambda _checked=False, radio_id=ident, snap=snapshot, anchor=health_btn: self._show_station_command_health_menu(
                 device_profile_id=radio_id,
-                snapshot=snap,
+                snapshot=self._station_command_current_snapshot(radio_id) or snap,
                 anchor=anchor,
             )
         )
         plan_btn = QToolButton(tray)
         plan_btn.setObjectName("stationCommandControlsPlan")
-        plan_btn.setIcon(QIcon(str(icon_root / "plans.svg")))
-        plan_btn.setIconSize(QSize(21, 21))
+        plan_btn.setText("Plan…")
         plan_btn.setAccessibleName("Change radio plan")
         plan_btn.setToolTip("Assign or change the Frequency Plan for the selected radio.")
         plan_btn.setEnabled(ident > 0)
@@ -10752,10 +11285,14 @@ class MainWindow(QMainWindow):
             lambda _checked=False, radio_id=ident: self._open_schedule_assignment_for_radio(radio_id)
         )
         utility_size = control_height_for_font(tray, vertical_padding=9, floor=34)
-        health_btn.setFixedSize(utility_size, utility_size)
-        plan_btn.setFixedSize(utility_size, utility_size)
+        for button in (health_btn, plan_btn):
+            button.setMinimumHeight(utility_size)
+            button.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
 
         def update_qsy_buttons(_index: int = -1) -> None:
+            manual_qsy_active = self._station_command_scheduler_manual_qsy_active_for_radio(ident)
+            hold = self._station_command_hold_snapshot_for_radio(ident)
+            timed_qsy_active = bool(hold.get("active") and manual_qsy_active)
             selected_key = self._station_command_combo_selected_key(freq_combo)
             action_state = qsy_action_state(
                 selected_meta=selected_qsy_meta(freq_combo),
@@ -10817,33 +11354,35 @@ class MainWindow(QMainWindow):
             grid.addWidget(freq_combo, 0, 1)
             grid.addWidget(qsy_btn, 0, 2)
             grid.addWidget(timer_btn, 0, 3)
-            grid.addWidget(suspend_btn, 0, 4)
-            grid.addWidget(resume_btn, 0, 5)
-            grid.addWidget(health_btn, 0, 6)
-            grid.addWidget(plan_btn, 0, 7)
+            grid.addWidget(resume_btn, 0, 4)
             grid.setColumnStretch(1, 1)
-        elif density == "compact":
-            grid.addWidget(target_label, 0, 0)
-            grid.addWidget(freq_combo, 0, 1, 1, 3)
-            grid.addWidget(qsy_btn, 0, 4)
-            grid.addWidget(timer_btn, 0, 5)
-            grid.addWidget(suspend_btn, 1, 1)
-            grid.addWidget(resume_btn, 1, 2)
-            grid.addWidget(health_btn, 1, 4)
-            grid.addWidget(plan_btn, 1, 5)
-            grid.setColumnStretch(1, 1)
-            grid.setColumnStretch(3, 1)
+            detail_row = 1
         else:
             grid.addWidget(target_label, 0, 0)
-            grid.addWidget(freq_combo, 0, 1, 1, 5)
-            grid.addWidget(qsy_btn, 1, 1, 1, 2)
-            grid.addWidget(timer_btn, 1, 3, 1, 3)
-            grid.addWidget(suspend_btn, 2, 1, 1, 2)
-            grid.addWidget(resume_btn, 2, 3)
-            grid.addWidget(health_btn, 2, 4)
-            grid.addWidget(plan_btn, 2, 5)
+            grid.addWidget(freq_combo, 0, 1, 1, 3)
+            grid.addWidget(qsy_btn, 1, 1)
+            grid.addWidget(timer_btn, 1, 2)
+            grid.addWidget(resume_btn, 1, 3)
             grid.setColumnStretch(1, 1)
+            grid.setColumnStretch(2, 1)
             grid.setColumnStretch(3, 1)
+            detail_row = 2
+        tools = QWidget(tray)
+        tools_layout = QHBoxLayout(tools)
+        tools_layout.setContentsMargins(0, 0, 0, 0)
+        tools_layout.setSpacing(6)
+        for button in (suspend_btn, health_btn, plan_btn):
+            tools_layout.addWidget(button)
+        tools_layout.addStretch(1)
+        detail_scroll = QScrollArea(tray)
+        detail_scroll.setObjectName("stationCommandAdvancedToolsScroll")
+        detail_scroll.setWidgetResizable(True)
+        detail_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        detail_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        detail_scroll.setWidget(tools)
+        detail_scroll.setMinimumHeight(utility_size + 2 * detail_scroll.frameWidth())
+        detail_scroll.setMaximumHeight(utility_size + 2 * detail_scroll.frameWidth() + 8)
+        grid.addWidget(detail_scroll, detail_row, 1, 1, 4 if density == "roomy" else 3)
 
         self._station_command_radio_tile_controls = {
             ident: {
@@ -10867,36 +11406,41 @@ class MainWindow(QMainWindow):
         density: str,
         theme: Mapping[str, object],
     ) -> QFrame:
-        rail = QFrame(parent)
-        rail.setObjectName("stationCommandSourceRail")
+        rail = ResponsiveAwarenessRail(parent)
         rail.setAccessibleName("Radio, condition and time awareness")
-        row = QHBoxLayout(rail)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(6)
+        # The rail owns responsive wrapping.  It exposes the two small
+        # QHBoxLayout-compatible methods used below so status publication can
+        # keep treating this as a cache-only presentation surface.
+        row = rail
+        self._station_command_source_widgets = {}
+        self._station_command_mesh_widgets = {}
+        self.station_command_local_time_label = None
+        self.station_command_utc_time_label = None
         attention = self._station_command_unique_attention_snapshots(
             [item for item in choices if self._station_command_snapshot_needs_operator_attention(item)]
         )
-        if attention:
-            compact_attention = density == "condensed"
-            button = QPushButton(
-                f"! {len(attention)}" if compact_attention else f"ATTN: {len(attention)}",
-                rail,
+        compact_attention = density == "condensed"
+        button = QPushButton(
+            f"! {len(attention)}" if compact_attention else f"ATTN: {len(attention)}",
+            rail,
+        )
+        button.setObjectName("stationCommandAttentionChip")
+        attention_noun = "radio or source" if len(attention) == 1 else "radios or sources"
+        attention_verb = "needs" if len(attention) == 1 else "need"
+        button.setAccessibleName(f"{len(attention)} {attention_noun} {attention_verb} attention")
+        button.setToolTip("Review radios or sources that need operator attention.")
+        button.setStyleSheet(button_style("warning", theme))
+        button.clicked.connect(
+            lambda _checked=False, focus_id=selected_id, anchor=button, menu_theme=dict(theme): self._show_station_command_attention_menu(
+                choices=tuple(self._station_command_unique_attention_snapshots([item for item in getattr(self, "_station_command_last_choices", ()) if self._station_command_snapshot_needs_operator_attention(item)])),
+                selected_id=focus_id,
+                anchor=anchor,
+                theme=menu_theme,
             )
-            button.setObjectName("stationCommandAttentionChip")
-            attention_noun = "radio or source" if len(attention) == 1 else "radios or sources"
-            attention_verb = "needs" if len(attention) == 1 else "need"
-            button.setAccessibleName(f"{len(attention)} {attention_noun} {attention_verb} attention")
-            button.setToolTip("Review radios or sources that need operator attention.")
-            button.setStyleSheet(button_style("warning", theme))
-            button.clicked.connect(
-                lambda _checked=False, snapshots=tuple(attention), focus_id=selected_id, anchor=button, menu_theme=dict(theme): self._show_station_command_attention_menu(
-                    choices=snapshots,
-                    selected_id=focus_id,
-                    anchor=anchor,
-                    theme=menu_theme,
-                )
-            )
-            row.addWidget(button)
+        )
+        row.addWidget(button)
+        button.setVisible(bool(attention))
+        self._station_command_attention_widget = button
         for item in self._station_command_saved_mesh_control_items():
             button = QPushButton(f"{item.label} ▾", rail)
             button.setObjectName("stationCommandSourceChip")
@@ -10904,8 +11448,9 @@ class MainWindow(QMainWindow):
             button.setAccessibleName(f"Mesh source {item.label}")
             button.setStyleSheet(button_style(item.role, theme))
             button.clicked.connect(
-                lambda _checked=False, anchor=button, source=item: self._show_mesh_source_menu(anchor, source)
+                lambda _checked=False, anchor=button, key=getattr(item, "key", item.label): self._show_current_mesh_source_menu(anchor, key)
             )
+            self._station_command_mesh_widgets[getattr(item, "key", item.label)] = button
             row.addWidget(button)
         for snapshot in choices:
             ident = self._station_command_snapshot_id(snapshot)
@@ -10939,6 +11484,7 @@ class MainWindow(QMainWindow):
             button.clicked.connect(
                 lambda _checked=False, profile_id=ident: self._on_station_command_summary_radio_clicked(profile_id)
             )
+            self._station_command_source_widgets[ident] = button
             row.addWidget(button)
         condition_levels = self._collect_condition_levels()
         if density != "condensed":
@@ -10957,7 +11503,7 @@ class MainWindow(QMainWindow):
                 row.addWidget(condition)
         elif condition_levels:
             condition = QPushButton(
-                f"◆ {len(condition_levels)}" if len(condition_levels) > 1 else f"{condition_levels[0][0]} L{condition_levels[0][1]}",
+                f"Groups {len(condition_levels)}" if len(condition_levels) > 1 else f"{condition_levels[0][0]} L{condition_levels[0][1]}",
                 rail,
             )
             condition.setObjectName("stationCommandConditionChip")
@@ -10970,6 +11516,20 @@ class MainWindow(QMainWindow):
             condition.setStyleSheet(button_style("warning", theme))
             condition.clicked.connect(self._open_condition_levels_editor)
             row.addWidget(condition)
+        minimize = QToolButton(rail)
+        minimize.setObjectName("stationCommandMinimizeToggle")
+        minimized = bool(getattr(self, "_station_command_minimized", False))
+        minimize.setText("More" if minimized else "Less")
+        minimize.setAccessibleName("Restore control bar details" if minimized else "Minimize control bar details")
+        minimize.setToolTip("Keep dial, authority, activity and alerts visible; collapse healthy readbacks." if not minimized else "Restore application readbacks and control bar details.")
+        minimize.setStyleSheet(button_style("muted", theme))
+        minimize.clicked.connect(self._toggle_station_command_minimized)
+        # The retained card panel owns one disclosure control. Keep the legacy
+        # rail toggle only when this rail is used outside that panel.
+        if not isinstance(parent, QWidget) or parent.objectName() != "radioControlGlobalContext":
+            row.addWidget(minimize)
+        else:
+            minimize.hide()
         row.addStretch(1)
         local_text = self.ledge_local_time_label.text() if hasattr(self, "ledge_local_time_label") else "Local --"
         utc_text = self.ledge_utc_time_label.text() if hasattr(self, "ledge_utc_time_label") else "UTC --"
@@ -10985,6 +11545,9 @@ class MainWindow(QMainWindow):
             self.station_command_utc_time_label.setObjectName("stationCommandUtcTime")
             for label in (self.station_command_local_time_label, self.station_command_utc_time_label):
                 label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                label.setProperty("clockSeconds", density == "roomy")
+                if density != "roomy":
+                    label.setText(re.sub(r"(\d{2}:\d{2}):\d{2}", r"\1", label.text()))
             clock_layout.addWidget(self.station_command_local_time_label)
             clock_layout.addWidget(self.station_command_utc_time_label)
         else:
@@ -10998,7 +11561,217 @@ class MainWindow(QMainWindow):
         row.addWidget(clock)
         return rail
 
+    def _show_current_mesh_source_menu(self, anchor, key) -> None:
+        item = next((item for item in self._station_command_saved_mesh_control_items()
+                     if getattr(item, "key", item.label) == key), None)
+        if item is not None:
+            self._show_mesh_source_menu(anchor, item)
+
+    def _station_command_current_snapshot(self, radio_id):
+        return next((item for item in getattr(self, "_station_command_last_choices", ())
+                     if self._station_command_snapshot_id(item) == radio_id), None)
+
+    def _station_command_sop_button_text(self, button, selected) -> str:
+        label = str(getattr(self, "_sop_next_action_label", "") or "").strip()
+        minutes = self._get_next_sop_action_minutes(selected)
+        count = int(getattr(self, "_sop_next_action_count", 0) or 0)
+        full = sop_action_text(label, minutes, count)
+        if not label:
+            return "SOP actions"
+        tail = full[len("SOP: " + label):]
+        width = max(0, button.maximumWidth() - button.fontMetrics().horizontalAdvance("SOP: " + tail) - 28)
+        return "SOP: " + button.fontMetrics().elidedText(label, Qt.ElideRight, width) + tail
+
+    def _station_command_readback_visibility(self, name: str, text: str) -> bool:
+        if not getattr(self, "_station_command_minimized", False) or name == "Activity":
+            return True
+        return "unknown" in text.lower() or "→" in text or "target" in text.lower()
+
+    def _update_adaptive_station_values(self, selected, selected_id, application_summary, shell_state, theme) -> None:
+        """Publish semantic changes in place; never rebuild controls for polling."""
+        values = getattr(self, "_station_command_adaptive_values", {})
+        attention = self._station_command_unique_attention_snapshots(
+            [item for item in getattr(self, "_station_command_last_choices", ())
+             if self._station_command_snapshot_needs_operator_attention(item)]
+        )
+        button = getattr(self, "_station_command_attention_widget", None)
+        if button is not None:
+            set_widget_value(button, "text", f"! {len(attention)}" if shell_state.density == "condensed" else f"ATTN: {len(attention)}")
+            button.setVisible(bool(attention))
+            noun = "radio or source needs" if len(attention) == 1 else "radios or sources need"
+            set_widget_value(button, "accessibleName", f"{len(attention)} {noun} attention")
+        for item in self._station_command_saved_mesh_control_items():
+            button = getattr(self, "_station_command_mesh_widgets", {}).get(getattr(item, "key", item.label))
+            if button is not None:
+                set_widget_value(button, "toolTip", item.tooltip or "Manage this mesh source.")
+                set_widget_value(button, "styleSheet", button_style(item.role, theme))
+        for snapshot in getattr(self, "_station_command_last_choices", ()):
+            ident = self._station_command_snapshot_id(snapshot)
+            button = getattr(self, "_station_command_source_widgets", {}).get(ident)
+            if button is None:
+                continue
+            role, status_label = self._station_command_attention_role_for_snapshot(snapshot)
+            now = self._station_command_now_text_for_summary(snapshot, selected_id)
+            prefix = "! " if role == "danger" else "△ " if role == "warning" else "● "
+            name = self._station_command_snapshot_name(snapshot)
+            set_widget_value(button, "text", prefix + source_chip_text(name, now, density=shell_state.density))
+            set_widget_value(button, "toolTip", self._station_command_source_chip_tooltip(snapshot, selected_id))
+            set_widget_value(button, "accessibleName", f"{name}, {status_label}, {now or 'frequency unavailable'}")
+            set_widget_value(button, "styleSheet", button_style(role if role in {"danger", "warning", "muted"} else "info", theme))
+        if selected is None or not values:
+            return
+        ident = self._station_command_snapshot_id(selected)
+        resume = (self._station_command_scheduler_manual_qsy_active_for_radio(ident)
+                  or self._station_command_timed_suspend_active_for_radio(ident)
+                  or self._station_command_scheduler_suspended_manually_for_radio(ident))
+        set_widget_value(values["hold"], "text", "Resume schedule" if resume else "Hold schedule")
+        set_widget_value(values["hold"], "styleSheet", button_style("warning" if resume else "muted", theme))
+        set_widget_value(values["hold"], "toolTip", "Resume scheduled control for this radio." if resume else "Temporarily hold scheduled changes for this radio.")
+        self._update_station_command_radio_tile_hold_controls({})
+        name = self._station_command_snapshot_name(selected)
+        now = self._station_command_selected_context_text(selected)
+        state = self._station_command_authority_text(selected)
+        role, _label = self._station_command_attention_role_for_snapshot(selected)
+        prefix = "! " if role == "danger" else "△ " if role == "warning" else ""
+        set_widget_value(values["now"], "text", now)
+        set_widget_value(values["now"], "toolTip", self._station_command_frequency_text(selected))
+        set_widget_value(values["now"], "accessibleName", f"{name} now operating at {now}")
+        set_widget_value(values["state"], "text", prefix + state)
+        set_widget_value(values["state"], "toolTip", self._station_command_radio_summary_tooltip(selected, selected_id))
+        set_widget_value(values["state"], "styleSheet",
+                         f"color:{theme.get(role, theme.get('warning', '#D1A000'))}; font-weight:800;"
+                         if role in {"danger", "warning"} else "")
+        next_state = planned_transition_text(self._station_command_next_text(selected), self._station_command_next_minutes(selected), self._station_command_is_held(selected))
+        set_widget_value(values["next"], "text", next_state.text)
+        set_widget_value(values["next"], "accessibleName", next_state.text)
+        set_widget_value(values["next"], "styleSheet", label_style(next_state.role, theme, weight=600))
+        if values.get("progress") is not None:
+            progress = self._station_command_qsy_progress_text(selected)
+            progress_role = "danger" if "blocked" in progress else "warning" if "stale" in progress or "unknown" in progress else "muted"
+            set_widget_value(values["progress"], "text", progress)
+            set_widget_value(values["progress"], "toolTip", progress + ". A requested target is not an observed frequency.")
+            set_widget_value(values["progress"], "accessibleName", progress)
+            set_widget_value(values["progress"], "styleSheet", label_style(progress_role, theme, weight=400))
+        if values["next"].property("prominence") != next_state.prominence:
+            values["next"].setProperty("prominence", next_state.prominence)
+        minutes = self._get_next_sop_action_minutes(selected)
+        label = str(getattr(self, "_sop_next_action_label", "") or "").strip()
+        count = int(getattr(self, "_sop_next_action_count", 0) or 0)
+        sop = values["sop"]
+        text = self._station_command_sop_button_text(sop, selected)
+        set_widget_value(sop, "text", text)
+        set_widget_value(sop, "accessibleName", sop_action_text(label, minutes, count) + ". Open SOP actions.")
+        set_widget_value(sop, "toolTip", (f"Primary SOP action: {label}. " if label else "")
+                         + (f"{count} upcoming action{'s' if count != 1 else ''}. " if count else "")
+                         + "Open SOP actions and their operational rationale.")
+        set_widget_value(sop, "styleSheet", button_style(next_action_state("SOP", minutes).role if minutes is not None else "muted", theme))
+        for key, text, tooltip in application_summary:
+            widget = values["apps"].get(key)
+            if widget is not None:
+                widget.setVisible(self._station_command_readback_visibility(key, text))
+                set_widget_value(widget, "text", text)
+                set_widget_value(widget, "toolTip", tooltip)
+                set_widget_value(widget, "accessibleName", text + ". " + tooltip)
+        health = self.station_command_radio_summary_widget.findChild(QToolButton, "stationCommandControlsHealth")
+        if health is not None:
+            summary = self._station_command_health_summary_for_profile(selected)
+            state = str(summary.get("state", "warn") or "warn").strip().lower()
+            role = "danger" if state == "error" else "warning" if state in {"warn", "warning", "review"} else "success"
+            set_widget_value(health, "toolTip", f"Health: {summary.get('label', 'Review')}. Open radio health summary.")
+            set_widget_value(health, "styleSheet",
+                             "QToolButton {"
+                             f"background:{theme.get('surface_alt', '#ECEFF1')};"
+                             f"border:2px solid {theme.get(role, theme.get('border', '#CCCCCC'))};"
+                             "border-radius:5px; padding:3px;"
+                             "}QToolButton:focus {"
+                             f"border:2px solid {theme.get('info', '#1565C0')};"
+                             "}")
+
+    def _station_command_application_summary(self, selected):
+        """Format only worker-retained observations; never probe applications."""
+        radio_id = self._station_command_snapshot_id(selected)
+        profile = self._station_command_health_profile(selected, radio_id) or {}
+        evidence = self._station_command_display_evidence(selected)
+        expected = evidence.get("expected_state") or {}
+        states = evidence.get("display_field_states") or {}
+        summaries = []
+        if profile.get("use_fldigi"):
+            target = expected.get("fldigi_offset_hz")
+            if target is None:
+                group, band = self._station_command_assigned_plan_group_band(selected)
+                target = self._station_command_operating_group_qsy_lookup().get((group.upper(), band), {}).get("fldigi_offset")
+            observed = evidence.get("fldigi_offset_hz")
+            mode = evidence.get("fldigi_mode")
+            field_state = states.get("fldigi_offset_hz", states.get("fldigi_mode", "unobserved"))
+            if mode and states.get("fldigi_mode") != "current":
+                field_state = "delayed" if field_state == "current" else field_state
+            text = application_display_text("FLDigi", observed, target=target, mode=mode, state=field_state)
+            if field_state == "current" and fldigi_receive_active(evidence) and not display_activity_text(evidence):
+                text += " · RX"
+            summaries.append(("FLDigi", text,
+                "Actual FLDigi modem and audio carrier from this radio's endpoint. Last-confirmed values are presentation only, not fresh safety evidence."))
+        if profile.get("use_js8call"):
+            target = expected.get("js8_offset_hz")
+            if target is None:
+                target = profile.get("js8_offset_hz")
+            text = application_display_text("JS8", evidence.get("js8_offset_hz"), target=target,
+                state=states.get("js8_offset_hz", "unobserved"))
+            if states.get("js8_busy") == "current" and evidence.get("js8_busy"):
+                text += " · Busy"
+            summaries.append(("JS8", text,
+                "Actual JS8Call offset. Busy is not proof of RX. Click JS8 to edit and save the default; scheduler locks and fresh activity safety still apply."))
+        if profile.get("use_varac"):
+            text = varac_display_text(evidence.get("varac_status"), current=states.get("varac_status") == "current")
+            summaries.append(("VarAC", text,
+                "Connected means CommsPlan can read this configured VarAC instance’s status while its process is running. It does not confirm VARA modem or RF readiness. QSO-BBS requires explicit BBS-session evidence."))
+        lane = self._station_command_lane_for_radio(radio_id) or {}
+        activity = display_activity_text(evidence, net=str(lane.get("current_source") or "").upper() == "NET")
+        summaries.append(("Activity", activity,
+            "TX requires fresh positive transmit evidence. NET is operating context. Unreported activity remains neutral; busy alone is not RX or QSO."))
+        return tuple(summaries)
+
+    def _show_station_js8_offset_editor(self, selected) -> None:
+        radio_id = self._station_command_snapshot_id(selected)
+        profile = self._station_command_health_profile(selected, radio_id) or {}
+        if not profile.get("use_js8call"):
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"{self._station_command_snapshot_name(selected)} — JS8 offset")
+        body = QVBoxLayout(dialog)
+        summary = QLabel("Change this radio's default JS8 offset. Scheduled offsets retain authority; changes wait for scheduler safety checks.", dialog)
+        summary.setWordWrap(True)
+        body.addWidget(summary)
+        spin = QSpinBox(dialog)
+        spin.setRange(1800, 2700)
+        spin.setSingleStep(50)
+        spin.setSuffix(" Hz")
+        spin.setValue(int(profile.get("js8_offset_hz") or 2050))
+        spin.setAccessibleName("Default JS8 offset")
+        body.addWidget(spin)
+        buttons = QHBoxLayout()
+        save = QPushButton("Save Default", dialog)
+        cancel = QPushButton("Cancel", dialog)
+        theme = resolve_theme(self.settings)
+        save.setStyleSheet(button_style("success", theme))
+        cancel.setStyleSheet(button_style("muted", theme))
+        def commit():
+            if self._save_station_command_js8_offset(radio_id, spin.value(),
+                    expected_instance_id=int(profile.get("js8_instance_id") or 0) or None):
+                dialog.accept()
+        save.clicked.connect(commit)
+        cancel.clicked.connect(dialog.reject)
+        buttons.addWidget(save)
+        buttons.addWidget(cancel)
+        body.addLayout(buttons)
+        dialog.exec()
+
     def _refresh_adaptive_station_command_shell(self, choices: list[object], selected_id: int) -> None:
+        # The approved radio-card surface owns the normal station-control
+        # presentation.  Keep the older selected-radio builder available for
+        # lightweight compatibility harnesses that do not construct the panel.
+        if getattr(self, "radio_control_panel", None) is not None:
+            self._refresh_radio_control_panel(choices, selected_id)
+            return
         layout = self.station_command_radio_summary_layout
         parent = self.station_command_radio_summary_widget
         selected = next(
@@ -11018,8 +11791,9 @@ class MainWindow(QMainWindow):
         if selected is not None:
             selected_signature = (
                 self._station_command_snapshot_id(selected),
-                self._station_command_now_text_for_summary(selected, selected_id),
-                self._station_command_compact_state_text(self._station_command_state_text(selected)),
+                self._station_command_selected_context_text(selected),
+                self._station_command_authority_text(selected),
+                self._station_command_qsy_progress_text(selected),
                 self._station_command_next_text(selected),
                 self._station_command_next_minutes(selected),
                 str(self._station_command_health_summary_for_profile(selected).get("state", "")),
@@ -11027,21 +11801,65 @@ class MainWindow(QMainWindow):
                 self._station_command_scheduler_suspended_manually_for_radio(selected_id),
                 self._station_command_timed_suspend_active_for_radio(selected_id),
             )
+        # A single context row must fit at the actual configured font size.
+        # Use a stable role budget, rather than changing layout as live text varies.
+        if shell_state.density == "compact" and parent.width() < parent.fontMetrics().horizontalAdvance("M") * 110:
+            shell_state = replace(shell_state, stack_primary_context=True)
+        application_summary = self._station_command_application_summary(selected) if selected is not None else ()
+        mesh_items = self._station_command_saved_mesh_control_items()
+        source_values = tuple(
+            (self._station_command_snapshot_id(item), self._station_command_snapshot_name(item),
+             self._station_command_now_text_for_summary(item, selected_id),
+             self._station_command_attention_role_for_snapshot(item),
+             self._station_command_source_chip_tooltip(item, selected_id))
+            for item in choices
+        )
         signature = (
             "adaptive-shell",
             shell_state.density,
+            shell_state.stack_primary_context,
             bool(getattr(self, "_station_command_controls_expanded", False)),
+            bool(getattr(self, "_station_command_minimized", False)),
             tuple(self._station_command_snapshot_id(item) for item in choices),
             selected_signature,
             tuple(self._collect_condition_levels()),
             self._station_command_source_control_items_signature(self._station_command_saved_mesh_control_items()),
-            self._get_next_sop_action_minutes(),
+            application_summary,
+            self._get_next_sop_action_minutes(selected),
             str(getattr(self, "_sop_next_action_label", "") or ""),
             int(getattr(self, "_sop_next_action_count", 0) or 0),
+            source_values,
         )
-        if signature == getattr(self, "_station_command_radio_summary_signature", None):
-            return
+        previous_signature = getattr(self, "_station_command_radio_summary_signature", None)
         self._station_command_radio_summary_signature = signature
+        try:
+            theme = resolve_theme(self.settings)
+        except Exception:
+            theme = {}
+        structure = (
+            shell_state.density,
+            shell_state.stack_primary_context,
+            bool(getattr(self, "_station_command_controls_expanded", False)),
+            bool(getattr(self, "_station_command_minimized", False)),
+            tuple((self._station_command_snapshot_id(item), self._station_command_snapshot_name(item)) for item in choices),
+            selected_id,
+            tuple(self._collect_condition_levels()),
+            tuple((getattr(item, "key", item.label), item.label) for item in mesh_items),
+            tuple(name for name, _text, _tip in application_summary),
+            tuple(sorted(theme.items())),
+            parent.font().toString(),
+            # These inputs own menu destinations and captured command authority.
+            # Readbacks, countdowns and health wording do not own widget lifetime.
+            repr(sorted(self._station_command_plan_qsy_options(selected).items())) if selected is not None else "",
+            self._station_command_preferred_qsy_key(selected) if selected is not None else "",
+            self._station_command_frequency_controls_available(selected) if selected is not None else False,
+        )
+        if structure == getattr(self, "_station_command_shell_structure_signature", None):
+            if signature != previous_signature:
+                self._update_adaptive_station_values(selected, selected_id, application_summary, shell_state, theme)
+            return
+        self._station_command_shell_structure_signature = structure
+        self._station_command_adaptive_values = {}
         self.station_command_local_time_label = None
         self.station_command_utc_time_label = None
         while layout.count():
@@ -11055,10 +11873,6 @@ class MainWindow(QMainWindow):
                 widget.setParent(None)
                 widget.deleteLater()
         self._station_command_radio_tile_controls = {}
-        try:
-            theme = resolve_theme(self.settings)
-        except Exception:
-            theme = {}
         layout.addWidget(
             self._build_adaptive_station_awareness_rail(
                 parent,
@@ -11084,12 +11898,13 @@ class MainWindow(QMainWindow):
         context_layout.setContentsMargins(7, 4, 7, 4)
         context_layout.setHorizontalSpacing(8)
         context_layout.setVerticalSpacing(3)
-        now = self._station_command_now_text_for_summary(selected, selected_id) or "Unavailable"
-        state = self._station_command_compact_state_text(self._station_command_state_text(selected))
+        now = self._station_command_selected_context_text(selected)
+        state = self._station_command_authority_text(selected)
         attention_role, _attention_label = self._station_command_attention_role_for_snapshot(selected)
         radio_name = self._station_command_snapshot_name(selected)
-        now_label = QLabel(primary_context_text(radio_name, now), context)
+        now_label = ElidedLabel(now, context)
         now_label.setObjectName("stationCommandPrimaryNow")
+        now_label.setStyleSheet(label_style("text", theme, weight=700))
         now_label.setToolTip(self._station_command_frequency_text(selected))
         now_label.setAccessibleName(f"{radio_name} now operating at {now}")
         try:
@@ -11099,17 +11914,21 @@ class MainWindow(QMainWindow):
             pass
         state_prefix = "! " if attention_role == "danger" else "△ " if attention_role == "warning" else ""
         state_label = QLabel(f"{state_prefix}{state}", context)
+        state_label.setWordWrap(True)
+        state_label.setMinimumWidth(state_label.fontMetrics().horizontalAdvance("M") * 14)
+        state_label.setFixedHeight(state_label.fontMetrics().lineSpacing() * 2 + 4)
         state_label.setObjectName("stationCommandPrimaryState")
         state_label.setToolTip(self._station_command_radio_summary_tooltip(selected, selected_id))
         if attention_role in {"danger", "warning"}:
             state_label.setStyleSheet(
                 f"color:{theme.get(attention_role, theme.get('warning', '#D1A000'))}; font-weight:800;"
             )
-        next_state = next_action_state(
-            self._station_command_next_text(selected),
-            self._station_command_next_minutes(selected),
+        next_state = planned_transition_text(
+            self._station_command_next_text(selected), self._station_command_next_minutes(selected),
+            self._station_command_is_held(selected),
         )
-        next_label = QLabel(f"NEXT  {next_state.text}", context)
+        next_label = ElidedLabel(next_state.text, context)
+        next_label.setMinimumWidth(0)
         next_label.setObjectName("stationCommandPrimaryNext")
         next_label.setProperty("prominence", next_state.prominence)
         next_label.setAccessibleName(f"Next scheduled action: {next_state.text}")
@@ -11117,28 +11936,27 @@ class MainWindow(QMainWindow):
             f"Next scheduled destination for {self._station_command_snapshot_name(selected)}. "
             "The workspace explains the associated action and rationale."
         )
-        next_colors = {
-            "muted": (theme.get("surface_alt", "#ECEFF1"), theme.get("text", "#222222")),
-            "info": (theme.get("info", "#1565C0"), "#FFFFFF"),
-            "warning": (theme.get("warning", "#D1A000"), "#111111"),
-            "danger": (theme.get("danger", "#C62828"), "#FFFFFF"),
-        }
-        next_bg, next_fg = next_colors.get(next_state.role, next_colors["muted"])
-        next_label.setStyleSheet(
-            f"background:{next_bg}; color:{next_fg}; border-radius:5px; padding:4px 8px; font-weight:700;"
-        )
+        next_label.setStyleSheet(label_style(next_state.role, theme, weight=600))
+        progress = self._station_command_qsy_progress_text(selected)
+        progress_label = ElidedLabel(progress, context)
+        progress_label.setObjectName("stationCommandQsyProgress")
+        progress_role = "danger" if "blocked" in progress else "warning" if "stale" in progress or "unknown" in progress else "muted"
+        progress_label.setStyleSheet(label_style(progress_role, theme, weight=400))
+        progress_label.setAccessibleName(progress)
+        progress_label.setToolTip(progress + ". A requested target is not an observed frequency.")
 
         actions = QWidget(context)
         actions.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
-        actions_layout = QHBoxLayout(actions)
+        actions_layout = QGridLayout(actions)
         actions_layout.setContentsMargins(0, 0, 0, 0)
-        actions_layout.setSpacing(5)
+        actions_layout.setHorizontalSpacing(5)
+        actions_layout.setVerticalSpacing(3)
         controls_expanded = bool(getattr(self, "_station_command_controls_expanded", False))
         qsy_button = self._build_adaptive_qsy_button(context, selected, timed=False, theme=theme)
         manual_qsy = self._station_command_scheduler_manual_qsy_active_for_radio(ident)
         timed_suspend = self._station_command_timed_suspend_active_for_radio(ident)
         manual_suspend = self._station_command_scheduler_suspended_manually_for_radio(ident)
-        hold = QPushButton("Resume" if manual_qsy or timed_suspend or manual_suspend else "Hold", actions)
+        hold = QPushButton("Resume schedule" if manual_qsy or timed_suspend or manual_suspend else "Hold schedule", actions)
         hold.setObjectName("stationCommandQuickSchedule")
         hold.setToolTip(
             "Resume scheduled control for this radio."
@@ -11146,11 +11964,7 @@ class MainWindow(QMainWindow):
             else "Temporarily hold scheduled changes for this radio."
         )
         hold.clicked.connect(
-            lambda _checked=False, radio_id=ident, resume=bool(manual_qsy or timed_suspend or manual_suspend): (
-                self._on_station_command_resume_clicked(radio_id)
-                if resume
-                else self._on_station_command_timed_suspend_clicked(radio_id)
-            )
+            lambda _checked=False, radio_id=ident: self._run_station_quick_hold(radio_id)
         )
         hold.setStyleSheet(button_style("warning" if manual_qsy or timed_suspend or manual_suspend else "muted", theme))
         if controls_expanded:
@@ -11159,20 +11973,12 @@ class MainWindow(QMainWindow):
             # not float unlaid-out over the selected-radio context.
             qsy_button.setVisible(False)
             hold.setVisible(False)
-        sop_minutes = self._get_next_sop_action_minutes()
+        sop_minutes = self._get_next_sop_action_minutes(selected)
         sop_action_label = str(getattr(self, "_sop_next_action_label", "") or "").strip()
         sop_count = int(getattr(self, "_sop_next_action_count", 0) or 0)
-        if sop_action_label and sop_minutes is not None and sop_minutes <= 30:
-            sop_text = f"{sop_action_label} · {sop_minutes}m"
-        else:
-            sop_text = "SOP"
-        sop = QPushButton(sop_text, actions)
+        sop = QPushButton(sop_action_text(sop_action_label, sop_minutes, sop_count), actions)
         sop.setObjectName("stationCommandQuickSop")
-        sop.setAccessibleName(
-            f"SOP action {sop_action_label}, due in {sop_minutes} minutes"
-            if sop_action_label and sop_minutes is not None
-            else "Open SOP actions"
-        )
+        sop.setAccessibleName(sop_action_text(sop_action_label, sop_minutes, sop_count) + ". Open SOP actions.")
         sop.setToolTip(
             (f"Primary SOP action: {sop_action_label}. " if sop_action_label else "")
             + (f"{sop_count} upcoming action{'s' if sop_count != 1 else ''}. " if sop_count else "")
@@ -11181,7 +11987,7 @@ class MainWindow(QMainWindow):
         sop.clicked.connect(self._open_sop_from_station_command)
         sop_role = next_action_state("SOP", sop_minutes).role if sop_minutes is not None else "muted"
         sop.setStyleSheet(button_style(sop_role, theme))
-        controls = QPushButton("×" if controls_expanded else "Controls…", actions)
+        controls = QPushButton("Close controls" if controls_expanded else "Controls…", actions)
         controls.setObjectName("stationCommandControlsToggle")
         controls.setAccessibleName("Close advanced radio controls" if controls_expanded else "Open advanced radio controls")
         controls.setToolTip(
@@ -11193,28 +11999,74 @@ class MainWindow(QMainWindow):
         controls.setStyleSheet(
             button_style("info" if controls_expanded else "muted", theme)
         )
+        minimized = bool(getattr(self, "_station_command_minimized", False))
+        column = 0
         if not controls_expanded:
-            actions_layout.addWidget(qsy_button)
-            actions_layout.addWidget(hold)
-        actions_layout.addWidget(sop)
-        actions_layout.addWidget(controls)
-        qsy_button.setMaximumWidth(78)
-        hold.setMaximumWidth(92)
-        sop.setMaximumWidth(170)
-        controls.setMaximumWidth(44 if controls_expanded else 124)
+            if not minimized:
+                actions_layout.addWidget(qsy_button, 0, column)
+                column += 1
+            else:
+                qsy_button.hide()
+            actions_layout.addWidget(hold, 0, column)
+            column += 1
+        wrap_sop = shell_state.stack_primary_context and bool(sop_action_label) and not controls_expanded and not minimized
+        if wrap_sop:
+            actions_layout.addWidget(controls, 0, column)
+            actions_layout.addWidget(sop, 1, 0, 1, column + 1)
+        else:
+            actions_layout.addWidget(sop, 0, column)
+            actions_layout.addWidget(controls, 0, column + 1)
+        hold.setMinimumWidth(hold.fontMetrics().horizontalAdvance("Resume schedule") + 28)
+        sop.setMaximumWidth(parent.fontMetrics().horizontalAdvance("M") * (32 if shell_state.density == "roomy" else 30))
+        sop.setText(self._station_command_sop_button_text(sop, selected))
 
         if shell_state.stack_primary_context:
             context_layout.addWidget(now_label, 0, 0)
             context_layout.addWidget(state_label, 0, 1)
-            context_layout.addWidget(next_label, 1, 0, 1, 2)
-            context_layout.addWidget(actions, 2, 0, 1, 2)
+            context_layout.addWidget(next_label, 1, 0)
+            context_layout.addWidget(progress_label, 2, 0, 1, 2)
+            context_layout.addWidget(actions, 3, 0, 1, 2)
+            context_layout.setColumnStretch(0, 1)
         else:
             context_layout.addWidget(now_label, 0, 0)
             context_layout.addWidget(state_label, 0, 1)
-            context_layout.addWidget(next_label, 0, 2)
-            context_layout.addWidget(actions, 0, 3)
-            context_layout.setColumnStretch(2, 1)
+            context_layout.addWidget(actions, 0, 2)
+            context_layout.addWidget(next_label, 1, 0, 1, 2)
+            context_layout.addWidget(progress_label, 1, 2)
+            context_layout.setColumnStretch(0, 1)
+        # A reserved one-line progress slot prevents polling from growing the shell.
+        progress_label.setMinimumHeight(progress_label.fontMetrics().lineSpacing() + 4)
         layout.addWidget(context)
+
+        if application_summary:
+            app_row = QWidget(parent)
+            app_row.setObjectName("stationCommandApplicationAwareness")
+            app_layout = QHBoxLayout(app_row)
+            app_layout.setContentsMargins(4, 0, 4, 0)
+            app_layout.setSpacing(6)
+            for name, text, tooltip in application_summary:
+                if name == "JS8":
+                    value = QPushButton(text, app_row)
+                    value.setStyleSheet(button_style("muted", theme))
+                    value.clicked.connect(lambda _checked=False, target=selected: self._show_station_js8_offset_editor(target))
+                else:
+                    value = ReadbackLabel(text, app_row)
+                    value.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+                    value.setMinimumWidth(0)
+                value.setVisible(self._station_command_readback_visibility(name, text))
+                value.setObjectName("stationCommand" + name + "Awareness")
+                value.setToolTip(tooltip)
+                value.setAccessibleName(text + ". " + tooltip)
+                app_layout.addWidget(value)
+            app_layout.addStretch(1)
+            layout.addWidget(app_row)
+
+        self._station_command_adaptive_values = {
+            "now": now_label, "state": state_label, "next": next_label, "sop": sop, "hold": hold,
+            "progress": progress_label,
+            "apps": {name: app_row.findChild(QWidget, "stationCommand" + name + "Awareness")
+                     for name, _text, _tip in application_summary} if application_summary else {},
+        }
 
         if controls_expanded:
             layout.addWidget(
@@ -11234,6 +12086,713 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self._sync_station_command_radio_summary_height(card_mode=True)
+        self._schedule_station_command_summary_geometry()
+
+    def _station_command_card_plan_options(self, snapshot: object) -> tuple[dict, ...]:
+        """Resolve destinations from worker-published plan rows and memory settings."""
+        raw = self._station_command_value(snapshot, "plan_options", ())
+        if isinstance(raw, Mapping):
+            raw = tuple(raw.values())
+        if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)) and raw:
+            options = [dict(item) for item in raw if isinstance(item, Mapping)]
+        else:
+            ident = self._station_command_snapshot_id(snapshot)
+            lookup = self._station_command_operating_group_qsy_lookup()
+            options = []
+            seen = set()
+            for ref in self._station_command_assigned_plan_refs_for_radio(ident):
+                meta = self._station_command_qsy_meta_from_plan_ref(ref, lookup)
+                if not meta:
+                    continue
+                key = (meta.get("group"), meta.get("band"), meta.get("freq"))
+                if key not in seen:
+                    seen.add(key)
+                    options.append(meta)
+        catalog = []
+        for row in self._station_command_operating_group_qsy_rows():
+            meta = dict(row)
+            meta["freq"] = parse_frequency_mhz(meta.get("frequency") or meta.get("freq"))
+            if meta["freq"] is not None:
+                catalog.append(meta)
+        unique = {}
+        for meta in (*options, *catalog):
+            key = self._station_command_qsy_option_key(meta)
+            if key:
+                unique[key] = meta
+        options = list(unique.values())
+        # Next is a shortcut to an existing assigned destination, never a new
+        # command target fabricated by the UI from a countdown or label.
+        ident = self._station_command_snapshot_id(snapshot)
+        lane = self._station_command_lane_for_radio(ident) or {}
+        next_entry = lane.get("next_entry") or {}
+        next_hz = None
+        if isinstance(next_entry, Mapping):
+            frequency = parse_frequency_mhz(next_entry.get("frequency") or next_entry.get("freq"))
+            if frequency is not None:
+                next_hz = round(frequency * 1_000_000)
+        minutes = self._station_command_next_minutes(snapshot)
+        for option in options:
+            option.pop("is_next", None)
+            option.pop("next_minutes", None)
+            try:
+                if (next_hz and minutes is not None and 0 <= minutes <= 15
+                        and abs(round(float(option.get("freq")) * 1_000_000) - next_hz) <= 10):
+                    option["is_next"] = True
+                    option["next_minutes"] = minutes
+            except (TypeError, ValueError):
+                pass
+        return tuple(options)
+
+    def _radio_card_display(self, snapshot: object, *, plan_options=None) -> RadioCardDisplay:
+        """Translate the parent display cache into card presentation fields."""
+
+        ident = self._station_command_snapshot_id(snapshot)
+        evidence: Mapping[str, object] = {}
+        getter = getattr(self, "_station_command_display_evidence", None)
+        if callable(getter):
+            try:
+                raw = getter(snapshot)
+                if isinstance(raw, Mapping):
+                    evidence = raw
+            except Exception:
+                evidence = {}
+        dial_text = "Frequency unavailable"
+        dial_hz = None
+        dial_current = False
+        dial_getter = getattr(self, "_station_command_display_dial", None)
+        if callable(dial_getter):
+            try:
+                raw_dial = dial_getter(snapshot)
+                if isinstance(raw_dial, Sequence) and len(raw_dial) >= 3:
+                    dial_text = str(raw_dial[0] or dial_text)
+                    dial_current = bool(raw_dial[1])
+                    dial_hz = int(raw_dial[2]) if raw_dial[2] not in (None, "") else None
+            except Exception:
+                pass
+        observed_meta = evidence.get("observed_meta")
+        if not isinstance(observed_meta, Mapping) and dial_hz:
+            observed_meta = {"freq": float(dial_hz) / 1_000_000.0}
+        group = str(evidence.get("current_group") or evidence.get("group") or "").strip()
+        band = str(evidence.get("current_band") or evidence.get("band") or "").strip()
+        if not group or not band:
+            try:
+                group = group or str((observed_meta or {}).get("group") or "").strip()
+                band = band or str((observed_meta or {}).get("band") or "").strip()
+            except Exception:
+                pass
+        # Worker-published plan options carry the resolved group/band.  Use
+        # them only to explain an observed dial; a requested destination never
+        # becomes the current group in the card.
+        if observed_meta and (not group or not band):
+            try:
+                observed_freq = float(observed_meta.get("freq") or observed_meta.get("frequency"))
+            except (TypeError, ValueError):
+                observed_freq = 0.0
+            raw_plan = plan_options if plan_options is not None else self._station_command_card_plan_options(snapshot)
+            if isinstance(raw_plan, Mapping):
+                raw_plan = tuple(raw_plan.values())
+            matching_groups, matching_bands = set(), set()
+            for option in raw_plan if isinstance(raw_plan, Sequence) and not isinstance(raw_plan, (str, bytes)) else ():
+                if not isinstance(option, Mapping):
+                    continue
+                try:
+                    option_freq = float(option.get("freq", option.get("frequency")))
+                except (TypeError, ValueError):
+                    continue
+                if observed_freq and abs(round(option_freq * 1_000_000) - round(observed_freq * 1_000_000)) <= 10:
+                    matching_groups.add(str(option.get("group") or option.get("group_name") or "").strip())
+                    matching_bands.add(str(option.get("band") or "").strip())
+            # One dial can belong to multiple groups. A first-row choice is
+            # not evidence that this radio is operating in that group.
+            if not group and len(matching_groups) == 1:
+                group = next(iter(matching_groups))
+            if not band and len(matching_bands) == 1:
+                band = next(iter(matching_bands))
+        authority = evidence.get("authority")
+        try:
+            authority = authority or self._station_command_authority_text(snapshot)
+        except Exception:
+            authority = authority or "Control state unavailable"
+        state = str(evidence.get("display_state") or "current").strip().lower()
+        notice = str(evidence.get("notice") or "").strip()
+        if not notice and state in {"delayed", "unavailable", "invalidated"}:
+            notice = ("CAT delayed · last confirmed frequency" if state == "delayed" else
+                      "CAT unavailable · last confirmed frequency" if dial_hz else
+                      "CAT unavailable")
+        next_text = str(evidence.get("next_text") or "").strip()
+        if not next_text:
+            try:
+                next_text = self._station_command_next_text(snapshot)
+            except Exception:
+                next_text = "No next destination"
+        try:
+            next_state = planned_transition_text(
+                next_text,
+                None if next_text == "Schedule updating" else self._station_command_next_minutes(snapshot),
+                self._station_command_is_held(snapshot),
+            )
+            next_text = next_state.text
+        except Exception:
+            pass
+        next_tooltip = next_text
+        transition_getter = getattr(self, "_station_command_next_transition", None)
+        transition = transition_getter(snapshot) if callable(transition_getter) else {}
+        if isinstance(transition, Mapping) and transition.get("state") == "ready":
+            target = transition.get("entry") or {}
+            next_group, next_band = self._station_command_entry_group_band(target)
+            next_text = compact_card_next_text(
+                group=next_group, band=next_band,
+                frequency=self._station_command_qsy_frequency_text(target),
+                current_group=group, current_band=band,
+                minutes=self._station_command_next_minutes(snapshot), held=self._station_command_is_held(snapshot))
+            next_tooltip += "\n" + " · ".join(str(part) for part in
+                (next_group, next_band, self._station_command_qsy_frequency_text(target), transition.get("start_utc")) if part)
+        elif isinstance(transition, Mapping) and transition.get("state") == "no_next":
+            next_text = "Next: none"
+        elif isinstance(transition, Mapping) and transition.get("state") == "pending":
+            next_text = "Schedule updating"
+        progress_text = str(evidence.get("qsy_progress") or "").strip()
+        if not progress_text:
+            try:
+                progress_text = self._station_command_qsy_progress_text(snapshot)
+            except Exception:
+                progress_text = ""
+        app_rows: tuple[tuple[str, str, str], ...] = ()
+        try:
+            raw_rows = self._station_command_application_summary(snapshot)
+            if isinstance(raw_rows, Sequence):
+                app_rows = tuple(
+                    (str(row[0]), str(row[1]), str(row[2] if len(row) > 2 else ""))
+                    for row in raw_rows
+                    if isinstance(row, Sequence) and not isinstance(row, (str, bytes)) and len(row) >= 2
+                )
+        except Exception:
+            app_rows = ()
+        try:
+            role, _ = self._station_command_attention_role_for_snapshot(snapshot)
+        except Exception:
+            role = "info"
+        try:
+            frequency_controls_available = bool(self._station_command_frequency_controls_available(snapshot))
+        except Exception:
+            frequency_controls_available = False
+        runtime_active = self._station_command_value(snapshot, "runtime_active", None)
+        observer = str(self._station_command_value(snapshot, "device_class", "")).lower() == "observer"
+        inactive = runtime_active is not None and not self._station_command_bool(runtime_active, default=False)
+        if observer or inactive:
+            frequency_controls_available = False
+            authority = "Inactive" if inactive else "Read-only observer"
+            role = "muted"
+        hold_remaining_minutes = None
+        hold_getter = getattr(self, "_station_command_hold_snapshot_for_radio", None)
+        if callable(hold_getter):
+            try:
+                cached_hold = hold_getter(ident)
+                remaining = cached_hold.get("remaining_sec") if cached_hold.get("active") else None
+                if remaining is not None:
+                    hold_remaining_minutes = max(0, int(math.ceil(float(remaining) / 60)))
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                pass
+        scheduler = getattr(self, "scheduler", None)
+        choices = radio_choices({OPERATOR_CONTROLS_KEY: self.settings.get(OPERATOR_CONTROLS_KEY, {}),
+                                 "sop_schedule_layer_enabled": self.settings.get("sop_schedule_layer_enabled", True)}, ident)
+        lane = self._station_command_lane_for_radio(ident) or {}
+        net_active = bool(scheduler is not None and scheduler._manual_net_active_for_radio(ident))
+        net_active = net_active or (str(lane.get("current_source") or "").upper() == "NET"
+                                    and not self._station_command_is_held(snapshot))
+        policy = scheduler.radio_timer_policy(ident) if scheduler is not None else {}
+        if net_active:
+            authority = "Net · operator control"
+            role = "info"
+            next_text = "Schedule paused"
+            next_tooltip = "Net mode: operator controls tuning; no automatic frequency, mode or offset corrections."
+        elif choices.get("routine_schedule_enabled") is False and choices.get("sop_tuning_enabled") is False:
+            authority = "Schedule sources off"
+            next_text = "Sources off"
+            next_tooltip = "Automatic tuning disabled: all schedule sources are off for this radio."
+        elif lane.get("schedule_projection_pending"):
+            next_text = "Schedule updating"
+            next_tooltip = "Schedule updating: automatic tuning waits for the refreshed plan."
+        return RadioCardDisplay(
+            observed_text=dial_text,
+            observed_hz=dial_hz,
+            observed_meta=dict(observed_meta) if isinstance(observed_meta, Mapping) else None,
+            display_state=state,
+            current_group=group,
+            current_band=band,
+            authority=str(authority or "On schedule"),
+            authority_role=str(role or "info"),
+            next_text=next_text,
+            next_tooltip=next_tooltip,
+            notice=notice,
+            qsy_progress=progress_text,
+            app_rows=app_rows,
+            frequency_controls_available=frequency_controls_available,
+            hold_remaining_minutes=hold_remaining_minutes,
+            net_active=net_active,
+            sop_tuning_enabled=choices.get("sop_tuning_enabled") is not False,
+            routine_schedule_enabled=choices.get("routine_schedule_enabled") is not False,
+            timer_policy=policy,
+            cat_verified=bool(dial_hz and dial_current),
+            cat_status="CAT delayed" if state == "delayed" else "CAT unavailable",
+        )
+
+    def _refresh_radio_control_panel(self, choices: Sequence[object], selected_id: int) -> None:
+        panel = getattr(self, "radio_control_panel", None)
+        layout = getattr(self, "station_command_radio_summary_layout", None)
+        if panel is None or layout is None:
+            return
+        try:
+            theme = resolve_theme(self.settings)
+        except Exception:
+            theme = {}
+        panel.set_theme(theme)
+        global_layout = getattr(panel, "global_context_layout", None)
+        if global_layout is not None:
+            try:
+                global_signature = (
+                    tuple(self._collect_condition_levels()),
+                    self._station_command_source_control_items_signature(self._station_command_saved_mesh_control_items()),
+                    str(getattr(self, "_adaptive_station_shell_density", "compact")),
+                    repr(theme),
+                    panel.font().toString(),
+                )
+            except Exception:
+                global_signature = ((), (), "compact")
+            if global_signature != getattr(panel, "_global_context_signature", None):
+                panel._global_context_signature = global_signature
+                while global_layout.count():
+                    item = global_layout.takeAt(0)
+                    widget = item.widget()
+                    if widget is not None:
+                        widget.hide()
+                        widget.deleteLater()
+                try:
+                    global_rail = self._build_adaptive_station_awareness_rail(
+                        panel.global_context,
+                        [],
+                        int(selected_id or 0),
+                        density=global_signature[2] if global_signature[2] in {"condensed", "compact", "roomy"} else "compact",
+                        theme=theme,
+                    )
+                    global_layout.addWidget(global_rail)
+                    panel._global_awareness_rail = global_rail
+                except Exception:
+                    panel._global_awareness_rail = None
+            # The one-second clock publisher owns formatting. Status polls
+            # must not overwrite its minute-only/compact presentation.
+        in_dock = bool(panel.property("dockMode"))
+        if not in_dock:
+            # The retained panel owns its card viewport; avoid a nested
+            # outer-summary scrollbar in the full shell.
+            try:
+                panel.cards_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+                self.station_command_radio_summary_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            except (AttributeError, RuntimeError):
+                pass
+        if not in_dock and layout.indexOf(panel) < 0:
+            while layout.count():
+                item = layout.takeAt(0)
+                widget = item.widget()
+                if widget is not None and widget is not panel:
+                    widget.hide()
+                    widget.setParent(None)
+                    widget.deleteLater()
+            layout.addWidget(panel)
+        if not panel.isVisible():
+            panel.setVisible(True)
+        options_by_id: dict[int, Sequence[object]] = {}
+        display_by_id: dict[int, RadioCardDisplay] = {}
+        held_by_id: dict[int, bool] = {}
+        sop_text_by_id: dict[int, str] = {}
+        sop_minutes_by_id: dict[int, float | None] = {}
+        for snapshot in choices:
+            ident = self._station_command_snapshot_id(snapshot)
+            if ident <= 0:
+                continue
+            raw_options = self._station_command_card_plan_options(snapshot)
+            options_by_id[ident] = raw_options
+            display_by_id[ident] = self._radio_card_display(snapshot, plan_options=raw_options)
+            held_by_id[ident] = bool(
+                self._station_command_scheduler_manual_qsy_active_for_radio(ident)
+                or self._station_command_timed_suspend_active_for_radio(ident)
+                or self._station_command_scheduler_suspended_manually_for_radio(ident)
+            )
+            minutes = self._get_next_sop_action_minutes(snapshot)
+            sop_minutes_by_id[ident] = minutes
+            sop_text_by_id[ident] = sop_action_text(
+                str(getattr(self, "_sop_next_action_label", "") or ""), minutes,
+                int(getattr(self, "_sop_next_action_count", 0) or 0),
+            )
+        if any(display.hold_remaining_minutes is not None for display in display_by_id.values()):
+            timer = getattr(self, "_hold_state_timer", None)
+            if timer is not None and not timer.isActive():
+                timer.start()
+        # The shared reminder summary still belongs to the selected radio;
+        # projecting every card must not leave it scoped to the last peer.
+        selected_snapshot = next((item for item in choices
+            if self._station_command_snapshot_id(item) == int(selected_id or 0)), None)
+        if selected_snapshot is not None:
+            self._get_next_sop_action_minutes(selected_snapshot)
+        durations: list[int] = []
+        combo = getattr(self, "station_command_duration_combo", None)
+        if isinstance(combo, QComboBox):
+            for index in range(combo.count()):
+                try:
+                    value = int(combo.itemData(index) or 0)
+                except (TypeError, ValueError):
+                    value = 0
+                if value > 0:
+                    durations.append(value)
+        panel.update_cards(
+            list(choices),
+            selected_id=int(selected_id or 0),
+            display_by_id=display_by_id,
+            options_by_id=options_by_id,
+            hold_durations=durations,
+            held_by_id=held_by_id,
+            sop_text_by_id=sop_text_by_id,
+            sop_minutes_by_id=sop_minutes_by_id,
+        )
+        panel.set_minimized(bool(getattr(self, "_station_command_minimized", False)))
+        try:
+            self._sync_station_command_radio_summary_height(card_mode=True)
+        except Exception:
+            pass
+
+    def _on_radio_control_panel_minimized_changed(self, minimized: bool) -> None:
+        """Keep the legacy host flag aligned with the retained card panel."""
+
+        minimized = bool(minimized)
+        if bool(getattr(self, "_station_command_minimized", False)) == minimized:
+            return
+        self._station_command_minimized = minimized
+        self._station_command_radio_summary_signature = None
+
+    def _on_radio_card_qsy(self, radio_id: int, meta: Mapping[str, object] | None, duration: int | None) -> None:
+        # A disappearing draft must not fall back to the legacy selected-radio
+        # combo, which can still refer to a peer radio's destination.
+        if int(radio_id or 0) <= 0 or not isinstance(meta, Mapping):
+            return
+        if isinstance(meta, Mapping):
+            payload = dict(meta)
+            payload["target_device_profile_id"] = int(radio_id or 0)
+        else:
+            payload = None
+        if not self._activate_station_command_radio(int(radio_id or 0)):
+            return
+        self._dismiss_radio_off_schedule_prompt(radio_id)
+        if duration is None:
+            if payload is not None:
+                payload["manual_hold_policy"] = "until_resume"
+            self._on_station_command_qsy_now_clicked(payload)
+        else:
+            self._on_station_command_qsy_hold_clicked(payload, duration)
+
+    def _on_radio_card_hold(self, radio_id: int, duration: int | None) -> None:
+        if int(radio_id or 0) <= 0:
+            return
+        if not self._activate_station_command_radio(int(radio_id or 0)):
+            return
+        self._dismiss_radio_off_schedule_prompt(radio_id)
+        if duration is None:
+            self._on_station_command_pause_clicked(int(radio_id or 0))
+        else:
+            self._on_station_command_timed_suspend_clicked(int(radio_id or 0), minutes=int(duration))
+
+    def _on_radio_card_resume(self, radio_id: int) -> None:
+        if int(radio_id or 0) <= 0 or not self._activate_station_command_radio(radio_id):
+            return
+        self._dismiss_radio_off_schedule_prompt(radio_id)
+        self._on_station_command_resume_clicked(radio_id)
+
+    def _set_station_command_card_duration(self, minutes: int) -> None:
+        combo = getattr(self, "station_command_duration_combo", None)
+        if not isinstance(combo, QComboBox):
+            return
+        for index in range(combo.count()):
+            if combo.itemData(index) == int(minutes):
+                combo.setCurrentIndex(index)
+                return
+
+    def _on_radio_card_advanced(self, radio_id: int) -> None:
+        self._on_station_command_summary_radio_clicked(int(radio_id or 0))
+        self._toggle_adaptive_station_controls()
+
+    def _operator_card_target(self, radio_id: int) -> dict | None:
+        """Resolve only published identity; a missing card never targets a peer."""
+        ident = int(radio_id or 0)
+        if ident <= 0:
+            return None
+        for profile in getattr(self, "_station_command_profile_cache", ()):
+            if int(profile.get("id") or 0) == ident:
+                if (str(profile.get("device_class") or "").lower() == "observer"
+                        or profile.get("runtime_active") is False or profile.get("runtime_active") == 0):
+                    return None
+                return dict(profile)
+        return None
+
+    def _save_operator_card_choices(self, radio_id: int, changes: Mapping[str, object]) -> None:
+        if self._operator_card_target(radio_id) is None:
+            return
+        raw = self.settings.get(OPERATOR_CONTROLS_KEY, {})
+        rows = dict(raw) if isinstance(raw, Mapping) else {}
+        row = radio_choices({OPERATOR_CONTROLS_KEY: rows,
+                             "sop_schedule_layer_enabled": self.settings.get("sop_schedule_layer_enabled", True)}, radio_id)
+        row.update(changes)
+        rows[str(radio_id)] = row
+        # Invalidate before persistence: already queued work must not race the
+        # operator's click. This does not invalidate any peer's authority stamp.
+        self.scheduler._invalidate_command_authority(radio_id)
+        self._dismiss_radio_off_schedule_prompt(radio_id)
+        self.settings.set(OPERATOR_CONTROLS_KEY, rows)
+        self.scheduler.operator_choices_changed(radio_id, choices=row, sources_changed=bool(
+            set(changes).intersection({"sop_tuning_enabled", "routine_schedule_enabled"})))
+        self._station_command_radio_summary_signature = None
+        self._invalidate_station_command_lane_cache()
+        self._refresh_station_command_bar(force=False)
+
+    def _on_radio_card_sop(self, radio_id: int) -> None:
+        if self._operator_card_target(radio_id) is None:
+            return
+        current = self.scheduler.radio_operator_choices(radio_id)
+        self._save_operator_card_choices(radio_id, {"sop_tuning_enabled": current.get("sop_tuning_enabled") is False})
+
+    def _on_radio_card_sources(self, radio_id: int) -> None:
+        profile = self._operator_card_target(radio_id)
+        if profile is None:
+            return
+        menu = QMenu(self)
+        menu.addSection(f"Schedule sources · {profile.get('name') or radio_id}")
+        current = self.scheduler.radio_operator_choices(radio_id)
+        for key, label in (("routine_schedule_enabled", "Daily / Net schedule"), ("sop_tuning_enabled", "SOP tuning")):
+            action = menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(current.get(key) is not False)
+            action.triggered.connect(lambda checked, k=key, ident=radio_id: self._save_operator_card_choices(ident, {k: checked}))
+        note = menu.addAction("SOP profiles and reminders remain active")
+        note.setEnabled(False)
+        card = self.radio_control_panel._cards.get(radio_id)
+        if card is not None:
+            menu.exec(card.sources_button.mapToGlobal(card.sources_button.rect().bottomLeft()))
+
+    def _on_radio_card_policy(self, radio_id: int) -> None:
+        profile = self._operator_card_target(radio_id)
+        if profile is None:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Change policy · {profile.get('name') or radio_id}")
+        layout = QVBoxLayout(dialog)
+        note = QLabel("On Schedule Change applies the plan. Prompt reviews off-schedule differences at the chosen interval; it is not approval before every write. Net mode suspends corrections.", dialog)
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        grid = QGridLayout()
+        layout.addLayout(grid)
+        current = self.scheduler.radio_timer_policy(radio_id)
+        combos = {}
+        for row, (prefix, label) in enumerate((("freq", "Frequency"), ("fldigi", "FLDigi mode / offset"), ("js8", "JS8 offset"))):
+            grid.addWidget(QLabel(label, dialog), row, 0)
+            for column, (suffix, options, default) in enumerate((("enforcement_mode", POLICY_MODES, "On Schedule Change"), ("prompt_interval", POLICY_INTERVALS, "Hourly")), 1):
+                key = prefix + "_" + suffix
+                combo = QComboBox(dialog)
+                combo.addItems(options)
+                combo.setCurrentText(current.get(key, default))
+                combo.setAccessibleName(label + (" policy" if column == 1 else " reminder interval"))
+                grid.addWidget(combo, row, column)
+                combos[key] = combo
+        actions = QHBoxLayout()
+        layout.addLayout(actions)
+        defaults = QPushButton("Use profile defaults", dialog)
+        actions.addWidget(defaults)
+        def restore_profile_policy():
+            self._save_operator_card_choices(radio_id, {"timer_policy": {}})
+            dialog.reject()
+        defaults.clicked.connect(restore_profile_policy)
+        actions.addStretch()
+        cancel = QPushButton("Cancel", dialog)
+        save = QPushButton("Save policy", dialog)
+        actions.addWidget(cancel)
+        actions.addWidget(save)
+        cancel.clicked.connect(dialog.reject)
+        save.clicked.connect(dialog.accept)
+        if dialog.exec() == QDialog.Accepted:
+            self._save_operator_card_choices(radio_id, {"timer_policy": validated_timer_policy({k: combo.currentText() for k, combo in combos.items()})})
+
+    def _on_radio_card_net(self, radio_id: int) -> None:
+        profile = self._operator_card_target(radio_id)
+        if profile is None:
+            return
+        sessions = getattr(self.scheduler, "_manual_net_sessions", {})
+        token = sessions.get((radio_id, "OPERATOR"))
+        ncs_active = any(key[0] == radio_id and key[1] in {"FLDIGI", "JS8"} for key in sessions)
+        if ncs_active:
+            QMessageBox.information(self, "Net control", "This radio has an active NCS session. End that session in its NCS workspace before returning to the schedule.")
+            return
+        lane = self._station_command_lane_for_radio(radio_id) or {}
+        self._dismiss_radio_off_schedule_prompt(radio_id)
+        if token or str(lane.get("current_source") or "").upper() == "NET":
+            menu = QMenu(self)
+            menu.addSection(f"{'End operator net' if token else 'Scheduled net'} · {profile.get('name') or radio_id}")
+            resume = menu.addAction("Resume current schedule")
+            paused = menu.addAction("Remain paused")
+            card = self.radio_control_panel._cards.get(radio_id)
+            if card is None:
+                return
+            chosen = menu.exec(card.net_button.mapToGlobal(card.net_button.rect().bottomLeft()))
+            if chosen not in (resume, paused):
+                return
+            # Pause first so releasing ownership cannot dispatch in between.
+            self._station_command_set_scheduler_suspended_manual(True, target_device_profile_id=radio_id)
+            if token:
+                self.scheduler.set_manual_net_active("OPERATOR", False, radio_id=radio_id, session_id=token)
+            if chosen is resume:
+                self._on_station_command_resume_clicked(radio_id)
+        else:
+            # A durable pause survives a process restart as a safe interrupted
+            # net state. The live Net token grants operator freedom immediately.
+            self._station_command_set_scheduler_suspended_manual(True, target_device_profile_id=radio_id)
+            self.scheduler.set_manual_net_active("OPERATOR", True, radio_id=radio_id, session_id=f"control-bar:{radio_id}:{time.monotonic_ns()}")
+        self._station_command_radio_summary_signature = None
+        self._invalidate_station_command_lane_cache()
+        self._refresh_station_command_bar(force=False)
+
+    def _on_radio_card_health(self, radio_id: int) -> None:
+        if getattr(self, "_radio_control_panel_dock_window", None) is not None:
+            self._restore_radio_control_panel_from_dock()
+        self._show_station_command_health_menu(device_profile_id=int(radio_id or 0))
+
+    def _on_radio_card_plan(self, radio_id: int) -> None:
+        ident = int(radio_id or 0)
+        if ident <= 0:
+            return
+        plan = self._station_command_assigned_plan_for_radio(ident)
+        plan_id = int(plan.get("id") or 0) if isinstance(plan, Mapping) else 0
+        if getattr(self, "_radio_control_panel_dock_window", None) is not None:
+            self._restore_radio_control_panel_from_dock()
+        index = self._screen_index_by_label.get("FreqPlanner", -1)
+        if index < 0:
+            return
+        self._set_screen(index)
+        epoch = int(getattr(self, "_navigation_epoch", 0))
+        def focus_plan() -> None:
+            opener = getattr(getattr(self, "freq_planner_tab", None), "focus_frequency_plan", None)
+            if callable(opener):
+                opener(plan_id, device_profile_id=ident)
+        QTimer.singleShot(0, lambda: self._run_if_screen_current(index, epoch, focus_plan))
+
+    def _on_radio_card_launch(self, radio_id: int) -> None:
+        ident = int(radio_id or 0)
+        if ident <= 0:
+            return
+        if getattr(self, "_radio_control_panel_dock_window", None) is not None:
+            self._restore_radio_control_panel_from_dock()
+        self.open_settings_section(
+            "launch_control",
+            radio_id=ident,
+            settings_nav_context="radios",
+        )
+
+    def _on_radio_card_js8_offset(self, radio_id: int) -> None:
+        if getattr(self, "_radio_control_panel_dock_window", None) is not None:
+            self._restore_radio_control_panel_from_dock()
+        snapshot = self._station_command_current_snapshot(int(radio_id or 0))
+        if snapshot is not None:
+            self._show_station_js8_offset_editor(snapshot)
+
+    def _on_radio_card_navigation(self, route: str) -> None:
+        if getattr(self, "_radio_control_panel_dock_window", None) is not None:
+            self._restore_radio_control_panel_from_dock()
+        route_map = {"Ops Center": "ControlFreq", "Messages": "Messages", "BBS": "Managed BBS", "Schedules": "HF Schedule", "Settings": "Settings"}
+        index = self._screen_index_by_label.get(route_map.get(str(route), str(route)))
+        if index is not None:
+            self._set_screen(index)
+
+    def _on_radio_card_dock(self) -> None:
+        """Dock request hook; the host owns geometry and tab restoration."""
+        self._open_radio_control_dock()
+
+    def _open_radio_control_dock(self) -> None:
+        """Temporarily move the same card widgets into an ordinary Dock window."""
+        panel = getattr(self, "radio_control_panel", None)
+        if panel is None:
+            return
+        dock = getattr(self, "_radio_control_panel_dock_window", None)
+        if dock is not None:
+            try:
+                dock.show()
+                dock.raise_()
+                dock.activateWindow()
+                return
+            except RuntimeError:
+                self._radio_control_panel_dock_window = None
+        try:
+            self._radio_control_panel_main_geometry = self.saveGeometry()
+        except Exception:
+            self._radio_control_panel_main_geometry = None
+        # Keep the Dock top-level so hiding the main workspace cannot hide the
+        # operator's active control surface with it.
+        dock = RadioControlDockWindow()
+        dock.setObjectName("radioControlDockWindow")
+        dock.setWindowTitle("Radio controls")
+        dock.setMinimumSize(320, 260)
+        dock.closed.connect(self._restore_radio_control_panel_from_dock)
+        self._radio_control_panel_dock_window = dock
+        panel.setParent(dock)
+        dock.setCentralWidget(panel)
+        panel.set_dock_mode(True)
+        panel.show()
+        dock.resize(panel.preferred_dock_width(), max(360, min(760, int(self.height() * 0.72 or 520))))
+        dock_geometry = getattr(self, "_radio_control_panel_dock_geometry", None)
+        if dock_geometry:
+            dock.restoreGeometry(dock_geometry)
+        shell = getattr(self, "_right_shell_container", None)
+        if shell is not None:
+            shell.setVisible(False)
+        dock.show()
+        dock.raise_()
+        dock.activateWindow()
+        # The dock owns the command surface while open, so the full workspace
+        # disappears instead of leaving a blank shell behind it.
+        self.hide()
+
+    def _restore_radio_control_panel_from_dock(self) -> None:
+        panel = getattr(self, "radio_control_panel", None)
+        dock = getattr(self, "_radio_control_panel_dock_window", None)
+        if panel is None:
+            return
+        if bool(getattr(self, "_shutting_down", False)):
+            return
+        if dock is not None:
+            self._radio_control_panel_dock_geometry = dock.saveGeometry()
+        if dock is not None and dock.centralWidget() is panel:
+            dock.takeCentralWidget()
+        summary_parent = getattr(self, "station_command_radio_summary_widget", None)
+        if summary_parent is not None:
+            panel.setParent(summary_parent)
+            layout = getattr(self, "station_command_radio_summary_layout", None)
+            if layout is not None and layout.indexOf(panel) < 0:
+                layout.addWidget(panel)
+        panel.set_dock_mode(False)
+        panel.show()
+        shell = getattr(self, "_right_shell_container", None)
+        if shell is not None:
+            shell.setVisible(True)
+        self.show()
+        if dock is not None:
+            try:
+                dock.blockSignals(True)
+                dock.hide()
+                dock.deleteLater()
+            except RuntimeError:
+                pass
+        self._radio_control_panel_dock_window = None
+        geometry = getattr(self, "_radio_control_panel_main_geometry", None)
+        if geometry:
+            try:
+                self.restoreGeometry(geometry)
+            except Exception:
+                pass
+        QTimer.singleShot(0, self._schedule_station_command_summary_geometry)
 
     def _refresh_station_command_radio_summary(self, choices: list[object], selected_id: int) -> None:
         layout = getattr(self, "station_command_radio_summary_layout", None)
@@ -11335,22 +12894,86 @@ class MainWindow(QMainWindow):
                 )
             except Exception:
                 content_height = 0
-            expanded = bool(getattr(self, "_station_command_controls_expanded", False))
-            density = str(getattr(self, "_adaptive_station_shell_density", "compact") or "compact")
+            # Measure the finished layout, including native font/control floors.
+            # Keep the bounded selected-radio context and its actions visible.
+            # The advanced utility row owns any local overflow.
+            row_height = control_height_for_font(scroll, vertical_padding=10, floor=34)
+            frame_extra = 2 * scroll.frameWidth()
             try:
-                row_height = control_height_for_font(scroll, vertical_padding=10, floor=34)
-            except Exception:
-                row_height = 34
-            if expanded:
-                tray_rows = 1 if density == "roomy" else 2 if density == "compact" else 3
-                context_rows = 3 if density == "condensed" else 1
-                floor = row_height * (1 + context_rows + tray_rows) + 20
-                ceiling = 340
-            elif density == "condensed":
-                floor, ceiling = row_height * 4 + 16, 260
-            else:
-                floor, ceiling = max(76, row_height * 2 + 8), 170
-            scroll.setFixedHeight(max(floor, min(ceiling, content_height + 8)))
+                available_height = self.centralWidget().height()
+            except (AttributeError, RuntimeError):
+                available_height = self.height()
+            desired = max(row_height * 2, content_height + frame_extra + 8)
+            panel_floor = 0
+            # The retained card panel owns the card viewport. In the full
+            # shell the outer summary scrollbar is disabled, and its height
+            # must expose one complete card before the remaining cards
+            # continue below the panel viewport. Derive the floor from the
+            # actual retained card and named panel chrome so this stays
+            # font/theme aware without constructing a runtime worker.
+            panel = getattr(self, "radio_control_panel", None)
+            if panel is not None and not bool(panel.property("dockMode")):
+                parent.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+                scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+                try:
+                    panel.cards_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+                except (AttributeError, RuntimeError):
+                    pass
+                cards = getattr(panel, "cards", {})
+                first_card = next((card for card in cards.values() if not card.isHidden()), None) if cards else None
+                card_height = max(int(first_card.sizeHint().height() or 0), first_card.minimumSizeHint().height(),
+                    first_card.heightForWidth(first_card.width()) if first_card.hasHeightForWidth() else 0) if first_card is not None else 0
+                panel_layout = panel.layout()
+                # Subtract the viewport's hint from the finished layout so
+                # hidden rows contribute neither height nor phantom spacing.
+                viewport_item = panel_layout.itemAt(panel_layout.indexOf(panel.cards_scroll))
+                viewport_hint_height = viewport_item.sizeHint().height() if viewport_item is not None else 0
+                chrome_height = max(0, panel_layout.sizeHint().height() - viewport_hint_height)
+                margins = parent.layout().contentsMargins()
+                panel_floor = max(row_height * 2, chrome_height + card_height
+                    + margins.top() + margins.bottom() + frame_extra + 2)
+                desired = panel_floor + max(4, panel.fontMetrics().lineSpacing() // 2)
+            critical = parent.findChild(QFrame, "stationCommandPrimaryContext")
+            # The bounded production shell keeps critical context above its
+            # local utility scroller. Other/oversized content still obeys the
+            # window budget rather than forcing a laptop window to grow.
+            budget = max(row_height * 2, int(max(0, available_height) * 0.45))
+            if panel_floor and not bool(panel.property("dockMode")):
+                budget = max(budget, desired)
+                # Optional utility/navigation rows may reduce the card viewport,
+                # but must not increase the native window's minimum height.
+                # Reserve useful task workspace and account for real shell
+                # banners/margins instead of applying a screen-percentage guess.
+                shell = getattr(self, "_right_shell_container", None) or self.centralWidget()
+                shell_layout = shell.layout() if shell is not None else None
+                bar = getattr(self, "station_command_bar", None)
+                workspace = getattr(self, "stack", None) or getattr(self, "tab_workspace", None)
+                if shell_layout is not None and bar is not None and workspace is not None:
+                    shell_margins = shell_layout.contentsMargins()
+                    shell_chrome = shell_margins.top() + shell_margins.bottom()
+                    visible_items = 0
+                    for index in range(shell_layout.count()):
+                        item = shell_layout.itemAt(index)
+                        widget = item.widget()
+                        if widget is not None and widget.isHidden():
+                            continue
+                        visible_items += 1
+                        if widget is not bar and widget is not workspace:
+                            shell_chrome += max(0, item.sizeHint().height())
+                    shell_chrome += max(0, visible_items - 1) * max(0, shell_layout.spacing())
+                    bar_layout = bar.layout()
+                    bar_item = bar_layout.itemAt(bar_layout.indexOf(scroll)) if bar_layout is not None else None
+                    bar_chrome = max(0, bar_layout.sizeHint().height() - bar_item.sizeHint().height()) if bar_item is not None else 0
+                    task_height = max(80, panel.fontMetrics().lineSpacing() * 4)
+                    available_summary = max(row_height * 2, shell.height() - shell_chrome - bar_chrome - task_height)
+                    budget = min(budget, available_summary)
+            height = desired if critical is not None else min(desired, budget)
+            panel_owns_scroll = bool(panel_floor and panel is not None and not bool(panel.property("dockMode")))
+            scroll.setVerticalScrollBarPolicy(
+                Qt.ScrollBarAlwaysOff if critical is not None or panel_owns_scroll else Qt.ScrollBarAsNeeded
+            )
+            if scroll.height() != height:
+                scroll.setFixedHeight(height)
             return
         tiles = parent.findChildren(QFrame, "stationCommandRadioTile") if parent is not None else []
         tile_height = max((int(tile.sizeHint().height()) for tile in tiles), default=0)
@@ -11364,23 +12987,20 @@ class MainWindow(QMainWindow):
                 horizontal_extra = int(scroll.horizontalScrollBar().sizeHint().height() or 14)
         except Exception:
             horizontal_extra = 0
-        height = max(132, min(220, tile_height + rail_height + horizontal_extra + 14))
+        height = max(132, min(280, tile_height + rail_height + horizontal_extra + 14))
         scroll.setFixedHeight(height)
 
     def _station_command_set_qsy_combo_to_meta(self, meta: Mapping[str, object] | None) -> None:
         combo = getattr(self, "station_command_freq_combo", None)
         if not isinstance(combo, QComboBox) or not isinstance(meta, Mapping):
             return
-        try:
-            target_key = f"{float(meta.get('freq')):.6f}"
-        except Exception:
-            target_key = ""
+        target_key = self._station_command_qsy_option_key(meta)
         if not target_key:
             return
         for index in range(combo.count()):
             data = combo.itemData(index)
             try:
-                if isinstance(data, Mapping) and f"{float(data.get('freq')):.6f}" == target_key:
+                if isinstance(data, Mapping) and self._station_command_qsy_option_key(data) == target_key:
                     combo.setCurrentIndex(index)
                     return
             except Exception:
@@ -11391,7 +13011,7 @@ class MainWindow(QMainWindow):
         try:
             meta = selected_qsy_meta(combo)
             if isinstance(meta, Mapping):
-                return f"{float(meta.get('freq')):.6f}"
+                return MainWindow._station_command_qsy_option_key(meta)
         except Exception:
             pass
         return ""
@@ -11450,6 +13070,8 @@ class MainWindow(QMainWindow):
                 combo.addItem(self._station_command_qsy_label(meta), meta)
                 combo.setItemData(combo.count() - 1, self._station_command_qsy_tooltip(meta), Qt.ToolTipRole)
                 has_options = True
+            if has_options:
+                combo.setCurrentIndex(-1)
             if not has_options:
                 plan_name = ""
                 if snapshot is not None:
@@ -11459,69 +13081,142 @@ class MainWindow(QMainWindow):
                 for index in range(combo.count()):
                     data = combo.itemData(index)
                     try:
-                        if isinstance(data, Mapping) and f"{float(data.get('freq')):.6f}" == preferred_key:
+                        if isinstance(data, Mapping) and self._station_command_qsy_option_key(data) == preferred_key:
                             combo.setCurrentIndex(index)
                             break
                     except Exception:
                         continue
+            preferred_is_catalogued = False
+            if preferred_key:
+                try:
+                    preferred_is_catalogued = any(
+                        self._station_command_qsy_option_key(row) == preferred_key
+                        for row in self._station_command_operating_group_qsy_rows()
+                    )
+                except Exception:
+                    preferred_is_catalogued = False
+            if selected_qsy_meta(combo) is None:
+                if len(meta_map) == 1 and (not preferred_key or preferred_is_catalogued):
+                    combo.setCurrentIndex(0)
+                else:
+                    combo.setCurrentIndex(-1)
         finally:
             combo.blockSignals(previous_block)
         return has_options and selected_qsy_meta(combo) is not None
 
     def _station_command_operating_group_qsy_lookup(self) -> dict[tuple[str, str], dict[str, object]]:
+        cached = getattr(self, "_station_command_group_qsy_lookup_cache", None)
+        if cached is not None and cached[0] is self.settings:
+            return cached[1]
         lookup: dict[tuple[str, str], dict[str, object]] = {}
         try:
-            for meta in build_qsy_options(load_operating_groups(self.settings)).values():
-                if not isinstance(meta, Mapping):
+            buckets: dict[tuple[str, str], list[dict[str, object]]] = {}
+            for configured in self._station_command_operating_group_qsy_rows():
+                meta = dict(configured)
+                meta["freq"] = parse_frequency_mhz(meta.get("frequency"))
+                if meta["freq"] is None:
                     continue
                 group = self._station_command_group_display_name(meta.get("group"))
                 band = str(meta.get("band") or "").strip().upper()
                 if group and band:
-                    lookup.setdefault((group.upper(), band), dict(meta))
+                    buckets.setdefault((group.upper(), band), []).append(meta)
+            for key, rows in buckets.items():
+                if len(rows) == 1:
+                    lookup[key] = dict(rows[0])
         except Exception:
-            pass
+            return lookup
+        self._station_command_group_qsy_lookup_cache = (self.settings, lookup)
         return lookup
+
+    def _station_command_operating_group_qsy_rows(self) -> list[dict[str, object]]:
+        cached = getattr(self, "_station_command_group_qsy_rows_cache", None)
+        if cached is not None and cached[0] is self.settings:
+            return [dict(row) for row in cached[1]]
+        try:
+            rows = ensure_operating_group_frequency_keys(load_operating_groups(self.settings))
+        except Exception:
+            rows = []
+        self._station_command_group_qsy_rows_cache = (self.settings, rows)
+        return [dict(row) for row in rows]
 
     def _station_command_plan_qsy_options(self, snapshot: object | None) -> dict[str, dict[str, object]]:
         ident = self._station_command_snapshot_id(snapshot) if snapshot is not None else 0
         lookup = self._station_command_operating_group_qsy_lookup()
+        configured = self._station_command_operating_group_qsy_rows()
         options: dict[str, dict[str, object]] = {}
+
+        def add_group_band(ref: Mapping[str, object]) -> None:
+            group = self._station_command_group_display_name(ref.get("group_name") or ref.get("group"))
+            band = str(ref.get("band") or ref.get("band_name") or "").strip().upper()
+            if not group or not band:
+                return
+            family = resolve_operating_group_frequency(configured, group=group)
+            explicit_key = bool(
+                str(ref.get("operating_group_frequency_key") or "").strip()
+                or str(ref.get("operating_group_key") or "").strip()
+            )
+            if not family.candidates and not explicit_key:
+                # Explicit legacy plan refs remain usable for groups that are
+                # absent from today's catalog; there is no variant to guess.
+                meta = self._station_command_qsy_meta_from_plan_ref(ref, lookup)
+                if meta:
+                    option_key = self._station_command_qsy_option_key(meta)
+                    if option_key:
+                        options.setdefault(option_key, meta)
+                return
+            resolution = resolve_operating_group_frequency(
+                configured,
+                group=group,
+                frequency_key=ref.get("operating_group_frequency_key"),
+                band=band,
+                mode=ref.get("mode"),
+                frequency=ref.get("frequency") or ref.get("freq") or ref.get("frequency_mhz"),
+            )
+            # A stale explicit schedule reference must remain unresolved.
+            explicit_reference = bool(
+                str(ref.get("operating_group_frequency_key") or "").strip()
+                or ref.get("frequency") or ref.get("freq") or ref.get("frequency_mhz")
+            )
+            if explicit_reference and not resolution.resolved:
+                return
+            for row in configured:
+                if str(row.get("group") or "").strip().upper() != group.upper():
+                    continue
+                if str(row.get("band") or "").strip().upper() != band:
+                    continue
+                meta = self._station_command_qsy_meta_from_plan_ref(row, lookup)
+                if meta:
+                    option_key = self._station_command_qsy_option_key(meta)
+                    if option_key:
+                        options.setdefault(option_key, meta)
+
         if ident > 0:
             for item in self._station_command_assigned_plan_refs_for_radio(ident):
-                meta = self._station_command_qsy_meta_from_plan_ref(item, lookup)
-                if not meta:
-                    continue
-                try:
-                    freq_key = f"{float(meta.get('freq')):.6f}"
-                except Exception:
-                    continue
-                option_key = "|".join(
-                    (
-                        str(meta.get("group") or "").strip().upper(),
-                        str(meta.get("band") or "").strip().upper(),
-                        freq_key,
-                    )
-                )
-                options.setdefault(option_key, meta)
+                ref = self._station_command_ref_mapping(item)
+                if ref:
+                    add_group_band(ref)
             if options:
                 return self._station_command_alternate_qsy_options(options, snapshot)
         lane_rows = self._station_command_lane_schedule_rows(ident) if ident > 0 else []
         for item in lane_rows:
-            meta = self._station_command_qsy_meta_from_plan_ref(item, lookup)
-            if not meta:
-                continue
-            try:
-                freq_key = f"{float(meta.get('freq')):.6f}"
-            except Exception:
-                continue
-            option_key = "|".join(
-                (
-                    str(meta.get("group") or "").strip().upper(),
-                    str(meta.get("band") or "").strip().upper(),
-                    freq_key,
-                )
-            )
-            options.setdefault(option_key, meta)
+            ref = self._station_command_ref_mapping(item)
+            if ref:
+                add_group_band(ref)
+        if not options:
+            scheduler = getattr(self, "scheduler", None)
+            entry = getattr(scheduler, "current_schedule_entry", {}) if scheduler is not None else {}
+            if isinstance(entry, Mapping):
+                entry_radio_id = self._station_command_scheduler_entry_radio_id(entry)
+                if ident <= 0 or entry_radio_id <= 0 or entry_radio_id == ident:
+                    seed = self._station_command_qsy_meta_from_plan_ref(entry, lookup)
+                    if seed:
+                        seed_group = str(seed.get("group") or "").strip().upper()
+                        for row in configured:
+                            if str(row.get("group") or "").strip().upper() != seed_group:
+                                continue
+                            meta = self._station_command_qsy_meta_from_plan_ref(row, lookup)
+                            if meta:
+                                options[self._station_command_qsy_option_key(meta)] = meta
         return self._station_command_alternate_qsy_options(options, snapshot)
 
     def _station_command_qsy_meta_from_plan_ref(
@@ -11542,6 +13237,7 @@ class MainWindow(QMainWindow):
             vfo_value = ref.get("vfo")
             fldigi_mode_value = ref.get("fldigi_mode")
             fldigi_offset_value = ref.get("fldigi_offset")
+            auto_tune_value = ref.get("auto_tune")
         else:
             text = str(ref or "").strip()
             group = ""
@@ -11551,6 +13247,7 @@ class MainWindow(QMainWindow):
             vfo_value = "A"
             fldigi_mode_value = ""
             fldigi_offset_value = ""
+            auto_tune_value = None
             band_match = re.search(r"\b(160|80|60|40|30|20|17|15|12|10|6|2)\s*M\b", text, flags=re.IGNORECASE)
             if band_match:
                 band = f"{band_match.group(1).upper()}M"
@@ -11562,23 +13259,49 @@ class MainWindow(QMainWindow):
         freq = parse_frequency_mhz(freq_value)
         if not band and freq is not None:
             band = self._station_command_band_from_frequency(freq)
-        resolved = dict(lookup.get((group.upper(), band), {})) if group and band else {}
-        if freq is None:
-            freq = parse_frequency_mhz(resolved.get("freq"))
-        if not group:
-            group = self._station_command_group_display_name(resolved.get("group"))
-        if not band:
-            band = str(resolved.get("band") or "").strip().upper()
-        if freq is None:
+        if not group or not band or freq is None:
             return None
+        rows = self._station_command_operating_group_qsy_rows()
+        resolution = resolve_operating_group_frequency(
+            rows,
+            group=group,
+            frequency_key=(ref.get("operating_group_frequency_key") if isinstance(ref, Mapping) else ""),
+            band=band,
+            mode=mode_value,
+            frequency=freq,
+        )
+        if not resolution.resolved or resolution.row is None:
+            family = resolve_operating_group_frequency(rows, group=group)
+            explicit_key = bool(
+                isinstance(ref, Mapping)
+                and (ref.get("operating_group_frequency_key") or ref.get("operating_group_key"))
+            )
+            if family.candidates or explicit_key or not isinstance(ref, Mapping):
+                return None
+            return {
+                "group": group,
+                "band": band,
+                "freq": freq,
+                "frequency": format_frequency_mhz(freq_value),
+                "mode": str(mode_value or "").strip(),
+                "vfo": str(vfo_value or "A").strip().upper() or "A",
+                "fldigi_mode": str(fldigi_mode_value or "").strip(),
+                "fldigi_offset": str(fldigi_offset_value or "").strip(),
+                "auto_tune": bool(auto_tune_value) if auto_tune_value is not None else False,
+            }
+        resolved = dict(resolution.row)
         return {
-            "group": group,
-            "band": band,
-            "freq": float(freq),
+            "group": self._station_command_group_display_name(resolved.get("group")),
+            "band": str(resolved.get("band") or "").strip().upper(),
+            "freq": parse_frequency_mhz(resolved.get("frequency")),
+            "frequency": str(resolved.get("frequency") or ""),
+            "operating_group_key": str(resolved.get("operating_group_key") or ""),
+            "operating_group_frequency_key": str(resolved.get("operating_group_frequency_key") or ""),
             "mode": str(mode_value or resolved.get("mode") or "").strip(),
-            "vfo": str(vfo_value or resolved.get("vfo") or "A").strip().upper() or "A",
-            "fldigi_mode": str(fldigi_mode_value or resolved.get("fldigi_mode") or "").strip(),
-            "fldigi_offset": str(fldigi_offset_value or resolved.get("fldigi_offset") or "").strip(),
+            "vfo": str(resolved.get("vfo") or vfo_value or "A").strip().upper() or "A",
+            "fldigi_mode": str(resolved.get("fldigi_mode") or fldigi_mode_value or "").strip(),
+            "fldigi_offset": str(resolved.get("fldigi_offset") or fldigi_offset_value or "").strip(),
+            "auto_tune": bool(resolved.get("auto_tune", False) if auto_tune_value is None else auto_tune_value),
         }
 
     @staticmethod
@@ -11698,7 +13421,7 @@ class MainWindow(QMainWindow):
             freq_combo.setToolTip(
                 "Select the operating group and band for this radio."
                 if frequency_control_available
-                else "VarAC-only radio: VarAC handles frequency scheduling; FIO monitors messages and BBS."
+                else "VarAC-only radio: VarAC handles frequency scheduling; CommsPlan monitors messages and BBS."
             )
             freq_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             freq_combo.setEnabled(frequency_control_available)
@@ -11723,6 +13446,60 @@ class MainWindow(QMainWindow):
             now_font.setBold(True)
             now_font.setPointSize(max(now_font.pointSize(), 13))
             freq_combo.setFont(now_font)
+
+            uses_js8call = self._station_command_bool(
+                self._station_command_value(snapshot, "use_js8call", False)
+            )
+            js8_offset_widget = QWidget(tile)
+            js8_offset_widget.setObjectName("stationCommandRadioTileJs8Offset")
+            js8_offset_layout = QHBoxLayout(js8_offset_widget)
+            js8_offset_layout.setContentsMargins(0, 0, 0, 0)
+            js8_offset_layout.setSpacing(6)
+            js8_offset_label = QLabel("JS8 offset", js8_offset_widget)
+            js8_offset_spin = QSpinBox(js8_offset_widget)
+            js8_offset_spin.setObjectName("stationCommandRadioTileJs8OffsetValue")
+            js8_offset_spin.setRange(1800, 2700)
+            js8_offset_spin.setSingleStep(50)
+            js8_offset_spin.setSuffix(" Hz")
+            try:
+                persisted_offset = int(
+                    self._station_command_value(snapshot, "js8_offset_hz", 2050) or 2050
+                )
+            except Exception:
+                persisted_offset = 2050
+            js8_offset_spin.setValue(max(1800, min(2700, persisted_offset)))
+            js8_offset_spin.setAccessibleName(
+                f"{self._station_command_snapshot_name(snapshot)} JS8 default offset"
+            )
+            js8_offset_spin.setToolTip(
+                "Default JS8Call audio offset for this radio. CommsPlan holds live changes while TX or JS8 activity is present."
+            )
+            js8_offset_save = QPushButton("Save Default", js8_offset_widget)
+            js8_offset_save.setObjectName("stationCommandRadioTileJs8OffsetSave")
+            js8_offset_save.setToolTip(
+                "Save this radio's default JS8 offset. Application is deferred until radio safety checks allow it."
+            )
+            try:
+                expected_js8_instance_id = int(
+                    self._station_command_value(snapshot, "js8_instance_id", 0) or 0
+                ) or None
+            except Exception:
+                expected_js8_instance_id = None
+            js8_offset_save.clicked.connect(
+                lambda _checked=False,
+                radio_id=ident,
+                spin=js8_offset_spin,
+                instance_id=expected_js8_instance_id: self._save_station_command_js8_offset(
+                    radio_id,
+                    spin.value(),
+                    expected_instance_id=instance_id,
+                )
+            )
+            js8_offset_layout.addWidget(js8_offset_label)
+            js8_offset_layout.addWidget(js8_offset_spin)
+            js8_offset_layout.addWidget(js8_offset_save)
+            js8_offset_layout.addStretch(1)
+            js8_offset_widget.setVisible(bool(uses_js8call and ident > 0))
             next_label = ElidedLabel(f"Next: {next_text} | Plan: {plan_text}", tile)
             next_label.setObjectName("stationCommandRadioTileNext")
             next_label.setMinimumWidth(0)
@@ -11828,7 +13605,7 @@ class MainWindow(QMainWindow):
             suspend_btn.setToolTip(
                 f"Suspend scheduler control for {self._station_command_snapshot_name(snapshot)}."
                 if frequency_control_available
-                else "FIO scheduler suspend is not offered for VarAC-only radios."
+                else "CommsPlan scheduler suspend is not offered for VarAC-only radios."
             )
             suspend_btn.setEnabled(ident > 0 and frequency_control_available)
             suspend_btn.clicked.connect(
@@ -11867,7 +13644,7 @@ class MainWindow(QMainWindow):
             resume_btn.setToolTip(
                 f"Resume scheduled control for {self._station_command_snapshot_name(snapshot)}."
                 if frequency_control_available
-                else "VarAC-only radios use VarAC's scheduler; there is no FIO schedule to resume."
+                else "VarAC-only radios use VarAC's scheduler; there is no CommsPlan schedule to resume."
             )
             resume_btn.setEnabled(ident > 0 and frequency_control_available)
             resume_btn.clicked.connect(
@@ -11975,9 +13752,10 @@ class MainWindow(QMainWindow):
                 tile_layout.addWidget(qsy_btn, 2, 0)
                 tile_layout.addWidget(timer_btn, 2, 1)
                 tile_layout.addWidget(suspend_btn, 2, 2)
-                tile_layout.addWidget(next_label, 3, 0, 1, 3)
-                tile_layout.addWidget(resume_btn, 4, 0, 1, 2)
-                tile_layout.addWidget(assign_btn, 4, 2)
+                tile_layout.addWidget(js8_offset_widget, 3, 0, 1, 3)
+                tile_layout.addWidget(next_label, 4, 0, 1, 3)
+                tile_layout.addWidget(resume_btn, 5, 0, 1, 2)
+                tile_layout.addWidget(assign_btn, 5, 2)
             else:
                 tile_layout.addWidget(name_btn, 0, 0, 1, 3)
                 tile_layout.addWidget(health_btn, 0, 3)
@@ -11985,9 +13763,10 @@ class MainWindow(QMainWindow):
                 tile_layout.addWidget(qsy_btn, 2, 0)
                 tile_layout.addWidget(timer_btn, 2, 1)
                 tile_layout.addWidget(suspend_btn, 2, 2)
-                tile_layout.addWidget(next_label, 3, 0, 1, 4)
-                tile_layout.addWidget(resume_btn, 4, 0, 1, 2)
-                tile_layout.addWidget(assign_btn, 4, 2, 1, 2)
+                tile_layout.addWidget(js8_offset_widget, 3, 0, 1, 4)
+                tile_layout.addWidget(next_label, 4, 0, 1, 4)
+                tile_layout.addWidget(resume_btn, 5, 0, 1, 2)
+                tile_layout.addWidget(assign_btn, 5, 2, 1, 2)
             tile_layout.setColumnStretch(0, 0)
             tile_layout.setColumnStretch(1, 0)
             tile_layout.setColumnStretch(2, 0)
@@ -12002,6 +13781,8 @@ class MainWindow(QMainWindow):
                     "suspend_btn": suspend_btn,
                     "resume_btn": resume_btn,
                     "freq_combo": freq_combo,
+                    "js8_offset_spin": js8_offset_spin,
+                    "js8_offset_save": js8_offset_save,
                     "frequency_controls_available": frequency_control_available,
                     "compact_card": compact_card,
                 }
@@ -12052,19 +13833,19 @@ class MainWindow(QMainWindow):
             compact_card = bool(controls.get("compact_card", False))
             if isinstance(qsy_btn, QPushButton) and isinstance(combo, QComboBox):
                 if not frequency_control_available:
-                    qsy_btn.setText("QSY")
-                    qsy_btn.setEnabled(False)
-                    qsy_btn.setStyleSheet(button_style("muted", theme))
-                    combo.setEnabled(False)
+                    set_widget_value(qsy_btn, "text", "QSY")
+                    set_widget_value(qsy_btn, "enabled", False)
+                    set_widget_value(qsy_btn, "styleSheet", button_style("muted", theme))
+                    set_widget_value(combo, "enabled", False)
                     if isinstance(timer_btn, QToolButton):
-                        timer_btn.setEnabled(False)
-                        timer_btn.setStyleSheet(button_style("muted", theme))
+                        set_widget_value(timer_btn, "enabled", False)
+                        set_widget_value(timer_btn, "styleSheet", button_style("muted", theme))
                     if isinstance(suspend_btn, QToolButton):
-                        suspend_btn.setEnabled(False)
-                        suspend_btn.setStyleSheet(button_style("muted", theme))
+                        set_widget_value(suspend_btn, "enabled", False)
+                        set_widget_value(suspend_btn, "styleSheet", button_style("muted", theme))
                     if isinstance(resume_btn, QPushButton):
-                        resume_btn.setEnabled(False)
-                        resume_btn.setStyleSheet(button_style("muted", theme))
+                        set_widget_value(resume_btn, "enabled", False)
+                        set_widget_value(resume_btn, "styleSheet", button_style("muted", theme))
                     continue
                 preferred_key = str(combo.property("stationCommandPreferredKey") or "")
                 selected_key = self._station_command_combo_selected_key(combo)
@@ -12082,14 +13863,14 @@ class MainWindow(QMainWindow):
                     manual_qsy_active=manual_qsy_active,
                     timed_qsy_active=timed_qsy_active,
                 )
-                qsy_btn.setText("QSY")
-                qsy_btn.setEnabled(action_state.qsy_enabled)
-                qsy_btn.setStyleSheet(button_style(action_state.qsy_role, theme))
+                set_widget_value(qsy_btn, "text", "QSY")
+                set_widget_value(qsy_btn, "enabled", action_state.qsy_enabled)
+                set_widget_value(qsy_btn, "styleSheet", button_style(action_state.qsy_role, theme))
             if isinstance(timer_btn, QToolButton):
                 if compact_card:
-                    timer_btn.setText(f"{countdown}" if timed_qsy_active and countdown else "Extend" if timed_qsy_active else "Hold")
+                    set_widget_value(timer_btn, "text", f"{countdown}" if timed_qsy_active and countdown else "Extend" if timed_qsy_active else "Hold")
                 else:
-                    timer_btn.setText(f"{countdown} | Extend" if timed_qsy_active and countdown else timed_qsy_text(timed_qsy_active=timed_qsy_active))
+                    set_widget_value(timer_btn, "text", f"{countdown} | Extend" if timed_qsy_active and countdown else timed_qsy_text(timed_qsy_active=timed_qsy_active))
                 if isinstance(combo, QComboBox):
                     preferred_key = str(combo.property("stationCommandPreferredKey") or "")
                     selected_key = self._station_command_combo_selected_key(combo)
@@ -12107,10 +13888,10 @@ class MainWindow(QMainWindow):
                         manual_qsy_active=manual_qsy_active,
                         timed_qsy_active=timed_qsy_active,
                     )
-                    timer_btn.setEnabled(action_state.timed_qsy_enabled)
-                    timer_btn.setStyleSheet(button_style(action_state.timed_qsy_role, theme))
+                    set_widget_value(timer_btn, "enabled", action_state.timed_qsy_enabled)
+                    set_widget_value(timer_btn, "styleSheet", button_style(action_state.timed_qsy_role, theme))
                 else:
-                    timer_btn.setStyleSheet(button_style("warning" if timed_qsy_active else "muted", theme))
+                    set_widget_value(timer_btn, "styleSheet", button_style("warning" if timed_qsy_active else "muted", theme))
             if isinstance(suspend_btn, QToolButton):
                 scheduler_actions = scheduler_action_state(
                     manual_qsy_active=manual_qsy_active,
@@ -12133,12 +13914,12 @@ class MainWindow(QMainWindow):
                         suspend_text = "Extend"
                     elif suspend_text == "Timed Suspend":
                         suspend_text = "Suspend"
-                suspend_btn.setText(suspend_text)
-                suspend_btn.setStyleSheet(button_style(scheduler_actions.timed_suspend_role, theme))
+                set_widget_value(suspend_btn, "text", suspend_text)
+                set_widget_value(suspend_btn, "styleSheet", button_style(scheduler_actions.timed_suspend_role, theme))
             if isinstance(resume_btn, QPushButton):
                 resume_active = manual_qsy_active or timed_qsy_active or timed_suspend_active or scheduler_suspended_manual
-                resume_btn.setEnabled(radio_id > 0 and resume_active)
-                resume_btn.setStyleSheet(button_style("warning" if resume_active else "muted", theme))
+                set_widget_value(resume_btn, "enabled", radio_id > 0 and resume_active)
+                set_widget_value(resume_btn, "styleSheet", button_style("warning" if resume_active else "muted", theme))
 
     def _clear_station_command_admin_layout(self) -> None:
         layout = getattr(self, "station_command_radio_admin_layout", None)
@@ -12238,14 +14019,25 @@ class MainWindow(QMainWindow):
         settings_tab = getattr(self, "settings_tab", None)
         opener = getattr(settings_tab, "open_schedule_assignment_editor", None)
         if callable(opener):
-            QTimer.singleShot(0, lambda profile_id=ident: opener(device_profile_id=profile_id))
+            expected = self._screen_index_by_label.get("Settings", -1)
+            epoch = int(getattr(self, "_navigation_epoch", 0))
+            QTimer.singleShot(0, lambda profile_id=ident: self._run_if_screen_current(
+                expected, epoch, lambda: opener(device_profile_id=profile_id)
+            ))
 
     def _on_station_command_summary_radio_clicked(self, device_profile_id: int) -> None:
         ident = int(device_profile_id or 0)
         if ident <= 0:
             return
-        activated = self._activate_station_command_radio(ident)
-        if activated:
+        snapshot = self._station_command_current_snapshot(ident)
+        read_only = snapshot is not None and (
+            str(self._station_command_value(snapshot, "device_class", "")).lower() == "observer"
+            or (self._station_command_value(snapshot, "runtime_active", None) is not None
+                and not self._station_command_bool(self._station_command_value(snapshot, "runtime_active", None), default=False))
+        )
+        # Observer/inactive cards are inspectable without activating a control
+        # context. Their command controls remain unavailable.
+        if read_only or self._activate_station_command_radio(ident):
             self._station_command_selected_profile_id = ident
         self._refresh_station_command_bar(force=True)
 
@@ -12267,11 +14059,24 @@ class MainWindow(QMainWindow):
                 snapshots = []
         scheduler = getattr(self, "scheduler", None)
         operational = {}
+        # A transient cache-getter failure must not blank every visible radio.
+        # This is raw safety evidence; GUI retention is projected separately.
+        if not isinstance(getattr(self, "_station_command_endpoint_status_cache", None), dict):
+            self._station_command_endpoint_status_cache = {}
+        if scheduler is not None and hasattr(scheduler, "get_endpoint_status_summaries"):
+            try:
+                self._station_command_endpoint_status_cache = scheduler.get_endpoint_status_summaries() or {}
+            except Exception:
+                pass
         if scheduler is not None and hasattr(scheduler, "get_endpoint_operational_summaries"):
             try:
                 operational = scheduler.get_endpoint_operational_summaries() or {}
             except Exception:
                 operational = {}
+        settings_tab = getattr(self, "settings_tab", None)
+        publish_status = getattr(settings_tab, "set_radio_operational_status_cache", None)
+        if callable(publish_status):
+            publish_status(operational)
         for snapshot in snapshots:
             profile_id = self._station_command_snapshot_id(snapshot)
             endpoint_summary = operational.get(profile_id) if isinstance(operational, Mapping) else None
@@ -12289,10 +14094,16 @@ class MainWindow(QMainWindow):
             seen_ids.add(ident)
         for snapshot in snapshots:
             ident = self._station_command_snapshot_id(snapshot)
-            if ident > 0 and ident not in seen_ids and self._station_command_is_controllable_profile(snapshot):
+            if ident > 0 and ident not in seen_ids and (self._station_command_is_controllable_profile(snapshot)
+                    or str(self._station_command_value(snapshot, "device_class", "")).lower() == "observer"):
                 choices.append(snapshot)
                 seen_ids.add(ident)
         self._station_command_last_choices = list(choices)
+        active_ids = {self._station_command_snapshot_id(item) for item in choices}
+        self._station_command_endpoint_status_cache = {
+            key: value for key, value in self._station_command_endpoint_status_cache.items()
+            if key in active_ids
+        }
 
         selected = self._station_command_promoted_snapshot(choices, self._station_command_selected_snapshot(choices))
         selected_id = self._station_command_snapshot_id(selected) if selected is not None else 0
@@ -12485,9 +14296,7 @@ class MainWindow(QMainWindow):
         except Exception:
             ident = 0
         if ident > 0:
-            activated = self._activate_station_command_radio(ident)
-            self._station_command_selected_profile_id = ident if activated else getattr(self, "_station_command_selected_profile_id", None)
-            self._refresh_station_command_bar(force=True)
+            self._on_station_command_summary_radio_clicked(ident)
             return
         self._station_command_selected_profile_id = None
         self._refresh_station_command_bar(force=False)
@@ -12505,6 +14314,7 @@ class MainWindow(QMainWindow):
 
     def _refresh_station_health_scope_map(self) -> None:
         scope_map: dict[str, str] = {}
+        endpoint_owners: dict[str, set[str]] = {}
         try:
             profiles = list(self.multi_radio_store.list_runtime_active_device_profiles())
         except Exception:
@@ -12528,16 +14338,27 @@ class MainWindow(QMainWindow):
 
         def _add(service: str, host: object, port: object, name: str, *, default_port: int) -> None:
             host_text = _host(host)
+            if host_text in {"localhost", "loopback", "::1"}:
+                host_text = "127.0.0.1"
             port_text = str(_port(port, default_port))
-            scope_map[f"{service.lower()}:{host_text}:{port_text}"] = name
-            if host_text in {"127.0.0.1", "localhost"}:
-                scope_map[f"{service.lower()}:loopback:{port_text}"] = name
+            key = f"{service.lower()}:{host_text}:{port_text}"
+            owners = endpoint_owners.setdefault(key, set())
+            owners.add(name)
+            label = name if len(owners) == 1 else "Shared · " + ", ".join(sorted(owners))
+            scope_map[key] = label
+            if host_text == "127.0.0.1":
+                for alias in ("loopback", "localhost", "::1"):
+                    scope_map[f"{service.lower()}:{alias}:{port_text}"] = label
 
         for raw_profile in profiles:
             if not isinstance(raw_profile, dict):
                 continue
             name = _profile_name(raw_profile)
-            _add("JS8CALL", raw_profile.get("js8_host"), raw_profile.get("js8_port"), name, default_port=2442)
+            if raw_profile.get("id") not in (None, ""):
+                scope_map[f"radio_{raw_profile['id']}"] = name
+            if (raw_profile.get("js8_instance_id") or raw_profile.get("js8_install_path")
+                    or raw_profile.get("js8_profile_path") or raw_profile.get("control_backend") == "js8call"):
+                _add("JS8CALL", raw_profile.get("js8_host"), raw_profile.get("js8_port"), name, default_port=2442)
             _add("FLRIG", raw_profile.get("flrig_host"), raw_profile.get("flrig_port"), name, default_port=12345)
             fldigi_host = raw_profile.get("fldigi_host") or raw_profile.get("flrig_host")
             _add("FLDIGI", fldigi_host, raw_profile.get("fldigi_port"), name, default_port=7362)
@@ -12549,6 +14370,18 @@ class MainWindow(QMainWindow):
         self._station_health_scope_map = scope_map
 
     def _station_health_scope_resolver(self, key: str, metadata: dict[str, object]) -> str:
+        scope_map = getattr(self, "_station_health_scope_map", {}) or {}
+        radio_id = metadata.get("device_profile_id", metadata.get("radio_id"))
+        identity = str(metadata.get("radio_profile_id") or radio_id or "")
+        if identity and not identity.startswith("radio_"):
+            identity = f"radio_{identity}"
+        if identity:
+            return scope_map.get(identity, identity.replace("radio_", "Radio "))
+        endpoint = str(metadata.get("endpoint") or "").strip().lower()
+        if endpoint and "js8" in str(key).lower():
+            endpoint_scope = scope_map.get(f"js8call:{endpoint}")
+            if endpoint_scope:
+                return endpoint_scope
         for meta_key in ("scope", "radio_name", "radio", "profile_name", "device_name"):
             text = str(metadata.get(meta_key, "") or "").strip()
             if text:
@@ -12824,6 +14657,9 @@ class MainWindow(QMainWindow):
         )
 
     def _on_runtime_settings_saved(self) -> None:
+        self._station_command_qsy_requests = {}
+        self._station_command_qsy_dispositions = {}
+        self._station_command_endpoint_status_cache = {}
         self._rebuild_runtime_clients()
         try:
             self._station_command_profile_cache = list(
@@ -12846,6 +14682,9 @@ class MainWindow(QMainWindow):
             pass
 
     def _on_runtime_device_profiles_changed(self) -> None:
+        self._station_command_qsy_requests = {}
+        self._station_command_qsy_dispositions = {}
+        self._station_command_endpoint_status_cache = {}
         self._rebuild_runtime_clients()
         self._sync_settings_runtime_status(refresh_store=False)
         try:
@@ -12897,11 +14736,62 @@ class MainWindow(QMainWindow):
         except Exception as e:
             log.debug("MainWindow: launch-control startup sequence failed to start: %s", e)
 
+    @staticmethod
+    def _launch_sequence_radio_ids(payload: object) -> set[int]:
+        data = payload if isinstance(payload, Mapping) else {}
+        queue = data.get("queue") if isinstance(data, Mapping) else ()
+        radio_ids: set[int] = set()
+        if not isinstance(queue, Sequence) or isinstance(queue, (str, bytes)):
+            return radio_ids
+        for item in queue:
+            if not isinstance(item, Mapping):
+                continue
+            values = item.get("radio_ids", ())
+            if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+                values = (values,)
+            for value in values:
+                try:
+                    radio_id = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if radio_id > 0:
+                    radio_ids.add(radio_id)
+        return radio_ids
+
+    @staticmethod
+    def _launch_radio_ids_after_progress(
+        current_ids: set[int],
+        payload: object,
+    ) -> set[int]:
+        data = payload if isinstance(payload, Mapping) else {}
+        remaining = set(current_ids)
+        status = str(data.get("status", "") or "").strip()
+        if bool(data.get("counts_toward_total", True)) or status not in {
+            "ready",
+            "unavailable",
+        }:
+            return remaining
+        values = data.get("radio_ids", ())
+        if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+            values = (values,)
+        for value in values:
+            try:
+                remaining.discard(int(value))
+            except (TypeError, ValueError):
+                continue
+        return remaining
+
     def _on_launch_sequence_started(self, payload: object) -> None:
         data = payload if isinstance(payload, dict) else {}
         queue = data.get("queue") if isinstance(data, dict) else []
         queue_count = len(queue) if isinstance(queue, list) else 0
         trigger = str(data.get("trigger", "")).strip().capitalize() or "Launch"
+        launch_radio_ids = self._launch_sequence_radio_ids(payload)
+        self._launch_initializing_radio_ids = set(launch_radio_ids)
+        try:
+            self.scheduler.set_launch_initializing_radios(launch_radio_ids)
+        except Exception:
+            log.debug("MainWindow: could not apply launch scheduler hold", exc_info=True)
         self._launch_progress_total = max(queue_count, 1)
         self._launch_progress_done = 0
         try:
@@ -12938,6 +14828,22 @@ class MainWindow(QMainWindow):
         name = str(data.get("name", "")).strip() or "Application"
         status = str(data.get("status", "")).strip() or "status"
         detail = str(data.get("detail", "")).strip()
+        if (
+            not bool(data.get("counts_toward_total", True))
+            and status in {"ready", "unavailable"}
+        ):
+            active_ids = self._launch_radio_ids_after_progress(
+                set(getattr(self, "_launch_initializing_radio_ids", set())),
+                data,
+            )
+            self._launch_initializing_radio_ids = active_ids
+            try:
+                self.scheduler.set_launch_initializing_radios(active_ids)
+                if status == "ready":
+                    for radio_id in data.get("radio_ids", []):
+                        self.scheduler.begin_launch_schedule_apply(int(radio_id))
+            except Exception:
+                log.debug("MainWindow: could not release launch scheduler hold", exc_info=True)
         if bool(data.get("counts_toward_total", True)):
             self._launch_progress_done = min(self._launch_progress_total, self._launch_progress_done + 1)
         try:
@@ -12955,6 +14861,13 @@ class MainWindow(QMainWindow):
                 pass
 
     def _on_launch_sequence_finished(self, payload: object) -> None:
+        self._launch_initializing_radio_ids = set()
+        try:
+            self.scheduler.set_launch_initializing_radios(())
+            self.scheduler.end_launch_schedule_apply()
+            self.scheduler.force_refresh()
+        except Exception:
+            log.debug("MainWindow: could not clear launch scheduler hold", exc_info=True)
         try:
             data = payload if isinstance(payload, dict) else {}
             trigger = str(data.get("trigger", "")).strip().lower()
@@ -13004,7 +14917,12 @@ class MainWindow(QMainWindow):
             asset_roots.append(Path(bundle_root) / "assets")
         asset_roots.append(Path(__file__).resolve().parents[2] / "assets")
         icon = QIcon()
-        candidates = ["FreqInOut.ico", "FreqInOut-desktop.png"] if sys.platform == "win32" else ["FreqInOut-desktop.png", "FreqInOut.ico"]
+        if sys.platform == "win32":
+            candidates = ["CommsPlan.ico", "CommsPlan-desktop.png", "FreqInOut.ico", "FreqInOut-desktop.png"]
+        elif sys.platform == "darwin":
+            candidates = ["CommsPlan.icns", "CommsPlan-desktop.png", "CommsPlan.ico", "FreqInOut-desktop.png", "FreqInOut.ico"]
+        else:
+            candidates = ["CommsPlan-desktop.png", "CommsPlan.ico", "FreqInOut-desktop.png", "FreqInOut.ico"]
         for assets_dir in asset_roots:
             for name in candidates:
                 icon_path = assets_dir / name
@@ -13018,7 +14936,7 @@ class MainWindow(QMainWindow):
             if not icon.isNull():
                 break
         if icon.isNull():
-            log.warning("FIO application icon could not be loaded from packaged or source assets.")
+            log.warning("CommsPlan application icon could not be loaded from packaged or source assets.")
             return
         self.setWindowIcon(icon)
         app = QApplication.instance()
@@ -13030,9 +14948,13 @@ class MainWindow(QMainWindow):
             return
         theme = resolve_theme(self.settings)
         assets_dir = Path(__file__).resolve().parents[2] / "assets"
-        logo_name = "FreqInOut-dark.png" if theme.get("bg") == "#0F1216" else "FreqInOut_logo.png"
-        logo_path = assets_dir / logo_name
-        if not logo_path.exists():
+        logo_names = (
+            ["CommsPlan-dark.png", "CommsPlan_logo.png", "FreqInOut-dark.png", "FreqInOut_logo.png"]
+            if theme.get("bg") == "#0F1216"
+            else ["CommsPlan_logo.png", "FreqInOut_logo.png"]
+        )
+        logo_path = next((assets_dir / name for name in logo_names if (assets_dir / name).exists()), None)
+        if logo_path is None:
             self.logo_label.clear()
             return
         pix = QPixmap(str(logo_path))
@@ -13215,14 +15137,15 @@ class MainWindow(QMainWindow):
                     header.setToolTip("")
             self._set_nav_group_header_visual_state(header, expanded)
             try:
-                header.setStyleSheet(button_style(role, theme) + align_style)
+                set_widget_value(header, "styleSheet", button_style(role, theme) + align_style)
             except Exception:
                 pass
 
     def _sync_nav_group_header_font(self, header: QPushButton) -> None:
         try:
             source = self.nav_buttons[0] if getattr(self, "nav_buttons", None) else self
-            header.setFont(source.font())
+            if header.font() != source.font():
+                header.setFont(source.font())
         except Exception:
             pass
 
@@ -13231,7 +15154,9 @@ class MainWindow(QMainWindow):
             style = header.style() or QApplication.style()
             if style is not None:
                 icon_kind = QStyle.SP_ArrowDown if expanded else QStyle.SP_ArrowRight
-                header.setIcon(style.standardIcon(icon_kind))
+                if header.property("fioExpandedIcon") != bool(expanded):
+                    header.setIcon(style.standardIcon(icon_kind))
+                    header.setProperty("fioExpandedIcon", bool(expanded))
         except Exception:
             pass
 
@@ -13366,14 +15291,17 @@ class MainWindow(QMainWindow):
 
     def _condition_sop_automation_status(self) -> tuple[str, str]:
         db_path = get_config_dir() / "config" / "freqinout_nets.db"
-        if not db_path.exists():
-            return "", "none"
-        try:
-            display = condition_sop_audit_display(condition_sop_audit_summary(db_path, limit=10))
-        except Exception as e:
-            log.debug("Condition SOP automation audit unavailable: %s", e)
-            return "", "none"
-        return display.text, display.severity
+        cache = getattr(self, "_condition_audit_read_cache", None)
+        if cache is None:
+            cache = self._condition_audit_read_cache = LatestReadCache("fio-condition-audit")
+        def reader_factory():
+            def read():
+                if not db_path.exists():
+                    return "", "none"
+                display = condition_sop_audit_display(condition_sop_audit_summary(db_path, limit=10))
+                return display.text, display.severity
+            return read
+        return cache.read(str(db_path), reader_factory, refresh_after_s=5.0) or ("", "none")
 
     def _style_condition_sop_automation_label(self, severity: str) -> None:
         label = getattr(self, "condition_sop_automation_label", None)
@@ -13741,14 +15669,25 @@ class MainWindow(QMainWindow):
         kind_key = (kind or "").strip().upper()
         if kind_key in self._ncs_net_active:
             self._ncs_net_active[kind_key] = bool(active)
-        try:
-            # Scheduler only tracks FLDIGI/JS8 manual net locks.
-            if kind_key in {"FLDIGI", "JS8"} and hasattr(self, "scheduler"):
-                self.scheduler.set_manual_net_active(kind_key, bool(active))
-        except Exception:
-            pass
         self._update_ncs_nav_button_styles()
         self._refresh_scheduler_status_panel()
+
+    def _on_ncs_scoped_net_status_changed(
+        self, kind: str, active: bool, radio_id: int, session_id: str
+    ) -> None:
+        kind_key = (kind or "").strip().upper()
+        try:
+            if kind_key in {"FLDIGI", "JS8"} and int(radio_id or 0) > 0 and hasattr(self, "scheduler"):
+                if active:
+                    self._dismiss_radio_off_schedule_prompt(int(radio_id))
+                self.scheduler.set_manual_net_active(
+                    kind_key,
+                    bool(active),
+                    radio_id=int(radio_id or 0) or None,
+                    session_id=str(session_id or ""),
+                )
+        except Exception:
+            pass
 
     def _active_ncs_session_flags_from_settings(self) -> dict[str, bool]:
         try:
@@ -13806,32 +15745,90 @@ class MainWindow(QMainWindow):
             theme = resolve_theme(self.settings)
         except Exception:
             theme = {}
-        self._update_nav_group_header_styles(theme)
         align_style = self._nav_button_alignment_style()
-        # Base styling for all sidebar buttons so typography/contrast is consistent.
-        for btn in self.nav_buttons:
+        ncs_by_index = {idx: kind for kind, idx in self._ncs_nav_indices.items()}
+        health_index = getattr(self, "_station_health_nav_index", None)
+        issue_count, severity = self._station_health_alert_counts()
+        ncs_tooltips = {}
+        for kind in ncs_by_index.values():
+            try:
+                ncs_tooltips[kind] = self._active_ncs_session_tooltip(kind)
+            except Exception:
+                ncs_tooltips[kind] = ""
+        try:
+            aggregate_ncs_tooltip = self._active_ncs_session_tooltip()
+        except Exception:
+            aggregate_ncs_tooltip = ""
+
+        def font_signature(widget: object | None) -> tuple[object, ...] | None:
+            if widget is None:
+                return None
+            try:
+                font = widget.font()
+                metrics = widget.fontMetrics()
+                return (
+                    font.toString(),
+                    int(metrics.height()),
+                    int(metrics.lineSpacing()),
+                    int(metrics.horizontalAdvance("M")),
+                )
+            except Exception:
+                return None
+
+        nav_group_headers = getattr(self, "_nav_group_headers", {})
+        if not isinstance(nav_group_headers, Mapping):
+            nav_group_headers = {}
+        nav_group_states = getattr(self, "_nav_group_states", {})
+        if not isinstance(nav_group_states, Mapping):
+            nav_group_states = {}
+        nav_group_order = tuple(str(key) for key in (getattr(self, "_nav_group_order", ()) or ()))
+        nav_group_signature = tuple(
+            (
+                str(key),
+                id(header),
+                bool(nav_group_states.get(key, True)),
+                font_signature(header),
+            )
+            for key, header in sorted(nav_group_headers.items(), key=lambda item: str(item[0]))
+        )
+        theme_signature = tuple(sorted((str(key), repr(value)) for key, value in theme.items()))
+        signature = (
+            theme_signature,
+            align_style,
+            tuple((id(btn), bool(btn.isChecked())) for btn in self.nav_buttons),
+            font_signature(self.nav_buttons[0] if self.nav_buttons else self),
+            tuple(sorted((int(index), str(kind)) for index, kind in ncs_by_index.items())),
+            tuple(sorted((str(kind), bool(self._ncs_net_active.get(kind)), str(tip))
+                         for kind, tip in ncs_tooltips.items())),
+            str(aggregate_ncs_tooltip),
+            nav_group_order,
+            tuple(sorted((str(key), bool(value)) for key, value in nav_group_states.items())),
+            nav_group_signature,
+            health_index,
+            issue_count,
+            severity,
+        )
+        if signature == getattr(self, "_ncs_nav_projection_signature", None):
+            return
+
+        self._update_nav_group_header_styles(theme)
+        # Resolve overlays before publication: resetting a warning to base and
+        # back on every health tick repolishes the entire sidebar twice.
+        for idx, btn in enumerate(self.nav_buttons):
             role = "primary" if btn.isChecked() else "muted"
+            kind = ncs_by_index.get(idx)
             try:
-                btn.setStyleSheet(button_style(role, theme) + align_style)
-            except Exception:
-                pass
-        # Overlay active-net reminder on NCS entries only.
-        for kind_key, idx in self._ncs_nav_indices.items():
-            if idx < 0 or idx >= len(self.nav_buttons):
-                continue
-            btn = self.nav_buttons[idx]
-            active = bool(self._ncs_net_active.get(kind_key))
-            try:
-                btn.setToolTip(self._active_ncs_session_tooltip(kind_key))
-            except Exception:
-                pass
-            if not active:
-                continue
-            try:
-                btn.setStyleSheet(button_style("warning", theme) + align_style)
+                if kind is not None:
+                    set_widget_value(btn, "toolTip", ncs_tooltips.get(kind, ""))
+                    if bool(self._ncs_net_active.get(kind)):
+                        role = "warning"
+                if idx == health_index and issue_count > 0:
+                    role = "danger" if severity == "danger" else "warning"
+                set_widget_value(btn, "styleSheet", button_style(role, theme) + align_style)
             except Exception:
                 pass
         self._apply_station_health_nav_alert(theme, align_style)
+        self._ncs_nav_projection_signature = signature
 
     def _station_health_nav_label(self, issue_count: int = 0) -> str:
         idx = getattr(self, "_station_health_nav_index", None)
@@ -13980,16 +15977,111 @@ class MainWindow(QMainWindow):
                         known_source_ids.add(source_id)
         except Exception:
             pass
+        for row in rows:
+            metadata = dict(row["metadata"]) if isinstance(row.get("metadata"), Mapping) else {}
+            radio_id = row.get("radio_id")
+            row["radio_scope"] = (self._station_health_scope_resolver("ingest:source", {"device_profile_id": radio_id})
+                                  if radio_id else "Shared" if metadata.get("attribution") == "shared" else "Unattributed")
+            candidates = metadata.get("candidate_radio_ids", ())
+            metadata["candidate_radio_names"] = tuple(
+                self._station_health_scope_resolver("ingest:source", {"device_profile_id": value})
+                for value in candidates
+            )
+            row["metadata"] = metadata
         return rows
+
+    @staticmethod
+    def _station_health_alert_source_signature(
+        registry_snapshot: Mapping[str, object],
+        extra_items: Sequence[Mapping[str, object]],
+        *,
+        now_monotonic: float | None = None,
+    ) -> tuple[object, ...]:
+        """Stable key for health inputs, including time-based freshness edges."""
+        now = time.monotonic() if now_monotonic is None else float(now_monotonic)
+
+        def number(value: object) -> float:
+            try:
+                return float(value or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        registry_rows = []
+        for key, raw in sorted(registry_snapshot.items(), key=lambda pair: str(pair[0])):
+            if not isinstance(raw, Mapping):
+                continue
+            try:
+                failures = int(raw.get("consecutive_failures", 0) or 0)
+                slow = int(raw.get("consecutive_slow", 0) or 0)
+                last_checked = float(raw.get("last_checked_ts", 0.0) or 0.0)
+                cooldown_active = float(raw.get("cooldown_remaining_sec", 0.0) or 0.0) > 0.0
+            except (TypeError, ValueError):
+                failures, slow, last_checked, cooldown_active = 0, 0, 0.0, False
+            service = str(key or "").split(":", 1)[0].strip().lower().replace("-", "_")
+            stale_ok = (
+                service != "scheduler"
+                and last_checked > 0.0
+                and failures <= 0
+                and slow <= 0
+                and now - last_checked > 600.0
+            )
+            expired_transient = (
+                str(key or "").strip().lower().replace("_", "-") == "scheduler:fldigi-busy-check"
+                and last_checked > 0.0
+                and now - last_checked > 300.0
+            )
+            registry_rows.append(
+                (
+                    str(key),
+                    str(raw.get("owner", "") or ""),
+                    failures,
+                    slow,
+                    number(raw.get("last_success_ts")),
+                    number(raw.get("last_failure_ts")),
+                    number(raw.get("issue_started_ts")),
+                    last_checked,
+                    number(raw.get("last_duration_ms")),
+                    cooldown_active,
+                    stale_ok,
+                    expired_transient,
+                    str(raw.get("last_error", "") or ""),
+                    repr(raw.get("metadata", {})),
+                )
+            )
+        return tuple(registry_rows), tuple(repr(dict(item)) for item in extra_items)
 
     def _refresh_station_health_alert(self) -> None:
         if not self._ui_refresh_allowed():
             self._mark_ui_refresh_dirty("station_health_alert")
             return
         try:
-            summary = summarize_station_health(include_ok=False, extra_items=self._station_health_alert_extra_items())
+            registry_snapshot = get_dependency_health_registry().snapshot()
+            extra_items = self._station_health_alert_extra_items()
+            input_signature = self._station_health_alert_source_signature(
+                registry_snapshot if isinstance(registry_snapshot, Mapping) else {},
+                extra_items,
+            )
+            if input_signature == getattr(self, "_station_health_alert_inputs_signature", None):
+                # The cached summary already represents the same source state.
+                # Still run the nav projection guard so theme/selection changes
+                # can publish independently of health input changes.
+                self._update_ncs_nav_button_styles()
+                return
+        except Exception:
+            registry_snapshot = {}
+            extra_items = []
+            input_signature = None
+        try:
+            summary = summarize_station_health(
+                registry_snapshot=registry_snapshot,
+                include_ok=False,
+                extra_items=extra_items,
+            )
         except Exception:
             summary = {"issue_count": 0, "severity": "ok", "issue_items": []}
+            input_signature = None
+        if input_signature is not None:
+            self._station_health_alert_inputs_signature = input_signature
         issue_count = int(summary.get("issue_count", 0) or 0)
         severity = str(summary.get("severity", "ok") or "ok")
         signature = (issue_count, severity)
@@ -14027,7 +16119,7 @@ class MainWindow(QMainWindow):
                 btn.setToolTip("Station Health: no known external software responsiveness issues.")
                 return
             role = "danger" if severity == "danger" else "warning"
-            btn.setStyleSheet(button_style(role, theme) + align_style)
+            set_widget_value(btn, "styleSheet", button_style(role, theme) + align_style)
             btn.setToolTip(
                 f"Station Health: {issue_count} responsiveness issue"
                 f"{'s' if issue_count != 1 else ''}. Open Station Health for details."

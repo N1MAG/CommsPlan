@@ -2,11 +2,18 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional
 import datetime
+import math
 import time
 
 from PySide6.QtWidgets import QComboBox, QMessageBox
 from freqinout.core.logger import log
 from freqinout.core.mode_utils import normalize_operating_group_mode
+from freqinout.core.operating_group_frequency import (
+    ensure_operating_group_frequency_keys,
+    format_frequency_mhz,
+    normalize_frequency_hz,
+    resolve_operating_group_frequency,
+)
 from freqinout.core.multi_radio_store import (
     DEFAULT_HOLD_DURATION_MINUTES,
     SUPPORTED_HOLD_DURATION_MINUTES,
@@ -32,12 +39,13 @@ def parse_frequency_mhz(value) -> Optional[float]:
         return None
     parts = text.split(".")
     try:
-        if len(parts) == 3 and all(part.strip().isdigit() for part in parts):
-            mhz = int(parts[0])
-            khz = int((parts[1] + "000")[:3])
-            hz = int((parts[2] + "000")[:3])
-            return mhz + ((khz * 1000) + hz) / 1_000_000.0
-        return float(text)
+        if len(parts) == 3:
+            if not all(part.isdigit() for part in parts) or any(len(part) > 3 for part in parts[1:]):
+                return None
+            hz = int(parts[0]) * 1_000_000 + int(parts[1]) * 1000 + int(parts[2])
+            return hz / 1_000_000.0 if hz > 0 else None
+        hz = normalize_frequency_hz(text)
+        return hz / 1_000_000.0 if hz is not None else None
     except Exception:
         return None
 
@@ -50,8 +58,16 @@ def load_operating_groups(settings) -> List[Dict]:
     og = data.get("operating_groups", [])
     if not isinstance(og, list):
         return []
+    prepared = []
+    for row in og:
+        if not isinstance(row, dict):
+            continue
+        item = dict(row)
+        if item.get("frequency") in (None, "") and item.get("freq") not in (None, ""):
+            item["frequency"] = item.get("freq")
+        prepared.append(item)
     cleaned: List[Dict] = []
-    for g in og:
+    for g in ensure_operating_group_frequency_keys(prepared):
         if not isinstance(g, dict):
             continue
         g = dict(g)
@@ -84,47 +100,67 @@ def snapshot_operating_groups(og_list: List[Dict]) -> str:
 
 def build_qsy_options(og_list: List[Dict]) -> Dict[str, Dict]:
     """
-    Build a unique frequency map keyed by frequency string. Auto-tune wins on duplicates.
+    Build QSY choices keyed by stable configured frequency-row identity.
     """
     meta: Dict[str, Dict] = {}
-    for g in og_list:
+    normalized_rows = ensure_operating_group_frequency_keys(og_list)
+    for g in normalized_rows:
         fval = parse_frequency_mhz(g.get("frequency", 0))
         if fval is None:
             continue
-        key = f"{fval:.6f}"
-        auto = bool(g.get("auto_tune", False))
-        vfo = (g.get("vfo") or "").strip().upper()
-        group = (g.get("group") or "").strip().upper()
-        existing = meta.get(key)
-        if existing:
-            existing["auto_tune"] = existing.get("auto_tune", False) or auto
-            if auto and g.get("mode"):
-                existing["mode"] = g.get("mode", "")
-            if auto and g.get("band"):
-                existing["band"] = g.get("band", "")
-            if vfo and not existing.get("vfo"):
-                existing["vfo"] = vfo
-            if group and not existing.get("group"):
-                existing["group"] = group
-        else:
-            meta[key] = {
-                "freq": fval,
-                "mode": g.get("mode", ""),
-                "band": g.get("band", ""),
-                "auto_tune": auto,
-                "vfo": vfo,
-                "group": group,
-            }
+        row_key = str(g.get("operating_group_frequency_key") or "").strip()
+        group = str(g.get("group") or "").strip().upper()
+        band = str(g.get("band") or "").strip().upper()
+        mode = str(g.get("mode") or "").strip().upper()
+        hz = normalize_frequency_hz(fval)
+        resolution = resolve_operating_group_frequency(
+            normalized_rows,
+            group=group,
+            group_key=g.get("operating_group_key"),
+            frequency_key=row_key,
+            band=band,
+            mode=mode,
+            frequency=g.get("frequency"),
+        )
+        if not resolution.resolved or resolution.row is None:
+            continue
+        key = "row:" + row_key
+        if not key.strip("|:"):
+            continue
+        meta[key] = {
+            "freq": fval,
+            "frequency": str(g.get("frequency") or fval),
+            "mode": g.get("mode", ""),
+            "band": g.get("band", ""),
+            "auto_tune": bool(g.get("auto_tune", False)),
+            "vfo": str(g.get("vfo") or "").strip().upper(),
+            "fldigi_mode": str(g.get("fldigi_mode") or "").strip(),
+            "fldigi_offset": str(g.get("fldigi_offset") or "").strip(),
+            "group": group,
+            "operating_group_key": g.get("operating_group_key", ""),
+            "operating_group_frequency_key": row_key,
+        }
     return meta
 
 
 def refresh_qsy_combo(combo: QComboBox, meta: Dict[str, Dict]) -> None:
-    items = sorted(meta.items(), key=lambda kv: float(kv[0]))
+    items = sorted(meta.items(), key=lambda kv: (
+        str(kv[1].get("group") or "").upper(),
+        str(kv[1].get("band") or "").upper(),
+        float(kv[1].get("freq") or 0.0),
+        str(kv[1].get("mode") or "").upper(),
+    ))
     combo.blockSignals(True)
     combo.clear()
     combo.addItem("Select frequency", None)
     for key, m in items:
-        combo.addItem(f"{key} MHz", m)
+        label = " · ".join(part for part in (
+            str(m.get("group") or "").strip(),
+            str(m.get("band") or "").strip(),
+            (format_frequency_mhz(m.get("frequency", m.get("freq"))) + " MHz"),
+            str(m.get("mode") or "").strip(),
+        ) if part)
+        combo.addItem(label or f"{key} MHz", m)
     combo.blockSignals(False)
 
 
@@ -367,11 +403,19 @@ def _submit_manual_qsy(
         )
     except TypeError:
         result = scheduler.apply_manual_qsy(entry)
+    disposition = "queued" if result is None else str(result).strip().lower()
+    try:
+        radio_id = int(entry.get("target_device_profile_id") or getattr(window, "_station_command_selected_profile_id", 0) or 0)
+        dispositions = getattr(window, "_station_command_qsy_dispositions", None)
+        if not isinstance(dispositions, dict):
+            dispositions = window._station_command_qsy_dispositions = {}
+        dispositions[radio_id] = disposition
+    except (TypeError, ValueError, AttributeError):
+        pass
     if result is None:
-        # Compatibility for existing integrations whose scheduler predates the
-        # result-bearing QSY contract. They own their established feedback.
+        # Compatibility integrations own their feedback. A new request must
+        # nevertheless replace any old cached disposition for this radio.
         return True
-    disposition = str(result).strip().lower()
     if disposition == "pending_verification":
         _publish_schedule_control_feedback(
             window,
@@ -379,7 +423,7 @@ def _submit_manual_qsy(
             status="partial",
             summary="Checking target radio before QSY…",
             detail=(
-                "FIO is verifying that the selected radio is not transmitting. "
+                "CommsPlan is verifying that the selected radio is not transmitting. "
                 "The QSY will continue automatically when safe."
             ),
             source_surface="qsy_helper_preflight",
@@ -389,13 +433,13 @@ def _submit_manual_qsy(
         _publish_schedule_control_feedback(
             window,
             action_type="qsy",
-            status="partial" if disposition == "pending" else "succeeded",
+            status="succeeded" if disposition == "already_applied" else "partial",
             summary=(
                 "The selected radio is already on this frequency."
                 if disposition == "already_applied"
                 else "QSY is queued for the selected radio."
             ),
-            detail="FIO will report the endpoint readback separately.",
+            detail="CommsPlan will report the endpoint readback separately.",
             source_surface="qsy_helper_submit",
         )
         return True
@@ -405,7 +449,7 @@ def _submit_manual_qsy(
             action_type="qsy",
             status="partial",
             summary="QSY selected · tune this radio manually.",
-            detail="FIO updated the manual hold but did not send a radio-control command.",
+            detail="CommsPlan updated the manual hold but did not send a radio-control command.",
             source_surface="qsy_helper_manual",
         )
         return True
@@ -417,9 +461,16 @@ def _submit_manual_qsy(
     return False
 
 
-def _resume_coordination_conflict(scheduler) -> Dict[str, object]:
+def _resume_coordination_conflict(scheduler, target_device_profile_id=None) -> Dict[str, object]:
     try:
-        entry = getattr(scheduler, "current_schedule_entry", {}) if scheduler is not None else {}
+        if target_device_profile_id is not None:
+            radio_id = int(target_device_profile_id or 0)
+            if radio_id <= 0:
+                return {}
+            _, entry = scheduler._active_schedule_entry_for_radio(radio_id, force=False)
+            entry = {**entry, "target_device_profile_id": radio_id} if entry else {}
+        else:
+            entry = getattr(scheduler, "current_schedule_entry", {}) if scheduler is not None else {}
     except Exception:
         entry = {}
     if not isinstance(entry, dict) or not entry:
@@ -513,8 +564,8 @@ def _warn_if_suspend_leaves_rf_conflict(window, scheduler) -> None:
         _suspend_guard_feedback_recent(signature, mark=True)
 
 
-def _resume_allowed_by_rf_guard(window, scheduler) -> tuple[bool, bool]:
-    conflict = _resume_coordination_conflict(scheduler)
+def _resume_allowed_by_rf_guard(window, scheduler, target_device_profile_id=None) -> tuple[bool, bool]:
+    conflict = _resume_coordination_conflict(scheduler, target_device_profile_id)
     if not bool(conflict.get("warning")):
         return True, False
     summary = str(conflict.get("summary") or "Resume blocked by RF Safety Guard.").strip()
@@ -593,7 +644,11 @@ def perform_qsy(window, meta: Dict) -> bool:
             QMessageBox.warning(window, "QSY", "Select a frequency before QSY.")
         return False
     try:
-        freq_text = f"{float(freq):.3f}"
+        frequency_mhz = float(freq)
+        if not math.isfinite(frequency_mhz) or frequency_mhz <= 0:
+            raise ValueError("Frequency must be positive and finite")
+        freq_text = f"{frequency_mhz:.6f}".rstrip("0")
+        freq_text += "0" * max(0, 3 - len(freq_text.partition(".")[2]))
     except Exception:
         if not _publish_qsy_blocked_feedback(
             window,
@@ -610,7 +665,15 @@ def perform_qsy(window, meta: Dict) -> bool:
         "vfo": meta.get("vfo", ""),
         "group": (meta.get("group") or "").strip().upper(),
         "group_name": (meta.get("group") or "").strip().upper(),
+        "operating_group_key": str(meta.get("operating_group_key") or ""),
+        "operating_group_frequency_key": str(meta.get("operating_group_frequency_key") or ""),
+        "fldigi_mode": str(meta.get("fldigi_mode") or ""),
+        "fldigi_offset": str(meta.get("fldigi_offset") or ""),
     }
+    # Cards make an explicit hold choice; other QSY entry points preserve
+    # their established existing-future-deadline policy.
+    if meta.get("manual_hold_policy") == "until_resume":
+        entry["manual_hold_policy"] = "until_resume"
     try:
         target_device_profile_id = int(meta.get("target_device_profile_id") or 0)
     except Exception:
@@ -854,8 +917,12 @@ def set_active_hold_duration(
         try:
             scheduler.suspend_schedule(mins, target_device_profile_id=target_device_profile_id)
         except TypeError:
+            if target_device_profile_id is not None:
+                return 0
             scheduler.suspend_schedule(mins)
     else:
+        if target_device_profile_id is not None:
+            return 0
         set_suspend_until(settings, until)
     if target_device_profile_id is None:
         _SUSPEND_CACHE["ts"] = until.timestamp()
@@ -897,7 +964,9 @@ def resume_schedule_hold(window, settings, *, target_device_profile_id: Optional
     except Exception:
         scheduler = None
     if scheduler and hasattr(scheduler, "resume_schedule"):
-        allowed, acknowledged = _resume_allowed_by_rf_guard(window, scheduler)
+        allowed, acknowledged = (_resume_allowed_by_rf_guard(window, scheduler)
+                                 if target_device_profile_id is None else
+                                 _resume_allowed_by_rf_guard(window, scheduler, target_device_profile_id))
         if not allowed:
             notify_hold_state_changed(window, force_reload=False)
             return False
@@ -907,6 +976,8 @@ def resume_schedule_hold(window, settings, *, target_device_profile_id: Optional
                 target_device_profile_id=target_device_profile_id,
             )
         except TypeError:
+            if target_device_profile_id is not None:
+                return False
             result = scheduler.resume_schedule()
         if result is False:
             notify_hold_state_changed(window, force_reload=False)
@@ -916,6 +987,8 @@ def resume_schedule_hold(window, settings, *, target_device_profile_id: Optional
             _SUSPEND_CACHE["loaded_at"] = time.time()
         notify_hold_state_changed(window, force_reload=False)
         return True
+    if target_device_profile_id is not None:
+        return False
     set_suspend_until(settings, None)
     notify_hold_state_changed(window, force_reload=False)
     return False

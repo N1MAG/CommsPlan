@@ -16,10 +16,14 @@ REPO_URL="${REPO_URL:-$DEFAULT_REPO_URL}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/FreqInOut}"
 LOG_FILE="${LOG_FILE:-$HOME/freqinout-install.log}"
 CONFIG_ROOT_OVERRIDE="${FREQINOUT_CONFIG_DIR:-}"
+RELOCATION_SOURCE=""
+RELOCATION_VERIFIED=0
 
 ASSUME_YES=0
 DRY_RUN=0
 REPAIR_MODE=0
+MAINTENANCE_ACTION=""
+UPDATE_REMOTE="origin"
 CLI_ARGS_PROVIDED=0
 OFFLINE_MODE=0
 SKIP_UPDATE_WORK=0
@@ -42,9 +46,14 @@ NETWORK_HINT_SHOWN=0
 ROLLBACK_DIR=""
 ROLLBACK_STAMP=""
 ROLLBACK_LAUNCHER_BACKUP=""
+ROLLBACK_COMMSPLAN_LAUNCHER_BACKUP=""
 ROLLBACK_DESKTOP_BACKUP=""
+ROLLBACK_DESKTOP_SHORTCUT_PATH=""
+ROLLBACK_DESKTOP_SHORTCUT_BACKUP=""
 ROLLBACK_ICON_BACKUP_DIR=""
+ROLLBACK_PIXMAPS_BACKUP=""
 ROLLBACK_VENV_BACKUP=""
+ROLLBACK_RECEIPT_BACKUP=""
 ROLLBACK_ORIGIN_URL=""
 CREATED_INSTALL_DIR=0
 REPLACED_NON_GIT_BACKUP=""
@@ -57,14 +66,13 @@ ICON_THEME_ROOT="$HOME/.local/share/icons/hicolor"
 ICON_PRIMARY_PATH="$ICON_THEME_ROOT/1024x1024/apps/freqinout.png"
 ICON_CACHE_DIR="$HOME/.local/state/freqinout/cache"
 BACKUP_ROOT="$HOME/.local/state/freqinout/backups"
-ICON_ZOOM_PERCENT="${ICON_ZOOM_PERCENT:-320}"
-PRIMARY_ICON_NAME="FreqInOut-desktop.png"
+PRIMARY_ICON_NAME="CommsPlan-desktop.png"
 LOCK_DIR="${XDG_RUNTIME_DIR:-/tmp}/freqinout-installer.lock"
 LOCK_HELD=0
 
 usage() {
   cat <<'EOF'
-FreqInOut Linux Installer
+CommsPlan Linux Installer
 
 Usage:
   bash install_FreqInOut_linux.sh
@@ -77,8 +85,12 @@ Options:
   -r, --repo <url>      Git repository URL (default: public FreqInOut repo)
   -c, --channel <name>  Update channel: stable or beta (default: stable/main)
   -b, --branch <name>   Git branch override (takes priority over --channel)
-      --config-root <p> Dedicated FIO profile root (sets FREQINOUT_CONFIG_DIR)
-      --repair          Rebuild venv + launcher + icon without recloning
+      --config-root <p> Dedicated FIO/CommsPlan profile root (sets FREQINOUT_CONFIG_DIR)
+      --relocate-from <p> Adopt this checkout after moving it from an old folder (setup only)
+      --repair          Verify/repair .venv + receipt + launcher/icon without Git update
+      --local           Set up this checkout without Git update
+      --update-current  Update the current branch/upstream and refresh everything
+      --desktop-only    Refresh local launcher/icon only
       --dry-run         Show what would be done without changing anything
       --offline         Skip network checks/downloads and use local files only
       --on-dirty <p>    Policy for dirty git tree: prompt|stash|skip|fail
@@ -91,9 +103,9 @@ EOF
 }
 
 timestamp() { date "+%Y-%m-%d %H:%M:%S"; }
-log() { echo "[$(timestamp)] [FreqInOut] $*"; }
-warn() { echo "[$(timestamp)] [FreqInOut] WARNING: $*" >&2; }
-die() { echo "[$(timestamp)] [FreqInOut] ERROR: $*" >&2; exit 1; }
+log() { echo "[$(timestamp)] [CommsPlan] $*"; }
+warn() { echo "[$(timestamp)] [CommsPlan] WARNING: $*" >&2; }
+die() { echo "[$(timestamp)] [CommsPlan] ERROR: $*" >&2; exit 1; }
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 expand_path() { local raw="$1"; echo "${raw/#\~/$HOME}"; }
@@ -121,14 +133,11 @@ run_step() {
   local end_ts
   start_ts="$(date +%s)"
   log "STEP START: $step_name"
-  if "$@"; then
-    end_ts="$(date +%s)"
-    log "STEP SUCCESS: $step_name ($((end_ts - start_ts))s)"
-    return 0
-  fi
+  # Do not run the function as an if-condition: Bash then disables errexit
+  # inside it, allowing failed verification to be followed by desktop writes.
+  "$@"
   end_ts="$(date +%s)"
-  warn "STEP FAILED: $step_name ($((end_ts - start_ts))s)"
-  return 1
+  log "STEP SUCCESS: $step_name ($((end_ts - start_ts))s)"
 }
 
 init_rollback_dir() {
@@ -183,17 +192,50 @@ restore_rollback_state() {
     mv "$ROLLBACK_VENV_BACKUP" "$VENV_DIR"
     warn "Rollback: restored previous virtual environment."
   fi
-
-  if [[ -n "$ROLLBACK_LAUNCHER_BACKUP" && -f "$ROLLBACK_LAUNCHER_BACKUP" ]]; then
-    mkdir -p "$(dirname "$LAUNCHER_PATH")"
-    cp -f "$ROLLBACK_LAUNCHER_BACKUP" "$LAUNCHER_PATH"
-    warn "Rollback: restored launcher file."
+  if [[ -n "$ROLLBACK_RECEIPT_BACKUP" && -f "$ROLLBACK_RECEIPT_BACKUP" ]]; then
+    cp -f "$ROLLBACK_RECEIPT_BACKUP" "$INSTALL_DIR/.freqinout-install-verified.json"
+    warn "Rollback: restored previous installation receipt."
   fi
 
-  if [[ -n "$ROLLBACK_DESKTOP_BACKUP" && -f "$ROLLBACK_DESKTOP_BACKUP" ]]; then
-    mkdir -p "$(dirname "$DESKTOP_ENTRY_PATH")"
-    cp -f "$ROLLBACK_DESKTOP_BACKUP" "$DESKTOP_ENTRY_PATH"
-    warn "Rollback: restored desktop entry."
+  if [[ -n "$ROLLBACK_LAUNCHER_BACKUP" ]]; then
+    if [[ -f "$ROLLBACK_LAUNCHER_BACKUP" ]]; then
+      mkdir -p "$(dirname "$LAUNCHER_PATH")"
+      cp -f "$ROLLBACK_LAUNCHER_BACKUP" "$LAUNCHER_PATH"
+      warn "Rollback: restored launcher file."
+    else
+      rm -f "$LAUNCHER_PATH"
+    fi
+  fi
+
+  if [[ -n "$ROLLBACK_COMMSPLAN_LAUNCHER_BACKUP" ]]; then
+    if [[ -f "$ROLLBACK_COMMSPLAN_LAUNCHER_BACKUP" ]]; then
+      cp -f "$ROLLBACK_COMMSPLAN_LAUNCHER_BACKUP" "$HOME/.local/bin/commsplan"
+    elif [[ -f "$HOME/.local/bin/commsplan" ]]; then
+      rm -f "$HOME/.local/bin/commsplan"
+    fi
+  fi
+  if [[ -n "$ROLLBACK_DESKTOP_BACKUP" ]]; then
+    if [[ -f "$ROLLBACK_DESKTOP_BACKUP" ]]; then
+      mkdir -p "$(dirname "$DESKTOP_ENTRY_PATH")"
+      cp -f "$ROLLBACK_DESKTOP_BACKUP" "$DESKTOP_ENTRY_PATH"
+      warn "Rollback: restored desktop entry."
+    else
+      rm -f "$DESKTOP_ENTRY_PATH"
+    fi
+  fi
+  if [[ -n "$ROLLBACK_DESKTOP_SHORTCUT_PATH" ]]; then
+    if [[ -f "$ROLLBACK_DESKTOP_SHORTCUT_BACKUP" ]]; then
+      cp -f "$ROLLBACK_DESKTOP_SHORTCUT_BACKUP" "$ROLLBACK_DESKTOP_SHORTCUT_PATH"
+    else
+      rm -f "$ROLLBACK_DESKTOP_SHORTCUT_PATH"
+    fi
+  fi
+  if [[ -n "$ROLLBACK_PIXMAPS_BACKUP" ]]; then
+    if [[ -f "$ROLLBACK_PIXMAPS_BACKUP" ]]; then
+      cp -f "$ROLLBACK_PIXMAPS_BACKUP" "$HOME/.local/share/pixmaps/freqinout.png"
+    else
+      rm -f "$HOME/.local/share/pixmaps/freqinout.png"
+    fi
   fi
 
   if [[ -n "$ROLLBACK_ICON_BACKUP_DIR" && -d "$ROLLBACK_ICON_BACKUP_DIR" ]]; then
@@ -203,6 +245,8 @@ restore_rollback_state() {
       if [[ -f "$src" ]]; then
         mkdir -p "$(dirname "$dst")"
         cp -f "$src" "$dst"
+      else
+        rm -f "$dst"
       fi
     done
     warn "Rollback: restored prior icon theme files."
@@ -244,6 +288,9 @@ on_error() {
   else
     warn "2) Retry with: bash install_FreqInOut_linux.sh --repair --dir \"$INSTALL_DIR\""
   fi
+  if [[ $RELOCATION_VERIFIED -eq 1 ]]; then
+    warn "Relocation failed. After this installer exits, move $INSTALL_DIR back to $RELOCATION_SOURCE to restore the old launcher path, or resolve the error and retry setup with --relocate-from."
+  fi
   warn "3) If package install failed, run again with sudo access."
 }
 trap 'on_error $LINENO "$BASH_COMMAND"' ERR
@@ -261,7 +308,7 @@ acquire_lock() {
   if [[ -f "$pid_file" ]]; then
     holder_pid="$(cat "$pid_file" 2>/dev/null || true)"
     if [[ -n "$holder_pid" ]] && kill -0 "$holder_pid" 2>/dev/null; then
-      die "Another FreqInOut installer is already running (PID $holder_pid)."
+      die "Another CommsPlan installer is already running (PID $holder_pid)."
     fi
   fi
 
@@ -316,6 +363,15 @@ parse_args() {
         [[ $# -ge 2 ]] || die "Missing value for $1"
         CONFIG_ROOT_OVERRIDE="$2"
         shift 2
+        ;;
+      --relocate-from)
+        [[ $# -ge 2 ]] || die "Missing value for $1"
+        RELOCATION_SOURCE="$2"
+        shift 2
+        ;;
+      --local|--update-current|--desktop-only)
+        MAINTENANCE_ACTION="$1"
+        shift
         ;;
       --repair)
         REPAIR_MODE=1
@@ -827,12 +883,12 @@ prompt_existing_install_mode() {
   local answer=""
   local existing_path=""
   local default_choice="3"
-  if [[ $ASSUME_YES -eq 1 || $REPAIR_MODE -eq 1 ]]; then
+  if [[ $ASSUME_YES -eq 1 || $REPAIR_MODE -eq 1 || -n "$MAINTENANCE_ACTION" ]]; then
     return
   fi
 
   log "Prompting for existing-install mode selection."
-  if prompt_yes_no "Have you already installed FreqInOut on this computer?"; then
+  if prompt_yes_no "Have you already installed FIO/CommsPlan on this computer?"; then
     SETUP_MODE="existing"
     DO_UPDATE=0
     DO_ICON=0
@@ -988,7 +1044,7 @@ from pathlib import Path
 SELF = os.getpid()
 PARENT = os.getppid()
 INSTALLER_NAMES = {"install_FreqInOut_linux.sh", "uninstall_FreqInOut_linux.sh"}
-APP_NAMES = {"freqinout", "freqinout.exe", "freqinout.appimage"}
+APP_NAMES = {"freqinout", "freqinout.exe", "freqinout.appimage", "commsplan", "commsplan.exe", "commsplan.appimage"}
 INSTALL_DIR = Path(os.environ.get("FIO_INSTALL_DIR", "") or "").expanduser()
 
 
@@ -1054,7 +1110,7 @@ def _is_freqinout_app(pid, args):
         if _path_is_inside_install(exe_path) or _path_is_inside_install(_proc_cwd(pid)):
             return True
         # Packaged/AppImage launches may not live under INSTALL_DIR.
-        if first in {"freqinout.exe", "freqinout.appimage"}:
+        if first in {"freqinout.exe", "freqinout.appimage", "commsplan", "commsplan.exe", "commsplan.appimage"}:
             return True
         return False
     for arg in args:
@@ -1083,7 +1139,7 @@ ensure_app_not_running_for_update() {
     return 0
   fi
 
-  warn "FreqInOut appears to be running."
+  warn "FIO/CommsPlan appears to be running."
   warn "Matched process(es):"
   is_freqinout_running >&2 || true
   if [[ "$policy" == "prompt" && $ASSUME_YES -eq 1 ]]; then
@@ -1097,18 +1153,18 @@ ensure_app_not_running_for_update() {
       return 0
       ;;
     fail)
-      die "Running-app policy is fail; close FreqInOut before updating."
+      die "Running-app policy is fail; close FIO/CommsPlan before updating."
       ;;
   esac
 
-  if prompt_yes_no "Close FreqInOut and continue update now?"; then
+  if prompt_yes_no "Close FIO/CommsPlan and continue update now?"; then
     if is_freqinout_running; then
-      warn "FreqInOut still appears to be running."
+      warn "FIO/CommsPlan still appears to be running."
       if prompt_yes_no "Skip app update and continue with launcher/icon only?"; then
         SKIP_UPDATE_WORK=1
         return 0
       fi
-      die "Please close FreqInOut before updating."
+      die "Please close FIO/CommsPlan before updating."
     fi
     return 0
   fi
@@ -1118,7 +1174,7 @@ ensure_app_not_running_for_update() {
     return 0
   fi
 
-  die "Update canceled because FreqInOut is running."
+  die "Update canceled because FIO/CommsPlan is running."
 }
 
 clone_repository_into_install_dir() {
@@ -1138,30 +1194,13 @@ configure_runtime_sparse_checkout() {
     log "DRY RUN: would configure runtime sparse checkout for $INSTALL_DIR"
     return 0
   fi
-  if ! git -C "$INSTALL_DIR" sparse-checkout -h >/dev/null 2>&1; then
-    warn "Installed git does not support sparse-checkout; leaving full source tree in place."
-    return 0
-  fi
-
   log "Configuring runtime sparse checkout (excludes tests/dev-only paths)"
   run_cmd git -C "$INSTALL_DIR" sparse-checkout init --cone
-  run_cmd git -C "$INSTALL_DIR" sparse-checkout set \
-    assets \
-    config \
-    docs \
-    freqinout \
-    third_party \
-    requirements.txt \
-    pyproject.toml \
-    README.md \
-    CHANGELOG.md \
-    LICENSE.md \
-    CREDITS.md \
-    SECURITY.md \
-    start-freqinout.sh \
-    start-multi-rig.sh \
-    install_FreqInOut_linux.sh \
-    uninstall_FreqInOut_linux.sh
+  # Cone mode includes all root files automatically, including
+  # install_freqinout.py, install-commsplan.sh and start-multi-rig.sh.
+  # Passing root files as directories fails on current Git.
+  run_cmd git -C "$INSTALL_DIR" sparse-checkout set assets config docs freqinout third_party packaging
+
 }
 
 handle_non_git_install_dir() {
@@ -1282,13 +1321,13 @@ update_existing_install() {
       fi
     fi
 
-    run_cmd git -C "$INSTALL_DIR" fetch origin "$target_branch:refs/remotes/origin/$target_branch"
+    run_cmd git -C "$INSTALL_DIR" fetch "$UPDATE_REMOTE" "$target_branch:refs/remotes/$UPDATE_REMOTE/$target_branch"
     if git -C "$INSTALL_DIR" show-ref --verify --quiet "refs/heads/$target_branch"; then
       run_cmd git -C "$INSTALL_DIR" checkout "$target_branch"
     else
-      run_cmd git -C "$INSTALL_DIR" checkout -b "$target_branch" --track "origin/$target_branch"
+      run_cmd git -C "$INSTALL_DIR" checkout -b "$target_branch" --track "$UPDATE_REMOTE/$target_branch"
     fi
-    run_cmd git -C "$INSTALL_DIR" pull --ff-only origin "$target_branch"
+    run_cmd git -C "$INSTALL_DIR" pull --ff-only "$UPDATE_REMOTE" "$target_branch"
   else
     run_cmd git -C "$INSTALL_DIR" pull --ff-only
   fi
@@ -1296,36 +1335,14 @@ update_existing_install() {
 }
 
 create_venv_and_install_python_deps() {
-  if [[ $DRY_RUN -eq 1 && ! -f "$INSTALL_DIR/requirements.txt" ]]; then
-    log "DRY RUN: would install Python dependencies from $INSTALL_DIR/requirements.txt after source checkout."
-    return 0
-  fi
-  [[ -f "$INSTALL_DIR/requirements.txt" ]] || die "requirements.txt not found in $INSTALL_DIR"
-
-  if [[ -d "$VENV_DIR" && -z "$ROLLBACK_VENV_BACKUP" ]]; then
-    init_rollback_dir
-    ROLLBACK_VENV_BACKUP="$ROLLBACK_DIR/venv-backup"
-    run_cmd rm -rf "$ROLLBACK_VENV_BACKUP"
-    run_cmd cp -a "$VENV_DIR" "$ROLLBACK_VENV_BACKUP"
-    log "Saved rollback backup of virtual environment."
-  fi
-
-  if [[ $REPAIR_MODE -eq 1 && -d "$VENV_DIR" ]]; then
-    log "Repair mode: rebuilding virtual environment."
-    run_cmd rm -rf "$VENV_DIR"
-  fi
-
-  if [[ -d "$VENV_DIR" ]]; then
-    log "Using existing virtual environment at $VENV_DIR"
+  [[ -f "$INSTALL_DIR/install_freqinout.py" ]] || die "Verified installer missing from $INSTALL_DIR"
+  log "Running the shared verified installer (backup, .venv, dependencies, receipt)."
+  if [[ $OFFLINE_MODE -eq 1 ]]; then
+    run_cmd env PIP_NO_INDEX=1 PIP_DISABLE_PIP_VERSION_CHECK=1 python3 "$INSTALL_DIR/install_freqinout.py"
   else
-    log "Creating virtual environment..."
-    run_cmd python3 -m venv "$VENV_DIR"
+    run_cmd python3 "$INSTALL_DIR/install_freqinout.py"
   fi
-
-  log "Installing Python dependencies..."
-  run_cmd "$VENV_DIR/bin/python" -m ensurepip --upgrade
-  run_cmd "$VENV_DIR/bin/python" -m pip install --upgrade pip
-  run_cmd "$VENV_DIR/bin/python" -m pip install -r "$INSTALL_DIR/requirements.txt"
+  VENV_DIR="$INSTALL_DIR/.venv"
 }
 
 cleanup_deprecated_files() {
@@ -1369,17 +1386,122 @@ cleanup_deprecated_files() {
   log "Deprecated file cleanup complete. Removed $removed_count file(s)."
 }
 
+integration_belongs_to_install() {
+  local target="$1"
+  if [[ "$target" == *.desktop ]]; then
+    if grep -Fxq -- "Path=$INSTALL_DIR" "$target"; then return 0; fi
+    [[ $RELOCATION_VERIFIED -eq 1 ]] || return 1
+    grep -Fxq -- "Path=$RELOCATION_SOURCE" "$target" &&
+      { { grep -Fxq -- "Name=CommsPlan" "$target" &&
+          grep -Fxq -- "Exec=\"$HOME/.local/bin/commsplan\"" "$target"; } ||
+        { grep -Fxq -- "Name=FreqInOut" "$target" &&
+          grep -Fxq -- "StartupWMClass=FreqInOut" "$target" &&
+          grep -Fxq -- "Exec=$HOME/.local/bin/freqinout" "$target"; }; }
+  else
+    if grep -Fxq -- "# CommsPlan installation: $INSTALL_DIR" "$target" ||
+       grep -Fxq -- "cd $(printf '%q' "$INSTALL_DIR")" "$target"; then return 0; fi
+    [[ $RELOCATION_VERIFIED -eq 1 ]] || return 1
+    { grep -Fxq -- "# CommsPlan installation: $RELOCATION_SOURCE" "$target" &&
+      grep -Fxq -- "exec bash $(printf '%q' "$RELOCATION_SOURCE/start-commsplan.sh") \"\$@\"" "$target"; } ||
+      { grep -Fxq -- "cd $(printf '%q' "$RELOCATION_SOURCE")" "$target" &&
+        grep -Fxq -- "exec $(printf '%q' "$RELOCATION_SOURCE/.venv/bin/python") -m freqinout.main \"\$@\"" "$target"; }
+  fi
+}
+
+desktop_shortcut_path() {
+  local desktop_dir="$HOME/Desktop"
+  local candidate=""
+  if command_exists xdg-user-dir; then
+    candidate="$(xdg-user-dir DESKTOP 2>/dev/null || true)"
+    if [[ -n "$candidate" ]]; then desktop_dir="$candidate"; fi
+  fi
+  [[ -d "$desktop_dir" ]] || return 1
+  printf '%s/%s\n' "$desktop_dir" "$DESKTOP_FILE_NAME"
+}
+
+validate_relocation() {
+  [[ -n "$RELOCATION_SOURCE" ]] || return 0
+  [[ "$MAINTENANCE_ACTION" == --local && $REPAIR_MODE -eq 0 ]] || die "--relocate-from requires setup (local verification), not update/repair/desktop."
+  [[ -n "$CONFIG_ROOT_OVERRIDE" ]] || die "--relocate-from requires an explicit --config-root."
+  RELOCATION_SOURCE="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).expanduser().resolve())' "$RELOCATION_SOURCE")"
+  [[ "$RELOCATION_SOURCE" != "$INSTALL_DIR" ]] || die "Old and new installation folders are identical."
+  [[ "$(dirname "$RELOCATION_SOURCE")" == "$(dirname "$INSTALL_DIR")" ]] || die "Relocation requires a same-parent folder rename."
+  [[ ! -e "$RELOCATION_SOURCE" && ! -L "$RELOCATION_SOURCE" ]] || die "Old folder still exists; move it before adopting its launchers."
+  [[ -d "$INSTALL_DIR" && ! -L "$INSTALL_DIR" ]] || die "New installation folder must be a physical directory."
+  [[ "$(git -C "$INSTALL_DIR" rev-parse --show-toplevel 2>/dev/null)" == "$INSTALL_DIR" ]] || die "New installation folder must be this Git checkout root."
+  python3 - "$INSTALL_DIR" "$RELOCATION_SOURCE" "$CONFIG_ROOT_OVERRIDE" <<'PY' || die "Moved checkout receipt does not match the old installation and selected profile."
+import json, sys
+from pathlib import Path
+new, old, profile = map(Path, sys.argv[1:])
+receipt_path = new / '.freqinout-install-verified.json'
+if not receipt_path.is_file() or receipt_path.is_symlink():
+    raise SystemExit(1)
+try:
+    receipt = json.loads(receipt_path.read_text())
+except (OSError, ValueError):
+    raise SystemExit(1)
+python = new / '.venv/bin/python'
+if (not python.is_file() or not python.exists()
+        or receipt.get('python') not in (str(old / '.venv/bin/python'), str(python.resolve()))
+        or receipt.get('profile_root') != str(profile)):
+    raise SystemExit(1)
+PY
+  RELOCATION_VERIFIED=1
+  local old_launcher_found=0
+  local target=""
+  local shortcut=""
+  shortcut="$(desktop_shortcut_path || true)"
+  for target in "$LAUNCHER_PATH" "$HOME/.local/bin/commsplan" "$DESKTOP_ENTRY_PATH" "$shortcut"; do
+    [[ -n "$target" ]] || continue
+    if [[ -e "$target" ]]; then
+      integration_belongs_to_install "$target" || die "Existing integration $target does not belong to the moved checkout."
+      if [[ "$target" != *.desktop ]] &&
+         { grep -Fxq -- "# CommsPlan installation: $RELOCATION_SOURCE" "$target" ||
+           { grep -Fxq -- "cd $(printf '%q' "$RELOCATION_SOURCE")" "$target" &&
+             grep -Fxq -- "exec $(printf '%q' "$RELOCATION_SOURCE/.venv/bin/python") -m freqinout.main \"\$@\"" "$target"; }; }; then
+        old_launcher_found=1
+      fi
+    fi
+  done
+  [[ $old_launcher_found -eq 1 ]] || die "No launcher tied to the old checkout path was found; relocation ownership is unverified."
+  log "Verified moved checkout from $RELOCATION_SOURCE; old launchers may be adopted."
+}
+
+prepare_relocation_runtime() {
+  [[ $RELOCATION_VERIFIED -eq 1 ]] || return 0
+  init_rollback_dir
+  ROLLBACK_RECEIPT_BACKUP="$ROLLBACK_DIR/install-receipt.bak"
+  cp -f "$INSTALL_DIR/.freqinout-install-verified.json" "$ROLLBACK_RECEIPT_BACKUP"
+  if [[ -d "$VENV_DIR" ]]; then
+    [[ ! -e "$ROLLBACK_DIR/venv-before-relocation" ]] || die "Relocation runtime backup already exists."
+    mv "$VENV_DIR" "$ROLLBACK_DIR/venv-before-relocation"
+    ROLLBACK_VENV_BACKUP="$ROLLBACK_DIR/venv-before-relocation"
+    log "Previous virtual environment retained at $ROLLBACK_VENV_BACKUP; setup will build one for the new path."
+  fi
+}
+
 create_launcher() {
   if [[ $DRY_RUN -eq 1 && ! -d "$INSTALL_DIR" ]]; then
     log "DRY RUN: would write launcher to $LAUNCHER_PATH after source checkout."
     return 0
   fi
   [[ -d "$INSTALL_DIR" ]] || die "Install folder not found: $INSTALL_DIR"
+  local shortcut=""
+  shortcut="$(desktop_shortcut_path || true)"
+  for target in "$LAUNCHER_PATH" "$HOME/.local/bin/commsplan" "$DESKTOP_ENTRY_PATH" "$shortcut"; do
+    [[ -n "$target" ]] || continue
+    if [[ -e "$target" ]] && ! integration_belongs_to_install "$target"; then
+      warn "Launcher $target belongs to another installation or is unrecognized; keep it and resolve the conflict before setup."
+      return 1
+    fi
+  done
   log "Preparing launcher at $LAUNCHER_PATH"
   if [[ -z "$ROLLBACK_LAUNCHER_BACKUP" ]]; then
     init_rollback_dir
     ROLLBACK_LAUNCHER_BACKUP="$ROLLBACK_DIR/launcher.bak"
     backup_file_for_rollback "$LAUNCHER_PATH" "$ROLLBACK_LAUNCHER_BACKUP"
+    ROLLBACK_COMMSPLAN_LAUNCHER_BACKUP="$ROLLBACK_DIR/commsplan-launcher.bak"
+    backup_file_for_rollback "$HOME/.local/bin/commsplan" "$ROLLBACK_COMMSPLAN_LAUNCHER_BACKUP"
   fi
   mkdir -p "$(dirname "$LAUNCHER_PATH")"
   if [[ $DRY_RUN -eq 1 ]]; then
@@ -1388,15 +1510,19 @@ create_launcher() {
   fi
   {
     echo '#!/usr/bin/env bash'
+    printf '# CommsPlan installation: %s\n' "$INSTALL_DIR"
     echo 'set -euo pipefail'
     if [[ -n "$CONFIG_ROOT_OVERRIDE" ]]; then
-      printf 'export FREQINOUT_CONFIG_DIR=%q\n' "$CONFIG_ROOT_OVERRIDE"
+      printf 'if [[ -z "${FREQINOUT_CONFIG_DIR:-}" ]]; then export FREQINOUT_CONFIG_DIR=%q; fi\n' "$CONFIG_ROOT_OVERRIDE"
     fi
     printf 'cd %q\n' "$INSTALL_DIR"
-    printf 'exec %q -m freqinout.main "$@"\n' "$VENV_DIR/bin/python"
+    printf 'exec bash %q "$@"\n' "$INSTALL_DIR/start-commsplan.sh"
   } >"$LAUNCHER_PATH"
   chmod +x "$LAUNCHER_PATH"
   log "Launcher written: $LAUNCHER_PATH"
+  # Same verified launcher and profile for both user-facing command names.
+  run_cmd cp -f "$LAUNCHER_PATH" "$HOME/.local/bin/commsplan"
+  run_cmd chmod +x "$HOME/.local/bin/commsplan"
 }
 
 detect_desktop_environment() {
@@ -1448,36 +1574,9 @@ refresh_desktop_caches() {
 
 prepare_icon_source() {
   local primary_icon="$INSTALL_DIR/assets/$PRIMARY_ICON_NAME"
-  local cache_icon="$ICON_CACHE_DIR/$PRIMARY_ICON_NAME"
-  local input_icon=""
-  local output_icon="$INSTALL_DIR/.freqinout_icon_prepared.png"
-
-  if [[ -f "$primary_icon" ]]; then
-    log "Using icon from install assets: $primary_icon"
-    input_icon="$primary_icon"
-    run_cmd mkdir -p "$ICON_CACHE_DIR"
-    run_cmd cp -f "$primary_icon" "$cache_icon"
-  else
-    log "Icon file not found in install assets; attempting cached download of $PRIMARY_ICON_NAME"
-    run_cmd mkdir -p "$ICON_CACHE_DIR"
-    if download_icon_from_github "$cache_icon"; then
-      log "Downloaded icon to cache: $cache_icon"
-      input_icon="$cache_icon"
-    else
-      return 1
-    fi
-  fi
-
-  # If ImageMagick is available, trim transparent padding so the desktop icon appears larger.
-  if command_exists convert; then
-    log "Preparing zoomed desktop icon with ImageMagick (ICON_ZOOM_PERCENT=${ICON_ZOOM_PERCENT}%)"
-    run_cmd convert "$input_icon" -alpha set -fuzz 20% -trim +repage -background none -gravity center -resize 1024x1024 -extent 1024x1024 -resize "${ICON_ZOOM_PERCENT}%" -gravity center -extent 1024x1024 "$output_icon"
-    echo "$output_icon"
-  else
-    warn "ImageMagick not found; using raw PNG icon without zoom processing."
-    echo "$input_icon"
-  fi
-  return 0
+  [[ -f "$primary_icon" ]] || return 1
+  # The approved icon already has its intended margins. Never zoom/crop it.
+  printf '%s\n' "$primary_icon"
 }
 
 refresh_icon_asset() {
@@ -1548,14 +1647,30 @@ create_desktop_icon() {
   local icon_value="applications-utilities"
   local desktop_shortcut=""
   local prepared_icon=""
+  desktop_shortcut="$(desktop_shortcut_path || true)"
+  if [[ -n "$desktop_shortcut" && -e "$desktop_shortcut" ]] && ! integration_belongs_to_install "$desktop_shortcut"; then
+    warn "Desktop shortcut $desktop_shortcut belongs to another installation or is unrecognized."
+    return 1
+  fi
   if [[ -f "$DESKTOP_ENTRY_PATH" ]]; then
     log "Existing desktop entry detected at $DESKTOP_ENTRY_PATH; it will be replaced."
   fi
-  refresh_icon_asset
+  # Use the asset delivered with this exact checkout; no Git/network icon refresh.
   if [[ -z "$ROLLBACK_DESKTOP_BACKUP" ]]; then
     init_rollback_dir
     ROLLBACK_DESKTOP_BACKUP="$ROLLBACK_DIR/desktop-entry.bak"
     backup_file_for_rollback "$DESKTOP_ENTRY_PATH" "$ROLLBACK_DESKTOP_BACKUP"
+  fi
+  if [[ -n "$desktop_shortcut" && -z "$ROLLBACK_DESKTOP_SHORTCUT_PATH" ]]; then
+    init_rollback_dir
+    ROLLBACK_DESKTOP_SHORTCUT_PATH="$desktop_shortcut"
+    ROLLBACK_DESKTOP_SHORTCUT_BACKUP="$ROLLBACK_DIR/desktop-shortcut.bak"
+    backup_file_for_rollback "$desktop_shortcut" "$ROLLBACK_DESKTOP_SHORTCUT_BACKUP"
+  fi
+  if [[ -z "$ROLLBACK_PIXMAPS_BACKUP" ]]; then
+    init_rollback_dir
+    ROLLBACK_PIXMAPS_BACKUP="$ROLLBACK_DIR/pixmaps-icon.bak"
+    backup_file_for_rollback "$HOME/.local/share/pixmaps/freqinout.png" "$ROLLBACK_PIXMAPS_BACKUP"
   fi
   if [[ -z "$ROLLBACK_ICON_BACKUP_DIR" ]]; then
     backup_icon_targets_for_rollback
@@ -1582,11 +1697,11 @@ create_desktop_icon() {
 [Desktop Entry]
 Version=1.0
 Type=Application
-Name=FreqInOut
+Name=CommsPlan
 Comment=HF Radio Frequency and Net Control Utility
-Exec=$LAUNCHER_PATH
+Exec="$HOME/.local/bin/commsplan"
 Icon=$icon_value
-StartupWMClass=FreqInOut
+StartupWMClass=CommsPlan
 Terminal=false
 Categories=Utility;HamRadio;
 StartupNotify=true
@@ -1596,16 +1711,7 @@ EOF
     log "Desktop entry written: $DESKTOP_ENTRY_PATH"
   fi
 
-  local desktop_dir="$HOME/Desktop"
-  if command_exists xdg-user-dir; then
-    local candidate
-    candidate="$(xdg-user-dir DESKTOP 2>/dev/null || true)"
-    if [[ -n "$candidate" ]]; then
-      desktop_dir="$candidate"
-    fi
-  fi
-  if [[ -d "$desktop_dir" ]]; then
-    desktop_shortcut="$desktop_dir/$DESKTOP_FILE_NAME"
+  if [[ -n "$desktop_shortcut" ]]; then
     log "Copying desktop shortcut to $desktop_shortcut"
     run_cmd cp -f "$DESKTOP_ENTRY_PATH" "$desktop_shortcut"
     trust_desktop_launcher "$desktop_shortcut"
@@ -1670,8 +1776,8 @@ Completed:
   - $completed
 
 How to run:
-  - App launcher/menu: search for "FreqInOut"
-  - Terminal command: freqinout
+  - App launcher/menu: search for "CommsPlan"
+  - Terminal command: commsplan (freqinout remains a compatibility alias)
 
 Installed to:
   - App folder: $INSTALL_DIR
@@ -1691,14 +1797,24 @@ EOF
 
 Helpful commands:
   - Repair install: rerun this installer with --repair and the same --dir/--config-root values
-  - Dry run:        bash install_FreqInOut_linux.sh --dry-run
-  - Uninstall:      bash uninstall_FreqInOut_linux.sh --dir "$HOME/FreqInOut"
+  - Dry run:        bash install-commsplan.sh setup --dry-run
+  - Uninstall:      bash install-commsplan.sh uninstall --dry-run
 EOF
 }
 
 main() {
   parse_args "$@"
   prompt_startup_options
+  if [[ $DRY_RUN -eq 1 ]]; then
+    printf 'CommsPlan dry run: action=%s install=%s profile=%s\n' "${MAINTENANCE_ACTION:-guided/repair}" "$(expand_path "$INSTALL_DIR")" "${CONFIG_ROOT_OVERRIDE:-remembered receipt or ~/.freqinout}"
+    echo 'Would check the selected profile/app, run verified setup when requested, and refresh local launcher/icon.'
+    echo 'Update follows the current upstream unless --repo/--branch explicitly select another source.'
+    echo 'No files, logs, locks, dependencies, Git refs or desktop entries were changed.'
+    return
+  fi
+  if [[ $OFFLINE_MODE -eq 1 && "$MAINTENANCE_ACTION" == --update-current ]]; then
+    die "Offline mode cannot update Git source. Use setup/repair --offline for local maintenance."
+  fi
   acquire_lock
   LOG_FILE="$(expand_path "$LOG_FILE")"
   if [[ -n "$CONFIG_ROOT_OVERRIDE" ]]; then
@@ -1709,15 +1825,58 @@ main() {
   prompt_existing_install_mode
 
   INSTALL_DIR="$(expand_path "$INSTALL_DIR")"
+  if ! command_exists python3 || ! python_version_supported; then
+    run_step "Prepare supported Python" ensure_python_and_tools
+  fi
+  INSTALL_DIR="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).expanduser().resolve())' "$INSTALL_DIR")"
+  if [[ "$MAINTENANCE_ACTION" == --update-current && $REPO_EXPLICIT -eq 0 ]]; then
+    local current_branch
+    current_branch="$(git -C "$INSTALL_DIR" symbolic-ref --quiet --short HEAD)" || die "Update requires a checked-out branch."
+    UPDATE_REMOTE="$(git -C "$INSTALL_DIR" config "branch.$current_branch.remote")" || die "Current branch has no upstream; select --repo and --branch explicitly."
+    local merge_ref
+    merge_ref="$(git -C "$INSTALL_DIR" config "branch.$current_branch.merge")" || die "Current branch has no upstream branch."
+    [[ "$merge_ref" == "refs/heads/$current_branch" && "$UPDATE_REMOTE" != . ]] || die "Nonmatching/local upstream: use explicit --repo and --branch."
+    REPO_URL="$(git -C "$INSTALL_DIR" remote get-url "$UPDATE_REMOTE")" || die "Upstream remote is unavailable."
+    BRANCH="${BRANCH:-$current_branch}"
+  fi
   resolve_channel_branch
-  VENV_DIR="$INSTALL_DIR/venv"
-
-  if [[ $REPAIR_MODE -eq 1 ]]; then
-    SETUP_MODE="repair"
+  VENV_DIR="$INSTALL_DIR/.venv"
+  # Remember the verified profile instead of falling back to an empty default.
+  if [[ -z "$CONFIG_ROOT_OVERRIDE" ]]; then
+    CONFIG_ROOT_OVERRIDE="$(python3 - "$INSTALL_DIR" <<'PROFILE'
+import json, sys
+from pathlib import Path
+receipt = Path(sys.argv[1]) / '.freqinout-install-verified.json'
+if receipt.exists():
+    root = json.loads(receipt.read_text()).get('profile_root')
+    if not isinstance(root, str) or not Path(root).is_absolute():
+        raise SystemExit('Invalid remembered profile; supply --config-root explicitly.')
+    print(root)
+else:
+    if (Path(sys.argv[1]) / 'start-single-rig.sh').exists():
+        raise SystemExit('Historical launcher detected: identify its active profile and supply --config-root.')
+    print(Path.home() / '.freqinout')
+PROFILE
+)" || die "Cannot determine profile; supply --config-root explicitly."
+  fi
+  CONFIG_ROOT_OVERRIDE="$(python3 -c 'import sys; from pathlib import Path; print(Path(sys.argv[1]).expanduser().resolve())' "$CONFIG_ROOT_OVERRIDE")"
+  validate_relocation
+  export FREQINOUT_CONFIG_DIR="$CONFIG_ROOT_OVERRIDE"
+  if [[ "$MAINTENANCE_ACTION" == --update-current ]]; then
+    SETUP_MODE="existing"
     DO_UPDATE=1
     DO_ICON=1
   fi
 
+  if [[ $REPAIR_MODE -eq 1 ]]; then
+    SETUP_MODE="repair"
+    DO_UPDATE=0
+    DO_ICON=1
+  fi
+
+  if [[ "$MAINTENANCE_ACTION" == --local || "$MAINTENANCE_ACTION" == --desktop-only ]]; then
+    DO_UPDATE=0
+  fi
   log "Starting installer."
   log "Install folder: $INSTALL_DIR"
   log "Repository: $REPO_URL"
@@ -1726,7 +1885,7 @@ main() {
   else
     log "Profile root: default (~/.freqinout)"
   fi
-  log "Desktop icon zoom percent: $ICON_ZOOM_PERCENT"
+  log "Desktop icon: approved local asset, without cropping or zoom."
   log "Policies: on-dirty=$ON_DIRTY_POLICY, on-running=$ON_RUNNING_POLICY, on-non-git=$ON_NON_GIT_POLICY"
   if [[ $OFFLINE_MODE -eq 1 ]]; then
     log "Offline mode: enabled"
@@ -1737,27 +1896,31 @@ main() {
     log "Branch: repo default"
   fi
 
-  if [[ "$SETUP_MODE" == "repair" ]]; then
-    [[ -d "$INSTALL_DIR" ]] || die "Repair mode needs an existing install directory."
-    run_step "Check Python and required tools" ensure_python_and_tools
-    run_step "Cleanup deprecated files" cleanup_deprecated_files
-    run_step "Create virtual environment and install dependencies" create_venv_and_install_python_deps
-    run_step "Create launcher script" create_launcher
-    run_step "Create desktop icon and menu entry" create_desktop_icon
-    run_step "Run post-install self-test" run_self_test
+  if [[ "$MAINTENANCE_ACTION" == --local || "$MAINTENANCE_ACTION" == --desktop-only || "$SETUP_MODE" == repair ]]; then
+    [[ -d "$INSTALL_DIR" ]] || die "Maintenance requires an existing checkout."
+    if [[ "$MAINTENANCE_ACTION" != --desktop-only ]]; then
+      ON_RUNNING_POLICY=fail
+      run_step "Check application is closed" ensure_app_not_running_for_update
+      run_step "Check Python and required tools" ensure_python_and_tools
+      run_step "Prepare moved runtime and receipt backup" prepare_relocation_runtime
+      run_step "Verify installation and back up station configuration" create_venv_and_install_python_deps
+    else
+      [[ -f "$INSTALL_DIR/.freqinout-install-verified.json" ]] || die "Run install-commsplan.sh setup before desktop repair."
+    fi
+    run_step "Create verified command launchers" create_launcher
+    run_step "Refresh CommsPlan desktop icon and menu entry" create_desktop_icon
     print_finish_message
     return
   fi
 
   if [[ "$SETUP_MODE" == "existing" ]]; then
     [[ -d "$INSTALL_DIR" ]] || die "Install folder not found: $INSTALL_DIR"
-    run_step "Cleanup deprecated files" cleanup_deprecated_files
     if [[ $DO_UPDATE -eq 1 ]]; then
       run_step "Check Python and required tools" ensure_python_and_tools
       run_step "Update existing install from git" update_existing_install
       if [[ $SKIP_UPDATE_WORK -eq 0 ]]; then
         run_step "Create virtual environment and install dependencies" create_venv_and_install_python_deps
-        log "Configuration migration will be reviewed in FIO on first launch."
+        log "Configuration migration will be reviewed in CommsPlan on first launch."
         run_step "Run post-install self-test" run_self_test
       else
         log "Skipping dependency refresh and self-test because app update was skipped."
@@ -1780,7 +1943,7 @@ main() {
     run_step "Create virtual environment and install dependencies" create_venv_and_install_python_deps
     run_step "Create launcher script" create_launcher
     run_step "Create desktop icon and menu entry" create_desktop_icon
-    log "Configuration migration will be reviewed in FIO on first launch."
+    log "Configuration migration will be reviewed in CommsPlan on first launch."
     run_step "Run post-install self-test" run_self_test
   else
     log "Skipping install/update actions after clone step due to user choice."

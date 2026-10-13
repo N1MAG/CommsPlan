@@ -1,7 +1,18 @@
-# Installing and Updating FreqInOut 2.0.4
+# Installing and Updating CommsPlan — 2.0.5 Candidate
+
+> Non-publishing candidate: the published 2.0.4 release is still named FreqInOut.
+> The candidate is CommsPlan 2.0.5; candidate metadata is
+> 2.0.5. Public 2.0.4 downloads install FreqInOut. Historical installation examples
+> below do not constitute a CommsPlan migration procedure: use the migration
+> preview for an assigned upgrade test. CommsPlan packages
+> and native upgrade behavior are not yet release-qualified. See
+> [migration preview](CommsPlan-migration.md) before testing an existing station.
+> For a separate fresh candidate test profile and candidate branch commands, see
+> [Testing this candidate](../README.md#testing-this-candidate). No candidate GitHub
+> Release has been published.
 
 The [latest GitHub Release](https://github.com/N1MAG/FreqInOut/releases/latest)
-is the primary download location for FreqInOut. It provides release notes,
+currently provides the published FreqInOut 2.0.4 downloads. It provides release notes,
 source archives, SHA-256 checksums, and native packages for Windows x86-64,
 Linux amd64, macOS Intel, and macOS Apple Silicon. Source installation remains
 supported on Windows 10/11, current macOS releases, and common Linux desktop
@@ -10,7 +21,7 @@ distributions.
 Windows and macOS packages are currently unsigned and include `-unsigned` in
 their download filenames. Windows may display **Unknown publisher** or a
 SmartScreen prompt. macOS may require **Open Anyway** under Privacy & Security.
-The installed application name remains **FreqInOut**. Verify downloads against
+Published 2.0.4 packages install **FreqInOut**; the test candidate uses **CommsPlan**. Verify downloads against
 `SHA256SUMS.txt` on the release page.
 
 Python 3.10 through 3.13 is accepted for source installation; Python 3.11 is
@@ -20,7 +31,7 @@ are installed separately.
 ## Source installation rule
 
 New installations and upgrades use the same `install_freqinout.py` check. Do
-not start FIO until it prints exactly:
+not start CommsPlan until it prints exactly:
 
 ```text
 Installation verified. Run: ...
@@ -29,13 +40,13 @@ Installation verified. Run: ...
 The installer validates the release files and Python version, repairs an
 incomplete `.venv` without deleting it, installs the requirements, and runs an
 isolated application/database check. When it finds an existing station, it
-also requires FIO to be closed, checks both FIO databases, creates a cold
+also requires CommsPlan to be closed, checks both CommsPlan databases, creates a cold
 profile backup, verifies every copied file and database, and records the backup
 location. If any step fails, it prints `Installation failed. Do not launch
-FreqInOut.` and the launcher remains blocked.
+CommsPlan.` and the launcher remains blocked.
 
 On Windows, security or indexing software may prevent the verified backup
-directory from receiving its preferred timestamped name. FIO retries that
+directory from receiving its preferred timestamped name. CommsPlan retries that
 rename. If Windows continues to deny only the rename, the installer retains the
 already verified backup under the exact temporary name it reports and continues;
 the installation receipt records that actual path. This warning is safe only
@@ -45,19 +56,19 @@ still stop the installation.
 
 If database validation fails, do not delete, replace, or edit the named
 database. The installer made no changes; preserve the database and contact
-FreqInOut support before attempting the upgrade again.
+CommsPlan support before attempting the upgrade again.
 
 ## Upgrade an existing station
 
-1. Close FreqInOut, FLRig, FLDigi, JS8Call, FIO Spotter, VarAC, CommStat, and
+1. Close CommsPlan, FLRig, FLDigi, JS8Call, CommsPlan Spotter, VarAC, CommStat, and
    other companion radio applications.
 2. Download the appropriate package from the latest GitHub Release, or update
    the existing public source checkout using the manual procedure below.
 3. For a package, complete the operating-system installation and start
-   **FreqInOut**. For a source checkout, rerun `install_freqinout.py`, require
+   **CommsPlan**. For a source checkout, rerun `install_freqinout.py`, require
    the final `Installation verified` line, and use the neutral
    `start-freqinout` launcher.
-4. FIO automatically uses the established profile unless
+4. CommsPlan automatically uses the established profile unless
    `FREQINOUT_CONFIG_DIR` intentionally selects another one.
 5. In **Upgrade Existing Station**, review or select the manufacturer, model,
    display name, plan name, and detected software. Select **Back Up and Upgrade
@@ -65,13 +76,13 @@ FreqInOut support before attempting the upgrade again.
 6. Review the radio's software, schedule assignment, and Launch Control
    settings. Launch Control remains off until the operator enables it.
 
-The only other choice in the upgrade window is **Exit FIO**. Closing the window
-also exits FIO. No migration writes occur, and the same upgrade is required on
+The only other choice in the upgrade window is **Exit CommsPlan**. Closing the window
+also exits CommsPlan. No migration writes occur, and the same upgrade is required on
 the next launch.
 
-For rollback, close FIO, retain the failed/new folder, restore the `config`
+For rollback, close CommsPlan, retain the failed/new folder, restore the `config`
 folder from the reported `pre-install-...` backup, and launch the retained
-1.2.8 application folder. Do not copy a database while FIO is running.
+1.2.8 application folder. Do not copy a database while CommsPlan is running.
 
 ## Windows 10/11
 
@@ -88,7 +99,7 @@ py -3.11 install_freqinout.py
 .\start-freqinout.cmd
 ```
 
-The launcher accepts normal FIO command-line options. An explicit
+The launcher accepts normal CommsPlan command-line options. An explicit
 `FREQINOUT_CONFIG_DIR` is honored when a separate profile is intentionally
 required.
 
@@ -100,12 +111,12 @@ git pull --ff-only origin main
 py -3.11 install_freqinout.py
 ```
 
-Use only installers attached to an official FreqInOut GitHub Release.
+Use only installers attached to an official GitHub Release; CommsPlan 2.0.5 has not been published.
 
 ## macOS
 
 Download the disk image matching the Mac processor from the latest GitHub
-Release, open it, and copy **FreqInOut** to **Applications**. While the disk
+Release, open it, and copy **FreqInOut** to **Applications** for the published 2.0.4 release. While the disk
 images remain unsigned, macOS may require **Open Anyway** under Privacy &
 Security on the first launch.
 
@@ -178,9 +189,9 @@ packages when they are missing.
 3. Add or review the first radio and select only the software it uses.
 4. Review Software Administration and Launch Control for that radio.
 5. Assign a plan and schedule, then verify Ops Center and Station Health.
-6. Restart FIO and confirm that the selected profile and radio settings persist.
+6. Restart CommsPlan and confirm that the selected profile and radio settings persist.
 
-FIO vendors its supported JS8 networking integration. Do not install
+CommsPlan vendors its supported JS8 networking integration. Do not install
 `pyjs8call` as a replacement for that integration.
 
 ## Profile and log locations
@@ -211,12 +222,12 @@ support specifically requests them.
   supported.
 - **Module or import error:** rerun `install_freqinout.py`, or use the Linux
   installer's `--repair` option with the original paths.
-- **Wrong configuration appears:** close FIO and check
+- **Wrong configuration appears:** close CommsPlan and check
   `FREQINOUT_CONFIG_DIR` before changing any settings.
 - **A companion app is unavailable:** verify that the selected radio owns the
   correct executable, endpoint, profile, and data paths.
 - **Map is blank:** capture the logs; the Map is designed to use bundled
   geography and does not require an online tile API key.
 
-The in-app FreqInOut Guide contains configuration, recovery, and feature-level
+The in-app CommsPlan Guide contains configuration, recovery, and feature-level
 reference material.

@@ -10,6 +10,7 @@ from typing import Dict, Iterable, List, Optional
 
 from freqinout.core.checkins_db import ensure_operator_checkins_schema
 from freqinout.core.logger import log
+from freqinout.core.operating_group_frequency import normalize_frequency_hz, resolve_operating_group_frequency
 from freqinout.core.operator_activity import ensure_js8_callsign_stats, record_js8_activity_batch
 from freqinout.core.settings_manager import SettingsManager
 
@@ -81,7 +82,7 @@ class JS8LogLinkIndexer:
 
     def _lookup_operating_group(self, freq_hz: Optional[float]) -> str:
         """
-        Map an exact frequency (MHz) to an operating group name from settings (one-to-one).
+        Map a frequency to a group only when logical attribution is unique.
         """
         try:
             ops = self.settings.get("operating_groups", []) or []
@@ -90,21 +91,24 @@ class JS8LogLinkIndexer:
         if not freq_hz:
             return ""
         try:
-            mhz = round(float(freq_hz) / 1_000_000.0, 3)
-        except Exception:
+            mhz = float(freq_hz) / 1_000_000.0
+        except (TypeError, ValueError, OverflowError):
             return ""
-        for row in ops:
-            try:
-                ftxt = str(row.get("frequency", "")).strip()
-                if not ftxt:
-                    continue
-                if abs(float(ftxt) - mhz) < 0.0005:
-                    grp = str(row.get("group", "")).strip()
-                    if grp:
-                        return grp.upper()
-            except Exception:
+        band = self._freq_to_band(freq_hz) or ""
+        groups = {str(row.get("group") or "").strip().upper() for row in ops if isinstance(row, dict)}
+        matched: set[str] = set()
+        wanted_hz = normalize_frequency_hz(mhz)
+        for group in groups:
+            if not group:
                 continue
-        return ""
+            resolution = resolve_operating_group_frequency(ops, group=group, band=band, frequency=mhz)
+            exact_candidates = [
+                row for row in resolution.candidates
+                if wanted_hz is not None and normalize_frequency_hz(row.get("frequency")) == wanted_hz
+            ]
+            if resolution.resolved or exact_candidates:
+                matched.add(group)
+        return next(iter(matched)) if len(matched) == 1 else ""
 
     # -------- parsing helpers -------- #
     def _parse_directed_line(self, line: str) -> Optional[tuple]:
@@ -608,6 +612,8 @@ class JS8LogLinkIndexer:
                 conn.execute("ALTER TABLE js8_links ADD COLUMN app_instance_id TEXT")
             if "source_radio_id" not in cols:
                 conn.execute("ALTER TABLE js8_links ADD COLUMN source_radio_id TEXT")
+            if "direction_known" not in cols:
+                conn.execute("ALTER TABLE js8_links ADD COLUMN direction_known INTEGER NOT NULL DEFAULT 0")
         except Exception:
             pass
         try:
@@ -718,7 +724,7 @@ class JS8LogLinkIndexer:
         elif not using_legacy_offsets and directed_offset <= 0 and all_offset <= 0:
             effective_since = None
 
-        # De-duplicate by station pair + band, averaging SNR and keeping the newest timestamp/frequency.
+        # De-duplicate by ordered sender/recipient + band; reciprocal traffic stays separate.
         last_seen: Dict[str, float] = {}
         agg: Dict[tuple, Dict] = {}
 
@@ -745,7 +751,7 @@ class JS8LogLinkIndexer:
             except Exception:
                 pass
             band = self._freq_to_band(freq_hz)
-            key = (tuple(sorted((a, b))), band)
+            key = ((a, b), band)
             entry = agg.setdefault(
                 key,
                 {
@@ -890,19 +896,19 @@ class JS8LogLinkIndexer:
                 origin, dest = pair
                 if source_id_txt:
                     conn.execute(
-                        "DELETE FROM js8_links WHERE (origin=? AND destination=? OR origin=? AND destination=?) AND IFNULL(band,'')=IFNULL(?,IFNULL(band,'')) AND IFNULL(source_id,'')=?",
-                        (origin, dest, dest, origin, band, source_id_txt),
+                        "DELETE FROM js8_links WHERE origin=? AND destination=? AND direction_known=1 AND IFNULL(band,'')=IFNULL(?,IFNULL(band,'')) AND IFNULL(source_id,'')=?",
+                        (origin, dest, band, source_id_txt),
                     )
                 else:
                     conn.execute(
-                        "DELETE FROM js8_links WHERE (origin=? AND destination=? OR origin=? AND destination=?) AND IFNULL(band,'')=IFNULL(?,IFNULL(band,'')) AND IFNULL(source_id,'')=''",
-                        (origin, dest, dest, origin, band),
+                        "DELETE FROM js8_links WHERE origin=? AND destination=? AND direction_known=1 AND IFNULL(band,'')=IFNULL(?,IFNULL(band,'')) AND IFNULL(source_id,'')=''",
+                        (origin, dest, band),
                     )
             conn.executemany(
                 """
                 INSERT INTO js8_links
-                    (ts, origin, destination, snr, band, freq_hz, source_id, app_instance_id, source_radio_id, is_relay, relay_via, is_spotter)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (ts, origin, destination, snr, band, freq_hz, source_id, app_instance_id, source_radio_id, is_relay, relay_via, is_spotter, direction_known)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
                 """,
                 payload,
             )
@@ -1019,29 +1025,29 @@ class JS8LogLinkIndexer:
                 conn.execute(
                     """
                     DELETE FROM js8_links
-                     WHERE (origin=? AND destination=? OR origin=? AND destination=?)
+                     WHERE origin=? AND destination=? AND direction_known=1
                        AND IFNULL(band,'')=IFNULL(?,IFNULL(band,''))
                        AND COALESCE(source_id, '')=?
                     """,
-                    (origin, destination, destination, origin, band, source_id_txt),
+                    (origin, destination, band, source_id_txt),
                 )
             else:
                 conn.execute(
                     """
                     DELETE FROM js8_links
-                     WHERE (origin=? AND destination=? OR origin=? AND destination=?)
+                     WHERE origin=? AND destination=? AND direction_known=1
                        AND IFNULL(band,'')=IFNULL(?,IFNULL(band,''))
                        AND COALESCE(source_id, '')=''
                     """,
-                    (origin, destination, destination, origin, band),
+                    (origin, destination, band),
                 )
             conn.execute(
                 """
                 INSERT INTO js8_links (
                     ts, origin, destination, snr, band, freq_hz, is_relay, relay_via,
-                    is_spotter, last_seen_utc, source_id, app_instance_id, source_radio_id
+                    is_spotter, last_seen_utc, source_id, app_instance_id, source_radio_id, direction_known
                 )
-                VALUES (?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, ?, ?, ?, 1)
                 """,
                 (
                     ts_val,
@@ -1201,29 +1207,29 @@ class JS8LogLinkIndexer:
                     conn.execute(
                         """
                         DELETE FROM js8_links
-                         WHERE (origin=? AND destination=? OR origin=? AND destination=?)
+                         WHERE origin=? AND destination=? AND direction_known=1
                            AND IFNULL(band,'')=IFNULL(?,IFNULL(band,''))
                            AND COALESCE(source_id, '')=?
                         """,
-                        (origin, destination, destination, origin, band, source_id_txt),
+                        (origin, destination, band, source_id_txt),
                     )
                 else:
                     conn.execute(
                         """
                         DELETE FROM js8_links
-                         WHERE (origin=? AND destination=? OR origin=? AND destination=?)
+                         WHERE origin=? AND destination=? AND direction_known=1
                            AND IFNULL(band,'')=IFNULL(?,IFNULL(band,''))
                            AND COALESCE(source_id, '')=''
                         """,
-                        (origin, destination, destination, origin, band),
+                        (origin, destination, band),
                     )
                 conn.execute(
                     """
                     INSERT INTO js8_links (
                         ts, origin, destination, snr, band, freq_hz, is_relay, relay_via,
-                        is_spotter, last_seen_utc, source_id, app_instance_id, source_radio_id
+                        is_spotter, last_seen_utc, source_id, app_instance_id, source_radio_id, direction_known
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, ?, ?, ?, 1)
                     """,
                     (
                         ts_val,

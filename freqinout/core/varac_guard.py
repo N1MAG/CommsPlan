@@ -498,7 +498,37 @@ def _trusted_operator_callsigns() -> List[str]:
                 pass
 
 
-def _sender_allow_reason(sender: str, settings) -> str:
+class _UnavailableOperatorTrust(set):
+    """Explicit manual grants remain usable; unknown roster evidence is not denial."""
+
+
+def _operator_allowed_callsigns(settings):
+    if _operator_history_trust_enabled(settings):
+        policy_text = settings.get("varac_guard_access_policy_v1", "") if settings is not None else ""
+        if policy_text:
+            from freqinout.core.bbs_access_policy import (
+                normalize_access_policy, refresh_access_policy, load_access_families,
+            )
+            policy = normalize_access_policy(policy_text)
+            if not policy["group_sources"]:
+                return set(policy["manual_callsigns"])
+            try:
+                db_path = getattr(settings, "db_path", None)
+                roster_path = Path(db_path).with_name("freqinout_nets.db") if db_path else _local_operator_db_path()
+                live = refresh_access_policy(policy, load_access_families(roster_path))
+                # Newly trusted members require reviewed refresh; revoked trust
+                # and removed memberships cease authorizing on the next check.
+                trusted = set(policy["resolved_group_callsigns"]) & set(live["resolved_group_callsigns"])
+            except Exception:
+                return _UnavailableOperatorTrust(policy["manual_callsigns"])
+            allowed = set(policy["manual_callsigns"]) | trusted
+        else:
+            allowed = _trusted_operator_callsigns()
+        return allowed
+    return ()
+
+
+def _sender_allow_reason(sender: str, settings, *, operator_callsigns=None) -> str:
     if not sender:
         return ""
     if _bbs_allowed_trust_enabled(settings):
@@ -506,7 +536,8 @@ def _sender_allow_reason(sender: str, settings) -> str:
         if _callsign_set_matches(sender, allowed):
             return "authorized_bbs_allowed_callsign"
     if _operator_history_trust_enabled(settings):
-        if _callsign_set_matches(sender, _trusted_operator_callsigns()):
+        allowed = _operator_allowed_callsigns(settings) if operator_callsigns is None else operator_callsigns
+        if _callsign_set_matches(sender, allowed):
             return "authorized_operator_history_trusted"
     return ""
 
@@ -531,6 +562,7 @@ def evaluate_varac_guard_event(
     state: Optional[dict] = None,
     now_utc: Optional[float] = None,
     retry_seconds: int = 120,
+    operator_callsigns=None,
 ) -> tuple[VaracGuardDecision, Optional[VaracFileActionResult], bool]:
     incoming_dir = _resolve_incoming_dir(settings)
     if incoming_dir is None:
@@ -541,12 +573,22 @@ def evaluate_varac_guard_event(
         )
 
     sender = _normalize_call(event.sender)
-    allow_reason = _sender_allow_reason(sender, settings)
+    if operator_callsigns is None:
+        operator_callsigns = _operator_allowed_callsigns(settings)
+    allow_reason = _sender_allow_reason(sender, settings, operator_callsigns=operator_callsigns)
     if allow_reason:
         return (
             VaracGuardDecision(action="allow", reason=allow_reason, sender=sender, filename=event.filename, log_path=event.log_path),
             None,
             True,
+        )
+    if isinstance(operator_callsigns, _UnavailableOperatorTrust):
+        # Failed trust lookup must not delete/quarantine a potentially authorized
+        # sender. Retain the event for the next normal worker scan.
+        return (
+            VaracGuardDecision(action="pending", reason="operator_trust_unavailable", sender=sender,
+                               filename=event.filename, log_path=event.log_path),
+            None, False,
         )
 
     mode = str(settings.get("varac_guard_mode", "Log only") or "Log only").strip().lower() if settings is not None else "log only"
@@ -695,6 +737,8 @@ def run_varac_guard(settings, *, retry_seconds: Optional[int] = None) -> VaracGu
                 events_by_key[key] = event
 
     next_pending_events: List[dict] = []
+    # One roster snapshot per worker scan, not one SQL read per received file.
+    operator_callsigns = _operator_allowed_callsigns(settings) if events_by_key else ()
     for key, event in events_by_key.items():
         scanned += 1
         if key in seen:
@@ -706,6 +750,7 @@ def run_varac_guard(settings, *, retry_seconds: Optional[int] = None) -> VaracGu
             state=state,
             now_utc=now_utc,
             retry_seconds=retry_seconds,
+            operator_callsigns=operator_callsigns,
         )
         if decision.action == "allow":
             allowed += 1

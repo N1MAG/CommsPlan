@@ -384,7 +384,11 @@ def _dynamic_legend(payload: Mapping[str, object]) -> list[dict[str, object]]:
         and not isinstance(markers, (str, bytes, bytearray))
         and any(isinstance(item, Mapping) for item in markers)
     )
-    if has_markers and not has_paths:
+    has_reports = any(
+        isinstance(payload.get(key), Sequence) and any(isinstance(row, Mapping) for row in payload[key])
+        for key in ("weather_events", "alert_events", "infrastructure_events")
+    )
+    if (has_markers and not has_paths) or has_reports:
         status_items: list[dict[str, object]] = [
             {"label": "SitRep Status:", "color_role": "text", "heading": True}
         ]
@@ -396,12 +400,25 @@ def _dynamic_legend(payload: Mapping[str, object]) -> list[dict[str, object]]:
         ):
             color, role = _SITREP_STATUS_STYLE[status]
             status_items.append({"label": label, "color_role": role, "color": color})
-        add_group("Stations", status_items)
-    if has_paths:
+        add_group("Stations" if has_markers else "Reports", status_items)
+    if has_paths and payload.get("map_mode") == "mesh_nodes":
+        if any(isinstance(link, Mapping) and link.get("evidence_kind") == "cached_route" for link in payload.get("links", ())):
+            add("↝", "text_muted")
+            entries[-1].update(symbol_only=True, tooltip="Cached outgoing routes. Direction is from companion toward contact; delivery and current reachability are unverified.")
+        if any(isinstance(link, Mapping) and link.get("evidence_kind") == "observed_packet_path" for link in payload.get("links", ())):
+            add("→", "info")
+            entries[-1].update(symbol_only=True, tooltip="Observed flood packet hop order. Sender and recipient are not inferred; line color is not a per-hop signal measurement.")
+    if has_paths and payload.get("map_mode") != "mesh_nodes":
         # Keep the complete historical RF key together.  It takes priority
         # over contextual layers when the bounded legend surface is full.
         for label, color in _LINK_SNR_LEGEND:
             add(label, "info", color)
+        if payload.get("link_direction_markers"):
+            add("→  ⇄", "text")
+            entries[-1].update({
+                "symbol_only": True,
+                "tooltip": "→ Logged sender to addressee. ⇄ Traffic logged in both directions. Delivery and current reachability are unverified.",
+            })
 
     if bool(payload.get("show_regions")):
         add("FEMA Regions", "info")
@@ -421,7 +438,11 @@ def _dynamic_legend(payload: Mapping[str, object]) -> list[dict[str, object]]:
     ):
         value = payload.get(key)
         if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)) and any(isinstance(item, Mapping) for item in value):
+            previous_count = len(entries)
             add(label, role)
+            if len(entries) > previous_count:
+                entries[-1]["symbol_only"] = True
+                entries[-1]["tooltip"] = "Report symbols use the SitRep status colors."
     sitrep = payload.get("sitrep_state_summary")
     sitrep_roles = _sitrep_statuses(sitrep)
     for status in sitrep_roles:
@@ -567,9 +588,27 @@ def build_native_overlay_projection(payload: Mapping[str, object]) -> dict[str, 
             marker = dict(raw)
             status = str(marker.get("spotter_status_key") or "unknown").strip().lower()
             color, _role = _SITREP_STATUS_STYLE.get(status, _SITREP_STATUS_STYLE["unknown"])
-            marker["color"] = color
+            if not marker.get("is_mesh_node"):
+                marker["color"] = color
             station_markers.append(marker)
         projected["markers"] = station_markers
+    # Report symbols share the fixed status palette with station pins and the
+    # legend, independently of light/dark application accent colors.
+    for collection in ("weather_events", "alert_events", "infrastructure_events"):
+        source = payload.get(collection)
+        if not isinstance(source, Sequence) or isinstance(source, (str, bytes, bytearray)):
+            continue
+        events = []
+        for raw in source:
+            if not isinstance(raw, Mapping):
+                continue
+            event = dict(raw)
+            status = str(event.get("status") or event.get("severity") or "unknown").strip().lower()
+            status = {"routine": "green", "caution": "yellow", "severe": "red"}.get(status, status)
+            if status in _SITREP_STATUS_STYLE:
+                event["color"], event["color_role"] = _SITREP_STATUS_STYLE[status]
+            events.append(event)
+        projected[collection] = events
     projected["base_polygons"] = [dict(item) for item in _base_polygons()]
     projected["polygons"] = _state_polygons(payload)
     state_labels, region_labels = _state_and_region_labels()

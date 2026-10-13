@@ -8,12 +8,14 @@ status text, browse actions, and explicit validation actions.
 from __future__ import annotations
 
 from copy import deepcopy
+import json
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QFormLayout,
     QFrame,
     QGridLayout,
@@ -27,6 +29,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from freqinout.gui.theme import button_height_for_font
+from freqinout.gui.bbs_access_editor import BbsAccessEditor
 
 
 @dataclass(frozen=True)
@@ -67,10 +70,10 @@ SOFTWARE_EDITOR_TASKS: dict[str, dict[str, SoftwareEditorTask]] = {
         "message_storage": T("Message Storage", "DIRECTED.TXT is an ingest source. The Save folder does not relocate JS8Call message storage.", (
             F("js8_directed_path", "DIRECTED.TXT", "path", "Path to this instance's directed log", browse=True),
         )),
-        "ingest_forms": T("Ingest & Forms", "Configure directed-message ingest. FIO Spotter owns form administration.", (
+        "ingest_forms": T("Ingest & Forms", "Configure directed-message ingest. CommsPlan Spotter owns form administration.", (
             F("js8_directed_path", "DIRECTED.TXT", "path", "Path to this instance's directed log", browse=True),
-        ), action="fio_spotter", action_label="Open FIO Spotter"),
-        "launch": T("Launch", "Configure the application FIO launches for this radio.", (
+        ), action="fio_spotter", action_label="Open CommsPlan Spotter"),
+        "launch": T("Launch", "Configure the application CommsPlan launches for this radio.", (
             F("path_js8call", "JS8Call application", "path", "Application or executable path", browse=True),
         )),
         "health": T("Health", "Use an explicit check to validate the configured application, storage, and API endpoint.", action="validate", action_label="Check JS8Call"),
@@ -104,7 +107,7 @@ SOFTWARE_EDITOR_TASKS: dict[str, dict[str, SoftwareEditorTask]] = {
             F("path_flamp", "FLAmp application", "path", browse=True),
             F("message_paths.flamp", "FLAMP receive folder", "path", browse=True),
         ), action="message_signing", action_label="Manage signing identities"),
-        "message_folders": T("Message Folders", "Review the folders FIO watches for FLMsg and FLAmp traffic.", (
+        "message_folders": T("Message Folders", "Review the folders CommsPlan watches for FLMsg and FLAmp traffic.", (
             F("message_paths.flmsg", "FLMsg messages", "path", browse=True),
             F("message_paths.flamp", "FLAmp received files", "path", browse=True),
         )),
@@ -139,12 +142,13 @@ SOFTWARE_EDITOR_TASKS: dict[str, dict[str, SoftwareEditorTask]] = {
             F("message_paths.varac", "Incoming folder", "path", browse=True),
             F("varac_outbox_dir", "Outbox folder", "path", browse=True),
         )),
-        "inbound_guard": T("Inbound Guard", "Choose which known senders may pass the radio-specific inbound file guard.", (
+        "inbound_guard": T("Inbound Guard", "CommsPlan-only inbound safety: choose who may pass this radio's inbound file guard. Either enabled source may authorize. Selecting groups does not narrow the BBS access list. Save applies this policy in CommsPlan. Native Get/Update is in BBS > Radio Service.", (
             F("varac_guard_allow_bbs_allowed_callsigns", "Allow BBS access list", "boolean"),
             F("varac_guard_allow_operator_trusted", "Allow trusted operators", "boolean"),
+            F("varac_guard_access_policy_v1", "HF Operator access scope", "access_policy"),
         )),
         "cluster": T("Cluster", "Open the existing radio-specific VarAC cluster coordinator.", action="varac_cluster", action_label="Open cluster settings"),
-        "launch": T("Launch", "Configure the VarAC command FIO launches for this radio.", (
+        "launch": T("Launch", "Configure the VarAC command CommsPlan launches for this radio.", (
             F("varac_launch_cmd", "Launch command", "path", browse=True),
         )),
         "health": T("Health", "Run an explicit check of the VarAC application and runtime paths.", action="validate", action_label="Check VarAC"),
@@ -169,27 +173,27 @@ SOFTWARE_EDITOR_TASKS: dict[str, dict[str, SoftwareEditorTask]] = {
         )),
     },
     "external_spotter": {
-        "overview": T("External Spotter overview", "This optional external application is separate from built-in FIO Spotter."),
+        "overview": T("External Spotter overview", "This optional external application is separate from built-in CommsPlan Spotter."),
         "installation": T("Installation", "Choose the optional external Spotter launcher or shortcut.", (
             F("path_js8spotter", "External Spotter application", "path", browse=True),
         )),
         "profile": T("Profile", "Importing an external Spotter profile is an explicit operation.", action="external_spotter_import", action_label="Import external Spotter data"),
-        "forms": T("Form Synchronization", "FIO Spotter owns active form administration; external data can be imported explicitly.", action="fio_spotter", action_label="Open FIO Spotter forms"),
-        "launch": T("Launch", "Choose the external Spotter application FIO may launch.", (
+        "forms": T("Form Synchronization", "CommsPlan Spotter owns active form administration; external data can be imported explicitly.", action="fio_spotter", action_label="Open CommsPlan Spotter forms"),
+        "launch": T("Launch", "Choose the external Spotter application CommsPlan may launch.", (
             F("path_js8spotter", "External Spotter application", "path", browse=True),
         )),
         "health": T("Health", "Check the configured external application only when requested.", action="validate", action_label="Check External Spotter"),
-        "advanced": T("Advanced", "External Spotter is optional and does not control FIO Spotter.", (
+        "advanced": T("Advanced", "External Spotter is optional and does not control CommsPlan Spotter.", (
             F("path_js8spotter", "External Spotter application", "path", browse=True),
         )),
     },
     "fio_spotter": {
-        "overview": T("FIO Spotter overview", "FIO Spotter is built into FIO. Rules, Expect queries, watches, forms, and activity live in its top-level workspace.", action="fio_spotter", action_label="Open FIO Spotter"),
+        "overview": T("CommsPlan Spotter overview", "CommsPlan Spotter is built into CommsPlan. Rules, Expect queries, watches, forms, and activity live in its top-level workspace.", action="fio_spotter", action_label="Open CommsPlan Spotter"),
         "dependencies": T("Dependencies & Radio Mapping", "Review the JS8 transport selected for this radio. Built-in forms require no per-radio MCF folder.", (
             F("js8_host", "JS8 transport host", "readonly"),
             F("js8_port", "JS8 transport port", "readonly"),
-        ), action="fio_spotter", action_label="Open FIO Spotter"),
-        "operational_workspace": T("FIO Spotter workspace", "Manage rules, Expect queries, watches, forms, and activity in the operational workspace.", action="fio_spotter", action_label="Open FIO Spotter"),
+        ), action="fio_spotter", action_label="Open CommsPlan Spotter"),
+        "operational_workspace": T("CommsPlan Spotter workspace", "Manage rules, Expect queries, watches, forms, and activity in the operational workspace.", action="fio_spotter", action_label="Open CommsPlan Spotter"),
     },
 }
 
@@ -231,7 +235,7 @@ class SoftwareTaskEditor(QWidget):
     action_requested = Signal(str)
     save_requested = Signal(str, object)
 
-    def __init__(self, parent: Optional[QWidget] = None) -> None:
+    def __init__(self, parent: Optional[QWidget] = None, *, operator_db_path=None) -> None:
         super().__init__(parent)
         self._family_key = ""
         self._task_key = ""
@@ -240,7 +244,9 @@ class SoftwareTaskEditor(QWidget):
         self._state: dict[str, Any] = {}
         self._dirty = False
         self._field_widgets: dict[str, QWidget] = {}
+        self._browse_buttons: dict[str, QPushButton] = {}
         self._canonical_identity_managed = False
+        self._operator_db_path = operator_db_path
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -299,6 +305,18 @@ class SoftwareTaskEditor(QWidget):
         self.task_action_button.clicked.connect(self._emit_action)
         self.task_action_button.setMinimumHeight(button_height_for_font(self.task_action_button))
         self.task_action_button.hide()
+        self.edit_configuration_button = QPushButton("Edit configuration…")
+        self.edit_configuration_button.setAccessibleName("Edit this software configuration")
+        self.edit_configuration_button.setToolTip(
+            "Open the complete prefilled editor with conflict review and atomic save"
+        )
+        self.edit_configuration_button.clicked.connect(
+            lambda: self.action_requested.emit("edit_canonical_configuration")
+        )
+        self.edit_configuration_button.setMinimumHeight(
+            button_height_for_font(self.edit_configuration_button)
+        )
+        self.edit_configuration_button.hide()
         self.dirty_label = QLabel("No unsaved changes")
         self.dirty_label.setAccessibleName("Software draft state")
         self.save_button = QPushButton("Save selected software")
@@ -324,12 +342,14 @@ class SoftwareTaskEditor(QWidget):
         for widget in (
             self.discover_button,
             self.task_action_button,
+            self.edit_configuration_button,
             self.save_button,
         ):
             widget.setMinimumHeight(button_height_for_font(widget, vertical_padding=10 if compact else 12))
         for widget in (
             self.discover_button,
             self.task_action_button,
+            self.edit_configuration_button,
             self.dirty_label,
             self.save_button,
         ):
@@ -337,15 +357,17 @@ class SoftwareTaskEditor(QWidget):
         if compact:
             self.actions_layout.addWidget(self.discover_button, 0, 0)
             self.actions_layout.addWidget(self.task_action_button, 0, 1)
+            self.actions_layout.addWidget(self.edit_configuration_button, 0, 2)
             self.actions_layout.addWidget(self.dirty_label, 1, 0)
             self.actions_layout.addWidget(self.save_button, 1, 1, 1, 2)
-            self.actions_layout.setColumnStretch(2, 1)
+            self.actions_layout.setColumnStretch(3, 1)
         else:
             self.actions_layout.addWidget(self.discover_button, 0, 0)
             self.actions_layout.addWidget(self.task_action_button, 0, 1)
-            self.actions_layout.setColumnStretch(2, 1)
-            self.actions_layout.addWidget(self.dirty_label, 0, 3)
-            self.actions_layout.addWidget(self.save_button, 0, 4)
+            self.actions_layout.addWidget(self.edit_configuration_button, 0, 2)
+            self.actions_layout.setColumnStretch(3, 1)
+            self.actions_layout.addWidget(self.dirty_label, 0, 4)
+            self.actions_layout.addWidget(self.save_button, 0, 5)
 
     @staticmethod
     def _clear_form(form: QFormLayout) -> None:
@@ -373,6 +395,7 @@ class SoftwareTaskEditor(QWidget):
         task = task_definition(self._family_key, self._task_key)
         self._clear_form(self.form)
         self._field_widgets = {}
+        self._browse_buttons = {}
 
         if task is None:
             self.title_label.setText("Choose a configuration task")
@@ -415,7 +438,7 @@ class SoftwareTaskEditor(QWidget):
         identity_key: str = "",
         component_repair_available: bool = False,
     ) -> None:
-        """Keep the task projection read-only when a canonical bundle exists.
+        """Present canonical values as facts with one authoritative edit route.
 
         The guided instance assistant is the sole editor for a canonical
         identity because it can update the application row, manifest, launch
@@ -423,9 +446,27 @@ class SoftwareTaskEditor(QWidget):
         legacy field projection to save independently would create split state.
         """
 
-        self._canonical_identity_managed = bool(managed)
-        self.form_widget.setEnabled(not self._canonical_identity_managed)
+        self._canonical_identity_managed = bool(managed) and not (
+            self._family_key == "varac" and self._task_key == "inbound_guard"
+        )
         self.identity_notice_label.setVisible(self._canonical_identity_managed)
+        self.edit_configuration_button.setVisible(self._canonical_identity_managed)
+        for widget in self._field_widgets.values():
+            if isinstance(widget, QLineEdit):
+                widget.setReadOnly(self._canonical_identity_managed)
+                widget.setFrame(not self._canonical_identity_managed)
+                widget.setFocusPolicy(
+                    Qt.NoFocus if self._canonical_identity_managed else Qt.StrongFocus
+                )
+                widget.setStyleSheet(
+                    "background: transparent; border: none; padding: 2px 0;"
+                    if self._canonical_identity_managed
+                    else ""
+                )
+            elif isinstance(widget, QCheckBox):
+                widget.setEnabled(not self._canonical_identity_managed)
+        for button in self._browse_buttons.values():
+            button.setVisible(not self._canonical_identity_managed)
         if self._canonical_identity_managed:
             repair_note = (
                 " A component-only FLMsg/FLAmp repair is available below; it preserves the "
@@ -434,9 +475,9 @@ class SoftwareTaskEditor(QWidget):
                 else ""
             )
             self.identity_notice_label.setText(
-                f"This is the same saved {self._radio_name or 'radio'} software instance reviewed in Add Radio. "
-                "Review it here; use Add software instance… / Replace instance to change "
-                f"identity, paths, endpoints, or launch details as one safe transaction.{repair_note}"
+                f"These are the saved {self._radio_name or 'radio'} software values. "
+                "Choose Edit configuration… to change paths, endpoints, defaults, or launch details "
+                f"in one reviewed transaction.{repair_note}"
             )
             self.identity_notice_label.setToolTip("")
             self.discover_button.hide()
@@ -455,6 +496,7 @@ class SoftwareTaskEditor(QWidget):
                     self.task_action_button.setText(task.action_label or "Open")
                     self.task_action_button.setProperty("software_action", task.action)
         else:
+            self.edit_configuration_button.hide()
             task = task_definition(self._family_key, self._task_key)
             has_editable_fields = bool(
                 task and any(field.kind != "readonly" for field in task.fields)
@@ -478,7 +520,22 @@ class SoftwareTaskEditor(QWidget):
 
     def _add_field(self, field: SoftwareEditorField) -> None:
         value = _value_at(self._state, field.key)
-        if field.kind == "boolean":
+        if field.kind == "access_policy":
+            control = QWidget()
+            layout = QVBoxLayout(control)
+            layout.setContentsMargins(0, 0, 0, 0)
+            self.guard_scope_combo = QComboBox()
+            self.guard_scope_combo.addItems([
+                "All trusted HF Operators (legacy)", "Only selected groups and callsigns",
+            ])
+            self.guard_scope_combo.setAccessibleName("Inbound Guard HF Operator access scope")
+            self.guard_access_editor = BbsAccessEditor(control, operator_db_path=self._operator_db_path)
+            layout.addWidget(self.guard_scope_combo)
+            layout.addWidget(self.guard_access_editor)
+            self._set_guard_policy(value)
+            self.guard_scope_combo.currentIndexChanged.connect(self._guard_policy_changed)
+            self.guard_access_editor.changed.connect(self._guard_policy_changed)
+        elif field.kind == "boolean":
             control: QWidget = QCheckBox()
             control.setChecked(bool(value))
             control.stateChanged.connect(
@@ -505,10 +562,33 @@ class SoftwareTaskEditor(QWidget):
             browse = QPushButton("Browse")
             browse.setAccessibleName(f"Browse for {field.label}")
             browse.clicked.connect(lambda _checked=False, key=field.key: self.browse_requested.emit(key))
+            self._browse_buttons[field.key] = browse
             row_layout.addWidget(browse)
             self.form.addRow(field.label, row)
         else:
             self.form.addRow(field.label, control)
+
+    def _set_guard_policy(self, value):
+        blocked = self.guard_scope_combo.blockSignals(True)
+        self.guard_scope_combo.setCurrentIndex(1 if str(value or "").strip() else 0)
+        self.guard_scope_combo.blockSignals(blocked)
+        self.guard_access_editor.set_policy(value)
+        self._update_guard_scope()
+
+    def _update_guard_scope(self):
+        selected = self.guard_scope_combo.currentIndex() == 1
+        self.guard_access_editor.setVisible(selected)
+        flag = self._field_widgets.get("varac_guard_allow_operator_trusted")
+        label = self.form.labelForField(flag) if flag is not None else None
+        if isinstance(label, QLabel):
+            label.setText("Allow selected access list" if selected else "Allow trusted operators")
+
+    def _guard_policy_changed(self, *_args):
+        self._update_guard_scope()
+        value = "" if self.guard_scope_combo.currentIndex() == 0 else json.dumps(
+            self.guard_access_editor.policy(), sort_keys=True, separators=(",", ":")
+        )
+        self._on_value_changed("varac_guard_access_policy_v1", value)
 
     def _on_value_changed(self, key: str, value: Any) -> None:
         self._state = merge_draft_value(self._state, key, value)
@@ -529,6 +609,9 @@ class SoftwareTaskEditor(QWidget):
         self._state = deepcopy(dict(state or {}))
         for key, widget in self._field_widgets.items():
             value = _value_at(self._state, key)
+            if key == "varac_guard_access_policy_v1":
+                self._set_guard_policy(value)
+                continue
             blocked = widget.blockSignals(True)
             if isinstance(widget, QLineEdit):
                 widget.setText(str(value if value is not None else ""))
@@ -558,6 +641,8 @@ class SoftwareTaskEditor(QWidget):
     def apply_value(self, key: str, value: Any) -> None:
         """Apply a host-selected value through the normal draft-change path."""
         widget = self._field_widgets.get(key)
+        if key == "varac_guard_access_policy_v1" and widget is not None:
+            self._set_guard_policy(value)
         if isinstance(widget, QLineEdit) and widget.text() != str(value or ""):
             blocked = widget.blockSignals(True)
             widget.setText(str(value or ""))

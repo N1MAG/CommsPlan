@@ -232,7 +232,7 @@ def _guidance_for(family: str, state: str) -> tuple[str, ...]:
     if family == "js8call":
         return (
             general,
-            "Give every independently launched JS8Call instance a unique API port and FIO-managed --rig-name.",
+            "Give every independently launched JS8Call instance a unique API port and CommsPlan-managed --rig-name.",
             "Confirm the distinct application-data root for the rig name; SaveDir is not message storage.",
         )
     if family == "fast_light":

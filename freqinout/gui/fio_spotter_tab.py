@@ -1,4 +1,4 @@
-"""Primary, lazy FIO Spotter service workspace.
+"""Primary, lazy CommsPlan Spotter service workspace.
 
 This surface intentionally consumes the established projection, Expect, form and
 import stores.  It does not maintain a second Spotter catalog in the UI.
@@ -275,7 +275,7 @@ class _TokenListEditor(QWidget):
 
 
 class FioSpotterTab(QWidget):
-    """A bounded browser for FIO's existing Spotter facilities.
+    """A bounded browser for CommsPlan's existing Spotter facilities.
 
     Tables deliberately contain at most 200 rows.  A tab is populated only on
     first visit or explicit refresh, so changing selection or painting never
@@ -316,9 +316,9 @@ class FioSpotterTab(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(12, 10, 12, 12)
         outer.setSpacing(8)
-        title = QLabel("FIO Spotter")
+        title = QLabel("CommsPlan Spotter")
         title.setObjectName("fioSpotterTitle")
-        title.setAccessibleName("FIO Spotter service")
+        title.setAccessibleName("CommsPlan Spotter service")
         outer.addWidget(title)
         why = QLabel("Configure shared watches and safely administer JS8 Expect automation. Operational traffic is unified in Message Inbox.")
         why.setWordWrap(True)
@@ -326,7 +326,7 @@ class FioSpotterTab(QWidget):
         outer.addWidget(why)
         self.tab_selector = QListWidget()
         self.tab_selector.setObjectName("fioSpotterModeSelector")
-        self.tab_selector.setAccessibleName("FIO Spotter configuration sections")
+        self.tab_selector.setAccessibleName("CommsPlan Spotter configuration sections")
         self.tab_selector.setFlow(QListWidget.LeftToRight)
         self.tab_selector.setWrapping(True)
         self.tab_selector.setResizeMode(QListWidget.Adjust)
@@ -336,13 +336,13 @@ class FioSpotterTab(QWidget):
         self.tab_selector.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         for name in _TAB_NAMES:
             item = QListWidgetItem(name)
-            item.setToolTip(f"Open FIO Spotter {name}")
+            item.setToolTip(f"Open CommsPlan Spotter {name}")
             self.tab_selector.addItem(item)
         self.tab_selector.setCurrentRow(0)
         outer.addWidget(self.tab_selector)
         self.tabs = QTabWidget()
         self.tabs.setObjectName("fioSpotterBrowserTabs")
-        self.tabs.setAccessibleName("FIO Spotter browser tabs")
+        self.tabs.setAccessibleName("CommsPlan Spotter browser tabs")
         for name in _TAB_NAMES:
             page = QWidget()
             page.setObjectName(f"fioSpotter{name}Page")
@@ -762,7 +762,7 @@ class FioSpotterTab(QWidget):
             profiles = list(self._radio_store().list_device_profiles())
         except Exception as exc:
             profiles = []
-            log.warning("FIO Spotter: configured radio list unavailable: %s", exc)
+            log.warning("CommsPlan Spotter: configured radio list unavailable: %s", exc)
         js8_profiles = [
             dict(profile) for profile in profiles
             if (profile.get("use_js8call") or profile.get("js8_instance_id"))
@@ -1288,7 +1288,7 @@ class FioSpotterTab(QWidget):
         layout = self._page_layout(page)
         intro = QLabel(
             "Manage saved E? responses and their access here. Compose builds a response; "
-            "FIO Spotter owns whether it may answer."
+            "CommsPlan Spotter owns whether it may answer."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
@@ -1445,7 +1445,7 @@ class FioSpotterTab(QWidget):
         self.expect_radio = QComboBox()
         self.expect_radio.setAccessibleName("Radios that accept this Expect query")
         self.expect_radio.setToolTip(
-            "All JS8 radios is recommended. FIO replies through the radio and JS8Call service that received the query."
+            "All JS8 radios is recommended. CommsPlan replies through the radio and JS8Call service that received the query."
         )
         self.expect_radio.addItem("All JS8 radios — reply on receiving radio", "")
         self._fit_spotter_combo(self.expect_radio, minimum_characters=20)
@@ -1880,11 +1880,11 @@ class FioSpotterTab(QWidget):
             self._entry_rows = list_expect_entries(limit=_MAX_ROWS)
             self._cache_policy_usage_entries()
         except Exception as exc:
-            log.warning("FIO Spotter: Expect administration read failed: %s", exc, exc_info=True)
+            log.warning("CommsPlan Spotter: Expect administration read failed: %s", exc, exc_info=True)
             self._policy_rows, self._entry_rows = [], []
             self._policy_usage_entries = {}
             self.expect_maintenance_state.setText(
-                "Expect storage could not be read. Restart FIO to run startup database repair; details are in the log."
+                "Expect storage could not be read. Restart CommsPlan to run startup database repair; details are in the log."
             )
         self._refresh_runtime_state()
         selected = self.expect_policy.currentData()
@@ -2059,7 +2059,7 @@ class FioSpotterTab(QWidget):
         try:
             stored_rows = list_expect_entries(limit=5000)
         except Exception as exc:
-            log.warning("FIO Spotter: Expect date preview failed: %s", exc, exc_info=True)
+            log.warning("CommsPlan Spotter: Expect date preview failed: %s", exc, exc_info=True)
             self.expect_maintenance_state.setText(f"○ Saved form dates could not be reviewed: {exc}")
             return
         eligible = [
@@ -2093,7 +2093,7 @@ class FioSpotterTab(QWidget):
                 entry_ids=[int(row.get("id") or 0) for row in eligible]
             )
         except Exception as exc:
-            log.warning("FIO Spotter: bulk Expect date refresh failed: %s", exc, exc_info=True)
+            log.warning("CommsPlan Spotter: bulk Expect date refresh failed: %s", exc, exc_info=True)
             self.expect_maintenance_state.setText(f"○ Form dates were not updated: {exc}")
             return
         self.refresh_expect()
@@ -2245,7 +2245,7 @@ class FioSpotterTab(QWidget):
         self.expect_maintenance_state.setText(
             "Choose a named, enabled access policy before saving this automatic FLAMP Q rule. The Q ID and response are generated from the request and indexed FLAMP state."
         )
-        log.info("FIO Spotter: opened new dynamic FLAMP Q rule editor")
+        log.info("CommsPlan Spotter: opened new dynamic FLAMP Q rule editor")
 
     def _save_entry(self) -> None:
         selected = self.expect_entries_table.selectedItems(); existing = selected[0].data(Qt.UserRole) if selected else {}
@@ -2268,7 +2268,7 @@ class FioSpotterTab(QWidget):
             # Instance and schedule are routing metadata, not operator-facing
             # rule fields. Preserve legacy restrictions while the radio choice
             # is unchanged; a deliberate new radio choice adopts that radio's
-            # current JS8Call configuration and normal FIO schedule.
+            # current JS8Call configuration and normal CommsPlan schedule.
             js8_instance_id = _text(existing.get("js8_instance_id")) if same_radio_choice else ""
             auto_tx_schedule = _text(existing.get("auto_tx_schedule")) if same_radio_choice else ""
             auto_reply = bool(self.expect_delivery_mode.currentData())
@@ -2297,11 +2297,11 @@ class FioSpotterTab(QWidget):
                 if hasattr(self.settings, "save"):
                     self.settings.save()
         except Exception as exc:
-            log.warning("FIO Spotter: Expect rule save failed: %s", exc, exc_info=True)
+            log.warning("CommsPlan Spotter: Expect rule save failed: %s", exc, exc_info=True)
             self.expect_maintenance_state.setText(f"Rule not saved: {exc}")
             return
         log.info(
-            "FIO Spotter: %s Expect rule id=%s key=%s policy_id=%s scope=%s",
+            "CommsPlan Spotter: %s Expect rule id=%s key=%s policy_id=%s scope=%s",
             "created" if saved.created else "saved",
             saved.id,
             saved.expect_key,
@@ -2366,13 +2366,13 @@ class FioSpotterTab(QWidget):
                 "import_source": "fio-spotter",
             })
         except Exception as exc:
-            log.warning("FIO Spotter: allow policy save failed: %s", exc, exc_info=True)
+            log.warning("CommsPlan Spotter: allow policy save failed: %s", exc, exc_info=True)
             getattr(self, "policy_status", getattr(self, "expect_runtime_state", None)).setText(
                 f"○ Policy not saved: {exc}"
             )
             return
         log.info(
-            "FIO Spotter: %s Expect allow policy id=%s name=%s",
+            "CommsPlan Spotter: %s Expect allow policy id=%s name=%s",
             "created" if saved.created else "saved",
             saved.id,
             saved.name,
@@ -2437,7 +2437,7 @@ class FioSpotterTab(QWidget):
         selected = self.policy_scope.currentData() == "radio"
         self.policy_radios.setEnabled(selected)
         self.policy_radios.setToolTip(
-            "Select known FIO radios that may use this policy."
+            "Select known CommsPlan radios that may use this policy."
             if selected else
             "All JS8 radios may use this policy. Choose selected radios to limit its scope."
         )
@@ -2503,10 +2503,10 @@ class FioSpotterTab(QWidget):
         self.policy_blocked.setPlaceholderText("Find or enter a blocked callsign")
         self.policy_scope = QComboBox()
         self.policy_scope.addItem("All JS8 radios", "all")
-        self.policy_scope.addItem("Only selected FIO radios", "radio")
+        self.policy_scope.addItem("Only selected CommsPlan radios", "radio")
         self.policy_scope.currentIndexChanged.connect(self._sync_policy_radio_scope)
         self.policy_radios = _TokenListEditor()
-        self.policy_radios.setPlaceholderText("Selected FIO radios")
+        self.policy_radios.setPlaceholderText("Selected CommsPlan radios")
         self.policy_enabled = QCheckBox("Policy available for automatic replies")
         self.policy_enabled.setChecked(True)
         self.policy_access_catalog_state = QLabel()
@@ -2742,7 +2742,7 @@ class FioSpotterTab(QWidget):
         self.forms_preview_btn.clicked.connect(self._preview_selected_form)
         self.forms_compose_btn = QPushButton("Compose selected form")
         self.forms_compose_btn.setAccessibleName("Compose and send selected Spotter form")
-        self.forms_compose_btn.setToolTip("Open this form in the guarded FIO Spotter Compose workflow.")
+        self.forms_compose_btn.setToolTip("Open this form in the guarded CommsPlan Spotter Compose workflow.")
         self.forms_compose_btn.clicked.connect(self._open_spotter_compose)
         self.forms_expect_btn = QPushButton("Make available by E?…")
         self.forms_expect_btn.setAccessibleName("Configure selected Spotter form as an Expect response")
@@ -2826,7 +2826,7 @@ class FioSpotterTab(QWidget):
             expect_by_key = {}
         self.forms_state.setText(
             f"Forms catalog: {path} — {len(mappings)} catalog entries "
-            f"(bounded to {_MAX_ROWS}). Select which FIO services receive each form, then Save mappings."
+            f"(bounded to {_MAX_ROWS}). Select which CommsPlan services receive each form, then Save mappings."
         )
         self.forms_table.setUpdatesEnabled(False)
         self.forms_table.blockSignals(True)
@@ -2869,7 +2869,7 @@ class FioSpotterTab(QWidget):
         if self.forms_table.currentRow() >= 0:
             self._show_selected_form_summary()
         elif not mappings:
-            self.forms_preview.setPlainText("No MCF forms are configured. Choose the folder used by FIO Spotter, then refresh the catalog.")
+            self.forms_preview.setPlainText("No MCF forms are configured. Choose the folder used by CommsPlan Spotter, then refresh the catalog.")
         self._refresh_forms_action_state()
 
     def _form_mapping_rows_from_table(self) -> list[dict[str, object]]:
@@ -2901,7 +2901,7 @@ class FioSpotterTab(QWidget):
         except Exception as exc:
             self.forms_state.setText(f"Form mappings were not saved: {exc}")
             return
-        self.forms_state.setText(f"Saved {len(rows)} FIO Spotter form mapping(s).")
+        self.forms_state.setText(f"Saved {len(rows)} CommsPlan Spotter form mapping(s).")
 
     def _auto_classify_forms(self) -> None:
         if not hasattr(self, "forms_table"):

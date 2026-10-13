@@ -131,7 +131,7 @@ class StationHealthTab(QWidget):
                 "Scope",
                 "Dependency",
                 "State",
-                "What FIO Is Doing",
+                "What CommsPlan Is Doing",
                 "Last Check",
             ]
         )
@@ -241,7 +241,7 @@ class StationHealthTab(QWidget):
 
         self.scheduler_table = QTableWidget(0, 6, scheduler_tab)
         self.scheduler_table.setHorizontalHeaderLabels(
-            ["UTC Time", "Decision", "Source", "What FIO Did", "Detail", "Target"]
+            ["UTC Time", "Decision", "Radio / Source", "What CommsPlan Did", "Detail", "Target"]
         )
         self.scheduler_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.scheduler_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -359,6 +359,9 @@ class StationHealthTab(QWidget):
             scope_resolver=scope_resolver,
             extra_items=runtime_items,
         )
+        for event in summary.get("recent_scheduler_events", ()):
+            if isinstance(event, dict):
+                event["_display_scope"] = StationHealthTab._scheduler_event_scope(event, scope_resolver)
         return copy.deepcopy(summary), runtime_source_rows
 
     def _on_snapshot_ready(self, generation: int, payload: object, error: object) -> None:
@@ -416,7 +419,7 @@ class StationHealthTab(QWidget):
         elif severity == "danger":
             text = (
                 f"{issue_count} station responsiveness issue{'s' if issue_count != 1 else ''}. "
-                "FIO is backing off from at least one slow or unreachable dependency."
+                "CommsPlan is backing off from at least one slow or unreachable dependency."
             )
             color = theme.get("danger", "#C62828")
         else:
@@ -444,7 +447,8 @@ class StationHealthTab(QWidget):
         return (width, tuple(tuple(str(value or "") for value in row) for row in rows))
 
     def _render_table(self) -> None:
-        items = list(self._last_summary.get("items", []) or [])
+        items = [item for item in (self._last_summary.get("items", []) or [])
+                 if isinstance(item, Mapping) and item.get("is_issue", item.get("severity") in {"warning", "danger"})]
         height_rows: list[list[object]] = []
         self.table.setRowCount(len(items))
         for row, item in enumerate(items):
@@ -557,8 +561,12 @@ class StationHealthTab(QWidget):
                 )
                 if part
             )
+            title = str(row.get("title") or row.get("source_id") or "")
+            scope = str(row.get("radio_scope") or "")
+            if scope and not title.startswith(scope):
+                title = f"{scope} · {title}"
             values = [
-                row.get("title", "") or row.get("source_id", ""),
+                title,
                 row.get("state_label", "") or row.get("state", ""),
                 self._runtime_source_activity_summary(row),
                 row.get("action_hint", ""),
@@ -611,6 +619,9 @@ class StationHealthTab(QWidget):
         metadata = row.get("metadata", {})
         if not isinstance(metadata, Mapping):
             metadata = {}
+        candidates = metadata.get("candidate_radio_names", metadata.get("candidate_radio_ids", ()))
+        if candidates:
+            detail = (detail + "\n" if detail else "") + "Candidate radios (attribution unverified): " + ", ".join(map(str, candidates))
         freshness = self._runtime_source_freshness_text(metadata)
         radio_app = " / ".join(
             part
@@ -716,7 +727,7 @@ class StationHealthTab(QWidget):
         ]
         for heading, key in (
             ("Scope", "scope"),
-            ("What FIO Is Doing", "action"),
+            ("What CommsPlan Is Doing", "action"),
             ("Last Issue", "last_issue"),
             ("Issue Since", "issue_since"),
             ("Cooldown", "cooldown"),
@@ -768,7 +779,8 @@ class StationHealthTab(QWidget):
             idx = int(row)
         except Exception:
             idx = -1
-        items = list(self._last_summary.get("items", []) or [])
+        items = [item for item in (self._last_summary.get("items", []) or [])
+                 if isinstance(item, Mapping) and item.get("is_issue", item.get("severity") in {"warning", "danger"})]
         if idx < 0 or idx >= len(items):
             return None
         item = items[idx]
@@ -960,12 +972,31 @@ class StationHealthTab(QWidget):
                 parts.append(text)
         return " / ".join(parts)
 
+    @staticmethod
+    def _scheduler_event_scope(item: Mapping[str, object], scope_resolver=None) -> str:
+        if item.get("_display_scope"):
+            return str(item["_display_scope"])
+        metadata = dict(item["metadata"]) if isinstance(item.get("metadata"), Mapping) else {}
+        if item.get("radio_profile_id"):
+            metadata["radio_profile_id"] = item["radio_profile_id"]
+        identity = str(metadata.get("radio_profile_id") or "")
+        scope = ""
+        if scope_resolver is not None:
+            scope = str(scope_resolver("scheduler:event", metadata) or "")
+        scope = scope or identity.replace("radio_", "Radio ") or "Unattributed"
+        source = str(item.get("source") or "")
+        return f"{scope} · {source}" if source else scope
+
     def _scheduler_event_severity(self, item: Mapping[str, object]) -> str:
         kind = str(item.get("_station_health_kind", "") or "")
         if kind == "latest_success":
             return "ok"
         code = str(item.get("code", "") or "")
         event_type = str(item.get("event_type", "") or "")
+        if code in {"manual_qsy_active", "control_completion_authority_changed"}:
+            return "info"
+        if code in {"already_applied", "matching_readback_adopted", "post_apply_on_schedule"}:
+            return "ok"
         if event_type in {"failed"} or "failed" in code:
             return "danger"
         if event_type in {"hold", "skip", "watchdog", "breakaway"}:
@@ -973,6 +1004,16 @@ class StationHealthTab(QWidget):
         if event_type in {"applied", "resume"}:
             return "ok"
         return ""
+
+    @staticmethod
+    def _scheduler_decision_text(item: Mapping[str, object]) -> str:
+        code = str(item.get("code") or "")
+        labels = {"already_applied": "Already on schedule", "matching_readback_adopted": "Readback verified",
+                  "post_apply_on_schedule": "Schedule verified", "manual_qsy_active": "Manual QSY hold",
+                  "control_completion_authority_changed": "Authority changed", "control_failed": "Control failed",
+                  "rf_safety_guard_block": "RF safety hold", "rf_safety_guard_warning": "RF safety warning"}
+        text = labels.get(code, code.replace("_", " ").capitalize())
+        return f"Latest: {text}" if item.get("_station_health_kind") == "latest_success" else text
 
     def _render_scheduler_events(self) -> None:
         events = list(self._last_summary.get("recent_scheduler_events", []) or [])
@@ -983,20 +1024,21 @@ class StationHealthTab(QWidget):
                 continue
             severity = self._scheduler_event_severity(item)
             kind = str(item.get("_station_health_kind", "") or "")
-            decision = str(item.get("code", "") or "")
-            if kind == "latest_success":
-                decision = f"latest success: {decision}"
+            decision = self._scheduler_decision_text(item)
             values = [
                 self._format_scheduler_ts(item.get("ts_utc", "")),
                 decision,
-                item.get("source", ""),
+                self._scheduler_event_scope(item),
                 item.get("action", ""),
                 item.get("detail", ""),
                 self._format_scheduler_target(item),
             ]
             height_rows.append(values)
             for col, value in enumerate(values):
-                self.scheduler_table.setItem(row, col, self._item(value, severity=severity if col == 1 else ""))
+                cell = self._item(value, severity=severity if col == 1 else "")
+                if col == 1:
+                    cell.setToolTip(str(item.get("code") or ""))
+                self.scheduler_table.setItem(row, col, cell)
         signature = self._table_height_signature(self.scheduler_table, height_rows)
         if signature != self._scheduler_row_height_signature:
             self.scheduler_table.resizeRowsToContents()

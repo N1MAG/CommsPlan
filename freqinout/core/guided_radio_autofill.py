@@ -385,8 +385,8 @@ def guided_radio_autofill_suggestions(
             _suggest("varac_bbs_dir", guided_detection_path(varac_results, "varac_bbs_dir"))
             _suggest("varac_bbs_archive_dir", guided_detection_path(varac_results, "varac_bbs_archive_dir"))
         review.append(
-            "VarAC references were stored for FIO monitoring and BBS features only. "
-            "FIO did not write VarAC.ini, VarAC.db, or VarAC cluster membership."
+            "VarAC references were stored for CommsPlan monitoring and BBS features only. "
+            "CommsPlan did not write VarAC.ini, VarAC.db, or VarAC cluster membership."
         )
 
     return suggestions, tuple(review)

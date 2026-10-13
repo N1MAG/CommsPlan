@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 
 from freqinout.core.multi_radio_store import MultiRadioStore
 from freqinout.core.schedule_projection import build_blended_schedule_projection
+from freqinout.core.schedule_source_inputs import ScheduleSourceError, load_sop_projection_sources
 from freqinout.core.settings_manager import SettingsManager
 
 
@@ -247,9 +248,17 @@ def _rows_for_dependency(settings: Any, category: str, set_id: str) -> List[Dict
     if category == HF_NET_SOURCE_CATEGORY and str(set_id or "").strip() == NO_NET_SOURCE_SET_ID:
         return []
     sets_key = HF_DAILY_SOURCE_SETS_KEY if category == HF_DAILY_SOURCE_CATEGORY else HF_NET_SOURCE_SETS_KEY
-    row = source_set_row_by_id_for_category(settings, sets_key, category, set_id)
+    if str(set_id).startswith("plan:"):
+        try:
+            plan = MultiRadioStore().get_frequency_plan(int(set_id.split(":", 1)[1]))
+        except Exception as exc:
+            raise ScheduleSourceError(f"Cannot read declared schedule source {set_id}: {exc}") from exc
+        if not plan or str(plan.get("category") or "").lower() != category:
+            raise ScheduleSourceError(f"Declared schedule source is unavailable: {category}:{set_id}")
+        return _schedule_refs_for_plan(plan)
+    row = source_set_row_by_id(settings, sets_key, set_id)
     if not row:
-        return []
+        raise ScheduleSourceError(f"Declared schedule source is unavailable: {category}:{set_id}")
     return [dict(item) for item in row.get("rows", []) if isinstance(item, dict)]
 
 
@@ -259,6 +268,33 @@ def _week_start_sunday_utc(now_utc: datetime.datetime) -> datetime.date:
 
 def _schedule_refs_for_plan(plan: Dict[str, Any]) -> List[Dict[str, Any]]:
     return _parse_refs(plan.get("schedule_refs_json", plan.get("schedule_refs", "[]")))
+
+
+def _sop_sources_for_plan(settings: Any, plan: Dict[str, Any], source_refs: List[str]):
+    """Declared SOP dependencies own recurrence; output occurrences are not inputs."""
+    profile_ids = set()
+    for ref in source_refs:
+        if ref.startswith(f"{SOP_SCHEDULE_LAYER_CATEGORY}:"):
+            try:
+                profile_ids.add(int(ref.split(":", 1)[1]))
+            except ValueError as exc:
+                raise ScheduleSourceError(f"Invalid SOP dependency: {ref}") from exc
+    if profile_ids:
+        return load_sop_projection_sources(settings, profile_ids)
+    # Old plans without dependency metadata retain their concrete saved windows.
+    # New projections carry canonical rows, allowing exact source reconstruction.
+    rows = []
+    for ref in _schedule_refs_for_plan(plan):
+        if str(ref.get("source") or "").upper() != "SOP":
+            continue
+        canonical = ref.get("canonical_source_row")
+        row = dict(canonical) if isinstance(canonical, dict) else dict(ref)
+        if not isinstance(canonical, dict) and str(row.get("day_utc") or "ALL").upper() != "ALL":
+            if str(row.get("recurrence") or "").upper() == "DAILY":
+                row["recurrence"] = "Weekly"
+        if row not in rows:
+            rows.append(row)
+    return rows, []
 
 
 def _replace_sop_refs_for_profile(
@@ -324,26 +360,25 @@ def _reproject_refs_for_sop_update(
     daily_set_id = _dependency_set_id(source_refs, HF_DAILY_SOURCE_CATEGORY)
     net_set_id = _dependency_set_id(source_refs, HF_NET_SOURCE_CATEGORY)
     current_refs = _schedule_refs_for_plan(plan)
-    other_sop_rows = [
-        dict(row)
-        for row in current_refs
-        if isinstance(row, dict)
-        and str(row.get("source") or "").strip().upper() == "SOP"
-        and int(row.get("sop_profile_id") or row.get("profile_id") or 0) != int(profile_id)
-    ]
+    if not daily_set_id and not net_set_id:
+        # A direct SOP-only edit replaces the complete pending source supplied
+        # by its editor. No composed recurrence rebuild or policy read is needed.
+        refs = _replace_sop_refs_for_profile(current_refs, profile_id, [dict(row) for row in updated_rows])
+        return refs, _frequency_refs_for_schedule_refs(refs), _group_refs_for_schedule_refs(refs)
+    canonical_sop, policies = _sop_sources_for_plan(settings, plan, source_refs)
+    other_sop_rows = [row for row in canonical_sop
+                      if int(row.get("sop_profile_id") or row.get("profile_id") or 0) != int(profile_id)]
     sop_rows = other_sop_rows + [dict(row) for row in updated_rows if isinstance(row, dict)]
     if daily_set_id or net_set_id:
         projection = build_blended_schedule_projection(
             _rows_for_dependency(settings, HF_DAILY_SOURCE_CATEGORY, daily_set_id) if daily_set_id else [],
             _rows_for_dependency(settings, HF_NET_SOURCE_CATEGORY, net_set_id) if net_set_id else [],
             sop_rows,
-            [],
+            policies,
             week_start_utc=_week_start_sunday_utc(datetime.datetime.now(datetime.timezone.utc)),
         )
         return projection.schedule_refs(), projection.frequency_refs(), projection.group_refs()
 
-    refs = _replace_sop_refs_for_profile(current_refs, profile_id, [dict(row) for row in updated_rows])
-    return refs, _frequency_refs_for_schedule_refs(refs), _group_refs_for_schedule_refs(refs)
 
 
 def assigned_plan_rf_guard_impacts_for_sop_update(
@@ -430,11 +465,12 @@ def assigned_plan_rf_guard_impacts_for_source_update(
             daily_rows = [dict(row) for row in updated_rows]
         elif category == HF_NET_SOURCE_CATEGORY:
             net_rows = [dict(row) for row in updated_rows]
+        sop_rows, policies = _sop_sources_for_plan(settings, plan, source_refs)
         projection = build_blended_schedule_projection(
             daily_rows,
             net_rows,
-            [],
-            [],
+            sop_rows,
+            policies,
             week_start_utc=_week_start_sunday_utc(datetime.datetime.now(datetime.timezone.utc)),
         )
         payload = dict(plan)
@@ -504,16 +540,12 @@ def reproject_frequency_plans_for_source_update(
             daily_rows = [dict(row) for row in updated_rows]
         elif category == HF_NET_SOURCE_CATEGORY:
             net_rows = [dict(row) for row in updated_rows]
-        sop_rows = [
-            dict(row)
-            for row in _schedule_refs_for_plan(plan)
-            if isinstance(row, dict) and str(row.get("source") or "").strip().upper() == "SOP"
-        ]
+        sop_rows, policies = _sop_sources_for_plan(settings, plan, source_refs)
         projection = build_blended_schedule_projection(
             daily_rows,
             net_rows,
             sop_rows,
-            [],
+            policies,
             week_start_utc=_week_start_sunday_utc(datetime.datetime.now(datetime.timezone.utc)),
         )
         refs = _normalized_ref_items(projection.schedule_refs())
@@ -537,8 +569,9 @@ def reproject_frequency_plans_for_source_update(
             f"Reprojected after {category} source update "
             f"{datetime.datetime.now(datetime.timezone.utc).isoformat()}."
         )
-        updated.append(store.save_frequency_plan(payload))
-    return updated
+        updated.append(payload)
+    # Read/validate every dependency before persisting any replacement plan.
+    return [store.save_frequency_plan(payload) for payload in updated]
 
 
 def refresh_source_backed_frequency_plans(settings: Any) -> List[Dict[str, Any]]:
@@ -546,6 +579,7 @@ def refresh_source_backed_frequency_plans(settings: Any) -> List[Dict[str, Any]]
 
     store = MultiRadioStore()
     updated: List[Dict[str, Any]] = []
+    expected_by_id = {}
     for plan in store.list_frequency_plans():
         plan_id = int(plan.get("id", 0) or 0)
         if plan_id <= 0:
@@ -560,16 +594,12 @@ def refresh_source_backed_frequency_plans(settings: Any) -> List[Dict[str, Any]]
             continue
         daily_rows = _rows_for_dependency(settings, HF_DAILY_SOURCE_CATEGORY, daily_set_id) if daily_set_id else []
         net_rows = _rows_for_dependency(settings, HF_NET_SOURCE_CATEGORY, net_set_id) if net_set_id else []
-        sop_rows = [
-            dict(row)
-            for row in _schedule_refs_for_plan(plan)
-            if isinstance(row, dict) and str(row.get("source") or "").strip().upper() == "SOP"
-        ]
+        sop_rows, policies = _sop_sources_for_plan(settings, plan, source_refs)
         projection = build_blended_schedule_projection(
             daily_rows,
             net_rows,
             sop_rows,
-            [],
+            policies,
             week_start_utc=_week_start_sunday_utc(datetime.datetime.now(datetime.timezone.utc)),
         )
         refs = _normalized_ref_items(projection.schedule_refs())
@@ -592,8 +622,10 @@ def refresh_source_backed_frequency_plans(settings: Any) -> List[Dict[str, Any]]
         payload["notes"] = (
             f"Refreshed from source schedules {datetime.datetime.now(datetime.timezone.utc).isoformat()}."
         )
-        updated.append(store.save_frequency_plan(payload))
-    return updated
+        expected_by_id[plan_id] = dict(plan)
+        updated.append(payload)
+    return [store.save_frequency_plan(payload, expected=expected_by_id[int(payload["id"])])
+            for payload in updated]
 
 
 def source_sets_for_category(settings: Any, legacy_key: str, category: str) -> List[Dict[str, Any]]:

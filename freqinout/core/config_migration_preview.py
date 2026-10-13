@@ -106,9 +106,9 @@ def build_single_rig_upgrade_apply_plan(
     )
     blockers = []
     if not preview.backup_paths:
-        blockers.append("No FIO configuration path is available to back up before migration.")
+        blockers.append("No CommsPlan configuration path is available to back up before migration.")
     elif not Path(preview.backup_paths[0]).exists():
-        blockers.append("FIO configuration path does not exist, so it cannot be backed up before migration.")
+        blockers.append("CommsPlan configuration path does not exist, so it cannot be backed up before migration.")
     if not str(preview.radio_profile.get("name", "") or "").strip():
         blockers.append("A first radio name is required before migration.")
     return SingleRigUpgradeApplyPlan(
@@ -184,7 +184,7 @@ def _preview_warnings(
     warnings = []
     control_backend = str(radio_profile.get("control_backend", "") or "manual").strip().lower()
     if control_backend == "manual":
-        warnings.append("No radio control app is configured yet; FIO will create the radio as Manual control.")
+        warnings.append("No radio control app is configured yet; CommsPlan will create the radio as Manual control.")
     if "varac" not in roles:
         warnings.append("VarAC will remain disabled unless the operator enables it.")
     if referenced_paths_not_backed_up:
@@ -198,8 +198,8 @@ def _preview_summary(radio_profile: Mapping[str, Any], roles: Tuple[str, ...]) -
     control_label = _control_label(control_backend)
     role_labels = ", ".join(_role_label(role) for role in roles)
     if role_labels and role_labels != control_label:
-        return f"FIO will create first radio '{name}' using {control_label} with {role_labels}."
-    return f"FIO will create first radio '{name}' using {control_label}."
+        return f"CommsPlan will create first radio '{name}' using {control_label} with {role_labels}."
+    return f"CommsPlan will create first radio '{name}' using {control_label}."
 
 
 def _control_label(control_backend: str) -> str:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import re
 import sqlite3
@@ -9,6 +10,7 @@ import time
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Tuple
 
+from freqinout.core.commstat_brevity import brevity_metadata, cached_catalogs, analyze_brevity_codes
 from freqinout.core.commstat_sitrep import (
     commstat_origin_path,
     commstat_reach_mode,
@@ -516,6 +518,9 @@ def _insert_source_event(
     event_ts: float,
     event_ts_utc: str,
 ) -> bool:
+    if source.startswith("COMMSTAT"):
+        asset_dir = raw_payload.get("brevity_asset_dir") or (Path(source_db_path).parent if source_db_path else None)
+        raw_payload = {**raw_payload, **brevity_metadata(remarks_text, asset_dir)}
     cur = local_conn.cursor()
     cur.execute(
         """
@@ -672,7 +677,7 @@ def _commstat_metadata(
         "origin_path": commstat_origin_path(source_value),
         "remarks_text": str(remarks_text or "").strip(),
         "brevity_code": brevity_code,
-        "brevity_summary": decode_brevity_summary(brevity_code, asset_dir),
+        **brevity_metadata(remarks_text, asset_dir),
         "state_code": state_code,
         "state_confidence": state_confidence,
         "geo_confidence": geo_confidence,
@@ -768,6 +773,7 @@ def _upsert_commstat_statrep_artifact(
     subtype: str = "COMMSTAT_12",
     external_ids: Iterable[str] | None = None,
 ) -> None:
+    payload = {**payload, **brevity_metadata(remarks_text, payload.get("brevity_asset_dir"))}
     status_signature = _commstat_status_signature(status_payload)
     status_label = _commstat_status_label(status_payload)
     scope_txt = str(scope or "").strip()
@@ -830,6 +836,7 @@ def _upsert_commstat_message_artifact(
     external_ids: Iterable[str] | None = None,
 ) -> None:
     body = str(body_text or "").strip()
+    payload = {**payload, **brevity_metadata(body, payload.get("brevity_asset_dir"))}
     title = _preview_title(body, fallback="CommStat Message")
     upsert_commstat_artifact(
         local_conn,
@@ -1291,11 +1298,71 @@ def _ingest_js8spotter(local_conn: sqlite3.Connection, source_db: Path, *, setti
     return out
 
 
+def _refresh_commstat_brevity(local_conn, source_db, asset_dir, *, max_rows=250):
+    """Reinterpret bounded batches in FIO tables only; never alter receipt identity."""
+    if not asset_dir:
+        return 0
+    catalogs = cached_catalogs(asset_dir)
+    revision = hashlib.sha256(json.dumps(
+        [(key, value.get("_fio_fingerprint", "")) for key, value in sorted(catalogs.items())],
+        separators=(",", ":")
+    ).encode()).hexdigest() + ":adapter1"
+    owner = str(asset_dir)
+    source_key = "BREVITY_" + hashlib.sha256(str(source_db).encode()).hexdigest()[:24]
+    changed = 0
+    for table, payload_column, text_column in (
+        ("sitrep_source_events", "raw_payload", "remarks_text"),
+        ("commstat_artifacts", "payload_json", "body_text"),
+        ("sitrep_events", "raw_payload_json", "remarks_text"),
+    ):
+        if not _table_exists(local_conn, table):
+            continue
+        cursor = _get_last_id(local_conn, source_key, table, revision)
+        rows = local_conn.execute(
+            f"SELECT id, {payload_column}, {text_column} FROM {table} WHERE id>? ORDER BY id LIMIT ?",
+            (cursor, max(1, min(int(max_rows), 250))),
+        ).fetchall()
+        for row_id, raw, text in rows:
+            cursor = int(row_id)
+            try:
+                payload = json.loads(raw or "{}")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, dict) or payload.get("brevity_asset_dir") != owner:
+                continue  # Another profile's catalog must never reinterpret this receipt.
+            records = analyze_brevity_codes(text, catalogs)
+            derived = {"brevity_models": records, "brevity_asset_dir": owner,
+                       "brevity_code": records[-1]["code"] if records else "",
+                       "brevity_summary": "\n".join(r["summary"] for r in records)}
+            if all(payload.get(key) == value for key, value in derived.items()):
+                continue
+            payload.update(derived)
+            columns = [f"{payload_column}=?"]
+            params = [json.dumps(payload, separators=(",", ":"), ensure_ascii=True)]
+            if table != "commstat_artifacts":
+                columns += ["brevity_code=?", "brevity_summary=?"]
+                params += [derived["brevity_code"], derived["brevity_summary"]]
+            if table != "sitrep_source_events":
+                columns += ["updated_ts=?"]
+                params += [time.time()]
+            local_conn.execute(f"UPDATE {table} SET {', '.join(columns)} WHERE id=?", (*params, row_id))
+            if table == "sitrep_events" and _table_exists(local_conn, "sitrep_latest_by_callsign"):
+                local_conn.execute(
+                    "UPDATE sitrep_latest_by_callsign SET latest_brevity_code=?, latest_brevity_summary=? WHERE latest_event_id=?",
+                    (derived["brevity_code"], derived["brevity_summary"], row_id),
+                )
+            changed += 1
+        if rows or cursor == 0:
+            _set_last_id(local_conn, source_key, table, revision, cursor)
+    return changed
+
+
 def _ingest_commstat3(local_conn: sqlite3.Connection, source_db: Path, *, max_rows: int) -> Dict[str, int]:
     out = {"rows_scanned": 0, "events_inserted": 0, "errors": 0}
     source = "COMMSTAT3"
     source_db_path = str(source_db)
     asset_dir = _commstat_asset_dir(source_db)
+    _refresh_commstat_brevity(local_conn, source_db, asset_dir, max_rows=max_rows)
     health_key = "commstat:db:3"
     started = time.monotonic()
     try:
@@ -1372,6 +1439,7 @@ def _ingest_commstat3(local_conn: sqlite3.Connection, source_db: Path, *, max_ro
                         "source": row[6],
                         "source_value": row[6],
                         "global_id": global_id,
+                        **brevity_metadata(remarks_text, asset_dir),
                         "origin_path": metadata["origin_path"],
                         "reach_mode": metadata["reach_mode"],
                         "sr_id": str(row[7] or ""),
@@ -1472,7 +1540,8 @@ def _ingest_commstat3(local_conn: sqlite3.Connection, source_db: Path, *, max_ro
                         )
                     if parsed:
                         metadata = dict(parsed.get("metadata") or {})
-                        raw_payload = dict(parsed.get("raw_payload") or {})
+                        raw_payload = {**dict(parsed.get("raw_payload") or {}),
+                                       **{k: metadata[k] for k in ("brevity_models", "brevity_asset_dir") if k in metadata}}
                         raw_payload.update(
                             {
                                 "datetime": str(row[1] or ""),
@@ -1554,6 +1623,7 @@ def _ingest_commstat3(local_conn: sqlite3.Connection, source_db: Path, *, max_ro
                             "freq": row[3],
                             "db": row[4],
                             "source_value": row[5],
+                            "brevity_asset_dir": str(asset_dir or ""),
                             "origin_path": metadata.get("origin_path", ""),
                             "reach_mode": metadata.get("reach_mode", ""),
                             "msg_id": str(row[6] or ""),
@@ -1641,6 +1711,7 @@ def _ingest_commstat3(local_conn: sqlite3.Connection, source_db: Path, *, max_ro
                             "freq": row[3],
                             "db": row[4],
                             "source_value": row[5],
+                            "brevity_asset_dir": str(asset_dir or ""),
                             "origin_path": metadata.get("origin_path", ""),
                             "reach_mode": metadata.get("reach_mode", ""),
                             "alert_id": str(row[6] or ""),
@@ -1664,6 +1735,7 @@ def _ingest_commstat23(local_conn: sqlite3.Connection, source_db: Path, *, max_r
     source = "COMMSTAT23"
     source_db_path = str(source_db)
     asset_dir = _commstat_asset_dir(source_db)
+    _refresh_commstat_brevity(local_conn, source_db, asset_dir, max_rows=max_rows)
     health_key = "commstat:db:23"
     started = time.monotonic()
     try:
@@ -1789,6 +1861,7 @@ def _ingest_commstat23(local_conn: sqlite3.Connection, source_db: Path, *, max_r
                 payload={
                     "source": source,
                     "source_table": table,
+                    "brevity_asset_dir": str(asset_dir or ""),
                     "datetime": str(row[1] or ""),
                     "date": str(row[2] or ""),
                     "freq": row[3],

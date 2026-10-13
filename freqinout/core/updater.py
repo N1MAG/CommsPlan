@@ -196,7 +196,7 @@ def check_for_update() -> Tuple[bool, Optional[str], Optional[str]]:
     return False, remote, changelog
 
 def run_interactive_update() -> None:
-    print(f"FreqInOut current version: {LOCAL_VERSION}")
+    print(f"CommsPlan current version: {LOCAL_VERSION}")
     available, remote, changelog = check_for_update()
     if not available:
         print("No update available.")
@@ -218,6 +218,6 @@ def run_interactive_update() -> None:
         return
     install_dir = Path(__file__).resolve().parents[2]
     if apply_update_archive(archive, install_dir):
-        print("Update applied. Restart FreqInOut.")
+        print("Update applied. Restart CommsPlan.")
     else:
         print("Update failed. See log.")

@@ -254,7 +254,7 @@ class LogViewerTab(QWidget):
             text = b"".join(reversed(chunks)).decode("utf-8", errors="replace")
             return tuple(text.splitlines(keepends=True)[-max_lines:])
         except FileNotFoundError:
-            return ("No log file yet. Use FreqInOut a bit first.\n",)
+            return ("No log file yet. Use CommsPlan a bit first.\n",)
 
     def _ensure_snapshot_worker(self) -> SnapshotWorkerController:
         worker = self._snapshot_worker

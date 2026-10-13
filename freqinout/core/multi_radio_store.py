@@ -5,6 +5,7 @@ import json
 import re
 import sqlite3
 import threading
+import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
@@ -20,6 +21,13 @@ from freqinout.core.js8_storage import (
 )
 from freqinout.core.logger import log
 from freqinout.core.receiver_control import receiver_control_verification_matches
+from freqinout.core.radio_hardware_binding import (
+    HARDWARE_BINDING_SCHEMA_VERSION,
+    HARDWARE_ROLES,
+    HardwareBindingError,
+    match_hardware_selector,
+    normalize_hardware_binding,
+)
 from freqinout.core.receiver_software_stack import RECEIVE_ONLY_EXECUTION_SCOPE
 from freqinout.core.software_instance_manifest import (
     find_manifest_conflicts,
@@ -52,6 +60,7 @@ MULTI_RIG_MIGRATION_DEFERRED_KEY = "multi_rig_migration_deferred"
 MULTI_RIG_MIGRATION_COMPLETED_AT_KEY = "multi_rig_migration_completed_at_utc"
 MULTI_RIG_MIGRATION_SUMMARY_PREFIX = "multi_rig_migration_summary_v"
 CURRENT_MULTI_RIG_MIGRATION_VERSION = 3
+RADIO_HARDWARE_SCHEMA_VERSION_KEY = "radio_hardware_schema_version"
 
 SUPPORTED_DEVICE_CONTROL_BACKENDS = frozenset({"flrig", "js8call", "manual", "rigctld"})
 # Keep the runtime compatibility projection aligned with 1.2.2.
@@ -147,6 +156,9 @@ MIRRORED_LEGACY_KEYS = frozenset(
         "varac_bbs_limit_access_enabled",
         "varac_bbs_allowed_callsigns",
         "varac_bbs_allowed_group_sources",
+        "varac_guard_access_policy_v1",
+        "varac_guard_allow_bbs_allowed_callsigns",
+        "varac_guard_allow_operator_trusted",
         "varac_bbs_announce_enabled",
         "varac_bbs_vault_enabled",
         "varac_bbs_vault_managed_root",
@@ -194,6 +206,7 @@ FIO_EXISTING_USE_IGNORED_KEYS = frozenset(
         MULTI_RIG_MIGRATION_DEFERRED_KEY,
         FIRST_RUN_ONBOARDING_ACK_KEY,
         "multi_rig_shared_state_schema_version",
+        RADIO_HARDWARE_SCHEMA_VERSION_KEY,
         "autoquery_keys_purged_v1",
         "timezone",
     }
@@ -281,6 +294,9 @@ SETTINGS_TABLE_SPECS: Dict[str, Dict[str, object]] = {
             varac_bbs_limit_access_enabled INTEGER NOT NULL DEFAULT 0,
             varac_bbs_allowed_callsigns TEXT,
             varac_bbs_allowed_group_sources TEXT,
+            varac_guard_access_policy_v1 TEXT,
+            varac_guard_allow_bbs_allowed_callsigns INTEGER,
+            varac_guard_allow_operator_trusted INTEGER,
             varac_bbs_announce_enabled INTEGER NOT NULL DEFAULT 0,
             varac_bbs_auto_archive_enabled INTEGER NOT NULL DEFAULT 0,
             varac_bbs_auto_archive_days INTEGER NOT NULL DEFAULT 14,
@@ -389,6 +405,9 @@ SETTINGS_TABLE_SPECS: Dict[str, Dict[str, object]] = {
             "varac_bbs_limit_access_enabled": "INTEGER NOT NULL DEFAULT 0",
             "varac_bbs_allowed_callsigns": "TEXT",
             "varac_bbs_allowed_group_sources": "TEXT",
+            "varac_guard_access_policy_v1": "TEXT",
+            "varac_guard_allow_bbs_allowed_callsigns": "INTEGER",
+            "varac_guard_allow_operator_trusted": "INTEGER",
             "varac_bbs_announce_enabled": "INTEGER NOT NULL DEFAULT 0",
             "varac_bbs_auto_archive_enabled": "INTEGER NOT NULL DEFAULT 0",
             "varac_bbs_auto_archive_days": "INTEGER NOT NULL DEFAULT 14",
@@ -832,6 +851,110 @@ SETTINGS_TABLE_SPECS: Dict[str, Dict[str, object]] = {
         "indexes": (
             "CREATE INDEX IF NOT EXISTS idx_radio_software_identity_order ON radio_software_identity_records(radio_profile_id, display_order)",
             "CREATE INDEX IF NOT EXISTS idx_radio_software_identity_bundle ON radio_software_identity_records(bundle_id)",
+        ),
+    },
+    "radio_hardware_bundles": {
+        "ddl": """
+        CREATE TABLE IF NOT EXISTS radio_hardware_bundles (
+            radio_profile_id INTEGER PRIMARY KEY,
+            bundle_key TEXT NOT NULL UNIQUE,
+            schema_version INTEGER NOT NULL DEFAULT 1,
+            generation INTEGER NOT NULL DEFAULT 0,
+            lifecycle_state TEXT NOT NULL DEFAULT 'configured',
+            aggregate_state TEXT NOT NULL DEFAULT 'unverified',
+            source TEXT NOT NULL DEFAULT 'operator_confirmed',
+            recovery_json TEXT NOT NULL DEFAULT '{}',
+            last_verified_utc TEXT,
+            created_utc TEXT NOT NULL,
+            updated_utc TEXT NOT NULL,
+            FOREIGN KEY(radio_profile_id) REFERENCES device_profiles(id) ON DELETE CASCADE
+        )
+        """,
+        "columns": {
+            "bundle_key": "TEXT NOT NULL DEFAULT ''",
+            "schema_version": "INTEGER NOT NULL DEFAULT 1",
+            "generation": "INTEGER NOT NULL DEFAULT 0",
+            "lifecycle_state": "TEXT NOT NULL DEFAULT 'configured'",
+            "aggregate_state": "TEXT NOT NULL DEFAULT 'unverified'",
+            "source": "TEXT NOT NULL DEFAULT 'operator_confirmed'",
+            "recovery_json": "TEXT NOT NULL DEFAULT '{}'",
+            "last_verified_utc": "TEXT",
+            "created_utc": "TEXT NOT NULL DEFAULT ''",
+            "updated_utc": "TEXT NOT NULL DEFAULT ''",
+        },
+        "indexes": (
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_radio_hardware_bundle_key ON radio_hardware_bundles(bundle_key)",
+            "CREATE INDEX IF NOT EXISTS idx_radio_hardware_bundle_state ON radio_hardware_bundles(lifecycle_state, aggregate_state)",
+        ),
+    },
+    "radio_hardware_bindings": {
+        "ddl": """
+        CREATE TABLE IF NOT EXISTS radio_hardware_bindings (
+            binding_key TEXT PRIMARY KEY,
+            bundle_key TEXT NOT NULL,
+            radio_profile_id INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            platform TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            transport TEXT NOT NULL,
+            selector_json TEXT NOT NULL,
+            selector_fingerprint TEXT NOT NULL,
+            claim_key TEXT NOT NULL,
+            label TEXT,
+            observed_locator_json TEXT NOT NULL DEFAULT '{}',
+            match_state TEXT NOT NULL DEFAULT 'missing',
+            stability_class TEXT NOT NULL,
+            required INTEGER NOT NULL DEFAULT 1,
+            transmit_capable INTEGER NOT NULL DEFAULT 0,
+            desired_fingerprint TEXT,
+            observed_fingerprint TEXT,
+            verified_fingerprint TEXT,
+            verification_state TEXT NOT NULL DEFAULT 'unverified',
+            evidence_json TEXT NOT NULL DEFAULT '{}',
+            last_verified_utc TEXT,
+            last_error TEXT,
+            active INTEGER NOT NULL DEFAULT 1,
+            created_utc TEXT NOT NULL,
+            updated_utc TEXT NOT NULL,
+            retired_utc TEXT,
+            FOREIGN KEY(radio_profile_id) REFERENCES device_profiles(id) ON DELETE CASCADE,
+            FOREIGN KEY(bundle_key) REFERENCES radio_hardware_bundles(bundle_key) ON DELETE CASCADE
+        )
+        """,
+        "columns": {
+            "bundle_key": "TEXT NOT NULL DEFAULT ''",
+            "radio_profile_id": "INTEGER NOT NULL DEFAULT 0",
+            "role": "TEXT NOT NULL DEFAULT ''",
+            "generation": "INTEGER NOT NULL DEFAULT 0",
+            "platform": "TEXT NOT NULL DEFAULT ''",
+            "provider": "TEXT NOT NULL DEFAULT ''",
+            "transport": "TEXT NOT NULL DEFAULT ''",
+            "selector_json": "TEXT NOT NULL DEFAULT '{}'",
+            "selector_fingerprint": "TEXT NOT NULL DEFAULT ''",
+            "claim_key": "TEXT NOT NULL DEFAULT ''",
+            "label": "TEXT",
+            "observed_locator_json": "TEXT NOT NULL DEFAULT '{}'",
+            "match_state": "TEXT NOT NULL DEFAULT 'missing'",
+            "stability_class": "TEXT NOT NULL DEFAULT 'stable'",
+            "required": "INTEGER NOT NULL DEFAULT 1",
+            "transmit_capable": "INTEGER NOT NULL DEFAULT 0",
+            "desired_fingerprint": "TEXT",
+            "observed_fingerprint": "TEXT",
+            "verified_fingerprint": "TEXT",
+            "verification_state": "TEXT NOT NULL DEFAULT 'unverified'",
+            "evidence_json": "TEXT NOT NULL DEFAULT '{}'",
+            "last_verified_utc": "TEXT",
+            "last_error": "TEXT",
+            "active": "INTEGER NOT NULL DEFAULT 1",
+            "created_utc": "TEXT NOT NULL DEFAULT ''",
+            "updated_utc": "TEXT NOT NULL DEFAULT ''",
+            "retired_utc": "TEXT",
+        },
+        "indexes": (
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_radio_hardware_active_role ON radio_hardware_bindings(radio_profile_id, role) WHERE active=1",
+            "CREATE INDEX IF NOT EXISTS idx_radio_hardware_active_claim ON radio_hardware_bindings(claim_key, active)",
+            "CREATE INDEX IF NOT EXISTS idx_radio_hardware_bundle_generation ON radio_hardware_bindings(bundle_key, generation)",
         ),
     },
     "operating_profiles": {
@@ -3115,6 +3238,13 @@ def ensure_multi_radio_settings_schema(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
         for index_sql in tuple(spec["indexes"]):
             conn.execute(str(index_sql))
+    conn.execute(
+        """
+        INSERT INTO kv(key, value) VALUES(?, ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """,
+        (RADIO_HARDWARE_SCHEMA_VERSION_KEY, json.dumps(HARDWARE_BINDING_SCHEMA_VERSION)),
+    )
     conn.commit()
 
 
@@ -4722,6 +4852,13 @@ def _legacy_settings_projection_from_device(
         if use_varac
         else False,
         "varac_bbs_allowed_callsigns": _coerce_text(device_profile.get("varac_bbs_allowed_callsigns", ""), "") if use_varac else "",
+        "varac_guard_access_policy_v1": _coerce_text(device_profile.get("varac_guard_access_policy_v1", ""), ""),
+        "varac_guard_allow_bbs_allowed_callsigns": _coerce_bool_int(
+            device_profile.get("varac_guard_allow_bbs_allowed_callsigns") if device_profile.get("varac_guard_allow_bbs_allowed_callsigns") is not None
+            else existing_settings.get("varac_guard_allow_bbs_allowed_callsigns", True), True),
+        "varac_guard_allow_operator_trusted": _coerce_bool_int(
+            device_profile.get("varac_guard_allow_operator_trusted") if device_profile.get("varac_guard_allow_operator_trusted") is not None
+            else existing_settings.get("varac_guard_allow_operator_trusted", True), True),
         "varac_bbs_allowed_group_sources": _coerce_text(
             device_profile.get("varac_bbs_allowed_group_sources", ""),
             "",
@@ -5213,6 +5350,9 @@ def _seed_device_defaults(
         ),
         "varac_bbs_allowed_callsigns": _settings_text(settings_values, "varac_bbs_allowed_callsigns", ""),
         "varac_bbs_allowed_group_sources": _settings_text(settings_values, "varac_bbs_allowed_group_sources", ""),
+        "varac_guard_access_policy_v1": _settings_text(settings_values, "varac_guard_access_policy_v1", ""),
+        "varac_guard_allow_bbs_allowed_callsigns": _coerce_bool_int(settings_values["varac_guard_allow_bbs_allowed_callsigns"], True) if "varac_guard_allow_bbs_allowed_callsigns" in settings_values else None,
+        "varac_guard_allow_operator_trusted": _coerce_bool_int(settings_values["varac_guard_allow_operator_trusted"], True) if "varac_guard_allow_operator_trusted" in settings_values else None,
         "varac_bbs_announce_enabled": _coerce_bool_int(
             settings_values.get("varac_bbs_announce_enabled"),
             False,
@@ -5915,6 +6055,9 @@ def mirror_legacy_settings_into_runtime_active_device(
         ),
         "varac_bbs_allowed_callsigns": _settings_text(settings_values, "varac_bbs_allowed_callsigns", ""),
         "varac_bbs_allowed_group_sources": _settings_text(settings_values, "varac_bbs_allowed_group_sources", ""),
+        "varac_guard_access_policy_v1": _settings_text(settings_values, "varac_guard_access_policy_v1", ""),
+        "varac_guard_allow_bbs_allowed_callsigns": _coerce_bool_int(settings_values["varac_guard_allow_bbs_allowed_callsigns"], True) if "varac_guard_allow_bbs_allowed_callsigns" in settings_values else None,
+        "varac_guard_allow_operator_trusted": _coerce_bool_int(settings_values["varac_guard_allow_operator_trusted"], True) if "varac_guard_allow_operator_trusted" in settings_values else None,
         "varac_bbs_announce_enabled": _coerce_bool_int(
             settings_values.get("varac_bbs_announce_enabled"),
             False,
@@ -6510,7 +6653,7 @@ class MultiRadioStore:
                 if proposed_id is None:
                     raise ValueError(
                         f"Use disassociate_software_instance() to remove the {family.replace('_', ' ')} "
-                        "assignment and its FIO launch links."
+                        "assignment and its CommsPlan launch links."
                     )
                 raise ValueError(
                     f"Use adopt_software_instance(..., replace_existing=True) to explicitly replace "
@@ -6687,6 +6830,19 @@ class MultiRadioStore:
                     (existing or {}).get("varac_bbs_allowed_callsigns", ""),
                 ),
                 "",
+            ),
+            "varac_guard_access_policy_v1": _coerce_text(
+                payload.get("varac_guard_access_policy_v1", (existing or {}).get("varac_guard_access_policy_v1", "")), "",
+            ),
+            "varac_guard_allow_bbs_allowed_callsigns": (
+                (_coerce_bool_int(payload["varac_guard_allow_bbs_allowed_callsigns"], True) if payload["varac_guard_allow_bbs_allowed_callsigns"] is not None else None)
+                if "varac_guard_allow_bbs_allowed_callsigns" in payload
+                else (existing or {}).get("varac_guard_allow_bbs_allowed_callsigns")
+            ),
+            "varac_guard_allow_operator_trusted": (
+                (_coerce_bool_int(payload["varac_guard_allow_operator_trusted"], True) if payload["varac_guard_allow_operator_trusted"] is not None else None)
+                if "varac_guard_allow_operator_trusted" in payload
+                else (existing or {}).get("varac_guard_allow_operator_trusted")
             ),
             "varac_bbs_allowed_group_sources": _coerce_text(
                 payload.get(
@@ -7277,8 +7433,17 @@ class MultiRadioStore:
         with self._connect_readonly() as conn:
             return _record_by_id(conn, "frequency_plans", int(frequency_plan_id))
 
-    def save_frequency_plan(self, values: Mapping[str, Any]) -> Dict[str, Any]:
+    def save_frequency_plan(self, values: Mapping[str, Any], *,
+                            expected: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
         with self._connect() as conn:
+            if expected is not None:
+                # Source materialization must not overwrite a plan edited while
+                # its expensive projection was computed. Hold only the short
+                # compare/write transaction, never the projection itself.
+                conn.execute("BEGIN IMMEDIATE")
+                current = _record_by_id(conn, "frequency_plans", int(values.get("id") or 0))
+                if current != dict(expected):
+                    raise ValueError("Frequency Plan changed during source projection; retry required")
             payload = dict(values)
             record_id = _coerce_optional_int(payload.get("id"))
             if record_id is not None:
@@ -8382,7 +8547,7 @@ class MultiRadioStore:
                     arq_port = reserved
                     break
         if not arq_port:
-            raise ValueError("FIO could not allocate a distinct FLAmp ARQ port for this radio.")
+            raise ValueError("CommsPlan could not allocate a distinct FLAmp ARQ port for this radio.")
 
         launch_bundle = self.get_radio_launch_bundle(radio_id)
         if legacy_bootstrap:
@@ -9952,6 +10117,57 @@ class MultiRadioStore:
         with self._connect() as conn:
             return _save_js8_instance_conn(conn, values)
 
+    def update_radio_js8_offset(
+        self,
+        radio_profile_id: int,
+        offset_hz: int,
+        *,
+        expected_instance_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Atomically update only the assigned JS8Call default offset.
+
+        This intentionally does not contact JS8Call or any radio. Runtime
+        enforcement observes the committed per-radio value later and remains
+        subject to the scheduler's TX/busy interlocks.
+        """
+
+        radio_id = int(radio_profile_id or 0)
+        offset = int(offset_hz or 0)
+        if not 1800 <= offset <= 2700:
+            raise ValueError("JS8Call offset must be from 1800 through 2700 Hz.")
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                profile = _record_by_id(conn, "device_profiles", radio_id)
+                if profile is None:
+                    raise KeyError(f"Unknown radio profile id: {radio_id}")
+                instance_id = _coerce_optional_int(profile.get("js8_instance_id"))
+                if instance_id is None:
+                    raise ValueError("This radio does not have an assigned JS8Call instance.")
+                if (
+                    expected_instance_id is not None
+                    and int(expected_instance_id) != int(instance_id)
+                ):
+                    raise ValueError(
+                        "The radio's JS8Call assignment changed. Refresh before changing its offset."
+                    )
+                instance = _record_by_id(conn, "js8_instances", int(instance_id))
+                if instance is None:
+                    raise KeyError(f"Unknown JS8Call instance id: {instance_id}")
+                now_iso = _utc_now_iso()
+                conn.execute(
+                    "UPDATE js8_instances SET offset_hz=?, updated_utc=? WHERE id=?",
+                    (offset, now_iso, int(instance_id)),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        saved = self.get_device_profile(radio_id)
+        if not isinstance(saved, dict):
+            raise RuntimeError("Updated radio profile could not be read back.")
+        return saved
+
     def delete_js8_instance(self, js8_instance_id: int) -> None:
         with self._connect() as conn:
             row = _record_by_id(conn, "js8_instances", int(js8_instance_id))
@@ -10498,6 +10714,7 @@ class MultiRadioStore:
         writer_key: str,
         targets: Any,
         desired: Any,
+        exclusive: bool = False,
     ) -> Dict[str, Any]:
         """Durably record intent before any third-party VarAC file is touched."""
 
@@ -10508,6 +10725,10 @@ class MultiRadioStore:
             raise ValueError("Native VarAC apply journal identity is incomplete.")
         now_iso = _utc_now_iso()
         with self._open_connection() as conn:
+            if exclusive:
+                conn.execute("BEGIN IMMEDIATE")
+                if conn.execute("SELECT 1 FROM varac_native_apply_journal WHERE state NOT IN ('complete','rolled_back') LIMIT 1").fetchone():
+                    raise RuntimeError("Another native VarAC apply or recovery is pending")
             conn.execute(
                 """
                 INSERT INTO varac_native_apply_journal (
@@ -10624,6 +10845,353 @@ class MultiRadioStore:
         """Return recovery work that must block affected managed VarAC launches."""
 
         return self.list_unfinished_varac_native_applies()
+
+    @staticmethod
+    def _decode_radio_hardware_binding_row(row: Mapping[str, Any]) -> Dict[str, Any]:
+        data = dict(row)
+        for column, target in (
+            ("selector_json", "selector"),
+            ("observed_locator_json", "observed_locator"),
+            ("evidence_json", "evidence"),
+        ):
+            try:
+                parsed = json.loads(str(data.get(column, "") or "{}"))
+            except (TypeError, ValueError):
+                parsed = {}
+            data[target] = dict(parsed) if isinstance(parsed, Mapping) else {}
+        data["required"] = bool(int(data.get("required", 0) or 0))
+        data["transmit_capable"] = bool(int(data.get("transmit_capable", 0) or 0))
+        data["active"] = bool(int(data.get("active", 0) or 0))
+        return data
+
+    @classmethod
+    def _radio_hardware_bundle_conn(
+        cls,
+        conn: sqlite3.Connection,
+        radio_profile_id: int,
+        *,
+        include_retired: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        bundle_row = conn.execute(
+            "SELECT * FROM radio_hardware_bundles WHERE radio_profile_id=?",
+            (int(radio_profile_id),),
+        ).fetchone()
+        if bundle_row is None:
+            return None
+        bundle = dict(bundle_row)
+        try:
+            recovery = json.loads(str(bundle.get("recovery_json", "") or "{}"))
+        except (TypeError, ValueError):
+            recovery = {}
+        bundle["recovery"] = dict(recovery) if isinstance(recovery, Mapping) else {}
+        active_clause = "" if include_retired else " AND active=1"
+        rows = conn.execute(
+            "SELECT * FROM radio_hardware_bindings WHERE radio_profile_id=?"
+            f"{active_clause} ORDER BY generation DESC, role ASC, created_utc ASC",
+            (int(radio_profile_id),),
+        ).fetchall()
+        bundle["bindings"] = [cls._decode_radio_hardware_binding_row(dict(row)) for row in rows]
+        return bundle
+
+    def get_radio_hardware_bundle(
+        self,
+        radio_profile_id: int,
+        *,
+        include_retired: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the radio-owned hardware bundle without resolving OS devices."""
+
+        with self._connect_readonly() as conn:
+            return self._radio_hardware_bundle_conn(
+                conn,
+                int(radio_profile_id),
+                include_retired=include_retired,
+            )
+
+    def list_radio_hardware_bundles(self) -> List[Dict[str, Any]]:
+        """Return configured bundles; legacy radios intentionally have no row."""
+
+        with self._connect_readonly() as conn:
+            radio_ids = [
+                int(row[0])
+                for row in conn.execute(
+                    "SELECT radio_profile_id FROM radio_hardware_bundles ORDER BY radio_profile_id"
+                ).fetchall()
+            ]
+            return [
+                bundle
+                for radio_id in radio_ids
+                if (bundle := self._radio_hardware_bundle_conn(conn, radio_id)) is not None
+            ]
+
+    def save_radio_hardware_bundle(
+        self,
+        radio_profile_id: int,
+        bindings: Iterable[Mapping[str, Any]],
+        *,
+        expected_generation: Optional[int] = None,
+        source: str = "operator_confirmed",
+    ) -> Dict[str, Any]:
+        """Atomically replace one reviewed radio hardware bundle.
+
+        This stores identity only.  It does not enumerate hardware, open a
+        device, change application-native files, launch software, or control a
+        radio.  Existing bundles require an expected generation so a stale UI
+        draft cannot overwrite a newer operator choice.
+        """
+
+        radio_id = int(radio_profile_id)
+        normalized = [normalize_hardware_binding(binding) for binding in bindings]
+        if not normalized:
+            raise HardwareBindingError("At least one reviewed hardware assignment is required.")
+        roles = [str(binding["role"]) for binding in normalized]
+        if len(set(roles)) != len(roles):
+            raise HardwareBindingError("A radio can have only one active assignment for each hardware role.")
+        if any(role not in HARDWARE_ROLES for role in roles):
+            raise HardwareBindingError("The hardware bundle contains an unsupported role.")
+
+        now_iso = _utc_now_iso()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                radio = _record_by_id(conn, "device_profiles", radio_id)
+                if radio is None:
+                    raise KeyError(f"Unknown radio profile id: {radio_id}")
+                observer_profile = _is_observer_device_class(radio)
+                if observer_profile and any(role in {"ptt", "audio_tx"} for role in roles):
+                    raise HardwareBindingError(
+                        "Observer / SDR profiles are receive-only and cannot own PTT or transmit-audio hardware."
+                    )
+                if not observer_profile and any(
+                    binding["role"] == "audio_rx" and binding["transport"] == "pulse-monitor"
+                    for binding in normalized
+                ):
+                    raise HardwareBindingError(
+                        "A monitor or virtual audio source may be assigned only to an "
+                        "Observer / SDR receive-only profile."
+                    )
+                existing_row = conn.execute(
+                    "SELECT * FROM radio_hardware_bundles WHERE radio_profile_id=?",
+                    (radio_id,),
+                ).fetchone()
+                existing = dict(existing_row) if existing_row is not None else None
+                current_generation = int((existing or {}).get("generation", 0) or 0)
+                if existing is not None and expected_generation is None:
+                    raise HardwareBindingError(
+                        "Updating a hardware assignment requires its current generation. Refresh and try again."
+                    )
+                if expected_generation is not None and int(expected_generation) != current_generation:
+                    raise HardwareBindingError(
+                        f"The hardware assignment changed after review (expected generation {int(expected_generation)}, "
+                        f"found {current_generation}). Refresh and review again."
+                    )
+
+                for binding in normalized:
+                    conflicts = conn.execute(
+                        """
+                        SELECT b.role, b.radio_profile_id, b.claim_key,
+                               b.selector_json, d.name AS radio_name
+                          FROM radio_hardware_bindings AS b
+                          JOIN device_profiles AS d ON d.id=b.radio_profile_id
+                         WHERE b.active=1
+                           AND b.radio_profile_id<>?
+                           AND b.platform=?
+                           AND b.provider=?
+                           AND b.transport=?
+                      ORDER BY LOWER(d.name), b.role
+                        """,
+                        (
+                            radio_id,
+                            binding["platform"],
+                            binding["provider"],
+                            binding["transport"],
+                        ),
+                    ).fetchall()
+                    conflict = None
+                    for row in conflicts:
+                        candidate = dict(row)
+                        try:
+                            saved_selector = json.loads(
+                                str(candidate.get("selector_json", "") or "{}")
+                            )
+                        except (TypeError, ValueError):
+                            saved_selector = {}
+                        same_claim = str(candidate.get("claim_key", "") or "") == str(
+                            binding["claim_key"]
+                        )
+                        semantic_match = False
+                        if isinstance(saved_selector, Mapping) and saved_selector:
+                            semantic_match = (
+                                match_hardware_selector(
+                                    saved_selector,
+                                    ({"selector": binding["selector"]},),
+                                ).state
+                                == "exact"
+                                or match_hardware_selector(
+                                    binding["selector"],
+                                    ({"selector": saved_selector},),
+                                ).state
+                                == "exact"
+                            )
+                        if same_claim or semantic_match:
+                            conflict = candidate
+                            break
+                    if conflict is not None:
+                        raise HardwareBindingError(
+                            f"{binding['role'].upper()} hardware is already assigned to "
+                            f"{str(conflict.get('radio_name', '') or 'another radio')} "
+                            f"as {str(conflict.get('role', '') or 'hardware').upper()}. "
+                            "Choose another device or edit that radio's Connections assignment."
+                        )
+
+                generation = current_generation + 1
+                bundle_key = str((existing or {}).get("bundle_key", "") or "").strip()
+                if not bundle_key:
+                    bundle_key = f"radio-hardware:{radio_id}:{uuid.uuid4().hex}"
+                previous_rows = conn.execute(
+                    "SELECT binding_key FROM radio_hardware_bindings WHERE radio_profile_id=? AND active=1",
+                    (radio_id,),
+                ).fetchall()
+                previous_keys = [str(row[0]) for row in previous_rows]
+                recovery = {
+                    "prior_generation": current_generation,
+                    "prior_binding_keys": previous_keys,
+                }
+                conn.execute(
+                    """
+                    INSERT INTO radio_hardware_bundles (
+                        radio_profile_id, bundle_key, schema_version, generation,
+                        lifecycle_state, aggregate_state, source, recovery_json,
+                        last_verified_utc, created_utc, updated_utc
+                    ) VALUES (?, ?, ?, ?, 'configured', 'unverified', ?, ?, NULL, ?, ?)
+                    ON CONFLICT(radio_profile_id) DO UPDATE SET
+                        schema_version=excluded.schema_version,
+                        generation=excluded.generation,
+                        lifecycle_state='configured',
+                        aggregate_state='unverified',
+                        source=excluded.source,
+                        recovery_json=excluded.recovery_json,
+                        last_verified_utc=NULL,
+                        updated_utc=excluded.updated_utc
+                    """,
+                    (
+                        radio_id,
+                        bundle_key,
+                        HARDWARE_BINDING_SCHEMA_VERSION,
+                        generation,
+                        str(source or "operator_confirmed").strip() or "operator_confirmed",
+                        json.dumps(recovery, sort_keys=True),
+                        now_iso,
+                        now_iso,
+                    ),
+                )
+                conn.execute(
+                    """
+                    UPDATE radio_hardware_bindings
+                       SET active=0, retired_utc=?, updated_utc=?
+                     WHERE radio_profile_id=? AND active=1
+                    """,
+                    (now_iso, now_iso, radio_id),
+                )
+                for binding in normalized:
+                    binding_key = f"hardware-binding:{uuid.uuid4().hex}"
+                    conn.execute(
+                        """
+                        INSERT INTO radio_hardware_bindings (
+                            binding_key, bundle_key, radio_profile_id, role,
+                            generation, platform, provider, transport,
+                            selector_json, selector_fingerprint, claim_key, label,
+                            observed_locator_json, match_state, stability_class,
+                            required, transmit_capable, desired_fingerprint,
+                            observed_fingerprint, verified_fingerprint,
+                            verification_state, evidence_json, last_verified_utc,
+                            last_error, active, created_utc, updated_utc, retired_utc
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'missing', ?, ?, ?, ?, NULL, NULL,
+                                  'unverified', '{}', NULL, NULL, 1, ?, ?, NULL)
+                        """,
+                        (
+                            binding_key,
+                            bundle_key,
+                            radio_id,
+                            binding["role"],
+                            generation,
+                            binding["platform"],
+                            binding["provider"],
+                            binding["transport"],
+                            json.dumps(binding["selector"], sort_keys=True),
+                            binding["selector_fingerprint"],
+                            binding["claim_key"],
+                            binding["label"] or None,
+                            json.dumps(binding["observed_locator"], sort_keys=True),
+                            binding["stability_class"],
+                            int(bool(binding["required"])),
+                            int(bool(binding["transmit_capable"])),
+                            binding["selector_fingerprint"],
+                            now_iso,
+                            now_iso,
+                        ),
+                    )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            saved = self._radio_hardware_bundle_conn(conn, radio_id)
+            if saved is None:
+                raise RuntimeError("Saved hardware assignment could not be read back.")
+            return saved
+
+    def retire_radio_hardware_bundle(
+        self,
+        radio_profile_id: int,
+        *,
+        expected_generation: int,
+    ) -> Dict[str, Any]:
+        """Retire an assignment without deleting its bounded recovery evidence."""
+
+        radio_id = int(radio_profile_id)
+        now_iso = _utc_now_iso()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT generation FROM radio_hardware_bundles WHERE radio_profile_id=?",
+                    (radio_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(f"No hardware assignment exists for radio profile id: {radio_id}")
+                current_generation = int(row[0] or 0)
+                if current_generation != int(expected_generation):
+                    raise HardwareBindingError(
+                        f"The hardware assignment changed after review (expected generation {int(expected_generation)}, "
+                        f"found {current_generation}). Refresh and review again."
+                    )
+                next_generation = current_generation + 1
+                conn.execute(
+                    """
+                    UPDATE radio_hardware_bindings
+                       SET active=0, retired_utc=?, updated_utc=?
+                     WHERE radio_profile_id=? AND active=1
+                    """,
+                    (now_iso, now_iso, radio_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE radio_hardware_bundles
+                       SET generation=?, lifecycle_state='retired',
+                           aggregate_state='unbound', last_verified_utc=NULL,
+                           updated_utc=?
+                     WHERE radio_profile_id=?
+                    """,
+                    (next_generation, now_iso, radio_id),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            saved = self._radio_hardware_bundle_conn(conn, radio_id, include_retired=True)
+            if saved is None:
+                raise RuntimeError("Retired hardware assignment could not be read back.")
+            return saved
 
     @staticmethod
     def _decode_varac_native_journal_row(row: Mapping[str, Any]) -> Dict[str, Any]:

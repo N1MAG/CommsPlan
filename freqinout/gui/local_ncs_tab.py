@@ -343,7 +343,7 @@ class LocalNCSTab(QWidget):
 
         self.report_body_edit = QTextEdit()
         self.report_body_edit.setPlaceholderText(
-            "Capture the field report in plain language. FIO will classify useful terms for message intelligence."
+            "Capture the field report in plain language. CommsPlan will classify useful terms for message intelligence."
         )
         report_floor = font_derived_widget_height(self.report_body_edit, vertical_padding=12, floor=72)
         self.report_body_edit.setMinimumHeight(report_floor)

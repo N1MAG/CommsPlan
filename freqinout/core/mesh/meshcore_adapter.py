@@ -6,12 +6,18 @@ import math
 import sys
 import threading
 import time
+from collections import deque
 from concurrent.futures import CancelledError as FutureCancelledError, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from importlib import import_module, util
 from typing import Callable, Iterator, Mapping
 
 from freqinout.core.logger import log
+from freqinout.core.mesh.ble_deadlines import (
+    PAIRING_SEC, PAIR_RELEASE_SEC, READVERTISE_SEC, COMPANION_CONNECT_SEC,
+    VERIFY_SEC, ADAPTER_CONNECT_SEC,
+)
 from freqinout.core.mesh.ingest_status import MESHCORE_COMPANION_DECODER_WARNING
 from freqinout.core.mesh.lifecycle import MeshOperationCancelled
 from freqinout.core.mesh.meshcore_codec import (
@@ -60,8 +66,8 @@ MESHCORE_NUS_RX_UUID = "6e400002b5a3f393e0a9e50e24dcca9e"
 MESHCORE_NUS_TX_UUID = "6e400003b5a3f393e0a9e50e24dcca9e"
 
 PAIRING_GUIDANCE = (
-    "Keep FIO open, choose Connect, and accept the operating-system Bluetooth prompt using the PIN shown on "
-    "the device. FIO requests pairing when needed but does not store the PIN."
+    "Keep CommsPlan open, choose Connect, and accept the operating-system Bluetooth prompt using the PIN shown on "
+    "the device. CommsPlan requests pairing when needed but does not store the PIN."
 )
 STALE_BOND_GUIDANCE = (
     "Disconnect phone/tablet clients, restart the card, and retry the saved device once. "
@@ -86,7 +92,16 @@ MESHCORE_RECEIVE_PENDING_WARNING = MESHCORE_COMPANION_DECODER_WARNING
 MESHCORE_BLE_DISCONNECTING_MESSAGE = (
     "MeshCore Bluetooth is still disconnecting. Wait for it to finish before reconnecting."
 )
-MESHCORE_LINUX_PAIRING_TIMEOUT_SEC = 75.0
+MESHCORE_LINUX_PAIRING_TIMEOUT_SEC = PAIRING_SEC
+MESHCORE_CMD_APP_START = 1
+MESHCORE_RESP_SELF_INFO = 5
+MESHCORE_PUSH_ADVERT = 0x80
+MESHCORE_PUSH_PATH_UPDATED = 0x81
+MESHCORE_PUSH_LOG_RX_DATA = 0x88
+_MESHCORE_RAW_FRAME_LIMIT = 512
+_MESHCORE_RESPONSE_QUEUE_LIMIT = 2048
+_MESHCORE_CONTACT_LIMIT = 512
+_MESHCORE_CONTACT_REFRESH_SEC = 300.0
 
 
 class _MeshCoreBleSessionGate:
@@ -146,10 +161,17 @@ class MeshCoreBleCompanionClient:
         self._command_timeout_sec = max(0.5, float(command_timeout_sec))
         self._max_waiting_messages = max(1, int(max_waiting_messages))
         self._response_queue: asyncio.Queue[bytes] | None = None
+        self._response_codes: frozenset[int] | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._notification_started = False
-        self._raw_frames: list[bytes] = []
+        self._raw_frames: deque[bytes] = deque(maxlen=_MESHCORE_RAW_FRAME_LIMIT)
+        self._raw_frames_lock = threading.Lock()
         self._msg_waiting_seen = False
+        self._contacts_cache: dict[str, dict[str, object]] = {}
+        self._contacts_initialized = False
+        self._contacts_dirty = False
+        self._contacts_since = 0
+        self._contacts_refreshed_at = 0.0
         self.last_error = ""
 
     @property
@@ -164,6 +186,13 @@ class MeshCoreBleCompanionClient:
         self._loop = asyncio.get_running_loop()
         await start_notify(self._tx_uuid, self._on_notification)
         self._notification_started = True
+        try:
+            # Companion app start asks firmware to begin app-scoped updates,
+            # including SELF_INFO. Keep it best-effort for older firmwares.
+            app_start = bytes([MESHCORE_CMD_APP_START, 3]) + (b"\x00" * 6) + b"FreqInOut"
+            await self._write_command(app_start)
+        except Exception:
+            pass
         try:
             await self._write_command(bytes([MESHCORE_CMD_DEVICE_QUERY, 3]))
         except Exception:
@@ -217,29 +246,81 @@ class MeshCoreBleCompanionClient:
     async def getContacts(self) -> list[dict[str, object]]:
         if not self.is_connected:
             raise MeshConnectionError("MeshCore BLE device is not connected.")
+        if (
+            self._contacts_initialized
+            and not self._contacts_dirty
+            and time.monotonic() - self._contacts_refreshed_at < _MESHCORE_CONTACT_REFRESH_SEC
+        ):
+            return [dict(contact) for contact in self._contacts_cache.values()]
+        since = max(0, self._contacts_since - 1) if self._contacts_initialized else None
         previous_queue = self._response_queue
-        queue: asyncio.Queue[bytes] = asyncio.Queue()
+        previous_codes = self._response_codes
+        queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=_MESHCORE_RESPONSE_QUEUE_LIMIT)
         self._response_queue = queue
+        self._response_codes = frozenset({
+            MESHCORE_RESP_ERR, MESHCORE_RESP_CONTACTS_START,
+            MESHCORE_RESP_CONTACT, MESHCORE_RESP_CONTACTS_END,
+        })
         contacts: list[dict[str, object]] = []
+        most_recent_lastmod = self._contacts_since if since is not None else 0
+        deadline = time.monotonic() + max(5.0, min(60.0, self._command_timeout_sec * 10.0))
         try:
-            await self._write_command(bytes([MESHCORE_CMD_GET_CONTACTS]))
-            while True:
-                frame = await asyncio.wait_for(queue.get(), timeout=self._command_timeout_sec)
+            command = bytes([MESHCORE_CMD_GET_CONTACTS])
+            if since is not None:
+                command += int(since).to_bytes(4, "little", signed=False)
+            await self._write_command(command)
+            for _frame_number in range(_MESHCORE_RESPONSE_QUEUE_LIMIT):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("MeshCore Companion contact sync exceeded its bounded deadline.")
+                frame = await asyncio.wait_for(queue.get(), timeout=min(self._command_timeout_sec, remaining))
                 if not frame:
                     continue
                 if frame[0] == MESHCORE_RESP_ERR:
+                    if since is not None:
+                        self._response_queue = previous_queue
+                        self._response_codes = previous_codes
+                        self._contacts_dirty = True
+                        self._contacts_initialized = False
+                        return await self.getContacts()
                     raise MeshConnectionError("MeshCore Companion contact sync returned an error response.")
                 if frame[0] == MESHCORE_RESP_CONTACTS_START:
                     continue
                 if frame[0] == MESHCORE_RESP_CONTACTS_END:
-                    return contacts
+                    if len(frame) >= 5:
+                        most_recent_lastmod = max(
+                            most_recent_lastmod,
+                            int.from_bytes(frame[1:5], "little", signed=False),
+                        )
+                    break
                 if frame[0] != MESHCORE_RESP_CONTACT:
                     continue
                 parsed = decode_meshcore_contact_frame(frame)
-                if parsed is not None:
+                if parsed is not None and (
+                    str(parsed.get("publicKey") or parsed.get("pubKeyPrefix") or "") in self._contacts_cache
+                    or len(self._contacts_cache) + len(contacts) < _MESHCORE_CONTACT_LIMIT
+                ):
                     contacts.append(parsed)
+                    most_recent_lastmod = max(
+                        most_recent_lastmod,
+                        int(parsed.get("lastMod") or 0),
+                    )
+            else:
+                raise MeshConnectionError("MeshCore Companion contact sync exceeded its bounded frame count.")
         finally:
             self._response_queue = previous_queue
+            self._response_codes = previous_codes
+        if since is None:
+            self._contacts_cache.clear()
+        for contact in contacts:
+            identity = str(contact.get("publicKey") or contact.get("pubKeyPrefix") or "")
+            if identity:
+                self._contacts_cache[identity] = contact
+        self._contacts_since = most_recent_lastmod
+        self._contacts_initialized = True
+        self._contacts_dirty = False
+        self._contacts_refreshed_at = time.monotonic()
+        return [dict(contact) for contact in self._contacts_cache.values()]
 
     async def getWaitingMessages(self) -> list[dict[str, object]]:
         messages: list[dict[str, object]] = []
@@ -271,9 +352,10 @@ class MeshCoreBleCompanionClient:
         return decode_meshcore_waiting_message_frame(frame)
 
     def raw_frames_pending(self) -> tuple[bytes, ...]:
-        frames = tuple(self._raw_frames)
-        self._raw_frames.clear()
-        return frames
+        with self._raw_frames_lock:
+            frames = tuple(self._raw_frames)
+            self._raw_frames.clear()
+            return frames
 
     def waiting_messages_pending(self) -> bool:
         """Return whether firmware announced queued traffic.
@@ -293,9 +375,13 @@ class MeshCoreBleCompanionClient:
             return
         if meshcore_frame_is_msg_waiting(frame):
             self._msg_waiting_seen = True
-        self._raw_frames.append(frame)
+        with self._raw_frames_lock:
+            self._raw_frames.append(frame)
+        if frame[0] in {MESHCORE_PUSH_ADVERT, MESHCORE_PUSH_PATH_UPDATED}:
+            self._contacts_dirty = True
         queue = self._response_queue
-        if queue is not None:
+        response_codes = self._response_codes
+        if queue is not None and (response_codes is None or frame[0] in response_codes):
             def enqueue() -> None:
                 try:
                     queue.put_nowait(frame)
@@ -316,8 +402,10 @@ class MeshCoreBleCompanionClient:
         if not self.is_connected:
             raise MeshConnectionError("MeshCore BLE device is not connected.")
         previous_queue = self._response_queue
-        queue: asyncio.Queue[bytes] = asyncio.Queue()
+        previous_codes = self._response_codes
+        queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=_MESHCORE_RESPONSE_QUEUE_LIMIT)
         self._response_queue = queue
+        self._response_codes = frozenset(response_codes | {MESHCORE_RESP_ERR})
         try:
             await self._write_command(command)
             while True:
@@ -328,6 +416,7 @@ class MeshCoreBleCompanionClient:
                     return frame
         finally:
             self._response_queue = previous_queue
+            self._response_codes = previous_codes
 
     async def _write_command(self, command: bytes) -> None:
         write_gatt_char = getattr(self._client, "write_gatt_char", None)
@@ -375,6 +464,8 @@ class MeshCoreBleAdapter:
         self._session_teardown_pending = False
         self._session_state_lock = threading.Lock()
         self._send_lock = threading.Lock()
+        self._self_node: MeshNode | None = None
+        self._received_paths: deque[dict[str, object]] = deque(maxlen=32)
 
     def connect(self) -> None:
         if not self.config.enabled:
@@ -473,7 +564,7 @@ class MeshCoreBleAdapter:
             supported=False,
             guidance=(
                 "MeshCore Bluetooth remains receive-only until the raw Companion transmit command and completion "
-                "evidence are qualified. Use a MeshCore USB serial or TCP Companion connection to send from FIO."
+                "evidence are qualified. Use a MeshCore USB serial or TCP Companion connection to send from CommsPlan."
             ),
         )
 
@@ -649,15 +740,82 @@ class MeshCoreBleAdapter:
         for event in tuple(self._pending_events):
             yield event
         self._pending_events.clear()
+        refresh_contacts = False
+        self_node_changed = False
         for frame in self._client_raw_frames_pending():
             node = self._node_from_push_frame(frame)
             if node is not None:
+                if frame and frame[0] == MESHCORE_RESP_SELF_INFO:
+                    self._self_node = node
+                    self_node_changed = True
+                else:
+                    yield MeshAdapterEvent(
+                        event_type="node",
+                        adapter_id=self.adapter_id,
+                        transport=self.transport_name,
+                        node=node,
+                        raw=node.raw,
+                    )
+            elif frame and frame[0] == MESHCORE_PUSH_LOG_RX_DATA:
+                path_record = _decode_meshcore_rx_log(frame)
+                if path_record is not None:
+                    self._received_paths.append(path_record)
+                    self_node_changed = True
+            elif frame and frame[0] in {MESHCORE_PUSH_ADVERT, MESHCORE_PUSH_PATH_UPDATED}:
+                # These pushes contain only a public key. Refresh the contact
+                # snapshot once after draining this notification burst.
+                refresh_contacts = True
+        client = self._client
+        pending_nodes = getattr(client, "node_events_pending", None)
+        if callable(pending_nodes):
+            try:
+                for raw_node in pending_nodes():
+                    nodes = normalize_meshcore_nodes(
+                        (raw_node,), adapter_id=self.adapter_id, transport=self.transport_name
+                    )
+                    for node in nodes:
+                        if bool(node.raw.get("is_self")):
+                            self._self_node = node
+                            self_node_changed = True
+                            continue
+                        yield MeshAdapterEvent(
+                            event_type="node", adapter_id=self.adapter_id,
+                            transport=self.transport_name, node=node, raw=node.raw,
+                        )
+            except Exception as exc:
+                self._last_error = str(exc)
+        pending_paths = getattr(client, "path_records_pending", None)
+        if callable(pending_paths):
+            try:
+                for path_record in pending_paths():
+                    if isinstance(path_record, Mapping):
+                        self._received_paths.append(dict(path_record))
+                        self_node_changed = True
+            except Exception as exc:
+                self._last_error = str(exc)
+        consume_refresh = getattr(client, "consume_contacts_refresh_pending", None)
+        if callable(consume_refresh):
+            try:
+                refresh_contacts = bool(consume_refresh()) or refresh_contacts
+            except Exception as exc:
+                self._last_error = str(exc)
+        if self_node_changed and self._self_node is not None:
+            raw = dict(self._self_node.raw)
+            raw["received_paths"] = tuple(self._received_paths)
+            nodes = normalize_meshcore_nodes(
+                (raw,), adapter_id=self.adapter_id, transport=self.transport_name
+            )
+            if nodes:
+                self._self_node = nodes[0]
                 yield MeshAdapterEvent(
-                    event_type="node",
-                    adapter_id=self.adapter_id,
-                    transport=self.transport_name,
-                    node=node,
-                    raw=node.raw,
+                    event_type="node", adapter_id=self.adapter_id,
+                    transport=self.transport_name, node=self._self_node, raw=self._self_node.raw,
+                )
+        if refresh_contacts:
+            for node in self.list_nodes():
+                yield MeshAdapterEvent(
+                    event_type="node", adapter_id=self.adapter_id,
+                    transport=self.transport_name, node=node, raw=node.raw,
                 )
         for message in self.get_recent_messages():
             yield MeshAdapterEvent(
@@ -691,10 +849,17 @@ class MeshCoreBleAdapter:
 
     def _node_from_push_frame(self, frame: bytes | bytearray | memoryview) -> MeshNode | None:
         data = bytes(frame)
-        if not data or data[0] != MESHCORE_PUSH_NEW_ADVERT:
+        if not data:
             return None
-        parsed = decode_meshcore_new_advert_frame(data)
-        if parsed is None:
+        if data[0] == MESHCORE_RESP_SELF_INFO:
+            parsed = _decode_meshcore_self_info(data)
+            if parsed is None:
+                return None
+        elif data[0] == MESHCORE_PUSH_NEW_ADVERT:
+            parsed = decode_meshcore_new_advert_frame(data)
+            if parsed is None:
+                return None
+        else:
             return None
         nodes = normalize_meshcore_nodes(
             [parsed],
@@ -896,6 +1061,140 @@ def _normalize_uuid(value: object) -> str:
     return str(value or "").replace("-", "").strip().lower()
 
 
+def _decode_meshcore_self_info(frame: bytes) -> dict[str, object] | None:
+    if not frame or frame[0] != MESHCORE_RESP_SELF_INFO or len(frame) < 47:
+        return None
+    public_key = frame[4:36]
+    adv_lat = int.from_bytes(frame[36:40], "little", signed=True)
+    adv_lon = int.from_bytes(frame[40:44], "little", signed=True)
+    name = ""
+    if len(frame) > 58:
+        name = frame[58:].split(b"\x00", 1)[0].decode("utf-8", errors="replace").strip()
+    return {
+        "node_id": public_key[:6].hex(),
+        "publicKey": public_key.hex(),
+        "name": name,
+        "type": frame[1],
+        "advLat": adv_lat,
+        "advLon": adv_lon,
+        "lat": adv_lat / 1_000_000 if adv_lat or adv_lon else None,
+        "lon": adv_lon / 1_000_000 if adv_lat or adv_lon else None,
+        "is_self": True,
+    }
+
+
+def _decode_meshcore_rx_log(frame: bytes) -> dict[str, object] | None:
+    """Extract only the received packet's encoded path and link metrics."""
+    if len(frame) < 6 or frame[0] != MESHCORE_PUSH_LOG_RX_DATA:
+        return None
+    packet = frame[3:]
+    if len(packet) < 3:
+        return None
+    header = packet[0]
+    route_code = header & 0x03
+    offset = 1
+    transport_codes: tuple[str, ...] = ()
+    if route_code in {0, 3}:
+        if len(packet) < offset + 4:
+            return None
+        transport_codes = (
+            packet[offset : offset + 2].hex(),
+            packet[offset + 2 : offset + 4].hex(),
+        )
+        offset += 4
+    if len(packet) <= offset:
+        return None
+    path_len = packet[offset]
+    offset += 1
+    if path_len == 0xFF:
+        return None
+    hash_size = (path_len >> 6) + 1
+    hop_count = path_len & 0x3F
+    path_byte_count = hop_count * hash_size
+    if hash_size > 3 or path_byte_count > 64 or len(packet) < offset + path_byte_count:
+        return None
+    path_bytes = packet[offset : offset + path_byte_count]
+    path_hops = tuple(
+        path_bytes[index : index + hash_size].hex()
+        for index in range(0, path_byte_count, hash_size)
+    )
+    snr_raw = frame[1]
+    rssi_raw = frame[2]
+    snr_signed = snr_raw - 256 if snr_raw & 0x80 else snr_raw
+    rssi_signed = rssi_raw - 256 if rssi_raw & 0x80 else rssi_raw
+    record: dict[str, object] = {
+        "path_hops": path_hops,
+        "hop_count": hop_count,
+        "hash_size": hash_size,
+        "snr": snr_signed / 4.0,
+        "rssi": float(rssi_signed),
+        "timestamp": utc_now().isoformat(),
+        "evidence_kind": (
+            "observed_packet_path" if route_code in {0, 1} else "remaining_packet_route"
+        ),
+        "route_code": route_code,
+    }
+    if transport_codes:
+        record["transport_codes"] = transport_codes
+    return record
+
+
+def _meshcore_python_rx_record(payload: Mapping[str, object]) -> dict[str, object] | None:
+    """Validate the parsed RX_LOG_DATA fields emitted by meshcore_py."""
+    route_code = _safe_int(payload.get("route_type"))
+    hop_count = _safe_int(payload.get("path_len"))
+    hash_size = _safe_int(payload.get("path_hash_size"))
+    if route_code not in {0, 1, 2, 3} or hop_count is None or not 0 <= hop_count <= 63:
+        return None
+    if hash_size not in {1, 2, 3} or hop_count * hash_size > 64:
+        return None
+    path_hex = str(payload.get("path") or "").strip()
+    try:
+        path_bytes = bytes.fromhex(path_hex)
+    except ValueError:
+        return None
+    expected = hop_count * hash_size
+    if len(path_bytes) != expected:
+        return None
+    path_hops = tuple(
+        path_bytes[index : index + hash_size].hex()
+        for index in range(0, expected, hash_size)
+    )
+    try:
+        snr = float(payload["snr"]) if payload.get("snr") is not None else None
+        rssi = float(payload["rssi"]) if payload.get("rssi") is not None else None
+    except (TypeError, ValueError):
+        return None
+    received_at = payload.get("recv_time")
+    try:
+        timestamp = datetime.fromtimestamp(float(received_at), tz=timezone.utc).isoformat()
+    except (TypeError, ValueError, OverflowError, OSError):
+        timestamp = utc_now().isoformat()
+    record: dict[str, object] = {
+        "path_hops": path_hops,
+        "hop_count": hop_count,
+        "hash_size": hash_size,
+        "snr": snr,
+        "rssi": rssi,
+        "timestamp": timestamp,
+        "evidence_kind": (
+            "observed_packet_path" if route_code in {0, 1} else "remaining_packet_route"
+        ),
+        "route_code": route_code,
+    }
+    transport_code = payload.get("transport_code")
+    if transport_code:
+        record["transport_codes"] = str(transport_code)
+    return record
+
+
+def _safe_int(value: object) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def _meshcore_channel_slot_is_unused(channel: object) -> bool:
     if not isinstance(channel, dict):
         return False
@@ -1006,8 +1305,14 @@ class MeshCorePythonCompanionClient:
         self._event_type = event_type
         self._subscriptions: list[object] = []
         self._messages: list[dict[str, object]] = []
+        self._node_events: deque[dict[str, object]] = deque(maxlen=512)
         self._message_lock = threading.Lock()
         self._auto_fetch_started = False
+        self._contacts_initialized = False
+        self._contacts_dirty = False
+        self._contacts_refresh_pending = False
+        self._contacts_refreshed_at = 0.0
+        self._path_records: deque[dict[str, object]] = deque(maxlen=32)
 
     @property
     def is_connected(self) -> bool:
@@ -1028,8 +1333,28 @@ class MeshCorePythonCompanionClient:
             )
         self._subscriptions.append(subscribe(channel_event, self._on_channel_message))
         self._subscriptions.append(subscribe(contact_event, self._on_contact_message))
+        # These are optional across meshcore_py versions. Subscribe only when
+        # the installed EventType exposes them; receive support stays backward
+        # compatible with older wrappers.
+        for event_name in ("ADVERTISEMENT", "NEW_CONTACT", "PATH_UPDATE", "SELF_INFO", "RX_LOG_DATA"):
+            optional_event = getattr(self._event_type, event_name, None)
+            if optional_event is None or optional_event == channel_event or optional_event == contact_event:
+                continue
+            self._subscriptions.append(
+                subscribe(optional_event, lambda event, name=event_name: self._on_node_event(event, name))
+            )
         await start_auto_fetch()
         self._auto_fetch_started = True
+        # APP_START can be sent by the factory before these subscriptions are
+        # installed. Seed the already-cached self record so consumers do not
+        # have to wait for another SELF_INFO push.
+        cached_self = getattr(self._client, "self_info", None)
+        if isinstance(cached_self, Mapping) and cached_self:
+            with self._message_lock:
+                if not any(bool(item.get("is_self")) for item in self._node_events):
+                    raw_self = dict(cached_self)
+                    raw_self["is_self"] = True
+                    self._node_events.append(raw_self)
 
     async def disconnect(self) -> None:
         if self._auto_fetch_started:
@@ -1084,11 +1409,46 @@ class MeshCorePythonCompanionClient:
 
     async def getContacts(self) -> list[dict[str, object]]:
         ensure_contacts = getattr(self._client, "ensure_contacts", None)
-        if callable(ensure_contacts):
+        refresh_due = time.monotonic() - self._contacts_refreshed_at >= _MESHCORE_CONTACT_REFRESH_SEC
+        refresh_timestamp_valid = True
+        if refresh_due and self._contacts_initialized and not self._contacts_dirty:
+            # meshcore 2.3.x ensure_contacts(follow=True) only fetches when
+            # its private dirty bit is set. A wrapper TTL expiry therefore
+            # needs an explicit public contacts command to actually refresh.
+            commands = getattr(self._client, "commands", None)
+            get_contacts = getattr(commands, "get_contacts", None)
+            if callable(get_contacts):
+                try:
+                    result = await asyncio.wait_for(
+                        get_contacts(lastmod=0, timeout=5), timeout=6
+                    )
+                    if _meshcore_event_is_error(result):
+                        refresh_timestamp_valid = False
+                        log.warning("MeshCore contact refresh returned an error; retaining cached contacts.")
+                except TypeError:
+                    # Older wrappers may not expose the timeout keyword.
+                    try:
+                        result = await asyncio.wait_for(get_contacts(lastmod=0), timeout=6)
+                        if _meshcore_event_is_error(result):
+                            refresh_timestamp_valid = False
+                            log.warning("MeshCore contact refresh returned an error; retaining cached contacts.")
+                    except Exception as exc:
+                        refresh_timestamp_valid = False
+                        log.debug(f"MeshCore contact refresh unavailable: {exc}")
+                except Exception as exc:
+                    refresh_timestamp_valid = False
+                    log.debug(f"MeshCore contact refresh unavailable: {exc}")
+            elif callable(ensure_contacts):
+                await ensure_contacts(follow=True)
+        elif callable(ensure_contacts) and (not self._contacts_initialized or self._contacts_dirty):
             await ensure_contacts(follow=True)
         contacts = getattr(self._client, "contacts", {})
         if not isinstance(contacts, Mapping):
             return []
+        self._contacts_initialized = True
+        self._contacts_dirty = False
+        if refresh_timestamp_valid:
+            self._contacts_refreshed_at = time.monotonic()
         return [dict(value) for value in contacts.values() if isinstance(value, Mapping)]
 
     def getWaitingMessages(self) -> list[dict[str, object]]:
@@ -1103,6 +1463,24 @@ class MeshCorePythonCompanionClient:
 
     def raw_frames_pending(self) -> tuple[bytes, ...]:
         return ()
+
+    def node_events_pending(self) -> tuple[dict[str, object], ...]:
+        with self._message_lock:
+            events = tuple(self._node_events)
+            self._node_events.clear()
+            return events
+
+    def consume_contacts_refresh_pending(self) -> bool:
+        with self._message_lock:
+            pending = self._contacts_refresh_pending
+            self._contacts_refresh_pending = False
+            return pending
+
+    def path_records_pending(self) -> tuple[dict[str, object], ...]:
+        with self._message_lock:
+            records = tuple(self._path_records)
+            self._path_records.clear()
+            return records
 
     async def send_channel_message(self, channel_index: int, text: str) -> object:
         commands = getattr(self._client, "commands", None)
@@ -1151,6 +1529,30 @@ class MeshCorePythonCompanionClient:
             with self._message_lock:
                 self._messages.append({"contactMessage": dict(payload)})
 
+    def _on_node_event(self, event: object, event_name: str) -> None:
+        payload = getattr(event, "payload", None)
+        if event_name == "RX_LOG_DATA" and isinstance(payload, Mapping):
+            record = _meshcore_python_rx_record(payload)
+            if record is not None:
+                with self._message_lock:
+                    self._path_records.append(record)
+            return
+        with self._message_lock:
+            if event_name in {"ADVERTISEMENT", "PATH_UPDATE"}:
+                self._contacts_dirty = True
+                self._contacts_refresh_pending = True
+            if isinstance(payload, Mapping):
+                raw = dict(payload)
+                if event_name == "SELF_INFO":
+                    raw["is_self"] = True
+                    self._node_events.append(raw)
+                elif event_name == "NEW_CONTACT" and any(
+                    key in raw for key in ("name", "adv_name", "lat", "adv_lat", "public_key")
+                ):
+                    self._node_events.append(raw)
+                    self._contacts_dirty = True
+                    self._contacts_refresh_pending = True
+
 
 class MeshCorePythonAdapter(MeshCoreBleAdapter):
     """MeshCore Companion adapter for official meshcore_py BLE/serial/TCP clients."""
@@ -1169,7 +1571,7 @@ class MeshCorePythonAdapter(MeshCoreBleAdapter):
             raise MeshConnectionError("; ".join(issue.message for issue in issues))
         if not meshcore_python_available():
             raise MeshConnectionError(
-                "The Python package 'meshcore' is not installed. Install the supported FIO mesh dependencies first."
+                "The Python package 'meshcore' is not installed. Install the supported CommsPlan mesh dependencies first."
             )
         with self._session_state_lock:
             teardown_pending = self._session_teardown_pending
@@ -1192,7 +1594,8 @@ class MeshCorePythonAdapter(MeshCoreBleAdapter):
         label = f"MeshCore {self.config.connection_type.value.upper()}"
         self._ble_loop = _AsyncioLoopRunner(label)
         try:
-            self._ble_loop.run(self._connect_python_client(), timeout_sec=30.0)
+            connect_budget = ADAPTER_CONNECT_SEC if self.config.connection_type is MeshConnectionType.BLE and sys.platform.startswith("linux") else 30.0
+            self._ble_loop.run(self._connect_python_client(), timeout_sec=connect_budget)
             self._last_error = ""
         except (MeshOperationCancelled, MeshConnectionError) as exc:
             self._last_error = str(exc)
@@ -1251,7 +1654,7 @@ class MeshCorePythonAdapter(MeshCoreBleAdapter):
         if not text.strip():
             raise MeshConnectionError("Enter a mesh message before sending.")
         if len(text.encode("utf-8")) > 160:
-            raise MeshConnectionError("MeshCore message is longer than FIO's qualified 160-byte text limit.")
+            raise MeshConnectionError("MeshCore message is longer than CommsPlan's qualified 160-byte text limit.")
         kind = str(request.destination_kind or "").strip().lower()
         accepted_at = utc_now()
         try:
@@ -1368,8 +1771,12 @@ class MeshCorePythonAdapter(MeshCoreBleAdapter):
                 f"The installed meshcore package does not support {self.config.connection_type.value.upper()}."
             )
         factory_kwargs = {"auto_reconnect": False, "default_timeout": 5}
+        linux_ble = self.config.connection_type is MeshConnectionType.BLE and sys.platform.startswith("linux")
+        async def connect_companion():
+            result = factory(*args, **factory_kwargs)
+            return await asyncio.wait_for(result, COMPANION_CONNECT_SEC) if linux_ble else await result
         try:
-            client = await factory(*args, **factory_kwargs)
+            client = await connect_companion()
         except Exception as exc:
             if not _linux_ble_pair_retry_recommended(self.config, exc):
                 raise
@@ -1383,14 +1790,20 @@ class MeshCorePythonAdapter(MeshCoreBleAdapter):
                 "MeshCore BLE Linux pairing completed; retrying Companion connection adapter=%s.",
                 self.adapter_id,
             )
-            client = await factory(*args, **factory_kwargs)
+            client = await connect_companion()
         if client is None:
             raise MeshConnectionError(_meshcore_no_handshake_message(self.config))
         wrapper = MeshCorePythonCompanionClient(client, event_type)
         try:
-            await wrapper.initialize()
+            if linux_ble:
+                await asyncio.wait_for(wrapper.initialize(), VERIFY_SEC)
+            else:
+                await wrapper.initialize()
         except Exception:
-            await wrapper.disconnect()
+            if linux_ble:
+                await asyncio.wait_for(wrapper.disconnect(), PAIR_RELEASE_SEC)
+            else:
+                await wrapper.disconnect()
             raise
         self._client = wrapper
         self._device_name = self.config.display_name
@@ -1419,11 +1832,11 @@ class MeshCorePythonAdapter(MeshCoreBleAdapter):
             )
         except TypeError as exc:
             raise MeshConnectionError(
-                "The installed Python BLE package is too old for secure in-FIO pairing. "
-                "Run the supported FIO installer or repair, then choose Connect again."
+                "The installed Python BLE package is too old for secure in-CommsPlan pairing. "
+                "Run the supported CommsPlan installer or repair, then choose Connect again."
             ) from exc
         try:
-            await pairing_client.connect()
+            await asyncio.wait_for(pairing_client.connect(), MESHCORE_LINUX_PAIRING_TIMEOUT_SEC)
             if not bool(getattr(pairing_client, "is_connected", False)):
                 raise MeshConnectionError(
                     f"Linux did not complete MeshCore Bluetooth pairing. {PAIRING_GUIDANCE}"
@@ -1436,15 +1849,28 @@ class MeshCorePythonAdapter(MeshCoreBleAdapter):
             ) from exc
         finally:
             disconnect = getattr(pairing_client, "disconnect", None)
-            if callable(disconnect) and bool(getattr(pairing_client, "is_connected", False)):
+            # A failed/cancelled connect can still own native BlueZ work even
+            # before is_connected becomes true. Always request bounded release.
+            if callable(disconnect):
                 try:
-                    await disconnect()
+                    await asyncio.wait_for(disconnect(), PAIR_RELEASE_SEC)
                 except Exception as exc:
                     log.warning(
                         "MeshCore BLE temporary pairing connection did not close cleanly adapter=%s raw=%s",
                         self.adapter_id,
                         str(exc),
                     )
+                    raise MeshConnectionError("Linux could not release the temporary pairing link. Reconnect paused; choose Connect after the device is available.") from exc
+        scanner = getattr(bleak, "BleakScanner", None)
+        if scanner is None:
+            raise MeshConnectionError("Linux BLE discovery is unavailable after pairing. Reconnect paused.")
+        finder = (getattr(scanner, "find_device_by_address", None) if self.config.ble_device_id
+                  else getattr(scanner, "find_device_by_name", None))
+        if not callable(finder):
+            raise MeshConnectionError("Linux BLE cannot verify the paired device's availability. Reconnect paused.")
+        device = await asyncio.wait_for(finder(target, timeout=READVERTISE_SEC), READVERTISE_SEC)
+        if device is None:
+            raise MeshConnectionError("The paired MeshCore device did not advertise after link release. Reconnect paused; turn it on and choose Connect.")
 
     def _finish_python_session(self) -> None:
         runner = self._ble_loop
@@ -1553,6 +1979,27 @@ def discover_meshcore_ble_devices(
     cancel_event: threading.Event | None = None,
     progress_callback: Callable[[tuple[MeshCoreBleAdvertisement, ...]], None] | None = None,
 ) -> tuple[MeshCoreBleAdvertisement, ...]:
+    if sys.platform.startswith("linux"):
+        # Discovery and runtime connections share one process-scoped BlueZ
+        # authority.  The helper can be terminated without retaining a Bleak
+        # event loop or native D-Bus request in the desktop process.
+        from freqinout.core.mesh.linux_ble_supervisor import (
+            discover_meshcore_ble_devices_supervised,
+        )
+
+        if cancel_event is not None and cancel_event.is_set():
+            raise MeshOperationCancelled("MeshCore BLE scan cancelled.")
+        result = tuple(
+            discover_meshcore_ble_devices_supervised(
+                timeout_sec,
+                cancel_event=cancel_event,
+            )
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            raise MeshOperationCancelled("MeshCore BLE scan cancelled.")
+        if progress_callback is not None and result:
+            progress_callback(result)
+        return result
     if not meshcore_ble_available():
         raise MeshConnectionError(
             "The Python BLE package 'bleak' is not installed. Install it before scanning for MeshCore BLE."

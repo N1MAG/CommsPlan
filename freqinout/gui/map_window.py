@@ -199,7 +199,7 @@ class PersistentMapWindow(QMainWindow):
     ) -> None:
         super().__init__(application_host, Qt.Window)
         self.setObjectName("persistentMapWindow")
-        self.setWindowTitle("FIO Map")
+        self.setWindowTitle("CommsPlan Map")
         try:
             self.setWindowIcon(application_host.windowIcon())
         except Exception:
@@ -366,7 +366,7 @@ class PersistentMapWindow(QMainWindow):
             return tab
         except Exception as exc:
             log.exception("Map window content creation failed")
-            self._status_label.setText("Map unavailable. Review configuration or retry without restarting FIO.")
+            self._status_label.setText("Map unavailable. Review configuration or retry without restarting CommsPlan.")
             self._retry_button.setVisible(True)
             self.content_failed.emit(str(exc))
             return None

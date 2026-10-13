@@ -19,10 +19,10 @@ def expected_asset_names(
     windows_suffix = "" if windows_signed else "-unsigned"
     macos_suffix = "" if macos_signed else "-unsigned"
     return (
-        f"FreqInOut-{version}-linux-amd64.deb",
-        f"FreqInOut-{version}-macos-arm64{macos_suffix}.dmg",
-        f"FreqInOut-{version}-macos-x86_64{macos_suffix}.dmg",
-        f"FreqInOut-{version}-windows-x86_64-setup{windows_suffix}.exe",
+        f"CommsPlan-{version}-linux-amd64.deb",
+        f"CommsPlan-{version}-macos-arm64{macos_suffix}.dmg",
+        f"CommsPlan-{version}-macos-x86_64{macos_suffix}.dmg",
+        f"CommsPlan-{version}-windows-x86_64-setup{windows_suffix}.exe",
     )
 
 

@@ -8,6 +8,7 @@ operator actions emitted here.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -112,6 +113,7 @@ class _NativeMapBridge(QObject):
         self._theme: dict[str, object] = dict(theme)
         self._view: dict[str, float] = {"lat": 39.5, "lon": -98.35, "zoom": 3.6}
         self._home_view: dict[str, float] = dict(self._view)
+        self._has_projection = False
         self._visible = True
 
     @Property("QVariantList", notify=markers_changed)
@@ -196,13 +198,19 @@ class _NativeMapBridge(QObject):
         paths: Sequence[dict[str, object]],
         view: Mapping[str, object] | None,
     ) -> None:
-        self._markers = [dict(item) for item in markers]
-        self._paths = [dict(item) for item in paths]
-        self.markers_changed.emit()
-        self.paths_changed.emit()
+        for name, values, signal in (
+            ("_markers", markers, self.markers_changed),
+            ("_paths", paths, self.paths_changed),
+        ):
+            replacement = [dict(item) for item in values]
+            if replacement != getattr(self, name):
+                setattr(self, name, replacement)
+                signal.emit()
         if view is not None:
             self.set_view(view, report=False)
-            self._home_view = dict(self._view)
+            if not self._has_projection:
+                self._home_view = dict(self._view)
+        self._has_projection = True
 
     def set_view(self, view: Mapping[str, object], *, report: bool) -> None:
         lat = _number(view.get("lat", view.get("latitude")))
@@ -240,33 +248,29 @@ class _NativeMapBridge(QObject):
         summary: str,
         direction_indicators: bool,
     ) -> None:
-        self._base_polygons = [dict(item) for item in base_polygons]
-        self._polygons = [dict(item) for item in polygons]
-        self._grid_lines = [dict(item) for item in grid_lines]
-        self._grid_labels = [dict(item) for item in grid_labels]
-        self._state_labels = [dict(item) for item in state_labels]
-        self._region_labels = [dict(item) for item in region_labels]
-        self._adaptive_grid = bool(adaptive_grid)
+        # Notify only changed layers: replacing an unchanged QVariantList
+        # tears down and rebuilds every corresponding MapItemView delegate.
+        replacements = {
+            "base_polygons": [dict(item) for item in base_polygons],
+            "polygons": [dict(item) for item in polygons],
+            "grid_lines": [dict(item) for item in grid_lines],
+            "grid_labels": [dict(item) for item in grid_labels],
+            "state_labels": [dict(item) for item in state_labels],
+            "region_labels": [dict(item) for item in region_labels],
+            "adaptive_grid": bool(adaptive_grid),
+            "city_labels": [dict(item) for item in city_labels],
+            "fills": [dict(item) for item in fills],
+            "directions": [dict(item) for item in directions],
+            "legend": [dict(item) for item in legend],
+            "summary": str(summary or ""),
+            "direction_indicators": bool(direction_indicators),
+        }
+        grid_labels_changed = self._adaptive_grid_labels != bool(adaptive_grid_labels)
         self._adaptive_grid_labels = bool(adaptive_grid_labels)
-        self._city_labels = [dict(item) for item in city_labels]
-        self._fills = [dict(item) for item in fills]
-        self._directions = [dict(item) for item in directions]
-        self._legend = [dict(item) for item in legend]
-        self._summary = str(summary or "")
-        self._direction_indicators = bool(direction_indicators)
-        self.base_polygons_changed.emit()
-        self.polygons_changed.emit()
-        self.grid_lines_changed.emit()
-        self.grid_labels_changed.emit()
-        self.state_labels_changed.emit()
-        self.region_labels_changed.emit()
-        self.adaptive_grid_changed.emit()
-        self.city_labels_changed.emit()
-        self.fills_changed.emit()
-        self.directions_changed.emit()
-        self.legend_changed.emit()
-        self.summary_changed.emit()
-        self.direction_indicators_changed.emit()
+        for name, replacement in replacements.items():
+            if replacement != getattr(self, "_" + name) or (name == "adaptive_grid" and grid_labels_changed):
+                setattr(self, "_" + name, replacement)
+                getattr(self, name + "_changed").emit()
 
     def set_map_visible(self, visible: bool) -> None:
         value = bool(visible)
@@ -399,9 +403,11 @@ class NativeMapRenderer(QWidget):
 
         self._surface_stack = QStackedLayout(self)
         self._surface_stack.setContentsMargins(0, 0, 0, 0)
+        self._surface_stack.setStackingMode(QStackedLayout.StackAll)
         self._status = QLabel(self.failure_reason, self)
         self._status.setObjectName("nativeMapRendererStatus")
         self._status.setWordWrap(True)
+        self._status.setAutoFillBackground(True)
         self._status.setAlignment(Qt.AlignCenter)
         self._surface_stack.addWidget(self._status)
         self.quick_widget: QQuickWidget | None = None
@@ -419,6 +425,10 @@ class NativeMapRenderer(QWidget):
             quick.statusChanged.connect(self._on_status_changed)
             self._surface_stack.addWidget(quick)
             self.quick_widget = quick
+            # Both children remain visible. The status label covers the scene
+            # until a coherent projection arrives, but the graphics child is
+            # already present before the Map top-level's first show.
+            self._surface_stack.setCurrentWidget(self._status)
             quick.setSource(QUrl.fromLocalFile(str(_QML_SOURCE)))
         except Exception as exc:
             self._set_unavailable(f"Native map unavailable. Review Qt Location support and retry the Map. ({exc})")
@@ -612,6 +622,7 @@ class NativeMapRenderer(QWidget):
         self.renderer_state = "loading"
         self.failure_reason = "Preparing native map…"
         self._status.setText(self.failure_reason)
+        self._status.show()
         self._surface_stack.setCurrentWidget(self._status)
         self.state_changed.emit("loading", "")
 
@@ -625,12 +636,15 @@ class NativeMapRenderer(QWidget):
             or quick.status() != QQuickWidget.Ready
         ):
             return
-        self._surface_stack.setCurrentWidget(quick)
+        if self._surface_stack.currentWidget() is not quick:
+            self._surface_stack.setCurrentWidget(quick)
+        self._status.hide()
 
     def _set_unavailable(self, message: str) -> None:
         self.renderer_state = "unavailable"
         self.failure_reason = str(message or "Native map unavailable. Review Qt Location support and retry the Map.")
         self._status.setText(self.failure_reason)
+        self._status.show()
         self._surface_stack.setCurrentWidget(self._status)
         self.state_changed.emit("unavailable", self.failure_reason)
         self.unavailable.emit(self.failure_reason)
@@ -712,7 +726,7 @@ class NativeMapRenderer(QWidget):
             path["color_role"] = NativeMapRenderer._semantic_color_role(path, "path")
             # Existing caller-supplied colours remain authoritative.  Normal
             # RF links without one use the original Leaflet's five SNR bins.
-            if not str(path.get("color") or "").strip():
+            if not str(path.get("color") or "").strip() and path.get("evidence_kind") not in {"cached_route", "observed_packet_path"}:
                 path["color"] = NativeMapRenderer._link_snr_color(path.get("snr"))
             path["_original_payload"] = dict(item)
             output.append(path)
@@ -835,28 +849,57 @@ class NativeMapRenderer(QWidget):
     @staticmethod
     def _direction_indicators(paths: Sequence[Mapping[str, object]]) -> list[dict[str, object]]:
         output: list[dict[str, object]] = []
+        def endpoints(path):
+            points = path.get("points")
+            if not isinstance(points, Sequence) or len(points) < 2:
+                return None
+            first, last = _coordinate(points[0]), _coordinate(points[-1])
+            if first is None or last is None:
+                return None
+            return ((first["lat"], first["lon"]), (last["lat"], last["lon"]))
+
+        directed_pairs = {pair for path in paths[:_MAX_PATHS] if path.get("direction_known") is not False and (pair := endpoints(path)) is not None}
         for path in paths[:_MAX_PATHS]:
+            if path.get("direction_known") is False:
+                continue
             raw_points = path.get("points")
             if not isinstance(raw_points, Sequence) or len(raw_points) < 2:
                 continue
-            first = _coordinate(raw_points[0])
-            last = _coordinate(raw_points[-1])
-            if first is None or last is None:
+            # MapPolyline uses straight Web Mercator segments. Place the
+            # arrow on the longest segment in that same projection, including
+            # wrapped longitudes, rather than averaging geographic latitudes.
+            segments = []
+            for start, end in zip(raw_points, raw_points[1:]):
+                first, last = _coordinate(start), _coordinate(end)
+                if first is None or last is None:
+                    continue
+                dx = (last["lon"] - first["lon"] + 180.0) % 360.0 - 180.0
+                ya, yb = (
+                    math.degrees(math.asinh(math.tan(math.radians(max(-85.0511, min(85.0511, point["lat"]))))))
+                    for point in (first, last)
+                )
+                dy = yb - ya
+                if math.hypot(dx, dy) > 0.000001:
+                    segments.append((math.hypot(dx, dy), first, dx, ya, yb))
+            if not segments:
                 continue
-            lat = (first["lat"] + last["lat"]) / 2.0
-            lon = (first["lon"] + last["lon"]) / 2.0
-            import math
-
-            delta_lon = math.radians(last["lon"] - first["lon"])
-            lat_a = math.radians(first["lat"])
-            lat_b = math.radians(last["lat"])
-            bearing = (math.degrees(math.atan2(math.sin(delta_lon) * math.cos(lat_b), math.cos(lat_a) * math.sin(lat_b) - math.sin(lat_a) * math.cos(lat_b) * math.cos(delta_lon))) + 360.0) % 360.0
+            _, first, dx, ya, yb = max(segments, key=lambda segment: segment[0])
+            pair = endpoints(path)
+            # Reciprocal traffic gets separate arrowheads along the shared
+            # segment; placing both at its midpoint hides one direction.
+            fraction = 0.65 if pair is not None and pair[::-1] in directed_pairs else 0.5
+            lat = math.degrees(math.atan(math.sinh(math.radians(ya + (yb - ya) * fraction))))
+            lon = (first["lon"] + dx * fraction + 180.0) % 360.0 - 180.0
+            rotation = math.degrees(math.atan2(-(yb - ya), dx)) % 360.0
+            bearing = (rotation + 90.0) % 360.0
             output.append({
                 "id": f"direction:{path.get('id')}",
                 "kind": "path_direction",
                 "lat": lat,
                 "lon": lon,
                 "bearing": bearing,
+                "rotation": rotation,
+                "color": str(path.get("color") or ""),
                 "color_role": str(path.get("color_role") or "info"),
                 "path": dict(path),
             })
@@ -875,6 +918,10 @@ class NativeMapRenderer(QWidget):
                     "label": label,
                     "color_role": NativeMapRenderer._semantic_color_role(raw, "legend"),
                 }
+                if raw.get("tooltip"):
+                    item["tooltip"] = str(raw["tooltip"])
+                if raw.get("symbol_only"):
+                    item["symbol_only"] = True
                 color = str(raw.get("color") or "").strip()
                 if color:
                     item["color"] = color
@@ -945,8 +992,8 @@ class NativeMapRenderer(QWidget):
             return explicit
         status = str(
             item.get("spotter_status_key")
-            or item.get("severity")
             or item.get("status")
+            or item.get("severity")
             or item.get("level")
             or item.get("score_level")
             or ""
@@ -955,7 +1002,7 @@ class NativeMapRenderer(QWidget):
             return "danger"
         if status in {"yellow", "warning", "watch", "moderate", "caution"}:
             return "warning"
-        if status in {"green", "good", "healthy", "ready", "normal"}:
+        if status in {"green", "good", "healthy", "ready", "normal", "routine"}:
             return "success"
         if kind == "alert":
             return "danger"

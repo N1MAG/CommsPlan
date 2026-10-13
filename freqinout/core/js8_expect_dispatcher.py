@@ -367,7 +367,7 @@ def dispatch_expect_auto_reply(
             selected_target = str(send_result.preflight.selected_call or "").strip()
             reason = (
                 f"JS8Call still has selected target '{selected_target}'. "
-                "Deselect it in JS8Call before FIO can send this automatic reply."
+                "Deselect it in JS8Call before CommsPlan can send this automatic reply."
             )
     if sign_detail:
         reason = f"{reason} ({sign_detail})"

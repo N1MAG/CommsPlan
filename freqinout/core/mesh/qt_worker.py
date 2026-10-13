@@ -420,6 +420,10 @@ class MeshConnectionWorker(QObject):
             try:
                 snapshot = self._manager.health(adapter_id)
                 state = self._retry_states.setdefault(adapter_id, MeshRetryState())
+                if (not snapshot.connected and not state.operator_action_required
+                        and mesh_error_requires_operator_action(snapshot.last_error)):
+                    state.record_operator_action_required()
+                    self._persist_retry_state(adapter_id)
                 if snapshot.enabled and not snapshot.connected and state.operator_action_required:
                     self.operation_state.emit(adapter_id, "needs-attention", 0)
                 elif snapshot.enabled and not snapshot.connected and state.due(now_ms):

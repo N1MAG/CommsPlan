@@ -158,7 +158,7 @@ def prepare_managed_varac_runtime_repair(
                 "reconcile", node_id, radio_id,
                 target_runtime=target_runtime,
                 target_ini=target_runtime / "VARA.ini",
-                why="The native INI is correct; FIO's older saved runtime projection is stale.",
+                why="The native INI is correct; CommsPlan's older saved runtime projection is stale.",
             )
 
         source_runtime = Path(str(node.get("vara_runtime_path") or "")).expanduser()
@@ -245,7 +245,7 @@ def prepare_varac_native_configuration(
     if str(intent.get("family_key") or "").strip().lower() != "varac":
         return _result("manual setup required", "This preparation route is only for VarAC.", intent, fingerprint, generation)
     if str(intent.get("mode") or "").strip().lower() != "managed":
-        return _result("manual setup required", "Choose a new FIO-managed VarAC instance to use native configuration.", intent, fingerprint, generation)
+        return _result("manual setup required", "Choose a new CommsPlan-managed VarAC instance to use native configuration.", intent, fingerprint, generation)
     if arrangement not in {"create_cluster", "join_cluster"}:
         return _result("manual setup required", "Choose Create cluster or Join cluster before preparing native VarAC.", intent, fingerprint, generation)
     platform_key = _platform_key(platform_override)
@@ -294,7 +294,7 @@ def prepare_varac_native_configuration(
     prepared_outbox = managed_directories[1] if len(managed_directories) > 1 else member_root / "outbox"
     vara_values = new_member.changes.get("VARAHF_CONFIG", {})
     apply_warning = (
-        " VarAC or VARA is currently running; close both applications before final Save so FIO can apply the reviewed files safely."
+        " VarAC or VARA is currently running; close both applications before final Save so CommsPlan can apply the reviewed files safely."
         if process_running
         else ""
     )
@@ -456,7 +456,7 @@ def _build_plan(
     if platform_key == "linux-wine" and wine_drive_root is None:
         raise ValueError(
             "The selected VarAC.ini is not inside a verified Wine drive_<letter> folder; "
-            "choose the Wine VarAC instance before FIO prepares a VARA runtime."
+            "choose the Wine VarAC instance before CommsPlan prepares a VARA runtime."
         )
     vara_target_parent = wine_drive_root or managed_member_root
     new_vara_target_base = (
@@ -691,7 +691,7 @@ def _allocate_port_bundle(occupied: set[int], *, start: int) -> tuple[int, int, 
         if not any(port in occupied for port in proposed):
             return command, command + 2, command + 3
         command += 10
-    raise ValueError("FIO could not allocate a non-conflicting local VARA port bundle.")
+    raise ValueError("CommsPlan could not allocate a non-conflicting local VARA port bundle.")
 
 
 def _qualified_version(hint: str, writer_key: str, executable: Path) -> str:

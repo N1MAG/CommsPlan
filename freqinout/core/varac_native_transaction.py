@@ -205,7 +205,7 @@ def mark_varac_native_fio_committed(
     """Mark FIO state inside the caller's active guided-save transaction."""
 
     if not session.ok:
-        raise ValueError("A verified external VarAC session is required before FIO commit.")
+        raise ValueError("A verified external VarAC session is required before CommsPlan commit.")
     return store.update_varac_native_apply_journal(
         session.journal_id,
         state="fio_committed",
@@ -238,7 +238,7 @@ def rollback_varac_native_external_session(
     store: MultiRadioStore,
     session: VarACNativeExternalSession,
     *,
-    error: str = "FIO guided save did not commit.",
+    error: str = "CommsPlan guided save did not commit.",
 ) -> VarACNativeTransactionResult:
     """Compensate a verified external apply after FIO save cancellation/failure."""
 

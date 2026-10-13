@@ -6,7 +6,11 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from freqinout.core.observation_projection import Observation, utc_now_iso
-from freqinout.core.sqlite_utils import connect_sqlite
+from freqinout.core.sqlite_utils import connect_sqlite, connect_sqlite_readonly
+
+
+class ObservationSchemaUnavailable(RuntimeError):
+    """The observation projection cannot be read without creating or changing it."""
 
 
 def ensure_observation_schema(conn: sqlite3.Connection) -> None:
@@ -206,6 +210,7 @@ def list_observations(
     grid: str = "",
     since_utc: str = "",
     limit: int = 200,
+    readonly: bool = False,
 ) -> list[Observation]:
     clauses: list[str] = []
     params: list[Any] = []
@@ -237,9 +242,28 @@ def list_observations(
         params.append(str(since_utc).strip())
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
     params.append(max(1, int(limit or 200)))
-    conn = connect_sqlite(db_path)
+    conn: sqlite3.Connection | None = None
     try:
-        ensure_observation_schema(conn)
+        conn = (
+            connect_sqlite_readonly(db_path)
+            if readonly
+            else connect_sqlite(db_path)
+        )
+        if readonly:
+            _validate_observation_read_schema(conn, db_path)
+    except ObservationSchemaUnavailable:
+        if conn is not None:
+            conn.close()
+        raise
+    except (sqlite3.Error, OSError) as exc:
+        if readonly:
+            if conn is not None:
+                conn.close()
+            raise ObservationSchemaUnavailable(f"observation schema unavailable: {db_path}") from exc
+        raise
+    try:
+        if not readonly:
+            ensure_observation_schema(conn)
         rows = conn.execute(
             f"""
             SELECT
@@ -279,8 +303,58 @@ def list_observations(
             tuple(params),
         ).fetchall()
         return [_row_to_observation(row) for row in rows]
+    except sqlite3.Error as exc:
+        if readonly:
+            raise ObservationSchemaUnavailable(f"observation read unavailable: {db_path}") from exc
+        raise
     finally:
         conn.close()
+
+
+_OBSERVATION_COLUMNS = frozenset(
+    {
+        "observation_id", "source_family", "source_ref", "source_radio_id", "source_app",
+        "received_utc", "event_utc", "from_call", "to_target", "groups_json",
+        "observed_topics_json", "operator_attention", "status", "urgency", "subject",
+        "summary", "state", "grid", "lat", "lon", "location_confidence", "auth_state",
+        "trusted_state", "confirmed_state", "exercise_flag", "route_eligible",
+        "publish_authorized", "provenance_json",
+    }
+)
+
+
+def _validate_observation_read_schema(conn: sqlite3.Connection, db_path: str | Path) -> None:
+    """Validate the read model without issuing DDL or opening a writable DB."""
+    try:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name IN (?, ?)",
+                ("observation_projection", "observation_projection_topics"),
+            ).fetchall()
+        }
+        required_tables = {"observation_projection", "observation_projection_topics"}
+        if tables != required_tables:
+            missing = ", ".join(sorted(required_tables - tables))
+            raise ObservationSchemaUnavailable(
+                f"observation schema unavailable: missing table(s) {missing or 'unknown'} ({db_path})"
+            )
+        projection_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(observation_projection)").fetchall()
+        }
+        topic_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(observation_projection_topics)").fetchall()
+        }
+        missing_projection = _OBSERVATION_COLUMNS - projection_columns
+        if missing_projection or not {"observation_id", "topic"}.issubset(topic_columns):
+            missing = sorted(missing_projection | ({"observation_id", "topic"} - topic_columns))
+            raise ObservationSchemaUnavailable(
+                f"observation schema unavailable: missing column(s) {', '.join(missing)} ({db_path})"
+            )
+    except ObservationSchemaUnavailable:
+        raise
+    except sqlite3.Error as exc:
+        raise ObservationSchemaUnavailable(f"observation schema unavailable: {db_path}") from exc
 
 
 def set_projection_checkpoint(

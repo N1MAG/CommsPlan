@@ -14,6 +14,22 @@ from freqinout.core.mode_utils import voice_sideband_for_band
 log = logging.getLogger(__name__)
 
 
+_FLRIG_ENDPOINT_LOCKS_GUARD = threading.Lock()
+_FLRIG_ENDPOINT_LOCKS: dict[tuple[str, int], threading.RLock] = {}
+
+
+def _flrig_endpoint_lock(host: str, port: int) -> threading.RLock:
+    """Return the process-wide serialization lock for one FLRig endpoint."""
+
+    key = (str(host or "").strip().casefold() or "127.0.0.1", int(port))
+    with _FLRIG_ENDPOINT_LOCKS_GUARD:
+        lock = _FLRIG_ENDPOINT_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _FLRIG_ENDPOINT_LOCKS[key] = lock
+        return lock
+
+
 def _settings_text(settings: object, key: str, default: str = "") -> str:
     try:
         getter = getattr(settings, "get", None)
@@ -116,6 +132,11 @@ class FLRigClient:
         self.port = port
         self._proxy: Optional[ServerProxy] = None
         self._lock = threading.Lock()
+        # Multiple FIO services create short-lived clients for status, launch,
+        # and scheduler work.  FLRig serves these through one XML-RPC endpoint,
+        # so serialize only callers sharing that exact host/port.  Other radios
+        # (and therefore other ports) remain independent.
+        self._endpoint_lock = _flrig_endpoint_lock(host, port)
         self.fldigi_port = fldigi_port
         self.fldigi_host = fldigi_host or host
         self._fldigi_proxy: Optional[ServerProxy] = None
@@ -152,18 +173,19 @@ class FLRigClient:
         """
         Serialize access to the XML-RPC proxy and retry once on transport glitches.
         """
-        with self._lock:
-            try:
-                proxy = self._connect()
-                return func(proxy)
-            except Exception as e:
-                msg = str(e)
-                if "Request-sent" in msg or "Idle" in msg:
-                    log.warning("FLRig XML-RPC transient error during %s; reconnecting.", label)
-                    self._proxy = None
+        with self._endpoint_lock:
+            with self._lock:
+                try:
                     proxy = self._connect()
                     return func(proxy)
-                raise
+                except Exception as e:
+                    msg = str(e)
+                    if "Request-sent" in msg or "Idle" in msg:
+                        log.warning("FLRig XML-RPC transient error during %s; reconnecting.", label)
+                        self._proxy = None
+                        proxy = self._connect()
+                        return func(proxy)
+                    raise
 
     def _connect_fldigi(self) -> Optional[ServerProxy]:
         if self._fldigi_proxy is None:
@@ -260,8 +282,7 @@ class FLRigClient:
         Quick health check: ask FLRig for its version.
         """
         try:
-            proxy = self._connect()
-            _ = proxy.main.get_version()
+            self._with_proxy(lambda p: p.main.get_version(), label="get_version")
             return True
         except Exception as e:
             log.debug("FLRig not available: %s", e)
@@ -313,6 +334,40 @@ class FLRigClient:
         except Exception as e:
             log.warning("Failed to get transceiver identity from FLRig: %s", e)
             return None
+
+    def get_launch_readback(self) -> tuple[Optional[str], Optional[int]]:
+        """Return the standard FLRig identity/frequency launch proof.
+
+        ``rig.get_xcvr`` and ``rig.get_vfo`` are established XML-RPC methods
+        present in FLRig 2.0.8 and later.  Read both in one endpoint-serialized
+        transaction so FIO's scheduler and launch/status workers cannot overlap
+        requests to the same FLRig instance.  Deliberately do not send a raw
+        CAT command here: launch readiness must not compete with FLRig's radio
+        polling queue or depend on a model-specific CAT response deadline.
+        """
+
+        try:
+            def _read(proxy: ServerProxy) -> tuple[object, object]:
+                raw_name = proxy.rig.get_xcvr()
+                if not str(raw_name or "").strip():
+                    return raw_name, None
+                return raw_name, proxy.rig.get_vfo()
+
+            raw_name, raw_frequency = self._with_proxy(
+                _read,
+                label="launch_readback",
+            )
+            name = str(raw_name or "").strip() or None
+            if not name:
+                return None, None
+        except Exception as e:
+            log.warning("Failed FLRig launch readback: %s", e)
+            return None, None
+        try:
+            frequency = int(float(raw_frequency))
+        except (TypeError, ValueError):
+            return name, None
+        return name, frequency if frequency > 0 else None
 
     def get_live_transceiver_name(self) -> Optional[str]:
         """Return the transceiver name after any supported fresh CAT proof.

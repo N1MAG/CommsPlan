@@ -67,6 +67,8 @@ class OperationalActivitySnapshot:
 def query_observations(
     db_path: str | Path,
     query: ObservationQuery | None = None,
+    *,
+    readonly: bool = False,
 ) -> tuple[Observation, ...]:
     q = query or ObservationQuery()
     source_families = tuple(
@@ -90,6 +92,7 @@ def query_observations(
                     grid=q.grid,
                     since_utc=q.since_utc,
                     limit=per_source_limit,
+                    readonly=readonly,
                 )
             )
     else:
@@ -104,6 +107,7 @@ def query_observations(
             grid=q.grid,
             since_utc=q.since_utc,
             limit=q.limit,
+            readonly=readonly,
         )
     group = _normalize_group(q.operating_group)
     search_text = str(q.search_text or "").strip()
@@ -121,10 +125,12 @@ def query_observations(
 def matching_observation_callsigns(
     db_path: str | Path,
     query: ObservationQuery | None = None,
+    *,
+    readonly: bool = False,
 ) -> frozenset[str]:
     """Return station callsigns represented by a shared observation query."""
     calls: set[str] = set()
-    for observation in query_observations(db_path, query):
+    for observation in query_observations(db_path, query, readonly=readonly):
         for value in (observation.from_call,):
             call = _normalize_callsign(value)
             if not call:
@@ -143,6 +149,7 @@ def map_observation_rows(
     layer_enabled: bool,
     allow_unconfirmed_local: bool = False,
     exercise_layer: bool = False,
+    readonly: bool = False,
 ) -> tuple[ObservationViewRow, ...]:
     return tuple(
         ObservationViewRow(
@@ -154,7 +161,7 @@ def map_observation_rows(
                 exercise_layer=exercise_layer,
             ),
         )
-        for observation in query_observations(db_path, query)
+        for observation in query_observations(db_path, query, readonly=readonly)
     )
 
 

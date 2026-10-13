@@ -114,7 +114,7 @@ class DependencySnapshot:
 
     def to_software_status_snapshot(self) -> Dict[str, Dict[str, object]]:
         out: Dict[str, Dict[str, object]] = {}
-        for key in STATUS_KEYS:
+        for key in dict.fromkeys((*STATUS_KEYS, *self.process)):
             status = self.process.get(key)
             if status is None:
                 out[key] = _unknown_status_dict(key, self.generated_at)
@@ -446,7 +446,7 @@ class DependencyStatusService(QObject):
         )
         self._cancel_token.checkpoint()
         statuses: Dict[str, DependencyStatus] = {}
-        for key in STATUS_KEYS:
+        for key in dict.fromkeys((*STATUS_KEYS, *rows)):
             self._cancel_token.checkpoint()
             row = dict(rows.get(key, {}) or {})
             state = str(row.pop("state", "idle") or "idle")
@@ -635,11 +635,11 @@ class DependencyStatusService(QObject):
         if mode == "api_full":
             return f"JS8Call API is ready at {endpoint}.{version_part}"
         if mode == "api_basic":
-            return f"JS8Call API is reachable at {endpoint}; FIO will keep compatibility fallbacks available.{version_part}"
+            return f"JS8Call API is reachable at {endpoint}; CommsPlan will keep compatibility fallbacks available.{version_part}"
         if mode == "file_fallback":
-            return f"JS8Call API support is limited at {endpoint}; FIO will use log/database fallbacks.{version_part}"
+            return f"JS8Call API support is limited at {endpoint}; CommsPlan will use log/database fallbacks.{version_part}"
         if running:
-            return f"JS8Call is running, but FIO could not verify the TCP API at {endpoint}."
+            return f"JS8Call is running, but CommsPlan could not verify the TCP API at {endpoint}."
         return "JS8Call is not running."
 
 

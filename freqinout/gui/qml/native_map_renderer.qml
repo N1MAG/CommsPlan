@@ -21,7 +21,7 @@ Item {
         var kind = String(marker.kind || "station").toLowerCase()
         var icon = String(marker.icon || marker.topic || "").toLowerCase()
         var source = String(marker.source_kind || "").toLowerCase()
-        if (kind === "station") return "•"
+        if (kind === "station") return marker.is_own_station ? "⌂" : (marker.is_mesh_self ? "⌖" : "•")
         if (kind === "alert") return "!"
         if (source === "pin") return "⌖"
         if (icon === "storm" || icon === "power") return "ϟ"
@@ -41,6 +41,7 @@ Item {
     }
 
     function markerDetail(marker) {
+        if (marker.is_own_station) return "My station · " + String(marker.callsign || "") + "\n" + String(marker.tooltip || marker.title || "")
         return String(marker.tooltip || marker.title || marker.label || marker.callsign || "Map item")
     }
 
@@ -384,6 +385,7 @@ Item {
         MapItemView {
             model: mapBridge.adaptiveGrid ? root.dynamicGridLines : mapBridge.gridLines
             delegate: MapPolyline {
+                referenceSurface: QtLocation.ReferenceSurface.Map
                 line.width: 1
                 line.color: modelData.color || mapBridge.theme.border
                 opacity: 0.65
@@ -401,7 +403,9 @@ Item {
         MapItemView {
             model: mapBridge.paths
             delegate: MapPolyline {
-                line.width: 2
+                referenceSurface: QtLocation.ReferenceSurface.Map
+                opacity: modelData.evidence_kind === "cached_route" ? 0.6 : 1.0
+                line.width: modelData.evidence_kind === "cached_route" ? 1.5 : 2.5
                 line.color: modelData.color || root.themeColor(modelData.color_role)
                 path: {
                     var result = []
@@ -417,6 +421,7 @@ Item {
         MapItemView {
             model: mapBridge.paths
             delegate: MapPolyline {
+                referenceSurface: QtLocation.ReferenceSurface.Map
                 // One generous, nearly transparent interaction stroke sits on
                 // top of the visible 2px path.  Only this layer handles taps,
                 // so one operator click can emit only one selection action.
@@ -464,7 +469,7 @@ Item {
                         id: markerDot
                         anchors.horizontalCenter: parent.horizontalCenter
                         y: (34 - height) / 2
-                        width: modelData.kind === "station" ? (modelData.qsy_soon ? 19 : 16) : 21
+                        width: modelData.kind === "station" ? (modelData.is_own_station ? 25 : (modelData.qsy_soon ? 19 : 16)) : 21
                         height: width
                         radius: modelData.kind === "alert" ? 3 : (modelData.kind === "infrastructure" ? 6 : width / 2)
                         rotation: modelData.kind === "alert" ? 45 : 0
@@ -472,6 +477,16 @@ Item {
                         border.color: root.themeColor(root.markerBorderRole(modelData))
                         border.width: modelData.qsy_soon ? 3 : 2
                         opacity: markerHover.hovered ? 1.0 : 0.96
+                    }
+                    Rectangle {
+                        visible: !!modelData.is_own_station || !!modelData.is_mesh_self
+                        anchors.centerIn: markerDot
+                        width: markerDot.width + 8
+                        height: width
+                        radius: width / 2
+                        color: "transparent"
+                        border.width: 2
+                        border.color: mapBridge.theme.text
                     }
                     Text {
                         anchors.centerIn: markerDot
@@ -494,8 +509,10 @@ Item {
                     Text {
                         id: stationLabel
                         anchors.horizontalCenter: parent.horizontalCenter
-                        anchors.top: markerDot.bottom
+                        anchors.top: modelData.is_mesh_self ? undefined : markerDot.bottom
+                        anchors.bottom: modelData.is_mesh_self ? markerDot.top : undefined
                         anchors.topMargin: 2
+                        anchors.bottomMargin: 2
                         visible: modelData.kind === "station" && String(modelData.label || "").length > 0
                         text: modelData.label || ""
                         color: mapBridge.theme.text
@@ -522,14 +539,27 @@ Item {
             delegate: MapQuickItem {
                 visible: mapBridge.directionIndicators && stationMap.zoomLevel >= Number(modelData.min_zoom || 1)
                 coordinate: QtPositioning.coordinate(Number(modelData.lat), Number(modelData.lon))
-                anchorPoint.x: arrow.width / 2
-                anchorPoint.y: arrow.height / 2
-                sourceItem: Text {
-                    id: arrow
-                    text: "➤"
-                    color: root.themeColor(modelData.color_role)
-                    font: Qt.application.font
-                    rotation: Number(modelData.bearing || 0)
+                anchorPoint.x: arrowContainer.width / 2
+                anchorPoint.y: arrowContainer.height / 2
+                // Rotate inside a stable source rectangle. Rotating the
+                // sourceItem itself shifts MapQuickItem's geographic anchor.
+                sourceItem: Item {
+                    id: arrowContainer
+                    width: arrow.implicitWidth
+                    height: arrow.implicitHeight
+                    Text {
+                        id: arrow
+                        anchors.centerIn: parent
+                        text: modelData.path && modelData.path.evidence_kind === "cached_route" ? "›" : "➤"
+                        color: modelData.color || root.themeColor(modelData.color_role)
+                        font: Qt.application.font
+                        rotation: Number(modelData.rotation || 0)
+                    }
+                    Accessible.role: Accessible.Button
+                    Accessible.name: root.pathDetail(modelData.path || {})
+                    HoverHandler { id: directionHover }
+                    ToolTip.visible: directionHover.hovered
+                    ToolTip.text: root.pathDetail(modelData.path || {})
                     MouseArea {
                         anchors.fill: parent
                         onClicked: mapBridge.selectPathById(String((modelData.path || {}).id || ""))
@@ -748,16 +778,20 @@ Item {
                     property bool grouped: childItems.length > 0
                     width: grouped ? legendRow.width : simpleEntry.implicitWidth
                     height: grouped ? groupedEntry.implicitHeight : simpleEntry.implicitHeight
+                    Accessible.name: modelData.tooltip || modelData.label || ""
+                    HoverHandler { id: legendHover }
+                    ToolTip.visible: legendHover.hovered && !!modelData.tooltip
+                    ToolTip.text: modelData.tooltip || ""
 
                     Row {
                         id: simpleEntry
                         visible: !legendEntry.grouped
                         spacing: 5
                         Rectangle {
-                            width: modelData.heading ? 0 : 10
-                            height: modelData.heading ? 0 : 10
+                            width: modelData.heading || modelData.symbol_only ? 0 : 10
+                            height: modelData.heading || modelData.symbol_only ? 0 : 10
                             radius: width / 2
-                            visible: !modelData.heading
+                            visible: !modelData.heading && !modelData.symbol_only
                             color: modelData.color || root.themeColor(modelData.color_role)
                             anchors.verticalCenter: parent.verticalCenter
                         }

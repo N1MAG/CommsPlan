@@ -6,11 +6,17 @@ import math
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
 from freqinout.core.config_paths import get_config_dir
 from freqinout.core.local_ops_store import get_all_operators
 from freqinout.core.logger import log
+from freqinout.core.operating_group_frequency import (
+    format_frequency_mhz,
+    normalize_frequency_hz,
+    reattach_sop_frequency_key,
+    sop_frequency_reference_signature,
+)
 from freqinout.core.propagation_outcome_ingest import STATE_TO_FEMA_REGION
 from freqinout.core.schedule_targeting import normalize_schedule_target_fields
 from freqinout.core.settings_manager import SettingsManager
@@ -18,6 +24,7 @@ from freqinout.core.settings_manager import SettingsManager
 
 CONFIG_DIR = get_config_dir() / "config"
 NETS_DB = CONFIG_DIR / "freqinout_nets.db"
+SOP_FREQUENCY_VARIANT_REFERENCES_KEY = "sop_frequency_variant_references"
 
 
 def _utc_now_iso() -> str:
@@ -257,6 +264,139 @@ class SOPManager:
         return get_config_dir() / "config" / "freqinout.db"
 
     @staticmethod
+    def _frequency_reference_signature(row: Mapping[str, Any]) -> Dict[str, Any]:
+        return sop_frequency_reference_signature(row)
+
+    @staticmethod
+    def _frequency_reference_entry(row_id: int, row: Mapping[str, Any]) -> Dict[str, Any]:
+        return {
+            "signature": SOPManager._frequency_reference_signature(row),
+            "operating_group_frequency_key": str(row.get("operating_group_frequency_key") or "").strip(),
+            "deleted": False,
+            "id": int(row_id),
+        }
+
+    @staticmethod
+    def _frequency_reference_row(
+        row: Mapping[str, Any], *, group: Any, band: Any, mode: Any, frequency: Any
+    ) -> Dict[str, Any]:
+        reference = dict(row)
+        reference.update(
+            {
+                "group_name": str(group or "").strip().upper(),
+                "band": str(band or "").strip().upper(),
+                "mode": str(mode or "").strip().upper(),
+                "frequency": SOPManager._normalize_frequency(frequency),
+            }
+        )
+        return reference
+
+    def _write_frequency_variant_sidecar(
+        self,
+        profile_id: int,
+        *,
+        actions: Mapping[int, Mapping[str, Any]] | None = None,
+        layers: Mapping[int, Mapping[str, Any]] | None = None,
+        deleted_actions: Set[int] = frozenset(),
+        deleted_layers: Set[int] = frozenset(),
+    ) -> None:
+        """Persist variant references in Settings JSON without changing the SOP DB schema."""
+        if not actions and not layers and not deleted_actions and not deleted_layers:
+            return
+        old_value = self.settings.get(SOP_FREQUENCY_VARIANT_REFERENCES_KEY, {})
+        if not old_value and not deleted_actions and not deleted_layers:
+            incoming = list((actions or {}).values()) + list((layers or {}).values())
+            if not any(str(row.get("operating_group_frequency_key") or "").strip() for row in incoming):
+                # Keep legacy imports and lightweight Settings fakes read-only.
+                return
+        sidecar = dict(old_value) if isinstance(old_value, dict) else {}
+        profile = dict(sidecar.get(str(int(profile_id))) or {})
+        action_refs = dict(profile.get("actions") or {})
+        layer_refs = dict(profile.get("layers") or {})
+        for row_id in deleted_actions:
+            old = dict(action_refs.get(str(row_id)) or {})
+            old["deleted"] = True
+            action_refs[str(row_id)] = old
+        for row_id in deleted_layers:
+            old = dict(layer_refs.get(str(row_id)) or {})
+            old["deleted"] = True
+            layer_refs[str(row_id)] = old
+        for row_id, row in (actions or {}).items():
+            key = str(int(row_id))
+            entry = self._frequency_reference_entry(int(row_id), row)
+            old = action_refs.get(key)
+            if not entry["operating_group_frequency_key"] and isinstance(old, dict) and not old.get("deleted"):
+                if old.get("signature") == entry["signature"]:
+                    entry["operating_group_frequency_key"] = str(old.get("operating_group_frequency_key") or "")
+                elif old.get("operating_group_frequency_key"):
+                    entry["operating_group_frequency_key"] = "unresolved_mirror_reference"
+            action_refs[key] = entry
+        for row_id, row in (layers or {}).items():
+            key = str(int(row_id))
+            entry = self._frequency_reference_entry(int(row_id), row)
+            old = layer_refs.get(key)
+            if not entry["operating_group_frequency_key"] and isinstance(old, dict) and not old.get("deleted"):
+                if old.get("signature") == entry["signature"]:
+                    entry["operating_group_frequency_key"] = str(old.get("operating_group_frequency_key") or "")
+                elif old.get("operating_group_frequency_key"):
+                    entry["operating_group_frequency_key"] = "unresolved_mirror_reference"
+            layer_refs[key] = entry
+        profile.update({"actions": action_refs, "layers": layer_refs})
+        sidecar[str(int(profile_id))] = profile
+        try:
+            self.settings.set(SOP_FREQUENCY_VARIANT_REFERENCES_KEY, sidecar)
+            persisted = self.settings._conn.execute(
+                "SELECT value FROM kv WHERE key=?", (SOP_FREQUENCY_VARIANT_REFERENCES_KEY,)
+            ).fetchone()
+            if not persisted or json.loads(str(persisted[0])) != sidecar:
+                raise RuntimeError("SOP frequency variant references were not persisted.")
+        except Exception:
+            try:
+                self.settings._data[SOP_FREQUENCY_VARIANT_REFERENCES_KEY] = old_value
+            except Exception:
+                pass
+            raise
+
+    def _reattach_frequency_variant_keys(self, profile_id: int, actions: List[Dict[str, Any]], layers: List[Dict[str, Any]]) -> None:
+        sidecar = self.settings.get(SOP_FREQUENCY_VARIANT_REFERENCES_KEY, {})
+        for kind, rows in (("actions", actions), ("layers", layers)):
+            for index, row in enumerate(rows):
+                rows[index] = reattach_sop_frequency_key(row, sidecar, profile_id, kind=kind)
+
+    def _prune_frequency_variant_sidecar(self, profile_id: int, *, remove_profile: bool = False) -> None:
+        """Best-effort post-commit cleanup; failures retain safe stale references."""
+        old_value = self.settings.get(SOP_FREQUENCY_VARIANT_REFERENCES_KEY, {})
+        if not isinstance(old_value, dict) or str(int(profile_id)) not in old_value:
+            return
+        sidecar = dict(old_value)
+        if remove_profile:
+            sidecar.pop(str(int(profile_id)), None)
+        else:
+            try:
+                conn = self._connect()
+                try:
+                    actions = {str(int(row[0])) for row in conn.execute("SELECT id FROM sop_actions WHERE profile_id=?", (int(profile_id),))}
+                    layers = {str(int(row[0])) for row in conn.execute("SELECT id FROM sop_schedule_layer WHERE profile_id=?", (int(profile_id),))}
+                finally:
+                    conn.close()
+            except Exception as exc:
+                log.debug("SOP: retaining stale frequency-reference metadata after row lookup failure: %s", exc)
+                return
+            profile = dict(sidecar.get(str(int(profile_id))) or {})
+            profile["actions"] = {key: value for key, value in dict(profile.get("actions") or {}).items() if key in actions}
+            profile["layers"] = {key: value for key, value in dict(profile.get("layers") or {}).items() if key in layers}
+            sidecar[str(int(profile_id))] = profile
+        try:
+            self.settings.set(SOP_FREQUENCY_VARIANT_REFERENCES_KEY, sidecar)
+            persisted = self.settings._conn.execute(
+                "SELECT value FROM kv WHERE key=?", (SOP_FREQUENCY_VARIANT_REFERENCES_KEY,)
+            ).fetchone()
+            if not persisted or json.loads(str(persisted[0])) != sidecar:
+                raise RuntimeError("SOP frequency variant reference cleanup was not persisted.")
+        except Exception as exc:
+            log.debug("SOP: retaining stale frequency-reference metadata after cleanup failure: %s", exc)
+
+    @staticmethod
     def _normalize_day_utc(value: Any) -> str:
         raw = str(value or "").strip()
         if not raw:
@@ -304,6 +444,8 @@ class SOPManager:
         text = str(value or "").strip()
         if not text:
             return ""
+        if normalize_frequency_hz(text) is not None:
+            return format_frequency_mhz(text)
         try:
             return f"{float(text):.3f}"
         except Exception:
@@ -1304,6 +1446,8 @@ class SOPManager:
                     }
                 )
 
+            self._reattach_frequency_variant_keys(int(profile_id), actions, schedule_layer)
+
             return {
                 "id": row[0],
                 "name": row[1],
@@ -1374,6 +1518,7 @@ class SOPManager:
                     for r in conn.execute("SELECT id FROM sop_actions WHERE profile_id = ?", (profile_id,)).fetchall()
                 }
                 kept: set[int] = set()
+                saved_action_refs: Dict[int, Mapping[str, Any]] = {}
 
                 for idx, action in enumerate(actions):
                     action_id = int(action.get("id") or 0)
@@ -1413,7 +1558,7 @@ class SOPManager:
                         int(action.get("sort_order") if action.get("sort_order") is not None else idx),
                     )
                     if action_id > 0:
-                        conn.execute(
+                        updated_action = conn.execute(
                             """
                             UPDATE sop_actions
                             SET group_name=?, condition_levels=?, band=?, frequency=?, software=?, mode=?,
@@ -1452,7 +1597,12 @@ class SOPManager:
                                 profile_id,
                             ),
                         )
+                        if int(updated_action.rowcount or 0) <= 0:
+                            raise ValueError(f"SOP action {action_id} no longer exists; reload before saving.")
                         kept.add(action_id)
+                        saved_action_refs[action_id] = self._frequency_reference_row(
+                            action, group=vals[1], band=vals[3], mode=vals[6], frequency=vals[4]
+                        )
                     else:
                         conn.execute(
                             """
@@ -1469,6 +1619,9 @@ class SOPManager:
                         )
                         new_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
                         kept.add(new_id)
+                        saved_action_refs[new_id] = self._frequency_reference_row(
+                            action, group=vals[1], band=vals[3], mode=vals[6], frequency=vals[4]
+                        )
 
                 to_delete = existing - kept
                 for aid in to_delete:
@@ -1484,6 +1637,7 @@ class SOPManager:
                         ).fetchall()
                     }
                     kept_layer: set[int] = set()
+                    saved_layer_refs: Dict[int, Mapping[str, Any]] = {}
                     for idx, layer in enumerate(schedule_layer):
                         if not isinstance(layer, dict):
                             continue
@@ -1546,6 +1700,9 @@ class SOPManager:
                             )
                             if int(cur.rowcount or 0) > 0:
                                 kept_layer.add(layer_id)
+                                saved_layer_refs[layer_id] = self._frequency_reference_row(
+                                    layer, group=vals[6], band=vals[7], mode=vals[8], frequency=vals[10]
+                                )
                                 continue
                         conn.execute(
                             """
@@ -1557,13 +1714,35 @@ class SOPManager:
                             """,
                             vals,
                         )
-                        kept_layer.add(int(conn.execute("SELECT last_insert_rowid()").fetchone()[0]))
+                        new_layer_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+                        kept_layer.add(new_layer_id)
+                        saved_layer_refs[new_layer_id] = self._frequency_reference_row(
+                            layer, group=vals[6], band=vals[7], mode=vals[8], frequency=vals[10]
+                        )
 
                     to_delete_layer = existing_layer - kept_layer
                     for lid in to_delete_layer:
                         conn.execute("DELETE FROM sop_schedule_layer WHERE id=? AND profile_id=?", (lid, profile_id))
+                    self._write_frequency_variant_sidecar(
+                        profile_id,
+                        actions=saved_action_refs,
+                        layers=saved_layer_refs,
+                        deleted_actions=to_delete,
+                        deleted_layers=to_delete_layer,
+                    )
                 elif profile_category == self.CATEGORY_HF:
                     rebuild_from_actions = True
+                    self._write_frequency_variant_sidecar(
+                        profile_id,
+                        actions=saved_action_refs,
+                        deleted_actions=to_delete,
+                    )
+                else:
+                    self._write_frequency_variant_sidecar(
+                        profile_id,
+                        actions=saved_action_refs,
+                        deleted_actions=to_delete,
+                    )
             if rebuild_from_actions:
                 try:
                     self.rebuild_schedule_layer_from_actions(profile_id)
@@ -1581,6 +1760,7 @@ class SOPManager:
                     )
                 except Exception as e:
                     log.debug("SOP: Net/SOP conflict policy sync failed for profile %s: %s", profile_id, e)
+            self._prune_frequency_variant_sidecar(profile_id)
             self._invalidate_active_hf_conflicts_cache()
             return profile_id
         finally:
@@ -1598,6 +1778,7 @@ class SOPManager:
 
         conn = self._connect()
         changed = 0
+        saved_layer_refs: Dict[int, Mapping[str, Any]] = {}
         try:
             now_iso = _utc_now_iso()
             with conn:
@@ -1667,6 +1848,9 @@ class SOPManager:
                         )
                         if int(updated.rowcount or 0) > 0:
                             changed += 1
+                            saved_layer_refs[layer_id] = self._frequency_reference_row(
+                                layer, group=group_name, band=band, mode=mode, frequency=freq
+                            )
                             continue
 
                     existing = conn.execute(
@@ -1703,6 +1887,9 @@ class SOPManager:
                             (enabled, now_iso, int(existing[0] or 0), pid),
                         )
                         changed += 1
+                        saved_layer_refs[int(existing[0] or 0)] = self._frequency_reference_row(
+                            layer, group=group_name, band=band, mode=mode, frequency=freq
+                        )
                         continue
 
                     conn.execute(
@@ -1732,8 +1919,14 @@ class SOPManager:
                             now_iso,
                         ),
                     )
+                    saved_layer_refs[int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])] = self._frequency_reference_row(
+                        layer, group=group_name, band=band, mode=mode, frequency=freq
+                    )
                     changed += 1
+                if saved_layer_refs:
+                    self._write_frequency_variant_sidecar(pid, layers=saved_layer_refs)
             if changed > 0:
+                self._prune_frequency_variant_sidecar(pid)
                 self._invalidate_active_hf_conflicts_cache()
             return changed
         finally:
@@ -1743,10 +1936,16 @@ class SOPManager:
         conn = self._connect()
         try:
             with conn:
+                action_ids = {int(row[0]) for row in conn.execute("SELECT id FROM sop_actions WHERE profile_id=?", (profile_id,))}
+                layer_ids = {int(row[0]) for row in conn.execute("SELECT id FROM sop_schedule_layer WHERE profile_id=?", (profile_id,))}
+                self._write_frequency_variant_sidecar(
+                    int(profile_id), deleted_actions=action_ids, deleted_layers=layer_ids
+                )
                 conn.execute("DELETE FROM sop_action_state WHERE profile_id=?", (profile_id,))
                 conn.execute("DELETE FROM sop_actions WHERE profile_id=?", (profile_id,))
                 conn.execute("DELETE FROM sop_schedule_layer WHERE profile_id=?", (profile_id,))
                 conn.execute("DELETE FROM sop_profiles WHERE id=?", (profile_id,))
+            self._prune_frequency_variant_sidecar(int(profile_id), remove_profile=True)
             self._invalidate_active_hf_conflicts_cache()
         finally:
             conn.close()
@@ -2461,6 +2660,7 @@ class SOPManager:
                     "mode": mode,
                     "vfo": "A",
                     "frequency": freq,
+                    "operating_group_frequency_key": str(action.get("operating_group_frequency_key") or ""),
                     "start_utc": start_utc,
                     "end_utc": end_utc,
                     "enabled": True,
@@ -2500,6 +2700,7 @@ class SOPManager:
             with conn:
                 conn.execute("DELETE FROM sop_schedule_layer WHERE profile_id = ?", (int(profile.get("id") or 0),))
             self.upsert_schedule_layer_rows(int(profile.get("id") or 0), final_rows)
+            self._prune_frequency_variant_sidecar(int(profile.get("id") or 0))
             with conn:
                 for daily_summary, net_summary, action_id in action_updates:
                     if action_id <= 0:
@@ -3729,14 +3930,12 @@ class SOPManager:
                     FROM daily_schedule_tab
                     WHERE UPPER(COALESCE({group_col}, '')) = ?
                       AND UPPER(COALESCE(band, '')) = ?
-                      AND (
-                          printf('%.3f', CAST(frequency AS REAL)) = ?
-                          OR TRIM(CAST(frequency AS TEXT)) = ?
-                      )
                     """
                 )
-                params = (group, band, freq, freq)
+                params = (group, band)
                 for d, s, e, b, f, m, v in conn.execute(sql, params).fetchall():
+                    if normalize_frequency_hz(f) != normalize_frequency_hz(freq):
+                        continue
                     rows.append(
                         {
                             "day_utc": "ALL",
@@ -3782,14 +3981,12 @@ class SOPManager:
                     FROM net_schedule_tab
                     WHERE UPPER(COALESCE({group_col}, '')) = ?
                       AND UPPER(COALESCE(band, '')) = ?
-                      AND (
-                          printf('%.3f', CAST(frequency AS REAL)) = ?
-                          OR TRIM(CAST(frequency AS TEXT)) = ?
-                      )
                     """
                 )
-                params = (group, band, freq, freq)
+                params = (group, band)
                 for d, s, e, rec, biw, weeks, b, f, m, v in conn.execute(sql, params).fetchall():
+                    if normalize_frequency_hz(f) != normalize_frequency_hz(freq):
+                        continue
                     rows.append(
                         {
                             "day_utc": "ALL",
@@ -3984,6 +4181,9 @@ class SOPManager:
                         "has_schedule_windows": has_schedule_windows,
                         "status": status,
                         "is_completed": completed_current and status == "Completed",
+                        **{key: value for key, value in normalize_schedule_target_fields(
+                            action if action.get("target_scope") else full
+                        ).items() if key in {"target_scope", "target_device_profile_id", "target_operating_profile_id"}},
                     }
                 )
         rows.sort(key=lambda x: x["next_due_utc"])
@@ -4477,6 +4677,7 @@ class SOPManager:
                         "condition_levels": self._normalize_condition_levels(a.get("condition_levels")),
                         "band": (a.get("band") or "").strip().upper(),
                         "frequency": (a.get("frequency") or "").strip(),
+                        "operating_group_frequency_key": str(a.get("operating_group_frequency_key") or "").strip(),
                         "software": (a.get("software") or "").strip(),
                         "mode": str(a.get("mode") or "").strip().upper(),
                         "action_key": (a.get("action_key") or "").strip(),
@@ -4515,6 +4716,7 @@ class SOPManager:
                         "mode": str(row.get("mode") or "").strip().upper(),
                         "vfo": str(row.get("vfo") or "").strip().upper(),
                         "frequency": self._normalize_frequency(row.get("frequency")),
+                        "operating_group_frequency_key": str(row.get("operating_group_frequency_key") or "").strip(),
                         "start_utc": self._normalize_hhmm(row.get("start_utc")),
                         "end_utc": self._normalize_hhmm(row.get("end_utc")),
                         "enabled": bool(row.get("enabled", True)),

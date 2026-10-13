@@ -63,7 +63,7 @@ class MeshChannelAdminWidget(QGroupBox):
         self.refresh_button = QPushButton("Refresh device channels")
         self.refresh_button.setToolTip(
             "Request the channels currently configured on this device. "
-            "This does not change FIO policy."
+            "This does not change CommsPlan policy."
         )
         self.refresh_button.clicked.connect(self._refresh)
         toolbar.addWidget(self.adapter_label)
@@ -98,7 +98,7 @@ class MeshChannelAdminWidget(QGroupBox):
             state_form.addRow(label, widget)
         detail_layout.addWidget(self.state_group)
 
-        self.policy_group = QGroupBox("FIO policy")
+        self.policy_group = QGroupBox("CommsPlan policy")
         policy_form = QFormLayout(self.policy_group)
         self.review_label = QLabel("—")
         self.category_combo = QComboBox()
@@ -143,10 +143,10 @@ class MeshChannelAdminWidget(QGroupBox):
         actions.setContentsMargins(0, 0, 0, 0)
         self._actions_layout = actions
         self.accept_button = QPushButton("Accept")
-        self.accept_button.setToolTip("Accept this channel for FIO handling; the device is not changed.")
+        self.accept_button.setToolTip("Accept this channel for CommsPlan handling; the device is not changed.")
         self.accept_button.clicked.connect(lambda: self._set_review("accepted"))
         self.ignore_button = QPushButton("Ignore")
-        self.ignore_button.setToolTip("Ignore this channel in FIO; the device is not changed.")
+        self.ignore_button.setToolTip("Ignore this channel in CommsPlan; the device is not changed.")
         self.ignore_button.clicked.connect(lambda: self._set_review("ignored"))
         self.configure_button = QPushButton("Configure device")
         self.configure_button.setToolTip("Change supported channel fields on the connected device after review.")
@@ -154,8 +154,8 @@ class MeshChannelAdminWidget(QGroupBox):
         self.remove_device_button = QPushButton("Remove from device")
         self.remove_device_button.setToolTip("Remove this channel from the connected device after confirmation.")
         self.remove_device_button.clicked.connect(self._remove_device)
-        self.remove_fio_button = QPushButton("Remove from FIO")
-        self.remove_fio_button.setToolTip("Archive FIO policy for this channel; the connected device is unchanged.")
+        self.remove_fio_button = QPushButton("Remove from CommsPlan")
+        self.remove_fio_button.setToolTip("Archive CommsPlan policy for this channel; the connected device is unchanged.")
         self.remove_fio_button.clicked.connect(self._remove_fio)
         self._action_buttons = (
             self.accept_button,
@@ -193,7 +193,7 @@ class MeshChannelAdminWidget(QGroupBox):
 
         The channel model is intentionally protocol-neutral and does not carry
         provenance.  Hosts can provide that provenance separately so staged
-        FIO-only channels never bury channels that are actually on the device.
+        CommsPlan-only channels never bury channels that are actually on the device.
         """
 
         self._device_channel_ids = {str(value) for value in (channel_ids or ()) if str(value)}

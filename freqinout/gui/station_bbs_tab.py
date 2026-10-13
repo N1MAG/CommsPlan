@@ -50,6 +50,8 @@ from PySide6.QtWidgets import (
 )
 
 from freqinout.core.settings_manager import SettingsManager
+from freqinout.core.bbs_access_policy import effective_callsigns
+from freqinout.gui.bbs_access_editor import BbsAccessEditor
 from freqinout.core import varac_bbs_library_store as bbs_library_store
 from freqinout.core.message_file_scanner import is_fio_bbs_helper_file_name
 from freqinout.core.multi_radio_store import MultiRadioStore
@@ -75,7 +77,7 @@ from freqinout.core.varac_bbs_initialization import (
     BbsInitializationResult,
     initialize_station_bbs_library,
 )
-from freqinout.core.varac_bbs_vault import hash_access_code
+from freqinout.core.varac_bbs_vault import DEFAULT_LOCATION_ID, hash_access_code
 from freqinout.gui.help_registry import resolve_help_host
 from freqinout.gui.theme import (
     button_height_for_font,
@@ -109,6 +111,7 @@ class _BbsCatalogSnapshot:
     allowed_callsigns: frozenset[str]
     limit_access_enabled: bool
     sweeper_rules: tuple[dict[str, object], ...]
+    managed_root: str = ""
 
 
 class _BbsCatalogWorker(QObject):
@@ -135,6 +138,7 @@ class _BbsCatalogWorker(QObject):
                 default_row = conn.execute(
                     "SELECT value FROM bbs_library_meta WHERE key='station_default_location_id' LIMIT 1"
                 ).fetchone()
+                root_row = conn.execute("SELECT value FROM bbs_library_meta WHERE key='station_managed_root' LIMIT 1").fetchone()
                 permission_rows = dict(
                     conn.execute(
                         "SELECT key, value FROM bbs_library_meta "
@@ -179,6 +183,7 @@ class _BbsCatalogWorker(QObject):
                         str(permission_rows.get("station_limit_access_enabled", "0") or "0") == "1"
                     ),
                     sweeper_rules=sweeper_rules,
+                    managed_root=str(root_row[0] or "") if root_row else "",
                 ),
             )
         except Exception as exc:
@@ -354,9 +359,9 @@ class StationBbsTab(QWidget):
         layout.setSpacing(8)
 
         title_row = QHBoxLayout()
-        self.bbs_title = QLabel("FIO BBS")
+        self.bbs_title = QLabel("CommsPlan BBS")
         self.bbs_title.setObjectName("stationBbsTitle")
-        self.bbs_title.setAccessibleName("FIO BBS")
+        self.bbs_title.setAccessibleName("CommsPlan BBS")
         title_row.addWidget(self.bbs_title)
         title_row.addStretch(1)
         self.help_btn = QPushButton("Help")
@@ -373,7 +378,7 @@ class StationBbsTab(QWidget):
 
         self.why_label = QLabel(
             "One station BBS: configure the radios that serve it, define locations and access, then publish files. "
-            "FIO projects the same catalog to each enabled VarAC radio without deleting source files."
+            "CommsPlan projects the same catalog to each enabled VarAC radio without deleting source files."
         )
         self.why_label.setObjectName("stationBbsWhy")
         self.why_label.setWordWrap(True)
@@ -431,7 +436,7 @@ class StationBbsTab(QWidget):
         service_options_layout.setContentsMargins(8, 6, 8, 6)
         service_options_layout.setSpacing(4)
         self.radio_service_enabled_chk = QCheckBox("Enable VarAC BBS")
-        self.radio_publish_enabled_chk = QCheckBox("Publish the FIO catalog")
+        self.radio_publish_enabled_chk = QCheckBox("Publish the CommsPlan catalog")
         self.radio_announce_enabled_chk = QCheckBox("Announce BBS")
         service_options_layout.addWidget(self.radio_service_enabled_chk)
         service_options_layout.addWidget(self.radio_publish_enabled_chk)
@@ -480,6 +485,13 @@ class StationBbsTab(QWidget):
         self.radio_service_status.setWordWrap(True)
         self.radio_service_status.setAccessibleName("Radio Service status")
         radio_editor_layout.addWidget(self.radio_service_status, 5, 0, 1, 3)
+        from freqinout.gui.bbs_varac_sync_panel import BbsVaracSyncPanel
+        self.varac_sync_panel = BbsVaracSyncPanel(
+            self, db_path=bbs_library_db_path_from_settings(self.settings),
+            radio_id=self._selected_radio_service_id, radio_dirty=self._radio_service_is_dirty,
+        )
+        self.varac_sync_panel.saved.connect(self.refresh_catalog)
+        radio_editor_layout.addWidget(self.varac_sync_panel, 6, 0, 1, 3)
         radio_editor_layout.setColumnStretch(1, 1)
         self.radio_editor_scroll = QScrollArea(self.radio_service_page)
         self.radio_editor_scroll.setWidgetResizable(True)
@@ -793,7 +805,7 @@ class StationBbsTab(QWidget):
         editor_grid.addWidget(QLabel("Source folder"), 1, 0)
         self.location_source_edit = QLineEdit()
         self.location_source_edit.setAccessibleName("Location source folder")
-        self.location_source_edit.setPlaceholderText("Existing folder path; FIO will not create it here")
+        self.location_source_edit.setPlaceholderText("Existing folder path; CommsPlan will not create it here")
         self.location_source_edit.setToolTip("Records a source folder path only. Saving never creates, scans, or changes that folder.")
         editor_grid.addWidget(self.location_source_edit, 1, 1)
         editor_grid.addWidget(QLabel("Parent"), 2, 0)
@@ -811,10 +823,15 @@ class StationBbsTab(QWidget):
         editor_grid.addWidget(self.location_access_combo, 3, 1)
         self.location_callsigns_label = QLabel("Allowed callsigns")
         editor_grid.addWidget(self.location_callsigns_label, 4, 0)
-        self.location_callsigns_edit = QLineEdit()
+        settings_db_path = getattr(self.settings, "db_path", None)
+        self.location_access_editor = BbsAccessEditor(
+            self,
+            operator_db_path=Path(settings_db_path).with_name("freqinout_nets.db") if settings_db_path else None,
+        )
+        self.location_callsigns_edit = self.location_access_editor.manual_edit
         self.location_callsigns_edit.setAccessibleName("Location allowed callsigns")
         self.location_callsigns_edit.setPlaceholderText("Callsign; add more with commas")
-        editor_grid.addWidget(self.location_callsigns_edit, 4, 1)
+        editor_grid.addWidget(self.location_access_editor, 4, 1)
         self.location_code_label = QLabel("Access code")
         editor_grid.addWidget(self.location_code_label, 5, 0)
         code_row = QHBoxLayout()
@@ -1274,6 +1291,15 @@ class StationBbsTab(QWidget):
         if self._radio_service_loading:
             return
         self._load_selected_radio_service()
+        self.varac_sync_panel.radio_changed()
+
+    def _radio_service_is_dirty(self) -> bool:
+        profile = self._radio_profiles_by_id.get(self._selected_radio_service_id(), {})
+        return any((
+            self.radio_service_enabled_chk.isChecked() != bool(profile.get("varac_bbs_enabled")),
+            self.radio_announce_enabled_chk.isChecked() != bool(profile.get("varac_bbs_announce_enabled")),
+            self.radio_live_dir_edit.text().strip() != str(profile.get("varac_bbs_dir") or ""),
+        ))
 
     def _selected_radio_service_id(self) -> int:
         if hasattr(self, "radio_service_selector"):
@@ -1339,6 +1365,7 @@ class StationBbsTab(QWidget):
                 f"{radio_name}: {serving}; {publication}; {health}."
             )
             self._set_radio_service_editor_enabled(use_varac)
+            self.radio_initialize_btn.setText("Serve station BBS" if getattr(self, "_station_managed_root", "") else "Initialize BBS…")
             self.radio_settings_btn.setEnabled(True)
             self.radio_service_status.setText(
                 "Configure the live BBS service here."
@@ -1365,7 +1392,7 @@ class StationBbsTab(QWidget):
             return
         live_dir = self.radio_live_dir_edit.text().strip()
         if self.radio_publish_enabled_chk.isChecked() and not self.radio_service_enabled_chk.isChecked():
-            self.radio_service_status.setText("Enable VarAC BBS before publishing the FIO catalog on this radio.")
+            self.radio_service_status.setText("Enable VarAC BBS before publishing the CommsPlan catalog on this radio.")
             return
         if (self.radio_service_enabled_chk.isChecked() or self.radio_publish_enabled_chk.isChecked()) and not live_dir:
             self.radio_service_status.setText("Choose the selected radio's live BBS folder before enabling service or publication.")
@@ -1416,6 +1443,15 @@ class StationBbsTab(QWidget):
         if not live_dir.exists() or not live_dir.is_dir():
             self.radio_service_status.setText("Choose an existing VarAC live BBS folder before initializing.")
             self.radio_live_dir_edit.setFocus(Qt.OtherFocusReason)
+            return
+        if getattr(self, "_station_managed_root", ""):
+            default = self._locations_by_id.get(getattr(self, "_station_default_location_id", ""))
+            if default is None or not str(default.source_dir or "").strip():
+                self.radio_service_status.setText("Repair the station BBS Default location before attaching another radio.")
+                return
+            self.radio_service_enabled_chk.setChecked(True)
+            self.radio_publish_enabled_chk.setChecked(True)
+            self._save_selected_radio_service()
             return
         answer = QMessageBox.question(
             self,
@@ -1493,6 +1529,8 @@ class StationBbsTab(QWidget):
         self._radio_profiles_by_id[profile_id] = dict(saved)
         self._refresh_radio_services(self._radio_profiles_by_id.values())
         self._pending_radio_status = (
+            f"Station BBS reused; this radio now serves the existing locations and access rules. "
+            if result.reused else
             f"Managed BBS initialized. {result.imported_files} existing file(s) copied; "
             f"{result.cataloged_files} file(s) cataloged in {result.default_location_dir}."
         )
@@ -1801,11 +1839,7 @@ class StationBbsTab(QWidget):
             self._set_combo_data(self.location_access_combo, location.access_rule if location is not None else "Public")
             metadata = dict(location.metadata or {}) if location is not None else {}
             allowed = metadata.get("allowed_callsigns", [])
-            if isinstance(allowed, str):
-                allowed_text = allowed
-            else:
-                allowed_text = ", ".join(str(value) for value in allowed if str(value or "").strip())
-            self.location_callsigns_edit.setText(allowed_text)
+            self.location_access_editor.set_policy(metadata.get("access_policy_v1"), legacy_callsigns=allowed)
             self.location_code_edit.clear()
             self.location_code_confirm_edit.clear()
             self._set_combo_data(self.location_retention_combo, location.retention_mode if location is not None else "global_default")
@@ -1848,7 +1882,7 @@ class StationBbsTab(QWidget):
         callsigns = "Allowed callsigns" in rule
         code = "access code" in rule.lower()
         self.location_callsigns_label.setVisible(callsigns)
-        self.location_callsigns_edit.setVisible(callsigns)
+        self.location_access_editor.setVisible(callsigns)
         self.location_code_label.setVisible(code)
         self.location_code_edit.setVisible(code)
         self.location_code_confirm_edit.setVisible(code)
@@ -1881,11 +1915,8 @@ class StationBbsTab(QWidget):
         metadata.setdefault("visibility_rule", "Public")
         metadata.setdefault("list_in_root_menu", True)
         metadata["inherit_global_allowed_callsigns"] = False
-        metadata["allowed_callsigns"] = [
-            value.strip().upper()
-            for value in re.split(r"[,;\s]+", self.location_callsigns_edit.text())
-            if value.strip()
-        ]
+        metadata["access_policy_v1"] = self.location_access_editor.policy()
+        metadata["allowed_callsigns"] = effective_callsigns(metadata["access_policy_v1"])
         code_text = self.location_code_edit.text()
         confirm_text = self.location_code_confirm_edit.text()
         needs_code = "access code" in access_rule.lower()
@@ -2104,6 +2135,9 @@ class StationBbsTab(QWidget):
             self._on_catalog_failure(generation, "Catalog loader returned an invalid snapshot.")
             return
         self._catalog_rows = snapshot.artifact_rows
+        self._station_managed_root = snapshot.managed_root
+        self._station_default_location_id = snapshot.default_location_id or DEFAULT_LOCATION_ID
+        self._locations_by_id = {location.location_id: location for location in snapshot.locations}
         self._refresh_radio_services(snapshot.profiles)
         if self._pending_radio_status:
             self.radio_service_status.setText(self._pending_radio_status)
@@ -2112,6 +2146,7 @@ class StationBbsTab(QWidget):
         selected = self._selected_location_id
         self._locations_by_id = {location.location_id: location for location in locations}
         self._station_allowed_callsigns = set(snapshot.allowed_callsigns)
+        self._station_managed_root = snapshot.managed_root
         self._station_limit_access_enabled = snapshot.limit_access_enabled
         if selected and selected not in self._locations_by_id:
             selected = ""

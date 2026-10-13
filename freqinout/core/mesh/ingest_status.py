@@ -7,7 +7,7 @@ from freqinout.core.mesh.channel_policy import MeshChannelPolicy
 
 MESHCORE_COMPANION_DECODER_WARNING = (
     "MeshCore is connected, but message ingest is not active yet. "
-    "FIO needs the MeshCore Companion decoder before Inbox traffic can appear."
+    "CommsPlan needs the MeshCore Companion decoder before Inbox traffic can appear."
 )
 
 
@@ -65,7 +65,7 @@ def mesh_ingest_readiness(
         return MeshIngestReadiness(
             state="needs_key",
             headline=f"Private key needed for {names}.",
-            guidance="Join that channel on the mesh device, then Mark Joined in FIO.",
+            guidance="Join that channel on the mesh device, then Mark Joined in CommsPlan.",
             **base,
         )
     if not accepted:
@@ -84,7 +84,7 @@ def mesh_ingest_readiness(
         )
     return MeshIngestReadiness(
         state="ready",
-        headline=f"{len(accepted)} mesh feed{'s' if len(accepted) != 1 else ''} ready for FIO.",
+        headline=f"{len(accepted)} mesh feed{'s' if len(accepted) != 1 else ''} ready for CommsPlan.",
         guidance="Accepted feeds can populate Inbox, Ops Center, Map, and topic scanning.",
         **base,
     )
