@@ -109,6 +109,10 @@ for (const file of htmlFiles) {
     const attribute = match[1];
     const value = match[2];
     if (/^(?:https?:|mailto:|data:)/.test(value)) continue;
+    if (value.startsWith("/") && !value.startsWith("/CommsPlan/")) {
+      failures.push(`${path.relative(siteRoot, file)} escapes the /CommsPlan/ site base: ${value}`);
+      continue;
+    }
 
     const { candidates, fragment } = htmlCandidates(file, value);
     const existing = candidates.find((candidate) => fs.existsSync(candidate));

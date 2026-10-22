@@ -45,7 +45,7 @@ hero:
     <div>
       <a href="https://github.com/N1MAG/CommsPlan/releases/latest">View published releases&nbsp; →</a>
       <span aria-hidden="true"> · </span>
-      <a href="/guide/whats-new">What's new in 2.0.6&nbsp; →</a>
+      <a href="./guide/whats-new">What's new in 2.0.6&nbsp; →</a>
     </div>
   </div>
 
