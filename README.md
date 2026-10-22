@@ -2,7 +2,10 @@
   <img src="assets/CommsPlan_logo.png" alt="CommsPlan logo" width="150">
 </p>
 
-# CommsPlan 2.0.5
+# CommsPlan 2.0.6
+
+See the CommsPlan 2.0.6 release page for available platform packages, source
+archives, checksums, and release notes.
 
 ### A coordinated operations console for HF digital stations
 
@@ -37,7 +40,7 @@ can move from configuration to a live, explainable operating picture:
 - **Message Intelligence:** normalize supported traffic into source-aware
   summaries, topics, locations, status, and attention cues while preserving the
   original message and its receive or import provenance.
-- **CommsPlan Spotter (FIO Spotter) and CommStat:** use CommsPlan's built-in FIO Spotter service to
+- **CommsPlan Spotter and CommStat:** use CommsPlan's built-in Spotter service to
   review Spotter forms and CommStat reports in the same station evidence model,
   with source and transport context kept visible.
   CommStat-derived or Internet-assisted evidence is not presented as proof that
@@ -119,7 +122,7 @@ message summaries, topics, locations, status and attention cues, and suggested
 routing context so operators can scan the inbox and map without losing the original
 message, source, radio, endpoint, or receive-path evidence.
 
-The library can include JS8Call, built-in FIO Spotter traffic, reviewed
+The library can include JS8Call, built-in CommsPlan Spotter traffic, reviewed
 JS8Spotter imports, CommStat, FLMsg, FLAmp, VarAC, BBS, MeshCore, and
 Meshtastic traffic. CommStat artifacts and
 JS8-delivered CommStat reports retain their status and brevity context when
@@ -130,11 +133,10 @@ RF, Spotter forms, VarAC files, and qualified Local Mesh sends.
 
 ![Messages inbox with fictional multi-transport exercise traffic](docs/images/readme-2.0/messages.png)
 
-## CommsPlan Spotter (FIO Spotter) and automation
+## CommsPlan Spotter and automation
 
-CommsPlan includes a built-in **CommsPlan Spotter** workspace—the FIO Spotter
-service—for station-wide watches, JS8 Expect responses, access policies, forms,
-and reviewed imports.
+CommsPlan includes a built-in **CommsPlan Spotter** workspace for station-wide
+watches, JS8 Expect responses, access policies, forms, and reviewed imports.
 Actual received traffic stays in Messages, where source-neutral actions can send
 it to the Map, an operator record, a reply workflow, or a saved watch.
 
@@ -156,6 +158,50 @@ decision support rather than a guarantee of current propagation or delivery.
 
 ![Offline operational map with station and regional context](docs/images/readme-2.0/operational-map.png)
 
+## What's new in 2.0.6
+
+CommsPlan 2.0.6 expands the station workflow in several areas:
+
+- **Call Finder:** search offline FCC amateur and GMRS records and Canadian
+  ISED amateur records, with optional U.S. and Canadian postal-reference estimates.
+  Source status, record counts, dates, and estimate provenance are visible.
+  **Update all** refreshes sources one at a time; cancel stops the current
+  operation and prevents the remaining sources from starting, while a failed
+  or cancelled replacement keeps the previous usable snapshot. NCS lookup can
+  fill the current entry draft after review without adding a check-in or sending
+  anything.
+- **Guided configuration:** Station Setup leads from operator and group choices
+  through radio, application, operating behavior, schedule, and final review.
+  Radio and software editors save their own scope, retain the last committed
+  view if saving fails, and show Complete, Review, Not checked, Unsaved, or
+  Optional status with a reason. Review scheduling per radio before explicitly
+  enabling it; disable is available from that radio's schedule controls.
+- **Forms Library:** preview selected forms or a folder, then explicitly import
+  valid new forms into the station library. Existing duplicates are reported
+  and skipped; merely browsing a folder does not copy its files.
+- **Map references:** the map includes bundled worldwide geography for offline
+  use, category and text search, and a saved starting area. Optional license
+  references can be searched and displayed using postal estimates after their
+  source datasets are loaded. A reference is an estimate, not evidence of a
+  station's current location or activity.
+- **Radio-aware services:** launch readiness and application identity stay
+  associated with the selected radio. BBS configuration and routing expose
+  their owning station or radio context before service actions are applied.
+
+### Release qualification
+
+Native package availability and automated build, install/upgrade and startup
+results are reported on the release page. Those checks do not establish every
+physical-radio, operating-system or display configuration. Python 3.11 is the
+tested and recommended interpreter; the broader Python 3.10 through 3.13
+compatibility range has not been clean-host qualified in full.
+
+A macOS/PySide test covering Compose comment wrapping and preserving oversized
+saved text reproduced a segmentation fault; no fix is recorded. An earlier
+combined test run omitted world-map grid lines at low zoom. The latest combined
+release check passed all 192 tests, including that grid test; the cause of the
+earlier failure has not been established.
+
 ## Supported systems
 
 | Platform | CommsPlan 2.0 support |
@@ -168,108 +214,89 @@ Python **3.10 through 3.13** is accepted by CommsPlan; Python 3.11 is the tested
 recommended release interpreter. Companion radio applications are installed
 separately and remain under the operator's control.
 
-## Compatibility identities retained from FreqInOut
+## Existing station data
 
-The product name changes while storage and compatibility identities remain stable:
+CommsPlan upgrades preserve the established station profile and data locations
+through the documented platform procedure. The application keeps its existing
+storage and compatibility identities so companion applications and saved
+stations continue to work. Follow the installation guide when upgrading, and
+make a verified backup before the first upgrade.
 
-- Existing profile roots remain `%LOCALAPPDATA%\FreqInOut` or `%APPDATA%\FreqInOut`
-  on Windows and `~/.freqinout` on macOS and Linux, unless
-  `FREQINOUT_CONFIG_DIR` selects another root.
-- The two operational databases remain `freqinout.db` and `freqinout_nets.db`.
-- The Windows installer retains `AppId=FreqInOut` for historical discovery and
-  upgrade continuity.
-- The Linux Debian package ID remains `freqinout`; the `freqinout` command and
-  desktop identity remain compatibility routes alongside `commsplan`.
-- The macOS bundle identifier remains `org.n1mag.freqinout`, while the displayed
-  application name and executable are CommsPlan.
-
-Do not rename these profiles, databases, package IDs, or bundle identifiers as
-part of a source or package installation.
-
-## Download from the CommsPlan release page
+## Download CommsPlan 2.0.6
 
 Use the [CommsPlan release page](https://github.com/N1MAG/CommsPlan/releases/latest)
-for the clearest installation path. Each release page contains the release
-notes, changelog highlights, source-code archives, package checksums, and the
-available native packages:
+for available 2.0.6 installers, source archives, checksums, and release notes.
+Use only the artifacts actually listed there. Unsigned Windows/macOS packages
+are identified in their filenames and release notes.
 
-- Windows: `CommsPlan-2.0.5-windows-x86_64-setup-unsigned.exe`
-- Debian/Ubuntu-family Linux: `CommsPlan-2.0.5-linux-amd64.deb`
-- Apple Silicon macOS: `CommsPlan-2.0.5-macos-arm64-unsigned.dmg`
-- Intel macOS: `CommsPlan-2.0.5-macos-x86_64-unsigned.dmg`
+Verify downloaded files against the checksums published on the release page.
 
-Windows and macOS packages are currently unsigned. Windows may show an
-**Unknown publisher** or SmartScreen prompt; macOS may require **Open Anyway**
-under Privacy & Security. Verify the package against `SHA256SUMS.txt` on the
-release page. The historical 2.0.4 packages install **FreqInOut**; the 2.0.5
-release packages install **CommsPlan**.
+## Install or update from the public source release
 
-## Install or update manually from the public repository
-
-Technical users may clone or update the public `main` branch instead. Close
-CommsPlan and its companion applications, use the same application folder as
-the existing installation, rerun `install_freqinout.py`, require the final
-`Installation verified` line, and then use the neutral launcher. A Git pull by
-itself is not a complete update.
-
-For an existing public source checkout, update the source first:
+Clone the public repository and select the 2.0.6 release tag. For an existing
+checkout, fetch the public tag and select it before running the installer.
+Close CommsPlan and its companion applications, use the same application folder
+as the existing installation, and require the final `Installation verified`
+line before launching CommsPlan. A Git pull by itself is not a complete update.
 
 ```bash
-git fetch origin
-git switch main
-git pull --ff-only origin main
+git clone https://github.com/N1MAG/CommsPlan.git
+cd CommsPlan
+git checkout v2.0.6
 ```
 
-Then rerun the platform-specific installer shown below. Users who need an exact
-immutable release can download the source archive from the Release page or
-check out its `v<version>` tag instead of following moving `main`.
+For an existing checkout:
+
+```bash
+git fetch origin --tags
+git checkout v2.0.6
+```
 
 ### Windows PowerShell
 
-Install Git and 64-bit Python 3.11 first:
+With Git and 64-bit Python 3.11 installed:
 
 ```powershell
-git clone https://github.com/N1MAG/CommsPlan.git "$HOME\CommsPlan"
-Set-Location "$HOME\CommsPlan"
-py -3.11 install_freqinout.py
-.\start-freqinout.cmd
+py -3.11 install-commsplan.py
+.\start-commsplan.cmd
 ```
 
 ### macOS
 
-Install Git and Python 3.11 from Python.org or Homebrew:
+With Python 3.11 installed:
 
 ```bash
-git clone https://github.com/N1MAG/CommsPlan.git "$HOME/CommsPlan"
-cd "$HOME/CommsPlan"
-python3.11 install_freqinout.py
-./start-freqinout.sh
+python3.11 install-commsplan.py
+./start-commsplan.sh
 ```
 
 ### Linux
 
 The guided installer installs required system packages where supported,
-creates CommsPlan's virtual environment, and prepares the desktop launcher:
+creates CommsPlan's virtual environment, and prepares the desktop launcher.
+Use `setup` for first setup, `update` for a source update, and `desktop` to
+refresh desktop integration after an update, including when an older package
+launcher is still installed. Run these commands from the checked-out 2.0.6
+release:
 
 ```bash
-git clone https://github.com/N1MAG/CommsPlan.git "$HOME/CommsPlan"
-cd "$HOME/CommsPlan"
-bash install_FreqInOut_linux.sh
+bash install-commsplan.sh setup
+# For a source update: bash install-commsplan.sh update
+# To refresh the desktop launcher: bash install-commsplan.sh desktop
 ```
 
 See the [installation guide](docs/Installation.md) for distribution details,
 custom paths, repair, update, and uninstall instructions.
 
-## Migration from an existing FreqInOut station
+## Upgrade an existing station
 
-CommsPlan 2.0.5 carries an existing single-radio station forward and updates an
-existing 2.0 installation through the same verified installer. Native replacement
-and rollback remain bounded by the platform procedures and operator checks in the
-migration guide.
+CommsPlan carries an existing single-radio station forward and updates an
+existing 2.0 installation through the verified installer. Follow the platform
+procedures and operator checks in the migration guide.
 Before upgrading:
 
 1. Close CommsPlan and affected companion applications.
-2. Create and verify a restorable backup of the existing FreqInOut profile.
+2. Create and verify a restorable backup of the existing station profile.
 3. Update the application using the documented platform procedure.
 4. Review the proposed default-radio conversion before confirming it.
 5. Verify software paths, endpoints, schedules, and Launch Control after the
@@ -290,11 +317,9 @@ its schedules, messages, software settings, and operating data forward. Adding
 a second radio is optional. The conversion path has automated rehearsal coverage,
 but operators should treat the verified backup as mandatory and be prepared to
 review or rebuild affected companion-application settings if an older station
-differs from the rehearsed profile. Windows stations on 1.2.8 must first use the
-historical FreqInOut 2.0.4 release; Linux 1.2.8 source checkouts retain the
-documented source-only path. See the [historical FreqInOut 2.0.4
-installation and upgrade guide](docs/FreqInOut%202.0.4%20Installation%20and%20Upgrade%20Guide.docx)
-for the Windows, macOS, and Linux workflows and rollback guidance.
+differs from the rehearsed profile. If you are upgrading a much older
+installation, use the staged upgrade path in the migration guide for your
+platform and release history.
 
 ## First configuration
 
@@ -328,15 +353,14 @@ normally needed unless support specifically requests them.
 
 The main CommsPlan logs are located in the configured profile root:
 
-- `freqinout.log`
+- the application log
 - `perf_metrics.log`
-- generated `fio_cpu_hotspot_*.txt` or UI-hang evidence, when present
+- performance or UI-hang evidence files, when present
 
 ## Documentation
 
 - [CommsPlan User Guide](docs/guide.html)
 - [Installation and update guide](docs/Installation.md)
-- [Linux installer reference](docs/FreqInOut-linux-installer.md)
 - [Changelog](CHANGELOG.md)
 - [Security and support](SECURITY.md)
 - [Credits](CREDITS.md)

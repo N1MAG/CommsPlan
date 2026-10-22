@@ -15,6 +15,7 @@ import zipfile
 import re
 import threading
 import uuid
+import weakref
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, Optional, List, Tuple, Mapping, Sequence
@@ -52,6 +53,7 @@ from PySide6.QtWidgets import (
     QCompleter,
     QFrame,
     QToolButton,
+    QMenu,
     QToolTip,
     QListWidget,
     QListWidgetItem,
@@ -71,6 +73,7 @@ from freqinout.core.perf_metrics import emit_span, span as perf_span
 from freqinout.core.checkins_db import ensure_operator_checkins_schema, get_all_operators as get_shared_operators
 from freqinout.core.settings_manager import SettingsManager
 from freqinout.gui.bbs_access_editor import BbsAccessEditor
+from freqinout.gui.operator_station_setup import OperatorStationSetup
 from freqinout.core.config_paths import get_fldigi_checkin_dir, get_config_dir
 from freqinout.core.config_autodiscovery import (
     DEFAULT_PORT_PLAN,
@@ -110,6 +113,7 @@ from freqinout.core.receiver_software_stack import build_receiver_launch_items
 from freqinout.core.software_administration_model import (
     SoftwareAdministrationSnapshot,
     build_software_administration_snapshot,
+    software_runtime_status,
 )
 from freqinout.core.software_administration_persistence import (
     family_state_keys,
@@ -134,6 +138,60 @@ from freqinout.core.operating_group_frequency import (
     new_operating_group_frequency_key,
     normalize_frequency_hz,
 )
+
+
+def _settings_loaded_operating_group_row(g):
+    """The existing Settings load normalization, shared with dirty comparison."""
+    vfo_val = str(g.get("vfo") or "A").strip().upper()
+    if vfo_val not in ("A", "B"):
+        vfo_val = "A"
+    try:
+        cond_level = int(g.get("condition_level", 5) or 5)
+    except Exception:
+        cond_level = 5
+    if cond_level < 1 or cond_level > 5:
+        cond_level = 5
+    band_val = str(g.get("band", "") or "").strip().upper()
+    mode_val = normalize_operating_group_mode(g.get("mode", ""), band_val)
+    return {
+        **g,
+        "group": str(g.get("group", "")).upper(),
+        "operating_group_key": str(g.get("operating_group_key", "") or "").strip(),
+        "operating_group_frequency_key": str(g.get("operating_group_frequency_key", "") or "").strip(),
+        "mode": mode_val,
+        "band": band_val,
+        "frequency": g.get("frequency", ""),
+        "vfo": vfo_val,
+        "fldigi_mode": str(g.get("fldigi_mode") or "").strip(),
+        "fldigi_offset": str(g.get("fldigi_offset") or "").strip(),
+        "auto_tune": bool(g.get("auto_tune", False)),
+        "use_condition_levels": bool(g.get("use_condition_levels", False)),
+        "condition_level": cond_level,
+        "fastlight_filename_delimiter": str(g.get("fastlight_filename_delimiter", "group_default") or "group_default").strip(),
+        "fastlight_custom_delimiter": str(g.get("fastlight_custom_delimiter", "") or "").strip(),
+        "fastlight_signed_suffix": str(g.get("fastlight_signed_suffix", "group_default") or "group_default").strip(),
+        "fastlight_unsigned_suffix": str(g.get("fastlight_unsigned_suffix", "group_default") or "group_default").strip(),
+        "fastlight_form_family": str(g.get("fastlight_form_family", "group_default") or "group_default").strip().upper(),
+    }
+
+
+def _settings_operating_group_configuration_signature(rows):
+    """Compare operator values, not table order or generated display metadata."""
+    result = []
+    for source in rows or ():
+        if not isinstance(source, dict):
+            continue
+        row = _settings_loaded_operating_group_row(source)
+        for key in ("operating_group_key", "operating_group_frequency_key"):
+            row.pop(key, None)
+        for key in ("alias", "aliases"):
+            if not row.get(key):
+                row.pop(key, None)
+        hz = _settings_frequency_hz(row.get("frequency"))
+        if hz is not None:
+            row["frequency"] = hz
+        result.append(json.dumps(row, sort_keys=True, default=str))
+    return tuple(sorted(result))
 
 
 def _settings_operating_group_frequency_rows(rows):
@@ -429,6 +487,12 @@ from freqinout.core.multi_rig_runtime_status import (
 )
 from freqinout.core.mode_utils import normalize_operating_group_mode, voice_sideband_for_band
 from freqinout.core.radio_catalog import catalog_entry_control_methods, find_radio_catalog_entry, load_radio_catalog
+from freqinout.core.configuration_attention import (
+    TASK_CHECKS,
+    attention,
+    attention_text,
+    software_attention,
+)
 from freqinout.core.station_readiness import (
     build_station_readiness_report,
     format_readiness_issue,
@@ -506,6 +570,8 @@ from freqinout.gui.mesh_channel_admin import MeshChannelAdminWidget
 from freqinout.gui.software_administration_workspace import SoftwareAdministrationWorkspace
 from freqinout.gui.software_administration_editor import (
     SoftwareTaskEditor,
+    FastLightOverview,
+    task_definition,
     merge_draft_value,
 )
 from freqinout.gui.software_instance_assistant import SoftwareInstanceAssistant
@@ -533,6 +599,7 @@ from freqinout.gui.theme import (
     normalize_ui_text_size,
     led_style,
     button_style,
+    ThemedCheckBox,
 )
 from freqinout.version import __version__
 
@@ -1684,6 +1751,13 @@ class SettingsTab(QWidget):
         self._software_administration_selected_radio_id: Optional[int] = None
         self._software_task_editors: Dict[Tuple[str, Optional[int], str], SoftwareTaskEditor] = {}
         self._software_dirty_families: set[Tuple[int, str]] = set()
+        self._operator_station_setup: OperatorStationSetup | None = None
+        self._operator_station_setup_group: QGroupBox | None = None
+        self._operator_station_job: QThread | None = None
+        self._operator_station_generation = 0
+        self._operator_station_job_action: str | None = None
+        self._operator_station_review_pending = False
+        self._operator_station_pending_action: tuple[str, Dict[str, Any]] | None = None
         # The Settings selector only consumes the latest lifecycle-owned
         # operational projection.  It must never probe an endpoint while
         # painting or rebuilding its radio choices.
@@ -1742,6 +1816,156 @@ class SettingsTab(QWidget):
         except Exception as exc:
             self._initial_settings_load_pending = False
             log.exception("SettingsTab: initial deferred settings load failed: %s", exc)
+
+    # ---------- station setup overview ---------------------------------
+
+    def _operator_station_request_review(self) -> None:
+        if self._operator_station_setup is None:
+            return
+        if self._operator_station_job is not None:
+            self._operator_station_review_pending = True
+            return
+        self._operator_station_generation += 1
+        from freqinout.gui.operator_configuration_job import OperatorConfigurationJob
+
+        job = OperatorConfigurationJob(
+            self.multi_radio_store.db_path,
+            {"generation": self._operator_station_generation},
+            action="station_review",
+            parent=self,
+        )
+        self._operator_station_job = job
+        self._operator_station_job_action = "station_review"
+        job.result_ready.connect(self._operator_station_job_result)
+        job.finished.connect(self._operator_station_job_finished)
+        self._operator_station_setup.set_busy(True)
+        job.start()
+
+    def _operator_station_start_action(self, action: str, payload: Mapping[str, Any]) -> None:
+        if self._operator_station_setup is None:
+            return
+        if self._operator_station_job is not None:
+            self._operator_station_review_pending = True
+            if action in {"schedule_enable", "schedule_disable"}:
+                self._operator_station_pending_action = (str(action), dict(payload))
+            return
+        self._operator_station_generation += 1
+        from freqinout.gui.operator_configuration_job import OperatorConfigurationJob
+
+        request = {**dict(payload), "generation": self._operator_station_generation}
+        job = OperatorConfigurationJob(
+            self.multi_radio_store.db_path,
+            request,
+            action=action,
+            parent=self,
+        )
+        self._operator_station_job = job
+        self._operator_station_job_action = str(action)
+        job.result_ready.connect(self._operator_station_job_result)
+        job.finished.connect(self._operator_station_job_finished)
+        self._operator_station_setup.set_busy(True)
+        job.start()
+
+    def _operator_station_job_finished(self) -> None:
+        job = self.sender()
+        if job is self._operator_station_job and not job.isRunning():
+            self._operator_station_job = None
+            self._operator_station_job_action = None
+            if self._operator_station_setup is not None:
+                self._operator_station_setup.set_busy(False)
+            self._operator_station_dispatch_pending()
+
+    def _operator_station_dispatch_pending(self) -> None:
+        if self._operator_station_job is not None:
+            return
+        pending_action = self._operator_station_pending_action
+        self._operator_station_pending_action = None
+        if pending_action is not None:
+            action, payload = pending_action
+            QTimer.singleShot(0, lambda: self._operator_station_start_action(action, payload))
+            return
+        if self._operator_station_review_pending:
+            self._operator_station_review_pending = False
+            QTimer.singleShot(0, self._operator_station_request_review)
+
+    def _operator_station_job_result(self, response: object) -> None:
+        job = self._operator_station_job
+        if job is None or self._operator_station_setup is None:
+            return
+        if not isinstance(response, Mapping) or response.get("job_token") != job.token:
+            return
+        self._operator_station_job = None
+        completed_action = self._operator_station_job_action
+        self._operator_station_job_action = None
+        self._operator_station_setup.set_busy(False)
+        if response.get("error"):
+            self._operator_station_setup.set_operation_status(str(response["error"]), error=True)
+            self._operator_station_dispatch_pending()
+            return
+        setup = response.get("setup")
+        if isinstance(setup, Mapping):
+            self._operator_station_setup.set_snapshot(setup)
+            self._operator_station_setup.set_operation_status(
+                str(response.get("message") or "Setup facts refreshed from saved configuration.")
+            )
+            if completed_action in {"schedule_enable", "schedule_disable"}:
+                self._operator_station_refresh_scheduler_projection()
+        else:
+            self._operator_station_setup.set_operation_status("Setup review did not return a snapshot.", error=True)
+        self._operator_station_dispatch_pending()
+
+    def _operator_station_refresh_scheduler_projection(self) -> None:
+        scheduler = getattr(self.window(), "scheduler", None)
+        refresh = getattr(scheduler, "_request_active_schedule_lane_rows_refresh", None)
+        if callable(refresh):
+            refresh(force=True)
+
+    def _operator_station_route_requested(self, route: str, radio_id: int) -> None:
+        route_key = str(route or "").strip().lower()
+        target = {
+            "operator": getattr(self, "operator_information_section_group", None),
+            "groups": getattr(self, "op_groups_section_group", None),
+            "radios": getattr(self, "radio_profile_section_group", None),
+            "behavior": getattr(self, "operating_profiles_section_group", None),
+            "schedule": getattr(self, "schedule_assignments_section_group", None),
+        }.get(route_key)
+        if route_key in {"radios", "behavior", "schedule"} and radio_id:
+            self._set_settings_radio_focus(int(radio_id))
+        if target is not None:
+            self._select_settings_section_group(target)
+            if route_key == "radios":
+                self._select_radio_profile_guided_task("apps")
+            elif route_key == "schedule":
+                self._select_radio_profile_guided_task("plans")
+            return
+        if route_key == "main":
+            host = self.window()
+            callback = getattr(host, "open_settings_section", None)
+            if callable(callback):
+                callback("operator_info", settings_nav_context="main")
+
+    def _operator_station_review_requested(self, radio_id: int) -> None:
+        self._operator_station_start_action(
+            "station_review",
+            {"radio_id": int(radio_id or 0)},
+        )
+
+    def _operator_station_enable_requested(self, radio_id: int, fingerprint: str) -> None:
+        self._operator_station_start_action(
+            "schedule_enable",
+            {"radio_id": int(radio_id or 0), "fingerprint": str(fingerprint or "")},
+        )
+
+    def _operator_station_disable_requested(self, radio_id: int) -> None:
+        host = self.window()
+        scheduler = getattr(host, "scheduler", None)
+        pending = getattr(scheduler, "configuration_review_pending", None)
+        if callable(pending):
+            pending(int(radio_id or 0))
+        self._operator_station_start_action(
+            "schedule_disable",
+            {"radio_id": int(radio_id or 0)},
+        )
 
     def set_tab_active(self, active: bool) -> None:
         self._active = bool(active)
@@ -2707,7 +2931,7 @@ class SettingsTab(QWidget):
             else ""
         )
         if not root_txt and hasattr(self, "varac_bbs_dir_edit"):
-            root_txt = compute_default_managed_root(self.varac_bbs_dir_edit.text().strip())
+            root_txt = self._computed_varac_bbs_vault_default_root()
         if not root_txt:
             return ""
         return str(Path(root_txt).expanduser() / "locations" / clean_name)
@@ -2841,6 +3065,14 @@ class SettingsTab(QWidget):
         self.varac_bbs_vault_flamp_relay_hint_label.setToolTip(hint)
 
     def _computed_varac_bbs_vault_default_root(self, bbs_dir: object = None) -> str:
+        settings = getattr(self, 'settings', None)
+        snapshot = settings.all().get('station_bbs_catalog') if settings is not None else None
+        if snapshot is not None:
+            return str(snapshot.get('managed_root') or '').strip()
+        # A saved location must not follow a different radio's live folder.
+        existing = self.varac_bbs_vault_root_edit.text().strip() if hasattr(self, 'varac_bbs_vault_root_edit') else ''
+        if existing:
+            return existing
         if bbs_dir is None:
             bbs_dir = (
                 self.varac_bbs_dir_edit.text().strip()
@@ -3902,6 +4134,16 @@ class SettingsTab(QWidget):
     def _refresh_varac_bbs_vault_status_label(self) -> None:
         if not hasattr(self, "varac_bbs_vault_status_label"):
             return
+        catalog = self.settings.all().get('station_bbs_catalog')
+        if catalog is not None:
+            locations = catalog.get('locations', [])
+            default = next((row for row in locations if row.get('id') == catalog.get('default_location_id')), None)
+            ready = bool(catalog.get('managed_root') and default and default.get('source_dir'))
+            summary = (f"Station BBS library configured · {len(locations)} locations. Manage the station library in CommsPlan BBS."
+                       if ready else 'Station BBS library needs repair. Review its root and Default location in CommsPlan BBS.')
+            self.varac_bbs_vault_status_label.setText(summary)
+            self.varac_bbs_vault_status_label.setToolTip(summary)
+            return
         if hasattr(self, "varac_bbs_vault_enabled_chk_main") and self.varac_bbs_vault_enabled_chk_main.isChecked():
             root_txt = self.varac_bbs_vault_root_edit.text().strip() if hasattr(self, "varac_bbs_vault_root_edit") else ""
             state = load_vault_runtime_state(self._varac_bbs_vault_runtime_state_cache)
@@ -3931,136 +4173,8 @@ class SettingsTab(QWidget):
         self._refresh_varac_bbs_vault_inline_preview()
 
     def _initialize_varac_bbs_vault(self) -> None:
-        live_bbs_dir = self.varac_bbs_dir_edit.text().strip() if hasattr(self, "varac_bbs_dir_edit") else ""
-        if not live_bbs_dir:
-            QMessageBox.warning(self, "Managed BBS Library", "Set the VarAC BBS directory before initializing the library.")
-            return
-        live_dir = Path(live_bbs_dir).expanduser()
-        if not live_dir.exists() or not live_dir.is_dir():
-            QMessageBox.warning(self, "Managed BBS Library", "The VarAC BBS directory must exist before initialization.")
-            return
-        default_root_txt = compute_default_managed_root(live_dir)
-        root_txt = default_root_txt
-        if hasattr(self, "varac_bbs_vault_root_edit"):
-            self._set_varac_bbs_vault_root_text(root_txt)
-        create_note = "Existing library root will be reused." if Path(root_txt).expanduser().exists() else "This library root will be created."
-        response = QMessageBox.question(
-            self,
-            "Managed BBS Library",
-            "Initialize Managed BBS Library at this location?\n\n"
-            f"Live BBS Directory:\n{live_dir}\n\n"
-            f"Managed Root:\n{root_txt}\n\n"
-            f"{create_note}",
-            QMessageBox.Yes | QMessageBox.Cancel,
-            QMessageBox.Yes,
-        )
-        if response != QMessageBox.Yes:
-            return
-        created = initialize_managed_root(root_txt)
-        default_dir = created["default"]
-        live_files = [child for child in live_dir.iterdir() if child.is_file()]
-        imported = 0
-        if live_files:
-            response = QMessageBox.question(
-                self,
-                "Managed BBS Library",
-                "Import current live BBS files into the Default location?\n\n"
-                "Yes: import and preserve the current published set.\n"
-                "No: start the Default location empty and leave current live files unmanaged until the first publish.\n"
-                "Cancel: stop initialization.",
-                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
-                QMessageBox.Yes,
-            )
-            if response == QMessageBox.Cancel:
-                return
-            if response == QMessageBox.Yes:
-                imported = import_live_bbs_to_default_location(live_dir, default_dir)
-        locations = list(self._varac_bbs_vault_locations_cache)
-        default_row = None
-        for row in locations:
-            if str(row.get("id", "") or "").strip() == DEFAULT_LOCATION_ID:
-                default_row = dict(row)
-                break
-        if default_row is None:
-            default_row = {
-                "id": DEFAULT_LOCATION_ID,
-                "name": DEFAULT_LOCATION_NAME,
-                "alias": "ROOT",
-                "description": "Main menu",
-                "source_dir": default_dir,
-                "enabled": True,
-                "list_in_root_menu": False,
-                "visibility_rule": "Public",
-                "open_rule": "Public",
-                "inherit_global_allowed_callsigns": True,
-                "allowed_callsigns": "",
-                "access_code_hash": "",
-                "access_code_salt": "",
-                "access_code_iterations": DEFAULT_ACCESS_CODE_ITERATIONS,
-            }
-            locations.insert(0, default_row)
-        else:
-            default_row["source_dir"] = default_dir
-            default_row["name"] = DEFAULT_LOCATION_NAME
-            default_row["alias"] = "ROOT"
-            default_row["description"] = "Main menu"
-            default_row["list_in_root_menu"] = False
-            default_row["visibility_rule"] = "Public"
-            default_row["open_rule"] = "Public"
-        self._varac_bbs_vault_locations_cache = [self._normalize_varac_bbs_vault_location(row) for row in locations]
-        self._varac_bbs_vault_selected_location_id = DEFAULT_LOCATION_ID
-        try:
-            sync_bbs_locations_from_folders(
-                bbs_library_db_path_from_settings(getattr(self, "settings", None)),
-                self._varac_bbs_vault_locations_cache,
-            )
-        except Exception:
-            pass
-        if hasattr(self, "varac_bbs_vault_default_location_combo"):
-            self.varac_bbs_vault_default_location_combo.blockSignals(True)
-            self.varac_bbs_vault_default_location_combo.clear()
-            self.varac_bbs_vault_default_location_combo.addItem(DEFAULT_LOCATION_NAME, DEFAULT_LOCATION_ID)
-            self.varac_bbs_vault_default_location_combo.blockSignals(False)
-        publish_result = publish_root_view(
-            sender="",
-            locations=load_vault_locations(self._varac_bbs_vault_locations_cache),
-            default_location_id=DEFAULT_LOCATION_ID,
-            global_allowed_callsigns=parse_callsign_list(self._varac_bbs_selected_callsigns_text()),
-            limit_access_enabled=bool(self.varac_bbs_limit_access_chk.isChecked() if hasattr(self, "varac_bbs_limit_access_chk") else False),
-            global_code_policy=(
-                self.varac_bbs_vault_global_code_policy_combo.currentText().strip()
-                if hasattr(self, "varac_bbs_vault_global_code_policy_combo")
-                else DEFAULT_GLOBAL_CODE_POLICY
-            ),
-            live_bbs_dir=live_dir,
-            managed_root=root_txt,
-            flamp_enabled=bool(self.varac_bbs_vault_flamp_enabled_chk.isChecked() if hasattr(self, "varac_bbs_vault_flamp_enabled_chk") else False),
-        )
-        runtime_state = VaultRuntimeState(
-            current_location_id=DEFAULT_LOCATION_ID,
-            current_session_callsign="",
-            current_session_qso_guid="",
-            current_view_mode="root",
-            current_view_label=DEFAULT_LOCATION_NAME,
-            current_overlay_file="",
-            processed_event_keys=(),
-            cooldowns={},
-            failed_attempts={},
-            last_publish_manifest_path=publish_result.manifest_path,
-            last_publish_ts=time.time(),
-            last_action=f"Managed BBS Library initialized. Imported {imported} file(s) into Default.",
-            last_request_ts=0.0,
-            last_error="",
-            unmanaged_live_files=publish_result.unmanaged_live_files,
-        )
-        if hasattr(self, "varac_bbs_vault_enabled_chk_main"):
-            self.varac_bbs_vault_enabled_chk_main.setChecked(True)
-        self._varac_bbs_vault_runtime_state_cache = vault_runtime_state_to_data(runtime_state)
-        self._varac_bbs_vault_last_summary_cache = runtime_state.last_action
-        self._refresh_varac_bbs_vault_location_list()
-        self._refresh_varac_bbs_vault_status_label()
-        self._mark_settings_dirty()
-        self._refresh_section_titles()
+        """One station owner creates/reuses the library; Settings never forks it."""
+        self._open_station_bbs_workspace()
 
     def _reset_varac_bbs_vault_to_default(self) -> None:
         root_txt = self.varac_bbs_vault_root_edit.text().strip() if hasattr(self, "varac_bbs_vault_root_edit") else ""
@@ -4151,10 +4265,12 @@ class SettingsTab(QWidget):
         header_layout.addWidget(self.utc_label)
         header_layout.addWidget(self.local_label)
         main_layout.addLayout(header_layout)
+        self.configuration_legend_label = QLabel("Configuration: ✓ Complete · ⚠ Review · ○ Not checked · ● Unsaved · — Optional")
+        self.configuration_legend_label.setWordWrap(True)
+        self.configuration_legend_label.setToolTip("Saved local configuration checks. Application running/connection status is shown separately in Health. Optional signing does not affect FLAmp completeness.")
+        main_layout.addWidget(self.configuration_legend_label)
 
         # Operator Information
-        callsign_layout = QVBoxLayout()
-        callsign_layout.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.callsign_edit = QLineEdit()
         self.callsign_edit.setMaxLength(16)
         self.callsign_edit.setFixedWidth(150)
@@ -4167,26 +4283,15 @@ class SettingsTab(QWidget):
         self.grid6_edit.setMaxLength(6)
         self.grid6_edit.setFixedWidth(90)
         self.grid6_edit.editingFinished.connect(self._load_known_operating_group_catalog)
-        operator_grid = QGridLayout()
-        operator_grid.setContentsMargins(0, 0, 0, 0)
-        operator_grid.setHorizontalSpacing(12)
-        operator_grid.setVerticalSpacing(10)
-        operator_grid.addWidget(QLabel("Callsign:"), 0, 0)
-        operator_grid.addWidget(self.callsign_edit, 0, 1)
-        operator_grid.addWidget(QLabel("Name:"), 0, 2)
-        operator_grid.addWidget(self.name_edit, 0, 3)
-        operator_grid.addWidget(QLabel("State:"), 1, 0)
-        operator_grid.addWidget(self.state_edit, 1, 1)
-        operator_grid.addWidget(QLabel("Grid 6:"), 1, 2)
-        operator_grid.addWidget(self.grid6_edit, 1, 3)
-        operator_grid.setColumnStretch(4, 1)
-        callsign_layout.addLayout(operator_grid)
-        callsign_container = QWidget()
-        callsign_container.setLayout(callsign_layout)
+        from freqinout.gui.operator_information_form import OperatorInformationForm
+        callsign_container = OperatorInformationForm(
+            self.callsign_edit, self.name_edit, self.state_edit, self.grid6_edit)
+        self.operator_information_form = callsign_container
         callsign_group = QGroupBox("Operator Information")
         callsign_group_layout = QVBoxLayout()
         callsign_group_layout.setContentsMargins(10, 10, 10, 12)
         callsign_group_layout.setSpacing(6)
+        callsign_group_layout.setAlignment(Qt.AlignTop)
         callsign_help_row = QHBoxLayout()
         callsign_help_row.addStretch()
         self.operator_info_help_btn = self._make_context_help_button(
@@ -4223,7 +4328,8 @@ class SettingsTab(QWidget):
         self.control_combo.addItems(["FLRig", "RIGCTLD", "JS8Call", "Manual"])
         top_preferences_grid.addWidget(self.control_combo, 1, 1)
         self.use_scheduler_chk = QCheckBox("Use CommsPlan Scheduler")
-        self.use_scheduler_chk.setToolTip("Enable automatic schedule-driven frequency changes.")
+        self.use_scheduler_chk.setToolTip("Scheduling enablement is reviewed per radio in Station setup.")
+        self.use_scheduler_chk.hide()
         top_preferences_grid.addWidget(self.use_scheduler_chk, 1, 2, 1, 2)
         top_preferences_grid.addWidget(QLabel("Radio Apps Base Folder:"), 2, 0)
         self.radio_apps_base_folder_edit = QLineEdit()
@@ -4445,9 +4551,7 @@ class SettingsTab(QWidget):
         selector_title_font.setBold(True)
         self.device_profile_selector_title_label.setFont(selector_title_font)
         configured_title_row = QHBoxLayout()
-        configured_title_row.addWidget(self.device_profile_selector_title_label)
-        configured_title_row.addStretch()
-        configured_title_row.addWidget(self.add_device_profile_btn)
+        self.device_profile_selector_title_label.setVisible(False)
         configured_radios_layout.addLayout(configured_title_row)
         self.device_profile_selector_widget = QWidget()
         self.device_profile_selector_layout = QHBoxLayout(self.device_profile_selector_widget)
@@ -4463,7 +4567,18 @@ class SettingsTab(QWidget):
         self.device_profile_selector_scroll.setMinimumHeight(device_selector_h)
         self.device_profile_selector_scroll.setMaximumHeight(device_selector_h)
         self.device_profile_selector_scroll.setWidget(self.device_profile_selector_widget)
-        configured_radios_layout.addWidget(self.device_profile_selector_scroll)
+        self.device_profile_selector_scroll.setParent(configured_radios_group)
+        self.device_profile_selector_scroll.hide()
+        self.settings_radio_context_combo = QComboBox()
+        self.settings_radio_context_combo.setObjectName("settingsRadioContextCombo")
+        self.settings_radio_context_combo.setAccessibleName("Radio to configure")
+        self.settings_radio_context_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.settings_radio_context_combo.setMinimumContentsLength(12)
+        self.settings_radio_context_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.settings_radio_context_combo.currentIndexChanged.connect(self._on_radio_context_combo_changed)
+        configured_title_row.addWidget(QLabel("Radio"))
+        configured_title_row.addWidget(self.settings_radio_context_combo, 1)
+        configured_title_row.addWidget(self.add_device_profile_btn)
         radio_selector_actions = QHBoxLayout()
         radio_selector_actions.setContentsMargins(0, 0, 0, 0)
         radio_selector_actions.setSpacing(6)
@@ -4503,20 +4618,45 @@ class SettingsTab(QWidget):
         )
         self.selector_remove_device_profile_btn.setAccessibleName("Remove selected radio")
         self.selector_remove_device_profile_btn.clicked.connect(self._delete_device_profiles)
-        radio_selector_actions.addWidget(QLabel("Selected:"))
         self.selector_selected_device_profile_label = QLabel("--")
         self.selector_selected_device_profile_label.setAccessibleName("Selected radio name")
         self.selector_selected_device_profile_label.setMinimumWidth(70)
-        radio_selector_actions.addWidget(self.selector_selected_device_profile_label)
-        radio_selector_actions.addWidget(self.selector_activate_device_profile_btn)
-        radio_selector_actions.addWidget(self.selector_deactivate_device_profile_btn)
-        radio_selector_actions.addWidget(self.selector_set_default_device_profile_btn)
-        radio_selector_actions.addWidget(self.selector_manage_connections_btn)
-        radio_selector_actions.addWidget(self.selector_edit_apps_btn)
-        radio_selector_actions.addWidget(self.selector_software_details_btn)
-        radio_selector_actions.addWidget(self.selector_remove_device_profile_btn)
-        radio_selector_actions.addStretch(1)
-        configured_radios_layout.addLayout(radio_selector_actions)
+        self.selector_selected_device_profile_label.setParent(configured_radios_group)
+        self.selector_selected_device_profile_label.hide()
+        self.selector_radio_actions_btn = QPushButton("Radio actions")
+        self.selector_radio_actions_btn.setAccessibleName("Radio use, default and removal actions")
+        self.selector_radio_actions_menu = QMenu(self.selector_radio_actions_btn)
+        self._selector_radio_actions = {}
+        for key, button in (
+            ("activate", self.selector_activate_device_profile_btn),
+            ("deactivate", self.selector_deactivate_device_profile_btn),
+            ("default", self.selector_set_default_device_profile_btn),
+            ("remove", self.selector_remove_device_profile_btn),
+        ):
+            action = self.selector_radio_actions_menu.addAction(button.text())
+            action.triggered.connect(button.click)
+            self._selector_radio_actions[key] = action
+            button.setParent(configured_radios_group)
+            button.hide()
+        self.selector_radio_actions_btn.setMenu(self.selector_radio_actions_menu)
+        configured_title_row.insertWidget(configured_title_row.count() - 1, self.selector_radio_actions_btn)
+        self.selector_manage_connections_btn.setText("Connections")
+        configured_title_row.insertWidget(configured_title_row.count() - 1, self.selector_manage_connections_btn)
+        self.selector_software_menu_btn = QPushButton("Software")
+        software_menu = QMenu(self.selector_software_menu_btn)
+        self._selector_change_software_action = software_menu.addAction("Change software used…")
+        self._selector_change_software_action.triggered.connect(self.selector_edit_apps_btn.click)
+        self._selector_configure_software_action = software_menu.addAction("Configure software…")
+        self._selector_configure_software_action.triggered.connect(self.selector_software_details_btn.click)
+        self.selector_software_menu_btn.setMenu(software_menu)
+        for button in (self.selector_edit_apps_btn, self.selector_software_details_btn):
+            button.setParent(configured_radios_group)
+            button.hide()
+        configured_title_row.insertWidget(configured_title_row.count() - 1, self.selector_software_menu_btn)
+        self.selector_radio_action_reason = QLabel()
+        self.selector_radio_action_reason.setWordWrap(True)
+        self.selector_radio_action_reason.setAccessibleName("Selected radio action availability")
+        configured_radios_layout.addWidget(self.selector_radio_action_reason)
         self.status_group.setVisible(False)
         self.configured_radios_group = configured_radios_group
 
@@ -4657,6 +4797,22 @@ class SettingsTab(QWidget):
         sections_row.addWidget(self.sections_scroll, 1)
         main_layout.addLayout(sections_row, 1)
         self.settings_section_nav_scroll.setVisible(True)
+
+        self._operator_station_setup = OperatorStationSetup(parent=self)
+        self._operator_station_setup.route_requested.connect(self._operator_station_route_requested)
+        self._operator_station_setup.review_requested.connect(self._operator_station_review_requested)
+        self._operator_station_setup.enable_requested.connect(self._operator_station_enable_requested)
+        self._operator_station_setup.disable_requested.connect(self._operator_station_disable_requested)
+        station_setup_group = self._make_collapsible_group(
+            "Station setup",
+            self._operator_station_setup,
+            checked=True,
+            fit_content=False,
+            help_context_key="settings.station_setup",
+        )
+        self._set_section_health_key(station_setup_group, "operator_station_setup")
+        self._operator_station_setup_group = station_setup_group
+        self._add_settings_section(station_setup_group, scope="global")
 
         op_container = QWidget()
         op_container.setLayout(op_layout)
@@ -4820,7 +4976,6 @@ class SettingsTab(QWidget):
         multi_rig_status_actions.addWidget(self.multi_rig_copy_summary_btn)
         multi_rig_status_actions.addStretch(1)
         multi_rig_status_layout.addWidget(self.multi_rig_status_actions_widget)
-        device_layout.addWidget(self.multi_rig_status_card)
 
         self.device_profile_detail_card = QFrame()
         self.device_profile_detail_card.setFrameShape(QFrame.StyledPanel)
@@ -4880,7 +5035,6 @@ class SettingsTab(QWidget):
         radio_identity_layout = QVBoxLayout(radio_identity_content)
         radio_identity_layout.setContentsMargins(0, 0, 0, 0)
         radio_identity_layout.setSpacing(6)
-        radio_identity_layout.addWidget(self.device_profile_detail_card)
         identity_help = QLabel(
             "Start here. Give the radio a plain station name, identify what kind of device it is, "
             "and mark whether it should be available to CommsPlan."
@@ -5135,6 +5289,7 @@ class SettingsTab(QWidget):
         self.radio_profile_timer_scheduler_chk.stateChanged.connect(self._on_radio_profile_timer_policy_changed)
         radio_profile_frequency_layout.addRow("", self.radio_profile_timer_scheduler_chk)
         self._radio_profile_timer_policy_controls["scheduler_enabled"] = self.radio_profile_timer_scheduler_chk
+        radio_profile_frequency_layout.setRowVisible(self.radio_profile_timer_scheduler_chk,False)
 
         def _make_radio_profile_timer_combo(items: Sequence[str], *, minimum: int) -> QComboBox:
             combo = QComboBox()
@@ -5359,6 +5514,8 @@ class SettingsTab(QWidget):
         readiness_content_layout.setContentsMargins(0, 0, 0, 0)
         readiness_content_layout.setSpacing(6)
         readiness_content_layout.addWidget(self.device_profile_readiness_card)
+        readiness_content_layout.addWidget(self.multi_rig_status_card)
+        readiness_content_layout.addWidget(self.device_profile_detail_card)
         self.radio_profile_readiness_section = _make_radio_profile_dashboard_section(
             "Readiness",
             readiness_content,
@@ -6464,6 +6621,7 @@ class SettingsTab(QWidget):
         # transport editor below is for the selected endpoint, not the way an
         # operator chooses between nearby or previously saved devices.
         saved_devices_group = QGroupBox("Saved devices")
+        self.mesh_saved_devices_group = saved_devices_group
         saved_devices_layout = QVBoxLayout(saved_devices_group)
         saved_devices_layout.setContentsMargins(8, 8, 8, 8)
         saved_devices_layout.setSpacing(6)
@@ -6478,23 +6636,36 @@ class SettingsTab(QWidget):
         self.mesh_saved_device_combo.setMaxVisibleItems(3)
         self.mesh_saved_device_combo.addItem("No saved mesh devices — add or scan one", "")
         self.mesh_saved_device_combo.currentIndexChanged.connect(self._on_mesh_saved_device_selected)
-        saved_devices_layout.addWidget(self.mesh_saved_device_combo)
+        saved_device_context = QHBoxLayout()
+        saved_device_context.setContentsMargins(0, 0, 0, 0)
+        saved_device_context.setSpacing(8)
+        saved_device_context.addWidget(self.mesh_saved_device_combo, 1)
         self.mesh_saved_device_detail_label = QLabel("No saved device selected.")
         self.mesh_saved_device_detail_label.setObjectName("meshSavedDeviceDetail")
         self.mesh_saved_device_detail_label.setWordWrap(True)
         saved_devices_layout.addWidget(self.mesh_saved_device_detail_label)
         self.mesh_connection_state_label = QLabel("Disconnected")
         self.mesh_connection_state_label.setObjectName("localMeshConnectionState")
-        self.mesh_connection_state_label.setMinimumWidth(140)
-        self.mesh_connection_state_label.setMaximumWidth(520)
-        self.mesh_connection_state_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-        saved_devices_layout.addWidget(self.mesh_connection_state_label)
-        saved_device_actions = QHBoxLayout()
-        saved_device_actions.setContentsMargins(0, 0, 0, 0)
-        saved_device_actions.setSpacing(6)
-        self.mesh_add_device_btn = QPushButton("Add Device")
-        self.mesh_add_device_btn.setToolTip("Prepare a new MeshCore Bluetooth device without changing an existing saved device.")
+        self.mesh_connection_state_label.setWordWrap(True)
+        self.mesh_connection_state_label.setMinimumWidth(0)
+        self.mesh_connection_state_label.setMaximumWidth(16777215)
+        self.mesh_connection_state_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        saved_device_context.addWidget(self.mesh_connection_state_label)
+        saved_devices_layout.addLayout(saved_device_context)
+        self.mesh_saved_device_actions_layout = QGridLayout()
+        self.mesh_saved_device_actions_layout.setContentsMargins(0, 0, 0, 0)
+        self.mesh_saved_device_actions_layout.setHorizontalSpacing(6)
+        self.mesh_saved_device_actions_layout.setVerticalSpacing(6)
+        self.mesh_add_device_btn = QPushButton("Add device…")
+        self.mesh_add_device_btn.setToolTip(
+            "Open a new discovery/manual connection workspace without changing an existing saved device."
+        )
         self.mesh_add_device_btn.clicked.connect(self._on_mesh_add_device_clicked)
+        self.mesh_find_device_btn = QPushButton("Find nearby device…")
+        self.mesh_find_device_btn.setToolTip(
+            "Show MeshCore discovery for the selected connection without changing its saved settings."
+        )
+        self.mesh_find_device_btn.clicked.connect(self._toggle_mesh_discovery)
         self.mesh_connect_saved_btn = QPushButton("Connect")
         self.mesh_connect_saved_btn.setToolTip("Connect using the selected saved device identity.")
         self.mesh_connect_saved_btn.clicked.connect(
@@ -6507,11 +6678,22 @@ class SettingsTab(QWidget):
             "Stop the selected local mesh connection and its automatic retry loop without removing the saved device."
         )
         self.mesh_disconnect_btn.clicked.connect(self.mesh_disconnect_requested.emit)
-        saved_device_actions.addWidget(self.mesh_add_device_btn)
-        saved_device_actions.addWidget(self.mesh_connect_saved_btn)
-        saved_device_actions.addWidget(self.mesh_disconnect_btn)
-        saved_device_actions.addStretch(1)
-        saved_devices_layout.addLayout(saved_device_actions)
+        self.mesh_test_connection_btn = QPushButton("Check connection")
+        self.mesh_test_connection_btn.setObjectName("meshCheckConnectionButton")
+        self.mesh_test_connection_btn.setToolTip(
+            "Recheck the selected saved connection without changing its settings."
+        )
+        self.mesh_test_connection_btn.clicked.connect(self._refresh_mesh_config_status)
+        self.mesh_saved_device_action_buttons = (
+            self.mesh_add_device_btn,
+            self.mesh_find_device_btn,
+            self.mesh_connect_saved_btn,
+            self.mesh_disconnect_btn,
+            self.mesh_test_connection_btn,
+        )
+        saved_devices_layout.addLayout(self.mesh_saved_device_actions_layout)
+        self._mesh_saved_device_action_columns = 0
+        self._apply_mesh_saved_device_actions_layout()
         self.mesh_status_label = QLabel("Local mesh is not enabled.")
         self.mesh_status_label.setObjectName("localMeshStatus")
         self.mesh_status_label.setWordWrap(True)
@@ -6522,7 +6704,7 @@ class SettingsTab(QWidget):
         mesh_send_permission_layout.setContentsMargins(0, 0, 0, 0)
         mesh_send_permission_layout.setSpacing(8)
         mesh_send_permission_layout.addWidget(QLabel("Outbound messages:"))
-        self.mesh_send_enabled_chk = QCheckBox("Allow Send")
+        self.mesh_send_enabled_chk = ThemedCheckBox("Allow Send")
         self.mesh_send_enabled_chk.setToolTip(
             "Allow explicit operator sends from Message Compose through this connection. Automatic relays remain unavailable."
         )
@@ -6579,21 +6761,21 @@ class SettingsTab(QWidget):
         discovery_layout.addWidget(self.mesh_ble_guidance_label)
         mesh_layout.addWidget(self.mesh_discovery_group)
 
-        mesh_form = QFormLayout()
-        self.mesh_form = mesh_form
-        mesh_form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
-        mesh_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
-        mesh_form.setLabelAlignment(Qt.AlignTop | Qt.AlignLeft)
-        mesh_form.setFormAlignment(Qt.AlignTop | Qt.AlignLeft)
-        mesh_form.setSpacing(8)
-        self.mesh_enabled_chk = QCheckBox("Enable local mesh ingest")
+        # Keep the operator's primary connection choices in the normal scan
+        # path.  Only uncommon addresses, identities, bridge settings, and
+        # policy details belong in Advanced connection details.
+        mesh_core_group = QGroupBox("Connection")
+        self.mesh_core_group = mesh_core_group
+        mesh_core_form = QGridLayout(mesh_core_group)
+        mesh_core_form.setContentsMargins(8, 8, 8, 8)
+        mesh_core_form.setHorizontalSpacing(8)
+        mesh_core_form.setVerticalSpacing(5)
+        self.mesh_enabled_chk = ThemedCheckBox("Enable local mesh ingest")
         self.mesh_enabled_chk.setToolTip("Receive mesh traffic into CommsPlan. Sending stays off unless you enable it below.")
-        mesh_form.addRow("Use:", self.mesh_enabled_chk)
         self.mesh_protocol_combo = QComboBox()
         self.mesh_protocol_combo.addItem("Meshtastic", "meshtastic")
         self.mesh_protocol_combo.addItem("MeshCore", "meshcore")
         self.mesh_protocol_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        mesh_form.addRow("Protocol:", self.mesh_protocol_combo)
         self._mesh_connection_name_auto = True
         self.mesh_connection_name_edit = QLineEdit(next_mesh_connection_name("meshtastic"))
         self.mesh_connection_name_edit.setPlaceholderText("Visible name for this connection")
@@ -6610,7 +6792,35 @@ class SettingsTab(QWidget):
         mesh_connection_name_layout.setSpacing(3)
         mesh_connection_name_layout.addWidget(self.mesh_connection_name_edit)
         mesh_connection_name_layout.addWidget(self.mesh_connection_name_auto_label)
-        mesh_form.addRow("Connection Name:", mesh_connection_name_row)
+        # Keep the composite row on the instance: the responsive layout seam
+        # reuses the same widget when switching between wide and compact
+        # arrangements after the Settings page has been shown.
+        self.mesh_connection_name_row = mesh_connection_name_row
+        self.mesh_connection_type_combo = QComboBox()
+        self._populate_mesh_transport_choices("meshtastic")
+        self.mesh_connection_type_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.mesh_protocol_label = QLabel("Protocol:")
+        self.mesh_connection_type_label = QLabel("Connection:")
+        self.mesh_connection_name_label = QLabel("Connection name:")
+        mesh_core_form.addWidget(self.mesh_enabled_chk, 0, 0, 1, 2)
+        mesh_core_form.addWidget(self.mesh_protocol_label, 0, 2)
+        mesh_core_form.addWidget(self.mesh_protocol_combo, 0, 3)
+        mesh_core_form.addWidget(self.mesh_connection_type_label, 0, 4)
+        mesh_core_form.addWidget(self.mesh_connection_type_combo, 0, 5)
+        mesh_core_form.addWidget(self.mesh_connection_name_label, 1, 0)
+        mesh_core_form.addWidget(mesh_connection_name_row, 1, 1, 1, 5)
+        mesh_core_form.setColumnStretch(3, 1)
+        mesh_core_form.setColumnStretch(5, 1)
+        mesh_layout.addWidget(mesh_core_group)
+        self._mesh_core_compact_layout = False
+
+        mesh_form = QFormLayout()
+        self.mesh_form = mesh_form
+        mesh_form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        mesh_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        mesh_form.setLabelAlignment(Qt.AlignTop | Qt.AlignLeft)
+        mesh_form.setFormAlignment(Qt.AlignTop | Qt.AlignLeft)
+        mesh_form.setSpacing(8)
         self.mesh_adapter_id_edit = QLineEdit()
         self.mesh_adapter_id_edit.setPlaceholderText("Stable internal identifier (optional)")
         self.mesh_adapter_id_edit.setToolTip("Stable internal identifier used by CommsPlan. Leave blank to use the protocol default.")
@@ -6628,11 +6838,6 @@ class SettingsTab(QWidget):
         mesh_source_layout.addWidget(QLabel("Role (optional)"))
         mesh_source_layout.addWidget(self.mesh_source_role_edit)
         mesh_form.addRow("Source:", mesh_source_row)
-        self.mesh_connection_type_combo = QComboBox()
-        self._populate_mesh_transport_choices("meshtastic")
-        self.mesh_connection_type_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        mesh_form.addRow("Connection:", self.mesh_connection_type_combo)
-
         self.mesh_tcp_row = QWidget()
         mesh_tcp_layout = QHBoxLayout(self.mesh_tcp_row)
         mesh_tcp_layout.setContentsMargins(0, 0, 0, 0)
@@ -6646,7 +6851,9 @@ class SettingsTab(QWidget):
         mesh_tcp_layout.addWidget(self.mesh_tcp_host_edit, 1)
         mesh_tcp_layout.addWidget(QLabel("Port"))
         mesh_tcp_layout.addWidget(self.mesh_tcp_port_spin)
-        mesh_form.addRow("TCP:", self.mesh_tcp_row)
+        self.mesh_tcp_label = QLabel("TCP:")
+        mesh_core_form.addWidget(self.mesh_tcp_label, 2, 0)
+        mesh_core_form.addWidget(self.mesh_tcp_row, 2, 1, 1, 5)
 
         self.mesh_serial_row = QWidget()
         mesh_serial_layout = QHBoxLayout(self.mesh_serial_row)
@@ -6667,7 +6874,14 @@ class SettingsTab(QWidget):
         mesh_serial_layout.addWidget(QLabel("Baud"))
         mesh_serial_layout.addWidget(self.mesh_serial_baud_spin)
         mesh_serial_layout.addWidget(self.mesh_refresh_serial_btn)
-        mesh_form.addRow("USB Serial:", self.mesh_serial_row)
+        self.mesh_serial_label = QLabel("USB Serial:")
+        mesh_core_form.addWidget(self.mesh_serial_label, 3, 0)
+        mesh_core_form.addWidget(self.mesh_serial_row, 3, 1, 1, 5)
+
+        # TCP and USB Serial are the selected transport's primary endpoint
+        # values. Keep them beside Protocol/Connection in the normal path;
+        # raw BLE identities and bridge details remain in Advanced details.
+        self._apply_mesh_core_responsive_layout()
 
         self.mesh_ble_row = QWidget()
         mesh_ble_layout = QVBoxLayout(self.mesh_ble_row)
@@ -6768,13 +6982,12 @@ class SettingsTab(QWidget):
         )
         self.mesh_details_toggle.toggled.connect(lambda _checked: self._queue_mesh_section_fit_refresh())
         mesh_details_layout.addWidget(self.mesh_details_content)
-        mesh_layout.addWidget(self.mesh_details_group)
 
         mesh_channel_seed_actions = QHBoxLayout()
         mesh_channel_seed_actions.setSpacing(8)
-        self.mesh_stage_default_channels_btn = QPushButton("Stage Defaults")
+        self.mesh_stage_default_channels_btn = QPushButton("Add public channel…")
         self.mesh_stage_default_channels_btn.setToolTip(
-            "Create the selected protocol's supported default channel policies so you can review them before use."
+            "Add a public channel policy for review in CommsPlan. This does not change the device."
         )
         self.mesh_stage_default_channels_btn.clicked.connect(self._stage_mesh_default_channels)
         self.mesh_add_private_channel_btn = QPushButton("Add Private Feed")
@@ -6803,13 +7016,10 @@ class SettingsTab(QWidget):
         self._mesh_live_channels: dict[tuple[str, str], MeshChannel] = {}
         self._mesh_operation_starts: dict[tuple[str, str], int] = {}
         mesh_layout.addWidget(self.mesh_channel_admin)
-
-        mesh_actions = QHBoxLayout()
-        mesh_actions.addStretch(1)
-        self.mesh_test_connection_btn = QPushButton("Check Configuration")
-        self.mesh_test_connection_btn.clicked.connect(self._refresh_mesh_config_status)
-        mesh_actions.addWidget(self.mesh_test_connection_btn)
-        mesh_layout.addLayout(mesh_actions)
+        # Channel review is the primary remaining workspace.  Advanced
+        # protocol/address/bridge fields follow it and stay collapsed by
+        # default, so the inspector is not buried under setup forms.
+        mesh_layout.addWidget(self.mesh_details_group)
 
         self._mesh_ble_scan_thread: QThread | None = None
         self._mesh_ble_scan_worker: _MeshCoreBleScanWorker | None = None
@@ -6818,6 +7028,7 @@ class SettingsTab(QWidget):
         self._mesh_ble_scan_cancel_requested = False
         self._mesh_ble_scan_results_present = False
         self._mesh_ble_scan_devices: tuple[MeshCoreBleAdvertisement, ...] = ()
+        self._mesh_discovery_expanded = False
         self._mesh_section_fit_refresh_pending = False
         self._mesh_ble_scan_timer = QTimer(self)
         self._mesh_ble_scan_timer.setInterval(100)
@@ -6882,6 +7093,7 @@ class SettingsTab(QWidget):
 
         self.software_administration_workspace = SoftwareAdministrationWorkspace(self)
         self.software_administration_workspace.set_embedded(True)
+        self.software_administration_workspace.status_check_requested.connect(self._request_software_status_check)
         self.software_administration_workspace.family_selected.connect(
             self._on_software_administration_family_selected
         )
@@ -6909,6 +7121,10 @@ class SettingsTab(QWidget):
         self.software_administration_workspace.instance_add_requested.connect(
             self._on_software_instance_add_requested
         )
+        self.software_administration_workspace.operator_edit_opened.connect(
+            lambda payload: self._save_operator_application_payload(payload, action='load'))
+        self.software_administration_workspace.operator_unfinished_discard_requested.connect(
+            lambda payload: self._save_operator_application_payload(payload, action='discard'))
         self.software_administration_workspace.instance_discovery_requested.connect(
             self._on_software_instance_discovery_requested
         )
@@ -6937,6 +7153,7 @@ class SettingsTab(QWidget):
         )
         self._set_section_health_key(software_administration_group, "software_administration")
         software_administration_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        software_administration_group.setProperty("fioOwnsContentScroll", True)
         self.software_administration_section_group = software_administration_group
         self._add_settings_section(software_administration_group, scope="software")
 
@@ -7891,6 +8108,10 @@ class SettingsTab(QWidget):
             section_layout.addWidget(header_btn)
             section_layout.addWidget(content)
             content.setVisible(checked)
+            if title == "Signing":
+                self.message_auth_signing_section = section
+                self.message_auth_signing_toggle = header_btn
+                self.message_auth_signing_content = content
             return section
 
         gpg_overview_tab = QWidget()
@@ -8254,6 +8475,11 @@ class SettingsTab(QWidget):
         signing_v.setSpacing(8)
         signing_v.setAlignment(Qt.AlignTop)
 
+        self.signing_return_to_software_btn = QPushButton("Back to software")
+        self.signing_return_to_software_btn.setAccessibleName("Return to the retained software configuration")
+        self.signing_return_to_software_btn.clicked.connect(self._return_to_software_signing_context)
+        self.signing_return_to_software_btn.hide()
+        signing_v.addWidget(self.signing_return_to_software_btn, 0, Qt.AlignLeft)
         signing_title = QLabel("<b>Signing Identity</b>")
         signing_v.addWidget(signing_title)
         signing_row = QHBoxLayout()
@@ -8794,7 +9020,7 @@ class SettingsTab(QWidget):
         vault_enabled_top.setSpacing(10)
         self.varac_bbs_vault_enabled_chk_main = QCheckBox("Enable Managed BBS Library")
         vault_enabled_top.addWidget(self.varac_bbs_vault_enabled_chk_main)
-        self.varac_bbs_vault_initialize_btn = QPushButton("Initialize Library")
+        self.varac_bbs_vault_initialize_btn = QPushButton("Manage BBS library…")
         self.varac_bbs_vault_initialize_btn.clicked.connect(self._initialize_varac_bbs_vault)
         vault_enabled_top.addWidget(self.varac_bbs_vault_initialize_btn)
         self.varac_bbs_vault_reset_btn = QPushButton("Return Live BBS Home")
@@ -9536,6 +9762,9 @@ class SettingsTab(QWidget):
         self.condition_alert_rules_table.setSelectionMode(QTableWidget.ExtendedSelection)
         self.condition_alert_rules_table.setAlternatingRowColors(True)
         self.condition_alert_rules_table.setSizeAdjustPolicy(QAbstractScrollArea.AdjustIgnored)
+        from freqinout.gui.theme import CellControlDelegate
+        self.condition_alert_rules_table.setItemDelegateForColumn(
+            0, CellControlDelegate(self.condition_alert_rules_table))
         condition_alert_header = self.condition_alert_rules_table.horizontalHeader()
         condition_alert_header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         condition_alert_header.setSectionResizeMode(1, QHeaderView.Stretch)
@@ -9662,14 +9891,12 @@ class SettingsTab(QWidget):
 
         self.launch_control_scope_label = QLabel("Editing Radio: --")
         self.launch_control_scope_label.setWordWrap(True)
-        launch_v.addWidget(self.launch_control_scope_label)
 
         (
             self.launch_guidance_card,
             self.launch_guidance_title_label,
             self.launch_guidance_status_label,
         ) = _make_support_card("Selected Radio Launch Apps", "launchControlGuidanceStatus")
-        launch_v.addWidget(self.launch_guidance_card)
 
         self.launch_hint_label = QLabel()
         self.launch_hint_label.setWordWrap(True)
@@ -9680,9 +9907,8 @@ class SettingsTab(QWidget):
         launch_global_row = QHBoxLayout()
         launch_global_row.setContentsMargins(0, 0, 0, 0)
         launch_global_row.setSpacing(8)
-        launch_global_row.addWidget(self.launch_hint_label, 1)
         self.launch_all_with_startup_chk = QCheckBox(
-            "Automatically launch this radio's startup apps when CommsPlan opens"
+            "Launch checked startup apps when CommsPlan opens"
         )
         launch_global_row.addWidget(self.launch_all_with_startup_chk)
         launch_v.addLayout(launch_global_row)
@@ -9719,15 +9945,37 @@ class SettingsTab(QWidget):
         self.launch_configured_now_btn = QPushButton("Start Startup Apps")
         self.launch_stop_btn = QPushButton("Stop Launch Sequence")
         self.launch_stop_btn.setEnabled(False)
-        launch_actions_grid.addWidget(QLabel("Order:"), 0, 0)
-        launch_actions_grid.addWidget(self.launch_order_up_btn, 0, 1)
-        launch_actions_grid.addWidget(self.launch_order_down_btn, 0, 2)
-        launch_actions_grid.addWidget(self.launch_reset_order_btn, 0, 3)
-        launch_actions_grid.addWidget(QLabel("Run:"), 1, 0)
-        launch_actions_grid.addWidget(self.launch_configured_now_btn, 1, 1, 1, 2)
-        launch_actions_grid.addWidget(self.launch_stop_btn, 1, 3)
-        launch_actions_grid.setColumnStretch(4, 1)
-        launch_v.addLayout(launch_actions_grid)
+        self.launch_order_menu_btn = QPushButton("Launch order")
+        order_menu = QMenu(self.launch_order_menu_btn)
+        for button in (self.launch_order_up_btn, self.launch_order_down_btn, self.launch_reset_order_btn):
+            action = order_menu.addAction(button.text())
+            action.triggered.connect(button.click)
+            button.setParent(self)
+            button.hide()
+            button.setProperty("launchOrderAction", action)
+        self.launch_order_menu_btn.setMenu(order_menu)
+        launch_actions_grid.addWidget(self.launch_configured_now_btn, 0, 0)
+        launch_actions_grid.addWidget(self.launch_stop_btn, 0, 1)
+        launch_actions_grid.addWidget(self.launch_order_menu_btn, 0, 2)
+        launch_actions_grid.setColumnStretch(3, 1)
+        launch_v.insertLayout(0, launch_actions_grid)
+
+        self.launch_details_toggle = QToolButton()
+        self.launch_details_toggle.setText("Launch details")
+        self.launch_details_toggle.setCheckable(True)
+        self.launch_details_toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.launch_details_toggle.setArrowType(Qt.RightArrow)
+        self.launch_details_content = QWidget()
+        details_layout = QVBoxLayout(self.launch_details_content)
+        details_layout.setContentsMargins(0, 0, 0, 0)
+        details_layout.addWidget(self.launch_control_scope_label)
+        details_layout.addWidget(self.launch_guidance_card)
+        details_layout.addWidget(self.launch_hint_label)
+        self.launch_details_content.hide()
+        self.launch_details_toggle.toggled.connect(self.launch_details_content.setVisible)
+        self.launch_details_toggle.toggled.connect(lambda checked: self.launch_details_toggle.setArrowType(Qt.DownArrow if checked else Qt.RightArrow))
+        launch_v.addWidget(self.launch_details_toggle)
+        launch_v.addWidget(self.launch_details_content)
 
         self.launch_summary_label = QLabel("Launch status: Idle")
         self.launch_summary_label.setWordWrap(True)
@@ -9827,6 +10075,7 @@ class SettingsTab(QWidget):
         bottom_row.addWidget(self.save_btn)
         main_layout.addLayout(bottom_row)
         self._wire_dirty_tracking()
+        self._configure_unified_radio_navigation()
         self._refresh_launch_control_table()
         self._set_save_button_state("success")
         self._refresh_section_titles()
@@ -9979,7 +10228,7 @@ class SettingsTab(QWidget):
                 btn.setMinimumHeight(max(30, int(btn.sizeHint().height())))
 
         if panel is not None and layout is not None:
-            panel.setMinimumHeight(max(420, int(layout.sizeHint().height())))
+            panel.setMinimumHeight(max(0, int(layout.sizeHint().height())))
 
     def _add_radio_profile_guided_task_button(
         self,
@@ -10021,7 +10270,51 @@ class SettingsTab(QWidget):
         if observer_mode and normalized == "connections":
             self._open_selected_receiver_setup()
             return
+        if getattr(self, "_unified_radio_navigation", False):
+            self._select_settings_section_group(self.radio_profile_section_group)
         self._select_radio_profile_guided_task(normalized)
+
+    def _configure_unified_radio_navigation(self) -> None:
+        """Reuse existing task handlers in the Settings left navigation."""
+        self._unified_radio_navigation = True
+        self.radio_profile_guided_task_panel.hide()
+        self.device_profiles_hint_label.hide()
+        # Keep compact radio forms top-packed in the expanding page.
+        self.radio_profile_section_group.layout().setAlignment(Qt.AlignTop)
+        layout = self.radio_section_buttons_layout
+        primary = self._section_nav_buttons.get(self.radio_profile_section_group)
+        if primary is not None:
+            primary.clicked.connect(lambda: self._select_radio_profile_guided_task("radio"))
+        for offset, key in enumerate(("apps", "control", "connections"), 1):
+            button = self.radio_profile_guided_task_buttons[key]
+            self.radio_profile_guided_task_buttons_layout.removeWidget(button)
+            layout.insertWidget(offset, button)
+        for key in ("plans", "review", "advanced", "launch"):
+            button = self.radio_profile_guided_task_buttons[key]
+            self.radio_profile_guided_task_buttons_layout.removeWidget(button)
+            layout.addWidget(button)
+        self.radio_profile_guided_task_buttons["radio"].hide()
+        self._select_radio_profile_guided_task("radio", scroll=False)
+
+    def _refresh_unified_radio_navigation(self, theme=None) -> None:
+        if not getattr(self, "_unified_radio_navigation", False):
+            return
+        theme = dict(theme or resolve_theme(self.settings))
+        on_profile = self.sections_stack.currentWidget() is self.radio_profile_section_group
+        radio_mode = str(getattr(self, "_settings_nav_context", "")) in {"radio", "radios"}
+        labels = {"apps": "Applications", "control": "Rig control", "connections": "Connections",
+                  "plans": "Automation", "review": "Readiness", "advanced": "RF Guard && advanced", "launch": "Radio actions"}
+        for key, button in self.radio_profile_guided_task_buttons.items():
+            button.setVisible(radio_mode and key in labels)
+            if key in labels:
+                button.setText(labels[key])
+                button.setStyleSheet(self._settings_nav_button_style(
+                    "primary" if on_profile and self.radio_profile_guided_task_key == key else "secondary", theme))
+        primary = self._section_nav_buttons.get(self.radio_profile_section_group)
+        if primary is not None:
+            primary.setStyleSheet(self._settings_nav_button_style(
+                "primary" if on_profile and self.radio_profile_guided_task_key == "radio" else "secondary", theme))
+        self._refresh_configuration_attention_presentations()
 
     def _radio_profile_guided_sections(self) -> Tuple[QGroupBox, ...]:
         section_attrs = (
@@ -10070,6 +10363,10 @@ class SettingsTab(QWidget):
         if hasattr(self, "radio_profile_section_group") and self.sections_stack.currentWidget() is self.radio_profile_section_group:
             self._sync_current_section_scroll_size()
         self._refresh_radio_profile_guided_task_buttons()
+        self._refresh_configuration_attention_presentations()
+        if getattr(self, "_unified_radio_navigation", False):
+            self._refresh_unified_radio_navigation()
+            self._refresh_settings_mode_visibility()
         if scroll and hasattr(self, "sections_scroll"):
             QTimer.singleShot(0, self._reset_sections_scroll_to_top)
 
@@ -10162,8 +10459,15 @@ class SettingsTab(QWidget):
         workspace = getattr(self, "software_administration_workspace", None)
         if isinstance(workspace, SoftwareAdministrationWorkspace):
             selected_family = str(family_key or workspace.selected_family_key() or "js8call").strip().lower()
+            if radio_id is None:
+                radio_id = workspace.selected_radio_id()
+                if radio_id is None and not getattr(workspace, "_radio_context_explicit", False):
+                    radio_id = int((self._selected_settings_radio_profile() or {}).get("id") or 0) or None
             workspace.select_context(selected_family, radio_id, task_key)
-            self._software_administration_selected_radio_id = radio_id
+            # A dirty/busy assistant may reject the requested context.
+            if workspace.selected_family_key() != selected_family or workspace.selected_radio_id() != radio_id:
+                return
+            self._software_administration_selected_radio_id = workspace.selected_radio_id()
         host = resolve_help_host(self)
         if host is not None and hasattr(host, "open_settings_section"):
             host.open_settings_section(
@@ -10177,7 +10481,7 @@ class SettingsTab(QWidget):
         self._show_software_task_editor()
 
     def _on_software_administration_family_selected(self, _family_key: str) -> None:
-        self._software_administration_selected_radio_id = None
+        self._software_administration_selected_radio_id = self.software_administration_workspace.selected_radio_id()
         self._show_software_task_editor()
 
     def _on_software_administration_radio_selected(self, radio_id: object) -> None:
@@ -10206,9 +10510,551 @@ class SettingsTab(QWidget):
         workspace = getattr(self, "software_administration_workspace", None)
         if not isinstance(workspace, SoftwareAdministrationWorkspace):
             return
-        del task_key
+        direct_tasks = {
+            'application_profile','api_radio','message_storage','flrig_control','fldigi_modem_logs',
+            'application_radio','runtime_paths','launch',
+        }
+        if (str(task_key) in direct_tasks and workspace.selected_family_key() in {'js8call','fast_light','varac'}
+                and workspace.selected_radio_id() is not None):
+            if not workspace.open_selected_instance_editor():
+                workspace.begin_instance_setup(workspace.selected_family_key(),workspace.selected_radio_id(),source='manual')
+            return
         self.show_settings_context("software", health_key="software_administration")
         self._show_software_task_editor()
+
+    def _route_software_task(self, task_key: str) -> None:
+        workspace = getattr(self, "software_administration_workspace", None)
+        if not isinstance(workspace, SoftwareAdministrationWorkspace):
+            return
+        requested = (workspace.selected_family_key(), workspace.selected_radio_id(), str(task_key))
+        workspace.select_context(*requested)
+        actual = (workspace.selected_family_key(), workspace.selected_radio_id(), workspace.selected_task_key())
+        if actual == requested:
+            self._on_software_administration_task_selected(str(task_key))
+
+    def _open_software_signing_settings(self) -> None:
+        """Reveal the station-wide owner without saving or discarding software drafts."""
+        workspace = self.software_administration_workspace
+        self._software_signing_return_context = (
+            workspace.selected_family_key(), workspace.selected_radio_id(), workspace.selected_task_key())
+        self.show_settings_context("main")
+        self._select_settings_section_group(self.message_auth_section_group)
+        self.message_auth_signing_toggle.setChecked(True)
+        self.signing_return_to_software_btn.show()
+        QTimer.singleShot(0, self._reveal_software_signing_owner)
+
+    def _reveal_software_signing_owner(self) -> None:
+        if self.sections_stack.currentWidget() is not self.message_auth_section_group:
+            return
+        self._sync_current_section_scroll_size()
+        self.sections_scroll.ensureWidgetVisible(self.gpg_signing_key_combo, 0, 12)
+        self.gpg_signing_key_combo.setFocus(Qt.OtherFocusReason)
+
+    def _return_to_software_signing_context(self) -> None:
+        context = getattr(self, "_software_signing_return_context", None)
+        if context:
+            self.open_software_administration(family_key=context[0], radio_id=context[1], task_key=context[2])
+
+    def _request_software_status_check(self) -> None:
+        """Explicitly refresh the selected Settings radio, without commanding it."""
+        workspace = self.software_administration_workspace
+        radio_id = workspace.selected_radio_id()
+        if not radio_id:
+            workspace.set_observation_summary("Choose a radio to check its status.")
+            return
+        # This changes only Settings' editing context, never runtime command focus.
+        self._set_settings_radio_focus(int(radio_id))
+        try:
+            self._status_service.refresh_now(reason="software_settings", force=True)
+            self._refresh_running_status(force=True)
+            workspace.set_observation_summary("Status check requested.")
+        except Exception:
+            log.exception("Unable to request software status refresh.")
+            workspace.set_observation_summary("Status check unavailable. Review Health.")
+
+    def _cached_software_status_rows(self, radio_id: int) -> Mapping[str, Any]:
+        reader = getattr(getattr(self, "_status_service", None), "software_status_snapshot", None)
+        try:
+            rows = reader(int(radio_id)) if callable(reader) else {}
+            return rows if isinstance(rows, Mapping) else {}
+        except Exception:
+            return {}
+
+    def _software_reference_summary(self, radio_id: int) -> Dict[str, str]:
+        """Display saved references only; never copy them into the software draft."""
+        fingerprint = normalize_fingerprint(str(self.settings.get("gpg_compose_signing_key_fingerprint", "") or ""))
+        signing = (f"Saved station-wide key: {fingerprint}" if fingerprint else
+                   "Station-wide automatic selection (keys not checked).")
+        profile = self._device_profile_by_id(int(radio_id)) or {}
+        rows = getattr(self, "_software_administration_inventory_by_family", {}).get("fast_light", ())
+        saved = next((row for row in rows if int(row.get("id", 0) or 0) == int(profile.get("fast_light_config_id", 0) or 0)), {})
+        port = saved.get("arq_port") or saved.get("fldigi_arq_port")
+        host = str(profile.get("fldigi_host") or saved.get("fldigi_host") or "").strip()
+        endpoint = f"{host}:{port}" if host and port else f"Host unknown · port {port}" if port else "Not recorded"
+        return {"signing_identity": signing, "arq_endpoint": endpoint}
+
+    def _fast_light_component_summary(self, radio_id: int, status_snapshot: Mapping[str, Any] | None = None) -> Tuple[Dict[str, Any], ...]:
+        """Join cached explicit Use flags, native selectors and published observations."""
+        from freqinout.core.software_identity_bundle import identity_record_to_mapping
+        profile = self._device_profile_by_id(int(radio_id)) or {}
+        owner_keys = {str(profile.get(key) or "") for key in ("system_key", "radio_key", "id")} - {""}
+        cached = getattr(self, "_software_administration_cached_inputs", {})
+        records = []
+        for raw in cached.get("identity_records", ()):
+            row = raw if isinstance(raw, Mapping) else identity_record_to_mapping(raw)
+            if row.get("family_key") == "fast_light" and str(row.get("owner") or "") in owner_keys:
+                records.append(row)
+        components = {str(row.get("component_id") or "").casefold(): row
+                      for row in (records[0].get("components", ()) if len(records) == 1 else ())
+                      if isinstance(row, Mapping)}
+        statuses = status_snapshot if status_snapshot is not None else self._cached_software_status_rows(int(radio_id))
+        summary = []
+        for label, flag, task in (("FLRig", "use_flrig", "flrig_control"),
+                                  ("FLDigi", "use_fldigi", "fldigi_modem_logs"),
+                                  ("FLMsg", "use_flmsg", "flmsg"),
+                                  ("FLAmp", "use_flamp", "flamp_signing")):
+            raw_flag = profile.get(flag)
+            enabled = None if raw_flag is None else str(raw_flag).strip().lower() in {"1", "true", "yes", "on"}
+            component = components.get(label.casefold(), {})
+            launch = component.get("launch") or {}
+            readiness = component.get("readiness") or {}
+            selector = str(launch.get("profile_selector") or readiness.get("profile_selector") or "").strip()
+            argv = tuple(component.get("argv") or ())
+            for index, arg in enumerate(argv[:-1]):
+                if not selector and arg in {"--config-dir", "--rig-name", "-r"}:
+                    selector = str(argv[index + 1])
+            identity = ("Separate settings" if selector else
+                        "Default settings" if readiness.get("settings_identity_mode") == "default" else
+                        "Launch settings not recorded")
+            if len(records) > 1:
+                identity = "Needs review"
+            evidence = statuses.get(label, {})
+            status = software_runtime_status(evidence) or "Not yet verified"
+            if enabled is False:
+                status = "Not selected"
+            owner = ("Started by operator" if launch.get("operator_starts") else "CP launches") if "operator_starts" in launch else "Launch control not recorded"
+            summary.append(dict(label=label, enabled=enabled, identity=identity,
+                identity_detail=selector, launch_owner=owner, status=status, task_key=task))
+        return tuple(summary)
+
+    def _publish_software_reference_presentations(self, status_by_radio: Mapping[int, Mapping[str, Any]] | None = None) -> None:
+        """Update reference/status text without resetting fields, focus or drafts."""
+        for (family, radio_id, task), editor in getattr(self, "_software_task_editors", {}).items():
+            if family == "fast_light" and task == "flamp_signing" and radio_id:
+                editor.set_reference_summary(self._software_reference_summary(int(radio_id)))
+        for radio_id, overview in getattr(self, "_software_component_overviews", {}).items():
+            overview.set_configuration_attention(self._software_configuration_states('fast_light', int(radio_id)).get('overview', {}))
+            overview.set_component_summary(self._fast_light_component_summary(
+                int(radio_id), status_by_radio.get(int(radio_id)) if status_by_radio is not None else None))
+        workspace = getattr(self, "software_administration_workspace", None)
+        if not isinstance(workspace, SoftwareAdministrationWorkspace):
+            return
+        radio_id = workspace.selected_radio_id()
+        if not radio_id:
+            workspace.set_observation_summary("")
+            return
+        profile = self._device_profile_by_id(int(radio_id)) or {}
+        rows = status_by_radio.get(int(radio_id), {}) if status_by_radio is not None else self._cached_software_status_rows(int(radio_id))
+        family = workspace.selected_family_key()
+        keys = {"js8call": ("JS8Call_API",), "varac": ("VarAC",), "commstat": ("CommStat",),
+                "external_spotter": ("JS8Spotter",), "fio_spotter": ("JS8Call_API",)}.get(family, ())
+        if family == "fast_light":
+            keys = tuple(label for label, flag in (("FLRig", "use_flrig"), ("FLDigi", "use_fldigi"),
+                                                   ("FLMsg", "use_flmsg"), ("FLAmp", "use_flamp"))
+                         if str(profile.get(flag, "")).lower() in {"1", "true", "yes", "on"})
+        observations = []
+        for key in keys:
+            try:
+                checked = float(rows.get(key, {}).get("checked_at") or 0)
+                if checked > 0:
+                    observations.append(checked)
+            except (ValueError, TypeError):
+                pass
+        if not observations:
+            text = "Not checked yet."
+        else:
+            minutes = max(0, int((time.time() - min(observations)) // 60))
+            age = "<1 min ago" if minutes == 0 else f"{minutes} min ago"
+            text = f"Oldest check: {age}."
+            if len(observations) < len(keys):
+                text += f" {len(observations)} of {len(keys)} components checked."
+        combo = getattr(self, "gpg_signing_key_combo", None)
+        if combo is not None:
+            selected_key = normalize_fingerprint(str(combo.currentData() or ""))
+            saved_key = normalize_fingerprint(str(self.settings.get("gpg_compose_signing_key_fingerprint", "") or ""))
+            if selected_key != saved_key:
+                text += " Signing changes are unsaved in Main."
+        workspace.set_observation_summary(text)
+        self._refresh_configuration_attention_presentations()
+
+    @staticmethod
+    def _raw_software_configuration(profile: Mapping[str, Any]) -> dict:
+        """Saved values only. Editor prefill/defaults must not prove completeness."""
+        columns = {"path_js8call": "js8_install_path", "path_flrig": "flrig_path",
+                   "path_fldigi": "fldigi_path", "path_flmsg": "flmsg_path", "path_flamp": "flamp_path",
+                   "varac_path": "varac_install_path", "varac_launch_cmd": "launch_cmd",
+                   "path_js8spotter": "spotter_launch_path", "path_commstat": "commstat_launch_path"}
+        values = dict(profile)
+        values.update({key: profile.get(column) for key, column in columns.items()})
+        values["message_paths"] = {"flmsg": profile.get("flmsg_message_path"),
+                                   "flamp": profile.get("flamp_message_path"),
+                                   "varac": profile.get("varac_incoming_path")}
+        return values
+
+    def _cache_configuration_attention(self) -> None:
+        """Bounded local checks at the existing explicit load/save boundary."""
+        from freqinout.gui.software_administration_editor import SOFTWARE_EDITOR_TASKS
+        from freqinout.core.operator_application_configuration import application_editor_values
+        cache = {}
+        inputs = getattr(self, "_software_administration_cached_inputs", {})
+        loaded = bool(getattr(self, "_software_configuration_load_succeeded", False))
+        manifests = tuple(inputs.get("manifests", ()) or ()) if isinstance(inputs, Mapping) else ()
+        manifests_by_application = {
+            (str(row.get("family_key") or "").strip().lower(),
+             str(row.get("application_system_key") or "").strip()): row
+            for row in manifests if isinstance(row, Mapping)
+        }
+        for profile in self.device_profiles:
+            radio_id = int(profile.get("id") or 0)
+            saved = self._raw_software_configuration(profile)
+            # A null per-radio flag inherits the saved station policy. Editor
+            # defaults must not turn an absent saved choice into completeness.
+            for key in ('varac_guard_allow_bbs_allowed_callsigns', 'varac_guard_allow_operator_trusted'):
+                if saved.get(key) is None:
+                    saved[key] = self.settings.get(key, None)
+            fast_row = next((row for row in getattr(self, "_software_administration_inventory_by_family", {}).get("fast_light", ())
+                             if row.get("id") == profile.get("fast_light_config_id")), {})
+            saved["arq_port"] = fast_row.get("arq_port") or fast_row.get("fldigi_arq_port") or ""
+            for family, tasks in SOFTWARE_EDITOR_TASKS.items():
+                fields = {key: tuple(field.key for field in task.fields) for key, task in tasks.items()}
+                issues = tuple(inputs.get("identity_projection_issues", {}).get((radio_id, family), ()))
+                link, flags = {"js8call": ("js8_instance_id", ("use_js8call",)),
+                               "fast_light": ("fast_light_config_id", ("use_flrig", "use_fldigi", "use_flmsg", "use_flamp")),
+                               "varac": ("varac_node_id", ("use_varac",))}.get(family, ("", ()))
+                selected = any(str(profile.get(flag, "")).lower() in {"1", "true", "yes", "on"} for flag in flags)
+                inventory = getattr(self, "_software_administration_inventory_by_family", {}).get(family, ())
+                linked_row = next((row for row in inventory
+                                   if str(row.get("id") or "") == str(profile.get(link) or "")), None)
+                if selected and linked_row is None:
+                    issues += ("No complete saved instance assignment. Use Manage instances to assign or configure this software.",)
+                application_values = None
+                if linked_row is not None:
+                    manifest = manifests_by_application.get(
+                        (family, str(linked_row.get("system_key") or "").strip())
+                    )
+                    application_values = application_editor_values(family, linked_row, manifest, profile=profile)
+                    if family == "fast_light":
+                        # Preserve saved component selection/path evidence for
+                        # legacy manifests without inventing per-component
+                        # launch policy.  Ownership still comes only from an
+                        # explicit recipe or management mode below.
+                        for component, use_key, path_keys in (
+                            ("flrig", "use_flrig", ("flrig_application_path", "flrig_path")),
+                            ("fldigi", "use_fldigi", ("fldigi_application_path", "fldigi_path")),
+                            ("flmsg", "use_flmsg", ("flmsg_application_path", "flmsg_path")),
+                            ("flamp", "use_flamp", ("flamp_application_path", "flamp_path")),
+                        ):
+                            application_values.setdefault(
+                                f"{component}_enabled", str(profile.get(use_key, "")).lower()
+                                in {"1", "true", "yes", "on"}
+                            )
+                            if not str(application_values.get(path_keys[0]) or "").strip():
+                                for path_key in path_keys:
+                                    candidate = str(profile.get(path_key) or "").strip()
+                                    if candidate:
+                                        application_values[path_keys[0]] = candidate
+                                        break
+                    if isinstance(manifest, Mapping):
+                        evidence = manifest.get("evidence")
+                        evidence = evidence if isinstance(evidence, Mapping) else {}
+                        application_values["management_mode"] = str(
+                            manifest.get("management_mode") or ""
+                        ).strip().lower()
+                        recipe = evidence.get("launch_recipe")
+                        if isinstance(recipe, Mapping):
+                            application_values["launch_recipe"] = dict(recipe)
+                        if manifest.get("launch_command"):
+                            application_values["launch_command"] = str(manifest.get("launch_command"))
+                cache[(radio_id, family)] = software_attention(
+                    family, profile, saved, fields, loaded=loaded,
+                    identity_issues=issues, repair=bool(
+                        getattr(self, "_software_component_repair_cache", {}).get(radio_id)
+                    ), application_values=application_values,
+                )
+        self._configuration_attention_cache = cache
+        data = dict(self.settings.all())
+        # Reuse the established readiness validator with saved station values.
+        station_values = dict(data)
+        # The visible operator owner loads these canonical keys. Old aliases
+        # must not turn an empty canonical form into a completed configuration.
+        station_values.update(callsign=data.get("operator_callsign", ""),
+                              grid=data.get("operator_grid6", ""), operator_grid=data.get("operator_grid6", ""))
+        report = build_station_readiness_report(station_values, device_profiles=self.device_profiles,
+                                               operating_groups=data.get("operating_groups", ()))
+        self._configuration_saved_settings = data
+        self._configuration_saved_group_signature = _settings_operating_group_configuration_signature(data.get("operating_groups", ()))
+        self._configuration_saved_readiness = report
+        self._configuration_radio_attention = {}
+        for profile in self.device_profiles:
+            ident = int(profile.get("id") or 0)
+            backend = str(profile.get("control_backend") or "").lower()
+            target = {"js8call": ("js8call", "api_radio"), "flrig": ("fast_light", "flrig_control"),
+                      "fldigi": ("fast_light", "fldigi_modem_logs")}.get(backend)
+            if target:
+                entry = dict(cache.get((ident, target[0]), {}).get(target[1], attention()))
+            else:
+                issues = [format_readiness_issue(issue) for issue in report.issues
+                          if int(issue.radio_id or 0) == ident and issue.integration_key == backend
+                          and issue.severity in {"required", "recommended"}]
+                entry = attention(issues=issues, optional=backend == "manual",
+                                  reason="Radio control is explicitly manual." if backend == "manual" else "Configuration has not been checked for this control backend.")
+            self._configuration_radio_attention[ident] = entry
+        self._refresh_configuration_attention_presentations()
+
+    def _software_saved_editor_values(self, radio_id: int) -> dict:
+        profile = self._device_profile_by_id(radio_id) or {}
+        baseline = self._radio_software_state_from_profile(profile)
+        inventory = getattr(self, "_software_administration_inventory_by_family", {}).get("fast_light", ())
+        row = next((row for row in inventory if row.get("id") == profile.get("fast_light_config_id")), {})
+        baseline["arq_port"] = str(row.get("arq_port") or row.get("fldigi_arq_port") or "")
+        return baseline
+
+    @staticmethod
+    def _configuration_field_value(values: Mapping[str, Any], key: str) -> object:
+        current = values
+        for part in key.split("."):
+            if not isinstance(current, Mapping):
+                return None
+            current = current.get(part)
+        return current
+
+    def _software_family_has_unsaved_values(self, radio_id: int, family: str) -> bool:
+        from freqinout.gui.software_administration_editor import SOFTWARE_EDITOR_TASKS
+        baseline = self._software_saved_editor_values(radio_id)
+        draft = self._software_radio_drafts.get(radio_id, {})
+        keys = set(family_state_keys(family))
+        keys.update(field.key for task in SOFTWARE_EDITOR_TASKS.get(family, {}).values() for field in task.fields)
+        return any(self._configuration_field_value(draft, key) != self._configuration_field_value(baseline, key)
+                   for key in keys if self._configuration_field_value(draft, key) is not None)
+
+    def _software_configuration_states(self, family: str, radio_id: int) -> dict:
+        """Overlay unsaved owning fields without rerunning validation or I/O."""
+        from freqinout.gui.software_administration_editor import SOFTWARE_EDITOR_TASKS
+        from freqinout.core.configuration_attention import REFERENCE_TASKS
+        cache = getattr(self, "_configuration_attention_cache", {})
+        tasks = SOFTWARE_EDITOR_TASKS.get(family, {})
+        entries = {key: dict(cache.get((radio_id, family), {}).get(key, attention()))
+                   for key in tasks if key not in {"advanced", "health"}
+                   and key not in REFERENCE_TASKS.get(family, ())
+                   and (key != "overview" or key in cache.get((radio_id, family), {}))}
+        draft = getattr(self, "_software_radio_drafts", {}).get(radio_id)
+        if draft is not None and (radio_id, family) in getattr(self, "_software_dirty_families", set()):
+            baseline = self._software_saved_editor_values(radio_id)
+            def value(values, key):
+                if key.startswith("message_paths."):
+                    return str((values.get("message_paths") or {}).get(key.split(".")[1]) or "")
+                return str(values.get(key) or "")
+            for key, task in tasks.items():
+                if key in entries and any(value(draft, field.key) != value(baseline, field.key) for field in task.fields):
+                    entries[key] = attention(dirty=True)
+        return entries
+
+    @staticmethod
+    def _set_navigation_attention(button: QPushButton, title: str, entry: Mapping[str, Any]) -> None:
+        # Preserve the selected role; status never recolors the whole button.
+        button.setText(attention_text(title, entry))
+        button.setProperty("configuration_state", entry.get("state", ""))
+        button.setToolTip(f"{title}: {entry.get('label', '')}. {entry.get('reason', '')}")
+        button.setAccessibleDescription(button.toolTip())
+        button.setMinimumHeight(max(30, button.sizeHint().height()))
+
+    def _refresh_configuration_attention_presentations(self) -> None:
+        """Shared saved-evidence navigation, reasons and dirty overlays; cache only."""
+        workspace = getattr(self, "software_administration_workspace", None)
+        if isinstance(workspace, SoftwareAdministrationWorkspace):
+            radio_id = int(workspace.selected_radio_id() or 0)
+            states = self._software_configuration_states(workspace.selected_family_key(), radio_id) if radio_id else {}
+            if workspace.task_configuration_states() != states:
+                workspace.set_task_configuration_states(states)
+            for (family, ident, task), editor in getattr(self, "_software_task_editors", {}).items():
+                entry = self._software_configuration_states(family, int(ident or 0)).get(task, {})
+                setter = getattr(editor, "set_configuration_attention", None)
+                if callable(setter):
+                    setter(entry)
+        saved = getattr(self, "_configuration_saved_settings", None)
+        report = getattr(self, "_configuration_saved_readiness", None)
+        if saved is None or report is None:
+            return
+        profile = self._selected_settings_radio_profile() or {}
+        radio_id = int(profile.get("id") or 0)
+        entries = {}
+        operator_issues = [format_readiness_issue(issue) for issue in report.issues
+                           if issue.section_key == "freqinout" and issue.radio_id is None]
+        operator_dirty = any(str(current).strip().upper() != str(saved.get(key) or saved.get(alias) or "").strip().upper()
+                             for current, key, alias in ((self.callsign_edit.text(), "operator_callsign", "operator_callsign"),
+                                                       (self.grid6_edit.text(), "operator_grid6", "operator_grid6")))
+        entries["operator_info"] = attention(checked=True, issues=operator_issues, dirty=operator_dirty)
+        group_issues = [format_readiness_issue(issue) for issue in report.issues if issue.section_key == "operating_groups"]
+        entries["operating_groups"] = attention(checked=True, issues=group_issues,
+            dirty=_settings_operating_group_configuration_signature(getattr(self, "operating_groups", ())) !=
+                  (self._configuration_saved_group_signature if hasattr(self, "_configuration_saved_group_signature") else
+                   _settings_operating_group_configuration_signature(saved.get("operating_groups", ()))))
+        radio_issues = [format_readiness_issue(issue) for issue in report.issues
+                        if int(issue.radio_id or 0) == radio_id and issue.section_key == "radio_profiles" and not issue.integration_key]
+        profile_loaded = bool(getattr(self, "_initial_settings_loaded", False)) and radio_id > 0
+        entries["radio_profiles"] = attention(
+            checked=profile_loaded,
+            issues=radio_issues,
+        )
+        for group, button in getattr(self, "_section_nav_buttons", {}).items():
+            meta = self._section_meta.get(group, {})
+            health_key = meta.get("health_key")
+            entry = entries.get(health_key)
+            if entry is None:
+                continue
+            title = "Radio profile" if health_key == "radio_profiles" else str(meta.get("title") or group.title())
+            self._set_navigation_attention(button, title, entry)
+            if group is self.sections_stack.currentWidget():
+                reason_label = meta.get("configuration_reason_label")
+                if health_key == "radio_profiles" and getattr(self, "radio_profile_guided_task_key", "radio") != "radio":
+                    if reason_label is not None:
+                        reason_label.hide()
+                    continue
+                if reason_label is None:
+                    reason_label = QLabel(group)
+                    reason_label.setWordWrap(True)
+                    reason_label.setTextFormat(Qt.PlainText)
+                    group.layout().insertWidget(1, reason_label)
+                    meta["configuration_reason_label"] = reason_label
+                if health_key == "operator_info":
+                    reason_label.setText("Required information complete." if entry['state'] == 'complete'
+                                         else entry['reason'])
+                    reason_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+                else:
+                    reason_label.setText(f"Configuration: {entry['label']}. {entry['reason']}")
+                reason_label.show()
+        # Station inventory problems belong to the radio collection, not every
+        # selected radio. Retain explicit ownership for no-default/no-active cases.
+        inventory_issues = [format_readiness_issue(issue) for issue in report.issues
+                            if issue.section_key == "radio_profiles" and issue.radio_id is None
+                            and issue.severity in {"required", "recommended"}]
+        inventory_label = getattr(self, "radio_inventory_configuration_label", None)
+        if inventory_label is None and inventory_issues:
+            group = getattr(self, "configured_radios_group", None)
+            if group is not None:
+                inventory_label = self.radio_inventory_configuration_label = QLabel(group)
+                inventory_label.setWordWrap(True)
+                inventory_label.setTextFormat(Qt.PlainText)
+                group.layout().addWidget(inventory_label)
+        if inventory_label is not None:
+            inventory_label.setText("Radio collection: ⚠ Review. " + "; ".join(inventory_issues))
+            inventory_label.setVisible(bool(inventory_issues))
+        control_entry = getattr(self, "_configuration_radio_attention", {}).get(radio_id, attention())
+        backend_target = {"js8call": ("js8call", "api_radio"), "flrig": ("fast_light", "flrig_control"),
+                          "fldigi": ("fast_light", "fldigi_modem_logs")}.get(str(profile.get("control_backend") or "").lower())
+        if backend_target:
+            control_entry = self._software_configuration_states(backend_target[0], radio_id).get(backend_target[1], attention())
+        for key, title in (("control", "Rig control"), ("connections", "Connections")):
+            button = getattr(self, "radio_profile_guided_task_buttons", {}).get(key)
+            if button is not None:
+                self._set_navigation_attention(button, title, control_entry)
+        if self.sections_stack.currentWidget() is self.radio_profile_section_group and getattr(self, "radio_profile_guided_task_key", "") in {"control", "connections"}:
+            meta = self._section_meta[self.radio_profile_section_group]
+            label = meta.get("configuration_reason_label")
+            if label is None:
+                label = QLabel(self.radio_profile_section_group)
+                label.setWordWrap(True)
+                label.setTextFormat(Qt.PlainText)
+                self.radio_profile_section_group.layout().insertWidget(1, label)
+                meta["configuration_reason_label"] = label
+            label.setText(f"Configuration: {control_entry['label']}. {control_entry['reason']}")
+            label.show()
+        apps = getattr(self, "radio_profile_guided_task_buttons", {}).get("apps")
+        if apps is not None and radio_id:
+            selected_families = []
+            family_flags = {
+                "js8call": ("js8call",),
+                "fio_spotter": ("js8spotter",),
+                "commstat": ("commstat",),
+                "fast_light": ("flrig", "fldigi", "flmsg", "flamp"),
+                "varac": ("varac",),
+            }
+            for family, flags in family_flags.items():
+                if any(self._radio_software_enabled(profile, flag) for flag in flags):
+                    selected_families.append(family)
+                    continue
+                # A shared service can have a saved diagnostic even on older
+                # rows that predate its explicit use_* flag.  Surface that
+                # durable review; an explicit disabled flag still excludes it.
+                if family in {"commstat", "fio_spotter"} and all(
+                    profile.get(f"use_{flag}") in (None, "") for flag in flags
+                ):
+                    states = self._software_configuration_states(family, radio_id)
+                    if any(entry.get("state") in {"review", "error", "unsaved"}
+                           for entry in states.values()):
+                        selected_families.append(family)
+            family_titles = {
+                "js8call": "JS8Call",
+                "fio_spotter": "CommsPlan Spotter",
+                "commstat": "CommStat",
+                "fast_light": "Fast Light",
+                "varac": "VarAC",
+            }
+
+            def application_reason_prefix(family: str, task: str) -> str:
+                definition = task_definition(family, task)
+                task_title = definition.title if definition is not None else task.replace("_", " ").title()
+                return f"{family_titles.get(family, family)} · {task_title}"
+
+            all_states = []
+            for family in selected_families:
+                states = self._software_configuration_states(family, radio_id)
+                relevant_tasks = set(TASK_CHECKS.get(family, {}))
+                if "overview" in states:
+                    relevant_tasks.add("overview")
+                all_states.extend(
+                    (family, task, entry)
+                    for task, entry in states.items() if task in relevant_tasks
+                )
+            problems = [f"{application_reason_prefix(family, task)}: {reason}"
+                        for family, task, entry in all_states
+                        if entry.get('state') in {'review', 'error'}
+                        for reason in str(entry.get('reason') or '').split('; ') if reason]
+            unknown_reasons = [f"{application_reason_prefix(family, task)}: {entry.get('reason')}"
+                               for family, task, entry in all_states
+                               if entry.get('state') == 'unknown'
+                               and str(entry.get('reason') or '').strip()]
+            dirty = any(ident == radio_id for ident, _ in self._software_dirty_families)
+            all_locally_checked = bool(all_states) and all(
+                entry.get('state') in {'complete', 'optional'}
+                for _family, _task, entry in all_states
+            )
+            if not selected_families:
+                entry = attention(optional=True, reason="No applications are selected for this radio.")
+            else:
+                entry = attention(
+                    checked=all_locally_checked,
+                    issues=tuple(dict.fromkeys(problems)),
+                    dirty=dirty,
+                    reason=(unknown_reasons[0] if unknown_reasons else ""),
+                )
+            self._set_navigation_attention(apps, "Applications", entry)
+            if self.sections_stack.currentWidget() is self.radio_profile_section_group and getattr(self, "radio_profile_guided_task_key", "") == "apps":
+                meta = self._section_meta[self.radio_profile_section_group]
+                label = meta.get("configuration_reason_label")
+                if label is None:
+                    label = QLabel(self.radio_profile_section_group)
+                    label.setWordWrap(True)
+                    label.setTextFormat(Qt.PlainText)
+                    self.radio_profile_section_group.layout().insertWidget(1, label)
+                    meta["configuration_reason_label"] = label
+                label.setText(f"Configuration: {entry['label']}. {entry['reason']}")
+                label.show()
+
+        # Publish the same cached evidence to the application shortcuts whenever
+        # the sidebar changes; otherwise a previous green chip can outlive a
+        # newly published review reason. Passing the report avoids another load.
+        self._refresh_radio_profile_software_chips(readiness_report=report)
 
     def _software_editor_state(self, radio_id: int) -> Dict[str, Any]:
         if radio_id in self._software_radio_drafts:
@@ -10240,6 +11086,10 @@ class SettingsTab(QWidget):
         workspace = getattr(self, "software_administration_workspace", None)
         if not isinstance(workspace, SoftwareAdministrationWorkspace):
             return
+        # Reconcile cached family/component evidence together on entry; no probe
+        # or store load is allowed here. A hidden tab may have missed publications.
+        self._refresh_software_administration_status_projection()
+        self._refresh_configuration_attention_presentations()
         family_key = workspace.selected_family_key()
         task_key = workspace.selected_task_key()
         family = self._software_administration_snapshot.family(family_key)
@@ -10255,9 +11105,10 @@ class SettingsTab(QWidget):
             (item for item in family.assignments if item.radio_id == radio_id),
             None,
         )
-        state: Dict[str, Any] = {}
-        radio_name = ""
-        status_text = ""
+        state: Dict[str, Any] = self._software_editor_state(int(radio_id))
+        profile = self._device_profile_by_id(int(radio_id)) or {}
+        radio_name = self._profile_display_name(profile)
+        status_text = "Not configured"
         shared_names: Tuple[str, ...] = ()
         if assignment is not None:
             radio_id = int(assignment.radio_id)
@@ -10265,6 +11116,22 @@ class SettingsTab(QWidget):
             radio_name = assignment.radio_name
             status_text = assignment.status_text
             shared_names = assignment.shared_radio_names
+        if family_key == "fast_light" and task_key == "overview":
+            overviews = getattr(self, "_software_component_overviews", None)
+            if overviews is None:
+                overviews = self._software_component_overviews = {}
+            overview = overviews.get(int(radio_id))
+            if overview is None:
+                overview = FastLightOverview()
+                overview.task_navigation_requested.connect(self._route_software_task)
+                overview.details_requested.connect(self._show_software_component_details)
+                overviews[int(radio_id)] = overview
+                workspace.register_task_editor(family_key, task_key, overview, radio_id=radio_id)
+            workspace.set_editor_widget(overview)
+            overview.set_configuration_attention(self._software_configuration_states('fast_light', int(radio_id)).get('overview', {}))
+            self._publish_software_reference_presentations()
+            self._sync_current_section_scroll_size()
+            return
         key = (family_key, radio_id, task_key)
         editor = self._software_task_editors.get(key)
         if editor is None:
@@ -10323,7 +11190,31 @@ class SettingsTab(QWidget):
                 ),
             )
         workspace.set_editor_widget(editor)
+        self._publish_software_reference_presentations()
         self._sync_current_section_scroll_size()
+
+    def _show_software_component_details(self, component: str, detail: object) -> None:
+        """Reveal a published path without probing or modifying native files."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"{component} settings details")
+        layout = QVBoxLayout(dialog)
+        label = QLabel(f"{component} settings folder")
+        layout.addWidget(label)
+        text = QPlainTextEdit(str(detail or "Launch settings not recorded"))
+        text.setReadOnly(True)
+        text.setAccessibleName(f"{component} full settings path")
+        layout.addWidget(text, 1)
+        actions = QHBoxLayout()
+        copy = QPushButton("Copy")
+        copy.clicked.connect(lambda: QApplication.clipboard().setText(text.toPlainText()))
+        actions.addWidget(copy)
+        actions.addStretch()
+        close = QPushButton("Close")
+        close.clicked.connect(dialog.accept)
+        actions.addWidget(close)
+        layout.addLayout(actions)
+        dialog.resize(dialog.fontMetrics().horizontalAdvance("M" * 55), dialog.fontMetrics().height() * 14)
+        dialog.exec()
 
     def _on_software_task_value_changed(
         self,
@@ -10338,9 +11229,13 @@ class SettingsTab(QWidget):
         state = self._software_editor_state(ident)
         self._software_radio_drafts[ident] = merge_draft_value(state, field_key, value)
         self._software_dirty_families.add((ident, str(family_key or "").strip().lower()))
+        if not self._software_family_has_unsaved_values(ident, family_key):
+            self._software_dirty_families.discard((ident, family_key))
+        if not any(dirty_id == ident for dirty_id, _ in self._software_dirty_families):
+            self._software_radio_drafts.pop(ident, None)
         for (editor_family, editor_radio, _task), editor in self._software_task_editors.items():
             if editor_family == family_key and editor_radio == ident:
-                editor.set_dirty(True)
+                editor.set_dirty((ident, family_key) in self._software_dirty_families)
         self._sync_software_dirty_ui()
 
     @staticmethod
@@ -10421,21 +11316,34 @@ class SettingsTab(QWidget):
             )
         elif action_key == "edit_canonical_configuration":
             workspace = getattr(self, "software_administration_workspace", None)
+            selected_family = getattr(workspace, 'selected_family_key', lambda: '')()
+            if selected_family in {'commstat', 'fio_spotter'}:
+                # These services bind to JS8; they have no standalone native
+                # application editor. Route the edit to the actual owner.
+                workspace.select_context('js8call', workspace.selected_radio_id(), 'api_radio')
+                if workspace.selected_family_key() != 'js8call':
+                    return
             opener = getattr(workspace, "open_selected_instance_editor", None)
-            if not callable(opener) or not opener():
+            if not callable(opener) or not opener(task_key=workspace.selected_task_key()):
                 QMessageBox.information(
                     self,
                     "Edit software configuration",
                     "The saved instance could not be opened from the current inventory. Refresh Software Administration and try again.",
                 )
+        elif action_key == "fio_spotter_forms" and host is not None and hasattr(host, "open_fio_spotter_forms"):
+            legacy_sources = [dict(label=row.get('name') or 'Radio', path=row.get('js8_forms_path') or '')
+                              for row in self.device_profiles if row.get('js8_forms_path')]
+            host.open_fio_spotter_forms(legacy_form_sources=legacy_sources)
+        elif action_key == "external_spotter_activity" and host is not None and hasattr(host, "open_fio_spotter_imports"):
+            host.open_fio_spotter_imports()
         elif action_key == "fio_spotter" and host is not None and hasattr(host, "open_fio_spotter"):
             host.open_fio_spotter()
         elif action_key == "bbs" and host is not None and hasattr(host, "open_station_bbs"):
             host.open_station_bbs()
         elif action_key == "message_signing":
-            self._settings_nav_context = "main"
-            self._apply_settings_nav_scope_visibility()
-            self._select_settings_section_group(getattr(self, "message_auth_section_group", None))
+            self._open_software_signing_settings()
+        elif action_key == "edit_flamp_arq":
+            self._route_software_task("fldigi_modem_logs")
         elif action_key == "varac_cluster":
             self._settings_nav_context = "radios"
             self._apply_settings_nav_scope_visibility()
@@ -10443,14 +11351,15 @@ class SettingsTab(QWidget):
         elif action_key == "external_spotter_import":
             self._choose_js8spotter_import_db()
         elif action_key == "validate":
-            try:
-                self._status_service.refresh_now(reason="software_settings", force=True)
-            except Exception:
-                log.exception("Unable to request software status refresh.")
+            self._request_software_status_check()
         elif action_key == "repair_fast_light_message_components":
             self._repair_fast_light_message_components()
 
     def _fast_light_message_component_repair_needed(self, radio_id: Optional[int]) -> bool:
+        """Read the eligibility published at the explicit configuration boundary."""
+        return bool(getattr(self, "_software_component_repair_cache", {}).get(int(radio_id or 0), False))
+
+    def _load_fast_light_message_component_repair_needed(self, radio_id: Optional[int]) -> bool:
         """Return whether a saved Fast Light identity has legacy child wiring."""
 
         ident = int(radio_id or 0)
@@ -10462,8 +11371,6 @@ class SettingsTab(QWidget):
                 "fast_light_message_component_repair_needed",
                 None,
             )
-            if callable(persisted_detector) and persisted_detector(ident):
-                return True
             record = next(
                 (
                     item
@@ -10473,7 +11380,11 @@ class SettingsTab(QWidget):
                 None,
             )
             if record is None:
+                # Legacy bootstrap is an available migration, not evidence of
+                # broken wiring. Explain missing launch choices at Overview.
                 return False
+            if callable(persisted_detector):
+                return bool(persisted_detector(ident))
             profile = self._device_profile_by_id(ident) or {}
             components = {item.component_id.casefold(): item for item in record.components}
             flmsg = components.get("flmsg")
@@ -10657,6 +11568,7 @@ class SettingsTab(QWidget):
         setter = getattr(workspace, "set_dirty_contexts", None)
         if callable(setter):
             setter(tuple(sorted(self._software_dirty_families)))
+        self._refresh_configuration_attention_presentations()
 
     def _save_selected_software_family(self, family_key: str, radio_id: object) -> None:
         family_key = str(family_key or "").strip().lower()
@@ -10669,7 +11581,17 @@ class SettingsTab(QWidget):
             QMessageBox.information(self, "Software Administration", "Select one configured radio and software family to save.")
             return
         canonical_assignment = self._software_family_assignment(family_key, ident)
-        if canonical_assignment is not None and str(
+        from freqinout.core.configuration_attention import VARAC_GUARD_FIELDS
+        from freqinout.core.software_administration_persistence import only_varac_guard_changes
+        draft = self._software_editor_state(ident)
+        persisted = self._radio_software_state_from_profile(profile)
+        workspace = getattr(self, 'software_administration_workspace', None)
+        guard_only = (family_key == 'varac' and (
+            only_varac_guard_changes(persisted, draft)
+            or (workspace is not None and workspace.selected_task_key() == 'inbound_guard'
+                and not any(self._configuration_field_value(draft, key) != self._configuration_field_value(persisted, key)
+                            for key in family_state_keys('varac') if key not in VARAC_GUARD_FIELDS))))
+        if not guard_only and canonical_assignment is not None and str(
             getattr(canonical_assignment, "canonical_identity_key", "") or ""
         ).strip():
             QMessageBox.information(
@@ -10682,13 +11604,17 @@ class SettingsTab(QWidget):
             return
         if not self._confirm_shared_software_save(family_key, ident):
             return
-        draft = self._software_editor_state(ident)
-        persisted = self._radio_software_state_from_profile(profile)
         scoped_state = merge_family_state(persisted, draft, family_key)
+        scoped_state['_software_save_families'] = (family_key,)
+        scoped_state['_software_base_state'] = persisted
         try:
-            saved = self._save_radio_software_bundle(profile, scoped_state)
+            if guard_only:
+                from freqinout.core.operator_application_configuration import save_operator_varac_guard
+                saved = save_operator_varac_guard(self.multi_radio_store, ident, profile, scoped_state)
+            else:
+                saved = self._save_radio_software_bundle(profile, scoped_state)
             primary_id = self._runtime_primary_device_profile_id()
-            if primary_id:
+            if primary_id and not guard_only:
                 self.multi_radio_store.sync_runtime_active_device_to_legacy_settings_if_single_active(int(primary_id))
         except ValueError as exc:
             QMessageBox.warning(self, "Software Administration", str(exc))
@@ -10715,11 +11641,16 @@ class SettingsTab(QWidget):
         dirty = tuple(sorted(self._software_dirty_families))
         if not dirty:
             return
+        from freqinout.core.software_administration_persistence import only_varac_guard_changes
+        guard_contexts = {(ident, family) for ident, family in dirty if family == 'varac'
+            and only_varac_guard_changes(self._radio_software_state_from_profile(self._device_profile_by_id(ident) or {}),
+                                        self._software_editor_state(ident))}
         canonical_dirty = tuple(
             (ident, family_key)
             for ident, family_key in dirty
             if (
-                (assignment := self._software_family_assignment(family_key, ident)) is not None
+                (ident, family_key) not in guard_contexts
+                and (assignment := self._software_family_assignment(family_key, ident)) is not None
                 and str(getattr(assignment, "canonical_identity_key", "") or "").strip()
             )
         )
@@ -10736,21 +11667,26 @@ class SettingsTab(QWidget):
                 return
         saved_rows: list[Mapping[str, Any]] = []
         try:
-            for ident in sorted({radio_id for radio_id, _family in dirty}):
-                profile = self._device_profile_by_id(ident)
-                if not isinstance(profile, dict):
-                    continue
-                draft = self._software_editor_state(ident)
-                merged = self._radio_software_state_from_profile(profile)
-                for _radio_id, family_key in dirty:
-                    if _radio_id == ident:
+            with self.multi_radio_store.configuration_save_transaction() as transaction:
+                for ident in sorted({radio_id for radio_id, _family in dirty}):
+                    profile = self._device_profile_by_id(ident)
+                    if not isinstance(profile, dict):
+                        raise ValueError('A radio was removed. Review the retained drafts before saving.')
+                    draft = self._software_editor_state(ident)
+                    baseline = self._radio_software_state_from_profile(profile)
+                    merged = baseline
+                    families = tuple(family for radio_id, family in dirty if radio_id == ident)
+                    for family_key in families:
                         merged = merge_family_state(merged, draft, family_key)
-                saved = self._save_radio_software_bundle(profile, merged)
-                if isinstance(saved, Mapping):
-                    saved_rows.append(saved)
-            primary_id = self._runtime_primary_device_profile_id()
-            if primary_id:
-                self.multi_radio_store.sync_runtime_active_device_to_legacy_settings_if_single_active(int(primary_id))
+                    merged['_software_save_families'] = families
+                    merged['_software_base_state'] = baseline
+                    saved = self._save_radio_software_bundle(profile, merged)
+                    if isinstance(saved, Mapping):
+                        saved_rows.append(saved)
+                primary_id = self._runtime_primary_device_profile_id()
+                if primary_id and set(dirty) - guard_contexts:
+                    self.multi_radio_store.sync_runtime_active_device_to_legacy_settings_if_single_active(int(primary_id))
+                transaction.complete()
         except ValueError as exc:
             QMessageBox.warning(self, "Software Administration", str(exc))
             return
@@ -11124,7 +12060,7 @@ class SettingsTab(QWidget):
         workspace = getattr(self, "software_administration_workspace", None)
         if not isinstance(workspace, SoftwareAdministrationWorkspace):
             return
-        workspace.set_instance_discovery_results(self._software_instance_inventory(family))
+        workspace.set_instance_discovery_results(getattr(self, '_software_administration_inventory_by_family', {}).get(family, ()))
         section = {"js8call": "js8", "fast_light": "fast_light", "varac": "varac"}.get(family, "")
         if section:
             self._request_software_autofill(
@@ -11200,6 +12136,72 @@ class SettingsTab(QWidget):
         )
         return with_canonical_managed_directory_actions(plan, {family: payload})
 
+    def _save_operator_application_payload(self, payload: Mapping[str, Any], *, action="save") -> None:
+        from freqinout.gui.operator_configuration_job import OperatorConfigurationJob
+        workspace = self.software_administration_workspace
+        assistant = getattr(workspace, '_instance_assistant', None)
+        if assistant is None or getattr(self, '_operator_application_job', None) is not None:
+            return
+        assistant.set_busy(True)
+        self._operator_application_target = assistant
+        self._operator_application_payload = dict(payload)
+        job = OperatorConfigurationJob(self.multi_radio_store.db_path, payload, action=action, parent=self)
+        self._operator_application_job = job
+        job.result_ready.connect(self._operator_application_saved)
+        job.finished.connect(self._operator_application_job_finished)
+        job.start()
+
+    def _operator_application_job_finished(self) -> None:
+        job = self.sender()
+        if job is getattr(self, '_operator_application_job', None):
+            self._operator_application_job = None
+
+    def _operator_application_saved(self, response: object) -> None:
+        job = getattr(self, '_operator_application_job', None)
+        if job is None or not isinstance(response, Mapping) or response.get('job_token') != job.token:
+            return
+        self._operator_application_job = None
+        workspace = self.software_administration_workspace
+        assistant = self._operator_application_target
+        if assistant is not getattr(workspace, '_instance_assistant', None):
+            return
+        assistant.set_busy(False)
+        if not isinstance(response, Mapping):
+            return
+        if response.get('unfinished', {}).get('payload'):
+            assistant.set_unfinished(response['unfinished'])
+        if response.get('error'):
+            assistant.set_operation_status(response['error'], error=True)
+            return
+        if response.get('discarded'):
+            assistant.set_unfinished(None)
+            assistant.set_operation_status('Saved unfinished work discarded. The active configuration is unchanged.')
+            return
+        result = response.get('result')
+        if result is None:
+            if 'context' in response:
+                context = dict(response['context'])
+                values = {**assistant.values(), **dict(response.get('current_values', {}))}
+                assistant.editor.set_values(values, preserve_dirty=True)
+                if not assistant.editor.is_dirty():
+                    assistant.operator_base_values = assistant.values()
+                assistant._expected_identity_generation = context.get('expected_identity_generation')
+                assistant._replacement_instance_id = context.get('expected_current_instance_id')
+                assistant._raw_fields.update(context)
+                assistant.set_operation_status('Saved unfinished work is available; choose Recover or Discard.' if response.get('unfinished',{}).get('payload') else 'Ready to edit. Save changes only CommsPlan settings.')
+            return
+        if result.state == 'incomplete':
+            assistant.set_saved_incomplete(result)
+            assistant.set_operation_status('Saved · incomplete. ' + ' '.join(result.issues))
+            return
+        profile = response.get('profile')
+        if isinstance(profile, Mapping):
+            self._replace_cached_device_profile(dict(profile))
+        workspace.complete_instance_add(success=True, message='Application settings saved in CommsPlan.')
+        self._refresh_device_profiles_table()
+        self._emit_device_profiles_changed()
+        self._operator_station_request_review()
+
     def _on_software_instance_add_requested(self, raw_payload: object) -> None:
         """Persist one reviewed instance, radio link, manifest, and launch recipe."""
 
@@ -11207,6 +12209,9 @@ class SettingsTab(QWidget):
         if not isinstance(workspace, SoftwareAdministrationWorkspace) or not isinstance(raw_payload, Mapping):
             return
         payload = dict(raw_payload)
+        if payload.get('operator_configuration_v1'):
+            self._save_operator_application_payload(payload)
+            return
         native_result = payload.pop("_guided_native_apply_result", None)
         if not isinstance(native_result, GuidedAppConfigApplyResult):
             native_result = None
@@ -11898,6 +12903,8 @@ class SettingsTab(QWidget):
         status_label = getattr(self, "radio_profile_guided_task_status_label", None)
         if isinstance(status_label, QLabel):
             status_label.setText(self._radio_profile_guided_status_text(profile, readiness_report))
+        if getattr(self, "_unified_radio_navigation", False):
+            self._refresh_unified_radio_navigation(theme)
 
     def _select_settings_section_group(self, group: QGroupBox | None) -> None:
         if group is None or group not in self._section_meta:
@@ -11955,7 +12962,7 @@ class SettingsTab(QWidget):
 
     def _add_settings_task_button(self, group: QGroupBox, scope: str) -> None:
         normalized_scope = str(scope or "").strip().lower()
-        if normalized_scope == "software":
+        if normalized_scope not in {"global", "radio"}:
             return
         layout = (
             getattr(self, "settings_global_tasks_layout", None)
@@ -11973,10 +12980,20 @@ class SettingsTab(QWidget):
         btn.setMinimumHeight(button_height_for_font(btn))
         btn.clicked.connect(lambda _checked=False, g=group: self._select_settings_section_group(g))
         self._settings_section_task_buttons[group] = btn
-        count = layout.count()
-        columns = 6
-        row = count // columns
-        col = count % columns
+        if normalized_scope == "radio":
+            primary_slots = {"radio_profiles": 0, "operating_model_assignments": 1,
+                             "schedule_assignments": 2, "launch_control": 3}
+            key = str(meta.get("health_key", ""))
+            if key in primary_slots:
+                row, col = 0, primary_slots[key]
+            else:
+                extra_count = sum(1 for existing in self._settings_section_task_buttons
+                                  if existing is not group and self._section_meta.get(existing, {}).get("scope") == "radio"
+                                  and self._section_meta.get(existing, {}).get("health_key") not in primary_slots)
+                row, col = 1 + extra_count // 4, extra_count % 4
+        else:
+            count = layout.count()
+            row, col = count // 6, count % 6
         layout.addWidget(btn, row, col)
 
     def _settings_task_button_role(self, group: QGroupBox, snapshot: Mapping[str, Dict[str, str]]) -> str:
@@ -12143,6 +13160,13 @@ class SettingsTab(QWidget):
             if requested_context in {"main", "global"}
             else "radio"
         )
+        previous_context = getattr(self, "_settings_nav_context", "")
+        if scope == "software" and previous_context != "software" and radio_id is None:
+            workspace = getattr(self, "software_administration_workspace", None)
+            if isinstance(workspace, SoftwareAdministrationWorkspace) and workspace.selected_radio_id() is None and not getattr(workspace, "_radio_context_explicit", False):
+                focused = self._selected_settings_radio_profile() or {}
+                ident = int(focused.get("id") or 0) or None
+                workspace.select_context(workspace.selected_family_key(), ident, workspace.selected_task_key())
         self._settings_nav_context = "software" if scope == "software" else "main" if scope == "global" else "radios"
         if scope != "global" and radio_id:
             self._set_settings_radio_focus(int(radio_id))
@@ -12175,26 +13199,11 @@ class SettingsTab(QWidget):
         scope = self._current_settings_section_scope()
         radio_mode = scope == "radio"
         software_mode = scope == "software"
-        if hasattr(self, "settings_compact_header"):
-            # The compact frame is a semantic task header, not a spacer.  In
-            # Radios mode every child may be hidden; leave neither its styled
-            # border nor its fixed margins behind in that case.
-            header_children = (
-                "settings_task_title_label",
-                "settings_task_hint_label",
-                "settings_global_tasks_label",
-                "settings_global_tasks_widget",
-                "settings_radio_tasks_label",
-                "settings_radio_tasks_widget",
-            )
-            has_visible_header_child = any(
-                getattr(self, name, None) is not None
-                and getattr(self, name).isVisible()
-                for name in header_children
-            )
-            self.settings_compact_header.setVisible(
-                not software_mode and has_visible_header_child
-            )
+        if hasattr(self, "sections_scroll"):
+            self.sections_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff if software_mode else Qt.ScrollBarAsNeeded)
+            # The Software editor owns overflow. Ignore the active page hint
+            # here so QScrollArea fits its viewport instead of clipping a taller child.
+            self.sections_stack.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored if software_mode else QSizePolicy.Expanding)
         if hasattr(self, "configured_radios_group"):
             self.configured_radios_group.setVisible(radio_mode)
         if hasattr(self, "settings_section_nav_scroll"):
@@ -12220,30 +13229,20 @@ class SettingsTab(QWidget):
                 else "These settings apply to the whole CommsPlan station."
             )
         if hasattr(self, "settings_compact_header"):
-            # Re-evaluate after scope visibility has been applied.  The
-            # initial calculation above may have observed children from the
-            # previous Settings page during a stack transition.
-            self.settings_compact_header.setVisible(
-                not software_mode
-                and any(
-                    getattr(self, name, None) is not None
-                    and getattr(self, name).isVisible()
-                    for name in (
-                        "settings_task_title_label",
-                        "settings_task_hint_label",
-                        "settings_global_tasks_label",
-                        "settings_global_tasks_widget",
-                        "settings_radio_tasks_label",
-                        "settings_radio_tasks_widget",
-                    )
-                )
-            )
+            self.settings_compact_header.setVisible(False)
+        if hasattr(self, "save_btn"):
+            current = self.sections_stack.currentWidget()
+            owns_save = not software_mode and (not radio_mode or current is self.launch_control_section_group)
+            self.save_btn.setVisible(owns_save)
+            self.save_btn.setText("Save Settings")
 
     def _apply_settings_nav_scope_visibility(self) -> None:
         if not hasattr(self, "sections_nav_list"):
             return
         context = str(getattr(self, "_settings_nav_context", "main") or "main").strip().lower()
         desired_scope = "software" if context == "software" else "radio" if context in {"radio", "radios"} else "global"
+        if getattr(self, "_unified_radio_navigation", False) and desired_scope == "radio":
+            self._radio_settings_nav_collapsed = False
         if hasattr(self, "global_settings_toggle_btn"):
             self.global_settings_toggle_btn.setVisible(False)
         if hasattr(self, "radio_settings_toggle_btn"):
@@ -12288,6 +13287,10 @@ class SettingsTab(QWidget):
                 nav_visible = section_visible and not bool(self._radio_settings_nav_collapsed)
             else:
                 nav_visible = False
+            if scope == "radio":
+                btn.setText({"Radio Profile": "Radio profile", "Operating Model Assignment": "Operating model",
+                             "Schedule Assignment": "Schedule", "Launch Control": "Launch"}.get(
+                                 str(meta.get("title", "")), str(meta.get("title", btn.text()))))
             btn.setVisible(nav_visible)
             btn.setStyleSheet(self._settings_nav_button_style(role, theme))
         if hasattr(self, "global_settings_toggle_btn"):
@@ -12298,6 +13301,9 @@ class SettingsTab(QWidget):
             self.radio_settings_toggle_btn.setStyleSheet(
                 self._settings_nav_button_style(self._settings_nav_group_toggle_role("radio"), theme)
             )
+        if getattr(self, "_unified_radio_navigation", False):
+            self._refresh_unified_radio_navigation(theme)
+        self._refresh_configuration_attention_presentations()
         self._refresh_settings_nav_scroll_size()
 
     def _settings_nav_group_toggle_role(self, scope: str) -> str:
@@ -12864,12 +13870,27 @@ class SettingsTab(QWidget):
             if hasattr(self, "varac_bbs_vault_root_edit")
             else ""
         )
+        catalog = self.settings.all().get('station_bbs_catalog')
+        vault_locations = self._varac_bbs_vault_locations_cache
+        if catalog is not None:
+            varac_vault_enabled = bool(catalog.get('enabled'))
+            varac_vault_root = str(catalog.get('managed_root') or '')
+            vault_locations = catalog.get('locations', [])
+            if not varac_bbs_dir:
+                varac_bbs_dir = next((str(row.get('varac_bbs_dir') or '').strip()
+                                      for row in self.device_profiles if row.get('runtime_active')
+                                      and row.get('use_varac') and row.get('varac_bbs_enabled')
+                                      and row.get('varac_bbs_dir')), '')
         if varac_vault_enabled and not varac_bbs_dir:
             varac_issues.append("Managed BBS Library has no live BBS directory")
         if varac_vault_enabled and not varac_vault_root:
             varac_issues.append("Managed BBS Library root missing")
-        if varac_vault_enabled and not self._varac_bbs_vault_locations_cache:
+        if varac_vault_enabled and not vault_locations:
             varac_issues.append("Managed BBS Library has no locations")
+        elif varac_vault_enabled and catalog is not None:
+            default = next((row for row in vault_locations if row.get('id') == catalog.get('default_location_id')), None)
+            if default is None or not default.get('source_dir'):
+                varac_issues.append('Managed BBS Library Default location needs repair')
         varac_engaged = any(
             [
                 varac_engaged,
@@ -12935,6 +13956,7 @@ class SettingsTab(QWidget):
         self._apply_sections_nav_style(theme)
         self._update_sections_nav_size()
         self._refresh_settings_task_buttons(snapshot)
+        self._refresh_configuration_attention_presentations()
 
     def _apply_collapsed_state(self, group: QGroupBox, content: QWidget, expanded: bool) -> None:
         content.setVisible(expanded)
@@ -13098,6 +14120,7 @@ class SettingsTab(QWidget):
         if not selected_key or selected_key == str(getattr(self, "_mesh_selected_connection_key", "") or ""):
             return
         self._mesh_adding_new_connection = False
+        self._mesh_discovery_expanded = False
         self._mesh_selected_connection_key = selected_key
         try:
             values = self.settings.all()
@@ -13105,6 +14128,18 @@ class SettingsTab(QWidget):
             values = {}
         self._load_mesh_settings_from_data(values)
         self._settings_dirty = bool(getattr(self, "_settings_dirty", False))
+
+    def _toggle_mesh_discovery(self) -> None:
+        """Expose nearby-device discovery without changing the saved endpoint."""
+
+        self._mesh_discovery_expanded = not bool(getattr(self, "_mesh_discovery_expanded", False))
+        self._refresh_mesh_connection_visibility()
+        group = getattr(self, "mesh_discovery_group", None)
+        toggle = getattr(self, "mesh_find_device_btn", None)
+        if isinstance(toggle, QPushButton):
+            toggle.setText("Hide nearby devices" if self._mesh_discovery_expanded else "Find nearby device…")
+        if isinstance(group, QGroupBox) and self._mesh_discovery_expanded:
+            group.setVisible(True)
 
     def _on_mesh_add_device_clicked(self) -> None:
         """Start a new endpoint without repurposing the selected saved device."""
@@ -13123,10 +14158,17 @@ class SettingsTab(QWidget):
         )
         self._mesh_selected_connection_key = ""
         self._mesh_adding_new_connection = True
+        self._mesh_discovery_expanded = True
         # Retain the generated internal id in the editor so a manual endpoint
         # save cannot collapse onto the default adapter identity.
         self._load_mesh_config_into_ui(config, saved_configs=saved_configs, is_new_connection=False)
         self._refresh_mesh_saved_device_selector(saved_configs)
+        # Add device is also the explicit entry point to discovery.  Keep the
+        # manual editor visible in the normal connection group/Advanced panel
+        # so an operator can choose either route without a hidden mode.
+        discovery_group = getattr(self, "mesh_discovery_group", None)
+        if isinstance(discovery_group, QGroupBox):
+            discovery_group.setVisible(True)
         self._refresh_mesh_connection_visibility()
         self._refresh_mesh_config_status()
         self._mark_settings_dirty()
@@ -14015,6 +15057,125 @@ class SettingsTab(QWidget):
         self._mesh_preserve_legacy_serial_baud = False
         self._set_mesh_receive_only_ui()
 
+    def _apply_mesh_core_responsive_layout(self) -> None:
+        """Keep core mesh choices readable when the Settings pane is narrow."""
+        group = getattr(self, "mesh_core_group", None)
+        if not isinstance(group, QGroupBox):
+            return
+        form = group.layout()
+        if not isinstance(form, QGridLayout):
+            return
+        controls = (
+            self.mesh_enabled_chk,
+            self.mesh_protocol_label,
+            self.mesh_protocol_combo,
+            self.mesh_connection_type_label,
+            self.mesh_connection_type_combo,
+            self.mesh_connection_name_label,
+            self.mesh_connection_name_row,
+            self.mesh_tcp_label,
+            self.mesh_tcp_row,
+            self.mesh_serial_label,
+            self.mesh_serial_row,
+        )
+        if not all(isinstance(widget, QWidget) for widget in controls):
+            return
+        metrics = group.fontMetrics()
+        label_width = max(
+            metrics.horizontalAdvance(self.mesh_protocol_label.text()),
+            metrics.horizontalAdvance(self.mesh_connection_type_label.text()),
+            metrics.horizontalAdvance(self.mesh_connection_name_label.text()),
+        )
+        control_width = max(
+            self.mesh_protocol_combo.sizeHint().width(),
+            self.mesh_connection_type_combo.sizeHint().width(),
+            metrics.horizontalAdvance("Meshtastic") + 28,
+        )
+        wide_minimum = (
+            metrics.horizontalAdvance(self.mesh_enabled_chk.text())
+            + (label_width * 2)
+            + (control_width * 2)
+            + (form.horizontalSpacing() * 3)
+            + 32
+        )
+        available = max(0, group.contentsRect().width())
+        compact = available < wide_minimum
+        if compact == bool(getattr(self, "_mesh_core_compact_layout", False)):
+            return
+        for widget in controls:
+            form.removeWidget(widget)
+        for column in range(6):
+            form.setColumnStretch(column, 0)
+        if compact:
+            # Labels occupy their own rows so enlarged fonts cannot collide
+            # with adjacent selectors.  The connection name remains a full
+            # width field beneath its label.
+            form.addWidget(self.mesh_enabled_chk, 0, 0, 1, 4)
+            form.addWidget(self.mesh_protocol_label, 1, 0, 1, 4)
+            form.addWidget(self.mesh_protocol_combo, 2, 0, 1, 4)
+            form.addWidget(self.mesh_connection_type_label, 3, 0, 1, 4)
+            form.addWidget(self.mesh_connection_type_combo, 4, 0, 1, 4)
+            form.addWidget(self.mesh_connection_name_label, 5, 0, 1, 4)
+            form.addWidget(self.mesh_connection_name_row, 6, 0, 1, 4)
+            form.addWidget(self.mesh_tcp_label, 7, 0, 1, 4)
+            form.addWidget(self.mesh_tcp_row, 8, 0, 1, 4)
+            form.addWidget(self.mesh_serial_label, 9, 0, 1, 4)
+            form.addWidget(self.mesh_serial_row, 10, 0, 1, 4)
+            form.setColumnStretch(0, 1)
+            form.setColumnStretch(1, 1)
+            form.setColumnStretch(2, 1)
+            form.setColumnStretch(3, 1)
+        else:
+            form.addWidget(self.mesh_enabled_chk, 0, 0, 1, 2)
+            form.addWidget(self.mesh_protocol_label, 0, 2)
+            form.addWidget(self.mesh_protocol_combo, 0, 3)
+            form.addWidget(self.mesh_connection_type_label, 0, 4)
+            form.addWidget(self.mesh_connection_type_combo, 0, 5)
+            form.addWidget(self.mesh_connection_name_label, 1, 0)
+            form.addWidget(self.mesh_connection_name_row, 1, 1, 1, 5)
+            form.addWidget(self.mesh_tcp_label, 2, 0)
+            form.addWidget(self.mesh_tcp_row, 2, 1, 1, 5)
+            form.addWidget(self.mesh_serial_label, 3, 0)
+            form.addWidget(self.mesh_serial_row, 3, 1, 1, 5)
+            form.setColumnStretch(3, 1)
+            form.setColumnStretch(5, 1)
+        self._mesh_core_compact_layout = compact
+        group.updateGeometry()
+
+    def _apply_mesh_saved_device_actions_layout(self) -> None:
+        """Keep saved-device actions reachable at large text and narrow widths."""
+
+        layout = getattr(self, "mesh_saved_device_actions_layout", None)
+        group = getattr(self, "mesh_saved_devices_group", None)
+        buttons = tuple(getattr(self, "mesh_saved_device_action_buttons", ()))
+        if not isinstance(layout, QGridLayout) or not isinstance(group, QGroupBox):
+            return
+        if not buttons or not all(isinstance(button, QPushButton) for button in buttons):
+            return
+        metrics = group.fontMetrics()
+        minimums = [
+            max(button.sizeHint().width(), metrics.horizontalAdvance(button.text()) + 28)
+            for button in buttons
+        ]
+        spacing = max(0, layout.horizontalSpacing())
+        available = max(0, layout.geometry().width() or group.contentsRect().width())
+        wide_minimum = sum(minimums) + spacing * (len(buttons) - 1) + 16
+        columns = len(buttons) if available >= wide_minimum else 2
+        if columns == getattr(self, "_mesh_saved_device_action_columns", 0):
+            return
+        for button in buttons:
+            layout.removeWidget(button)
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        for column in range(len(buttons)):
+            layout.setColumnStretch(column, 0)
+        for index, button in enumerate(buttons):
+            row, column = divmod(index, columns)
+            layout.addWidget(button, row, column)
+        for column in range(columns):
+            layout.setColumnStretch(column, 1)
+        self._mesh_saved_device_action_columns = columns
+        group.updateGeometry()
+
     def _queue_mesh_section_fit_refresh(self) -> None:
         if bool(getattr(self, "_mesh_section_fit_refresh_pending", False)):
             return
@@ -14022,6 +15183,8 @@ class SettingsTab(QWidget):
 
         def refresh() -> None:
             self._mesh_section_fit_refresh_pending = False
+            self._apply_mesh_core_responsive_layout()
+            self._apply_mesh_saved_device_actions_layout()
             self._refresh_fit_content_section_height(getattr(self, "local_mesh_section_group", None))
 
         QTimer.singleShot(0, refresh)
@@ -14548,27 +15711,49 @@ class SettingsTab(QWidget):
             if isinstance(row, QWidget):
                 visible = kind is selected
                 row.setVisible(visible)
-                if isinstance(form, QFormLayout):
+                if kind is MeshConnectionType.TCP:
+                    label = getattr(self, "mesh_tcp_label", None)
+                elif kind is MeshConnectionType.SERIAL:
+                    label = getattr(self, "mesh_serial_label", None)
+                elif isinstance(form, QFormLayout):
                     label = form.labelForField(row)
-                    if isinstance(label, QWidget):
-                        label.setVisible(visible)
+                else:
+                    label = None
+                if isinstance(label, QWidget):
+                    label.setVisible(visible)
         show_meshcore_ble = selected is MeshConnectionType.BLE and protocol == "meshcore"
         stage_defaults = getattr(self, "mesh_stage_default_channels_btn", None)
         if isinstance(stage_defaults, QPushButton):
-            stage_defaults.setText("Stage Public" if protocol == "meshcore" else "Stage Public + Direct")
+            stage_defaults.setText(
+                "Add public channel…" if protocol == "meshcore" else "Add public and direct channels…"
+            )
             stage_defaults.setToolTip(
-                "Create a Public channel policy for review. Direct recipient/receive facts remain message metadata."
+                "Add a public channel policy for review in CommsPlan. This does not change the device."
                 if protocol == "meshcore"
-                else "Create Public and Direct policies for this mesh connection so you can review them before use."
+                else "Add public and direct channel policies for review in CommsPlan. This does not change the device."
             )
         discovery_group = getattr(self, "mesh_discovery_group", None)
-        # Discovery remains independent from saved-device selection. A failed
-        # connection must not hide recovery or retarget another endpoint.
+        # Saved-device work stays compact.  Add device and Find nearby device
+        # are explicit entry points; an active scan/result remains visible so
+        # a failed attempt never hides the recovery path.
+        show_discovery = bool(
+            show_meshcore_ble
+            and (
+                getattr(self, "_mesh_adding_new_connection", False)
+                or getattr(self, "_mesh_discovery_expanded", False)
+                or self._mesh_ble_scan_is_active()
+                or getattr(self, "_mesh_ble_scan_results_present", False)
+            )
+        )
         if isinstance(discovery_group, QGroupBox):
-            discovery_group.setVisible(show_meshcore_ble)
+            discovery_group.setVisible(show_discovery)
         results_row = getattr(self, "mesh_ble_results_row", None)
         if isinstance(results_row, QWidget):
-            results_row.setVisible(show_meshcore_ble)
+            results_row.setVisible(show_discovery)
+        toggle = getattr(self, "mesh_find_device_btn", None)
+        if isinstance(toggle, QPushButton):
+            toggle.setVisible(show_meshcore_ble and not getattr(self, "_mesh_adding_new_connection", False))
+            toggle.setText("Hide nearby devices" if getattr(self, "_mesh_discovery_expanded", False) else "Find nearby device…")
         self._queue_mesh_section_fit_refresh()
 
     def _refresh_mesh_config_status(self) -> None:
@@ -14633,6 +15818,8 @@ class SettingsTab(QWidget):
         if not config.enabled:
             self._mesh_last_health_row = {}
             self._set_mesh_connection_action_state(config, connected=False)
+            if isinstance(getattr(self, "mesh_connect_saved_btn", None), QPushButton):
+                self.mesh_connect_saved_btn.setText("Connect")
             indicator.setText("Disconnected")
             muted = theme.get("text_muted", "#5b6b78")
             indicator.setStyleSheet(f"QLabel#localMeshConnectionState {{ color: {muted}; font-weight: 700; }}")
@@ -14642,6 +15829,8 @@ class SettingsTab(QWidget):
         self._set_mesh_connection_action_state(config, connected=bool(row.get("connected")))
         if bool(row.get("connected")):
             connection_name = self._mesh_saved_connection_label(config)
+            if isinstance(getattr(self, "mesh_connect_saved_btn", None), QPushButton):
+                self.mesh_connect_saved_btn.setText("Connect")
             indicator.setText(f"Connected: {connection_name}")
             tooltip_parts = [f"Saved connection: {connection_name}"]
             device_name = str(row.get("device_name") or "").strip() or str(config.ble_device_name or "").strip()
@@ -14661,6 +15850,8 @@ class SettingsTab(QWidget):
             return
         last_error = str(row.get("last_error") or "").strip()
         if last_error:
+            if isinstance(getattr(self, "mesh_connect_saved_btn", None), QPushButton):
+                self.mesh_connect_saved_btn.setText("Retry connection")
             indicator.setText("Needs attention")
             guidance = str(row.get("guidance") or "").strip()
             tooltip = guidance or last_error
@@ -14676,6 +15867,8 @@ class SettingsTab(QWidget):
             )
             return
         indicator.setText("Not connected")
+        if isinstance(getattr(self, "mesh_connect_saved_btn", None), QPushButton):
+            self.mesh_connect_saved_btn.setText("Connect")
         indicator.setToolTip(f"Saved connection: {self._mesh_saved_connection_label(config)}")
         muted = theme.get("text_muted", "#5b6b78")
         indicator.setStyleSheet(f"QLabel#localMeshConnectionState {{ color: {muted}; font-weight: 700; }}")
@@ -14920,9 +16113,28 @@ class SettingsTab(QWidget):
                 row = table.rowCount()
                 table.insertRow(row)
                 use_item = self._make_condition_alert_item("", editable=False, checkable=True, checked=normalized.enabled)
+                use_item.setFlags(use_item.flags() & ~Qt.ItemIsUserCheckable)
                 use_item.setData(Qt.UserRole, normalized.id)
                 use_item.setData(Qt.UserRole + 1, condition_alert_rule_to_settings(normalized))
                 table.setItem(row, 0, use_item)
+                from freqinout.gui.theme import ThemedCheckBox
+                use_control = ThemedCheckBox()
+                use_control.setAccessibleName(f"Enable rule: {normalized.name or normalized.id}")
+                use_control.setToolTip(use_control.accessibleName())
+                use_control.setChecked(normalized.enabled)
+                use_control.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+                host = QWidget(table)
+                host_layout = QHBoxLayout(host)
+                spacing = max(2, use_control.fontMetrics().height() // 4)
+                host_layout.setContentsMargins(spacing, spacing, spacing, spacing)
+                host_layout.setAlignment(Qt.AlignCenter)
+                host_layout.addWidget(use_control)
+                host.setMinimumWidth(use_control.sizeHint().width() + spacing * 2)
+                host.setMinimumHeight(use_control.sizeHint().height() + spacing * 2)
+                use_control.toggled.connect(lambda checked, item=use_item:
+                    item.setCheckState(Qt.Checked if checked else Qt.Unchecked))
+                table.setCellWidget(row, 0, host)
+
                 table.setItem(row, 1, self._make_condition_alert_item(normalized.name or normalized.id))
                 table.setItem(row, 2, self._make_condition_alert_item(normalized.operating_group))
                 table.setItem(row, 3, self._make_condition_alert_item(self._condition_alert_join(normalized.source_families)))
@@ -14983,6 +16195,13 @@ class SettingsTab(QWidget):
     def _on_condition_alert_table_item_changed(self, _item: QTableWidgetItem) -> None:
         if bool(getattr(self, "_condition_alert_rules_loading", False)):
             return
+        if _item.column() == 0:
+            host = self.condition_alert_rules_table.cellWidget(_item.row(), 0)
+            checkbox = host.findChild(QCheckBox) if host is not None else None
+            if checkbox is not None:
+                blocked = checkbox.blockSignals(True)
+                checkbox.setChecked(_item.checkState() == Qt.Checked)
+                checkbox.blockSignals(blocked)
         self.condition_alert_rules = self._table_to_condition_alert_rules()
         self._refresh_condition_alert_detail()
         self._mark_settings_dirty()
@@ -15108,6 +16327,10 @@ class SettingsTab(QWidget):
             hasattr(self, "varac_bbs_vault_enabled_chk_main") and self.varac_bbs_vault_enabled_chk_main.isChecked()
         )
         vault_locations = len(self._varac_bbs_vault_locations_cache)
+        catalog = self.settings.all().get('station_bbs_catalog')
+        if catalog is not None:
+            vault_enabled = bool(catalog.get('enabled'))
+            vault_locations = len(catalog.get('locations', []))
         return (
             f"Install {'set' if install_set else 'missing'}, "
             f"Launch {'override' if launch_cmd_set else 'auto'}, "
@@ -15258,8 +16481,10 @@ class SettingsTab(QWidget):
 
     def _station_readiness_report_for_software_chips(self):
         cached = getattr(self, "_last_station_readiness_report", None)
-        if cached is not None:
+        catalog = self.settings.all().get('station_bbs_catalog')
+        if cached is not None and catalog == getattr(self, '_last_readiness_bbs_catalog', None):
             return cached
+        self._last_readiness_bbs_catalog = catalog
         return self._current_station_readiness_report()
 
     def _clear_status_layout(self, layout: QHBoxLayout) -> None:
@@ -15549,10 +16774,9 @@ class SettingsTab(QWidget):
         self._start_software_autofill_request(request)
 
     def _set_software_autofill_feedback(self, request: Mapping[str, Any], text: str) -> None:
-        if str(request.get("target") or "") == "instance_assistant":
-            workspace = getattr(self, "software_administration_workspace", None)
-            assistant = getattr(workspace, "_instance_assistant", None)
-            if assistant is not None and hasattr(assistant, "set_operation_status"):
+        if str(request.get('target') or '') in {'instance_assistant','operator_nested_assistant'}:
+            assistant = self._operator_discovery_assistant(str(request.get('target')))
+            if assistant is not None:
                 assistant.set_operation_status(text)
             return
         if str(request.get("target") or "") == "software":
@@ -15617,14 +16841,10 @@ class SettingsTab(QWidget):
         if int(request.get("generation") or 0) != int(self._software_autofill_generation):
             return False
         target = str(request.get("target") or "")
-        if target == "instance_assistant":
-            workspace = getattr(self, "software_administration_workspace", None)
-            return bool(
-                isinstance(workspace, SoftwareAdministrationWorkspace)
-                and getattr(workspace, "_instance_assistant", None) is not None
-                and id(getattr(workspace, "_instance_assistant")) == request.get("assistant_token")
-                and workspace.selected_family_key() == str(request.get("family_key") or "")
-            )
+        if target in {'instance_assistant','operator_nested_assistant'}:
+            assistant = self._operator_discovery_assistant(target)
+            return bool(assistant is not None and id(assistant) == request.get('assistant_token')
+                        and assistant.family_key == str(request.get('family_key') or ''))
         if target != "software":
             return True
         workspace = getattr(self, "software_administration_workspace", None)
@@ -15647,9 +16867,9 @@ class SettingsTab(QWidget):
         if not self._software_autofill_request_is_current(request):
             return
         result_map = dict(results) if isinstance(results, Mapping) else {}
-        if str(request.get("target") or "") == "instance_assistant":
+        if str(request.get('target') or '') in {'instance_assistant','operator_nested_assistant'}:
             family = str(request.get("family_key") or "")
-            combined = list(self._software_instance_inventory(family))
+            combined = list(getattr(self, '_software_administration_inventory_by_family', {}).get(family, ()))
             discovered = result_map.get("__instance_candidates__")
             if isinstance(discovered, (list, tuple)):
                 detected_rows: List[Dict[str, Any]] = []
@@ -15689,14 +16909,10 @@ class SettingsTab(QWidget):
                     continue
                 identities.add(identity)
                 deduped.append(row)
-            workspace = getattr(self, "software_administration_workspace", None)
-            if isinstance(workspace, SoftwareAdministrationWorkspace):
-                workspace.set_instance_discovery_results(deduped)
-                assistant = getattr(workspace, "_instance_assistant", None)
-                if assistant is not None and hasattr(assistant, "set_operation_status"):
-                    assistant.set_operation_status(
-                        f"Found {len(deduped)} saved or detected configuration{'s' if len(deduped) != 1 else ''}."
-                    )
+            assistant = self._operator_discovery_assistant(str(request.get('target')))
+            if assistant is not None:
+                assistant.set_discovery_results(deduped)
+                assistant.set_operation_status(f'Found {len(deduped)} saved or detected configurations. Choose a suggestion explicitly.')
             return
         wanted = set(request.get("keys") or ())
         scoped = {
@@ -16553,39 +17769,7 @@ class SettingsTab(QWidget):
                 for g in og:
                     if not isinstance(g, dict):
                         continue
-                    vfo_val = str(g.get("vfo") or "A").strip().upper()
-                    if vfo_val not in ("A", "B"):
-                        vfo_val = "A"
-                    try:
-                        cond_level = int(g.get("condition_level", 5) or 5)
-                    except Exception:
-                        cond_level = 5
-                    if cond_level < 1 or cond_level > 5:
-                        cond_level = 5
-                    band_val = str(g.get("band", "") or "").strip().upper()
-                    mode_val = normalize_operating_group_mode(g.get("mode", ""), band_val)
-                    self.operating_groups.append(
-                        {
-                            **g,
-                            "group": str(g.get("group", "")).upper(),
-                            "operating_group_key": str(g.get("operating_group_key", "") or "").strip(),
-                            "operating_group_frequency_key": str(g.get("operating_group_frequency_key", "") or "").strip(),
-                            "mode": mode_val,
-                            "band": band_val,
-                            "frequency": g.get("frequency", ""),
-                            "vfo": vfo_val,
-                            "fldigi_mode": str(g.get("fldigi_mode") or "").strip(),
-                            "fldigi_offset": str(g.get("fldigi_offset") or "").strip(),
-                            "auto_tune": bool(g.get("auto_tune", False)),
-                            "use_condition_levels": bool(g.get("use_condition_levels", False)),
-                            "condition_level": cond_level,
-                            "fastlight_filename_delimiter": str(g.get("fastlight_filename_delimiter", "group_default") or "group_default").strip(),
-                            "fastlight_custom_delimiter": str(g.get("fastlight_custom_delimiter", "") or "").strip(),
-                            "fastlight_signed_suffix": str(g.get("fastlight_signed_suffix", "group_default") or "group_default").strip(),
-                            "fastlight_unsigned_suffix": str(g.get("fastlight_unsigned_suffix", "group_default") or "group_default").strip(),
-                            "fastlight_form_family": str(g.get("fastlight_form_family", "group_default") or "group_default").strip().upper(),
-                        }
-                    )
+                    self.operating_groups.append(_settings_loaded_operating_group_row(g))
                 self.operating_groups = list(_settings_operating_group_frequency_rows(self.operating_groups))
         except Exception:
             log.exception("Failed to fully normalize Operating Groups; preserving rows loaded so far.")
@@ -16655,6 +17839,8 @@ class SettingsTab(QWidget):
         self._refresh_radio_context_labels()
         self._refresh_section_titles()
         self._refresh_contextual_autofill_buttons()
+        if hasattr(self, "_operator_station_setup") and self._operator_station_setup is not None:
+            QTimer.singleShot(0, self._operator_station_request_review)
         emit_span(
             "settings.load_settings",
             (time.perf_counter() - _perf_t0) * 1000.0,
@@ -16664,12 +17850,17 @@ class SettingsTab(QWidget):
 
     def _save_settings_button(self):
         """Explicit save via the button (shows confirmation)."""
-        self._save_settings(show_message=True)
+        saved = self._save_settings(show_message=True)
+        if saved is not True:
+            # Validation and guarded child saves return False. Keep the dirty
+            # fence and do not broadcast a station-wide saved event.
+            return False
         # Defer settings fanout one tick to keep Save interaction responsive.
         QTimer.singleShot(0, self._emit_settings_saved)
         QTimer.singleShot(0, self._maybe_backfill_js8_geo)
         self._settings_dirty = False
         self._set_save_button_state("success")
+        return True
 
     def _emit_settings_saved(self) -> None:
         self._status_identity_epoch = int(getattr(self, "_status_identity_epoch", 0)) + 1
@@ -16730,10 +17921,13 @@ class SettingsTab(QWidget):
         if self._varac_bbs_vault_editor_has_pending_changes():
             if not show_message:
                 log.info("SettingsTab: skipped pending Managed BBS location editor changes during quiet shutdown save.")
-                return
+                return False
             if not self._save_varac_bbs_vault_location():
-                return
-        data = self.settings.all()
+                return False
+        # Work on a detached payload. Validation may return False; mutating
+        # SettingsManager's live cache before durable persistence would make a
+        # blocked save appear partially applied to later callers.
+        data = dict(self.settings.all())
         prev_operator = {
             "callsign": str(data.get("operator_callsign", "") or "").strip().upper(),
             "name": str(data.get("operator_name", "") or "").strip(),
@@ -16799,7 +17993,7 @@ class SettingsTab(QWidget):
                     f"Save blocked: select {missing_text}.",
                     "Choose a prompt interval for each Prompt enforcement mode before saving.",
                 )
-                return
+                return False
         data["freq_enforcement_mode"] = freq_mode
         data["freq_prompt_interval"] = freq_prompt
         data["fldigi_enforcement_mode"] = fldigi_mode
@@ -16974,6 +18168,7 @@ class SettingsTab(QWidget):
         data["sop_export_postamble"] = (
             self.sop_export_postamble_edit.toPlainText() if hasattr(self, "sop_export_postamble_edit") else ""
         )
+        station_catalog = self.settings.all().get('station_bbs_catalog')
         if data["varac_bbs_auto_archive_enabled"]:
             bbs_dir_txt = data["varac_bbs_dir"]
             bbs_archive_txt = data["varac_bbs_archive_dir"]
@@ -16983,7 +18178,7 @@ class SettingsTab(QWidget):
                     "Settings",
                     "When Auto-Archive BBS Files is enabled, both BBS Directory and BBS Archive are required.",
                 )
-                return
+                return False
             bbs_dir = Path(bbs_dir_txt)
             bbs_archive = Path(bbs_archive_txt)
             if not bbs_dir.exists() or not bbs_dir.is_dir() or not bbs_archive.exists() or not bbs_archive.is_dir():
@@ -16992,7 +18187,7 @@ class SettingsTab(QWidget):
                     "Settings",
                     "BBS Directory and BBS Archive must both exist and be directories when auto-archive is enabled.",
                 )
-                return
+                return False
             try:
                 if bbs_dir.resolve() == bbs_archive.resolve():
                     QMessageBox.warning(
@@ -17000,7 +18195,7 @@ class SettingsTab(QWidget):
                         "Settings",
                         "BBS Directory and BBS Archive must be different directories.",
                     )
-                    return
+                    return False
             except Exception:
                 pass
         if data["varac_bbs_limit_access_enabled"] and not data["varac_bbs_allowed_callsigns"]:
@@ -17009,8 +18204,8 @@ class SettingsTab(QWidget):
                 "Settings",
                 "Limit Access To Callsigns is enabled, but no allowed callsigns are configured.",
             )
-            return
-        if hasattr(self, "varac_bbs_vault_enabled_chk_main") and self.varac_bbs_vault_enabled_chk_main.isChecked():
+            return False
+        if station_catalog is None and hasattr(self, "varac_bbs_vault_enabled_chk_main") and self.varac_bbs_vault_enabled_chk_main.isChecked():
             root_txt = self.varac_bbs_vault_root_edit.text().strip()
             if not data["varac_bbs_dir"]:
                 QMessageBox.warning(
@@ -17018,14 +18213,14 @@ class SettingsTab(QWidget):
                     "Managed BBS Library",
                     "Set the VarAC BBS directory before enabling Managed BBS Library.",
                 )
-                return
+                return False
             if not root_txt:
                 QMessageBox.warning(
                     self,
                     "Managed BBS Library",
                     "Set the Managed Root before enabling Managed BBS Library.",
                 )
-                return
+                return False
             locations = load_vault_locations(self._varac_bbs_vault_locations_cache)
             if not locations:
                 QMessageBox.warning(
@@ -17033,7 +18228,7 @@ class SettingsTab(QWidget):
                     "Managed BBS Library",
                     "Initialize the Managed BBS Library or add at least one location before saving.",
                 )
-                return
+                return False
             default_location_id = (
                 str(self.varac_bbs_vault_default_location_combo.currentData() or "").strip() or DEFAULT_LOCATION_ID
             )
@@ -17044,7 +18239,7 @@ class SettingsTab(QWidget):
                     "Managed BBS Library",
                     "Choose a valid Default location before saving.",
                 )
-                return
+                return False
             missing_sources = [
                 str(loc.source_dir)
                 for loc in locations
@@ -17057,7 +18252,7 @@ class SettingsTab(QWidget):
                     "Every enabled location must point to an existing directory.\n\n"
                     + "\n".join(missing_sources[:5]),
                 )
-                return
+                return False
             code_policy = str(data.get("varac_bbs_vault_global_code_policy", DEFAULT_GLOBAL_CODE_POLICY) or DEFAULT_GLOBAL_CODE_POLICY).strip()
             if code_policy != "Allow public locations":
                 missing_codes = [
@@ -17075,7 +18270,7 @@ class SettingsTab(QWidget):
                         "Current code policy requires access codes for these enabled locations:\n\n"
                         + "\n".join(missing_codes[:8]),
                     )
-                    return
+                    return False
             if data.get("varac_bbs_vault_flamp_enabled", False):
                 relay_dir = str(data.get("varac_bbs_vault_flamp_relay_dir", "") or "").strip()
                 if not relay_dir or not Path(relay_dir).expanduser().is_dir():
@@ -17084,7 +18279,7 @@ class SettingsTab(QWidget):
                         "Managed BBS Library",
                         "Set a valid FLAMP relay folder before enabling FLAMP relay service.",
                     )
-                    return
+                    return False
         data["fldigi_log_path"] = (
             self.fldigi_log_path_edit.text().strip() if hasattr(self, "fldigi_log_path_edit") else ""
         )
@@ -17156,7 +18351,7 @@ class SettingsTab(QWidget):
                 "This can cause repeated already-running windows and extra Python processes. "
                 "Choose the correct app executable/script path.",
             )
-            return
+            return False
 
         data["operating_groups"] = self._table_to_operating_groups()
         data["local_net_profiles"] = self._table_to_local_net_profiles()
@@ -17169,184 +18364,93 @@ class SettingsTab(QWidget):
             if hasattr(self, "condition_alert_auto_sop_chk")
             else False
         )
-        if not self._persist_launch_radio_bundles():
-            return
+        # Launch bundles are radio-scoped.  The shared Save button is also
+        # used by the dedicated Launch section, while a global Settings save
+        # must not commit a hidden radio draft.  Quiet shutdown remains an
+        # explicit autosave boundary for drafts already staged in this tab.
+        save_launch_bundles = bool(getattr(self, "_shutdown_autosave", False))
+        if not save_launch_bundles and hasattr(self, "sections_stack"):
+            save_launch_bundles = (
+                self.sections_stack.currentWidget()
+                is getattr(self, "launch_control_section_group", None)
+            )
+        if save_launch_bundles and not self._persist_launch_radio_bundles():
+            return False
         if not self._persist_staged_radio_software_bundles():
-            return
+            return False
         try:
             set_log_level(str(data.get("log_level", "DISABLED") or "DISABLED"))
         except Exception:
             pass
 
         # Persist with a single write when possible.
+        batch = {
+            "operator_callsign": data["operator_callsign"],
+            "operator_name": data["operator_name"],
+            "operator_state": data["operator_state"],
+            "operator_grid6": data["operator_grid6"],
+            "wefax_station_override": data.get("wefax_station_override", ""),
+            "timezone": data["timezone"],
+            "log_level": data.get("log_level", "DISABLED"),
+            "use_scheduler": data["use_scheduler"],
+            "freq_enforcement_mode": data.get("freq_enforcement_mode", "On Schedule Change"),
+            "freq_prompt_interval": data.get("freq_prompt_interval", "Hourly"),
+            "fldigi_enforcement_mode": data.get("fldigi_enforcement_mode", "On Schedule Change"),
+            "fldigi_prompt_interval": data.get("fldigi_prompt_interval", "Hourly"),
+            "js8_enforcement_mode": data.get("js8_enforcement_mode", "On Schedule Change"),
+            "js8_prompt_interval": data.get("js8_prompt_interval", "Hourly"),
+            "ui_theme": data.get("ui_theme", "light"),
+            "primary_js8_groups": data["primary_js8_groups"],
+            MAPPER_SETTINGS_KEY: data.get(MAPPER_SETTINGS_KEY, []),
+            "js8_inbox_mark_retrieved_sync": data.get("js8_inbox_mark_retrieved_sync", False),
+            "gpg_verify_flamp_k2s_enabled": data.get("gpg_verify_flamp_k2s_enabled", False),
+            "hash_verify_flamp_k2s_enabled": data.get("hash_verify_flamp_k2s_enabled", True),
+            "js8_msg_auth_enabled": data.get("js8_msg_auth_enabled", True),
+            "js8spotter_import_db_path": data.get("js8spotter_import_db_path", ""),
+            "gpg_executable_path": data.get("gpg_executable_path", ""),
+            "gpg_trusted_signers": data.get("gpg_trusted_signers", []),
+            "gpg_compose_signing_key_fingerprint": data.get("gpg_compose_signing_key_fingerprint", ""),
+            "trusted_file_hashes": data.get("trusted_file_hashes", []),
+            "varac_bbs_dir": data.get("varac_bbs_dir", ""),
+            "varac_bbs_archive_dir": data.get("varac_bbs_archive_dir", ""),
+            "varac_bbs_enabled": data.get("varac_bbs_enabled", False),
+            "varac_bbs_limit_access_enabled": data.get("varac_bbs_limit_access_enabled", False),
+            "varac_bbs_allowed_callsigns": data.get("varac_bbs_allowed_callsigns", ""),
+            "varac_bbs_allowed_group_sources": data.get("varac_bbs_allowed_group_sources", ""),
+            "varac_bbs_announce_enabled": data.get("varac_bbs_announce_enabled", False),
+            "varac_bbs_auto_archive_enabled": data.get("varac_bbs_auto_archive_enabled", False),
+            "varac_bbs_auto_archive_days": data.get("varac_bbs_auto_archive_days", 14),
+            "varac_cluster_mode_enabled": data.get("varac_cluster_mode_enabled", False),
+            "sop_export_preamble": data.get("sop_export_preamble", ""),
+            "sop_export_postamble": data.get("sop_export_postamble", ""),
+            "custom_tool_items": data.get("custom_tool_items", []),
+            "launch_readiness_timeout_sec": data.get(
+                "launch_readiness_timeout_sec",
+                DEFAULT_LAUNCH_READINESS_TIMEOUT_SEC,
+            ),
+            "operating_groups": data.get("operating_groups", []),
+            "local_net_profiles": data.get("local_net_profiles", []),
+            **self._mesh_settings_payload_from_ui(),
+            CONDITION_ALERT_RULES_SETTING_KEY: data.get(CONDITION_ALERT_RULES_SETTING_KEY, []),
+            AUTO_SOP_INVOCATION_SETTING_KEY: data.get(AUTO_SOP_INVOCATION_SETTING_KEY, False),
+        }
         if hasattr(self.settings, "set_many"):
-            batch = {
-                "operator_callsign": data["operator_callsign"],
-                "operator_name": data["operator_name"],
-                "operator_state": data["operator_state"],
-                "operator_grid6": data["operator_grid6"],
-                "wefax_station_override": data.get("wefax_station_override", ""),
-                "timezone": data["timezone"],
-                "control_via": data["control_via"],
-                "log_level": data.get("log_level", "DISABLED"),
-                "use_scheduler": data["use_scheduler"],
-                "freq_enforcement_mode": data.get("freq_enforcement_mode", "On Schedule Change"),
-                "freq_prompt_interval": data.get("freq_prompt_interval", "Hourly"),
-                "fldigi_enforcement_mode": data.get("fldigi_enforcement_mode", "On Schedule Change"),
-                "fldigi_prompt_interval": data.get("fldigi_prompt_interval", "Hourly"),
-                "js8_enforcement_mode": data.get("js8_enforcement_mode", "On Schedule Change"),
-                "js8_prompt_interval": data.get("js8_prompt_interval", "Hourly"),
-                "ui_theme": data.get("ui_theme", "light"),
-                "primary_js8_groups": data["primary_js8_groups"],
-                "js8_host": data.get("js8_host", "127.0.0.1"),
-                "js8_port": data.get("js8_port", 2442),
-                "js8_offset_hz": data.get("js8_offset_hz", 0),
-                "js8_profile_path": data.get("js8_profile_path", ""),
-                "js8_directed_path": data.get("js8_directed_path", ""),
-                "js8_forms_path": data.get("js8_forms_path", ""),
-                "path_js8call": data.get("path_js8call", ""),
-                "path_js8spotter": data.get("path_js8spotter", ""),
-                "path_commstat": data.get("path_commstat", ""),
-                "message_paths": data.get("message_paths", {}),
-                MAPPER_SETTINGS_KEY: data.get(MAPPER_SETTINGS_KEY, []),
-                "js8_inbox_mark_retrieved_sync": data.get("js8_inbox_mark_retrieved_sync", False),
-                "gpg_verify_flamp_k2s_enabled": data.get("gpg_verify_flamp_k2s_enabled", False),
-                "hash_verify_flamp_k2s_enabled": data.get("hash_verify_flamp_k2s_enabled", True),
-                "js8_msg_auth_enabled": data.get("js8_msg_auth_enabled", True),
-                "js8spotter_import_db_path": data.get("js8spotter_import_db_path", ""),
-                "gpg_executable_path": data.get("gpg_executable_path", ""),
-                "gpg_trusted_signers": data.get("gpg_trusted_signers", []),
-                "gpg_compose_signing_key_fingerprint": data.get("gpg_compose_signing_key_fingerprint", ""),
-                "trusted_file_hashes": data.get("trusted_file_hashes", []),
-                "path_flrig": data.get("path_flrig", ""),
-                "path_fldigi": data.get("path_fldigi", ""),
-                "path_flmsg": data.get("path_flmsg", ""),
-                "path_flamp": data.get("path_flamp", ""),
-                "flrig_host": data.get("flrig_host", "127.0.0.1"),
-                "flrig_port": data.get("flrig_port", 12345),
-                "fldigi_host": data.get("fldigi_host", "127.0.0.1"),
-                "fldigi_port": data.get("fldigi_port", 7362),
-                "fldigi_log_path": data.get("fldigi_log_path", ""),
-                "fldigi_checkin_dir": data.get("fldigi_checkin_dir", ""),
-                "varac_path": data.get("varac_path", ""),
-                "varac_db_path": data.get("varac_db_path", ""),
-                "varac_ini_path": data.get("varac_ini_path", ""),
-                "varac_launch_cmd": data.get("varac_launch_cmd", ""),
-                "varac_incoming_path": data.get("varac_incoming_path", ""),
-                "varac_outbox_dir": data.get("varac_outbox_dir", ""),
-                "varac_bbs_dir": data.get("varac_bbs_dir", ""),
-                "varac_bbs_archive_dir": data.get("varac_bbs_archive_dir", ""),
-                "varac_bbs_enabled": data.get("varac_bbs_enabled", False),
-                "varac_bbs_limit_access_enabled": data.get("varac_bbs_limit_access_enabled", False),
-                "varac_bbs_allowed_callsigns": data.get("varac_bbs_allowed_callsigns", ""),
-                "varac_bbs_allowed_group_sources": data.get("varac_bbs_allowed_group_sources", ""),
-                "varac_bbs_announce_enabled": data.get("varac_bbs_announce_enabled", False),
-                "varac_bbs_auto_archive_enabled": data.get("varac_bbs_auto_archive_enabled", False),
-                "varac_bbs_auto_archive_days": data.get("varac_bbs_auto_archive_days", 14),
-                "varac_cluster_mode_enabled": data.get("varac_cluster_mode_enabled", False),
-                "sop_export_preamble": data.get("sop_export_preamble", ""),
-                "sop_export_postamble": data.get("sop_export_postamble", ""),
-                "custom_tool_items": data.get("custom_tool_items", []),
-                "launch_readiness_timeout_sec": data.get(
-                    "launch_readiness_timeout_sec",
-                    DEFAULT_LAUNCH_READINESS_TIMEOUT_SEC,
-                ),
-                "operating_groups": data.get("operating_groups", []),
-                "local_net_profiles": data.get("local_net_profiles", []),
-                **self._mesh_settings_payload_from_ui(),
-                CONDITION_ALERT_RULES_SETTING_KEY: data.get(CONDITION_ALERT_RULES_SETTING_KEY, []),
-                AUTO_SOP_INVOCATION_SETTING_KEY: data.get(AUTO_SOP_INVOCATION_SETTING_KEY, False),
-            }
             self.settings.set_many(batch, save=True)  # type: ignore[attr-defined]
         elif hasattr(self.settings, "set"):
-            self.settings.set("operator_callsign", data["operator_callsign"])
-            self.settings.set("operator_name", data["operator_name"])
-            self.settings.set("operator_state", data["operator_state"])
-            self.settings.set("operator_grid6", data["operator_grid6"])
-            self.settings.set("wefax_station_override", data.get("wefax_station_override", ""))
-            self.settings.set("timezone", data["timezone"])
-            self.settings.set("control_via", data["control_via"])
-            self.settings.set("log_level", data.get("log_level", "DISABLED"))
-            self.settings.set("ui_theme", data.get("ui_theme", "light"))
-            self.settings.set("js8_host", data.get("js8_host", "127.0.0.1"))
-            self.settings.set("js8_port", data.get("js8_port", 2442))
-            self.settings.set("js8_offset_hz", data.get("js8_offset_hz", 0))
-            self.settings.set("js8_profile_path", data.get("js8_profile_path", ""))
-            self.settings.set("js8_directed_path", data.get("js8_directed_path", ""))
-            self.settings.set("js8_forms_path", data.get("js8_forms_path", ""))
-            self.settings.set("path_js8call", data.get("path_js8call", ""))
-            self.settings.set("path_js8spotter", data.get("path_js8spotter", ""))
-            self.settings.set("path_commstat", data.get("path_commstat", ""))
-            self.settings.set("message_paths", data.get("message_paths", {}))
-            self.settings.set("freq_enforcement_mode", data.get("freq_enforcement_mode", "On Schedule Change"))
-            self.settings.set("freq_prompt_interval", data.get("freq_prompt_interval", "Hourly"))
-            self.settings.set("fldigi_enforcement_mode", data.get("fldigi_enforcement_mode", "On Schedule Change"))
-            self.settings.set("fldigi_prompt_interval", data.get("fldigi_prompt_interval", "Hourly"))
-            self.settings.set("js8_enforcement_mode", data.get("js8_enforcement_mode", "On Schedule Change"))
-            self.settings.set("js8_prompt_interval", data.get("js8_prompt_interval", "Hourly"))
-            self.settings.set("primary_js8_groups", data["primary_js8_groups"])
-            self.settings.set(MAPPER_SETTINGS_KEY, data.get(MAPPER_SETTINGS_KEY, []))
-            self.settings.set(
-                "js8_inbox_mark_retrieved_sync",
-                data.get("js8_inbox_mark_retrieved_sync", False),
-            )
-            self.settings.set("gpg_verify_flamp_k2s_enabled", data.get("gpg_verify_flamp_k2s_enabled", False))
-            self.settings.set("hash_verify_flamp_k2s_enabled", data.get("hash_verify_flamp_k2s_enabled", True))
-            self.settings.set("js8_msg_auth_enabled", data.get("js8_msg_auth_enabled", True))
-            self.settings.set("js8spotter_import_db_path", data.get("js8spotter_import_db_path", ""))
-            self.settings.set("gpg_executable_path", data.get("gpg_executable_path", ""))
-            self.settings.set("gpg_trusted_signers", data.get("gpg_trusted_signers", []))
-            self.settings.set(
-                "gpg_compose_signing_key_fingerprint",
-                data.get("gpg_compose_signing_key_fingerprint", ""),
-            )
-            self.settings.set("trusted_file_hashes", data.get("trusted_file_hashes", []))
-            self.settings.set("path_flrig", data.get("path_flrig", ""))
-            self.settings.set("path_fldigi", data.get("path_fldigi", ""))
-            self.settings.set("path_flmsg", data.get("path_flmsg", ""))
-            self.settings.set("path_flamp", data.get("path_flamp", ""))
-            self.settings.set("flrig_host", data.get("flrig_host", "127.0.0.1"))
-            self.settings.set("flrig_port", data.get("flrig_port", 12345))
-            self.settings.set("fldigi_host", data.get("fldigi_host", "127.0.0.1"))
-            self.settings.set("fldigi_port", data.get("fldigi_port", 7362))
-            self.settings.set("fldigi_log_path", data.get("fldigi_log_path", ""))
-            self.settings.set("fldigi_checkin_dir", data.get("fldigi_checkin_dir", ""))
-            self.settings.set("varac_path", data.get("varac_path", ""))
-            self.settings.set("varac_db_path", data.get("varac_db_path", ""))
-            self.settings.set("varac_ini_path", data.get("varac_ini_path", ""))
-            self.settings.set("varac_launch_cmd", data.get("varac_launch_cmd", ""))
-            self.settings.set("varac_incoming_path", data.get("varac_incoming_path", ""))
-            self.settings.set("varac_outbox_dir", data.get("varac_outbox_dir", ""))
-            self.settings.set("varac_bbs_dir", data.get("varac_bbs_dir", ""))
-            self.settings.set("varac_bbs_archive_dir", data.get("varac_bbs_archive_dir", ""))
-            self.settings.set("varac_bbs_enabled", data.get("varac_bbs_enabled", False))
-            self.settings.set("varac_bbs_limit_access_enabled", data.get("varac_bbs_limit_access_enabled", False))
-            self.settings.set("varac_bbs_allowed_callsigns", data.get("varac_bbs_allowed_callsigns", ""))
-            self.settings.set("varac_bbs_allowed_group_sources", data.get("varac_bbs_allowed_group_sources", ""))
-            self.settings.set("varac_bbs_announce_enabled", data.get("varac_bbs_announce_enabled", False))
-            self.settings.set("varac_bbs_auto_archive_enabled", data.get("varac_bbs_auto_archive_enabled", False))
-            self.settings.set("varac_bbs_auto_archive_days", data.get("varac_bbs_auto_archive_days", 14))
-            self.settings.set("varac_cluster_mode_enabled", data.get("varac_cluster_mode_enabled", False))
-            self.settings.set("sop_export_preamble", data.get("sop_export_preamble", ""))
-            self.settings.set("sop_export_postamble", data.get("sop_export_postamble", ""))
-            self.settings.set("custom_tool_items", data.get("custom_tool_items", []))
-            self.settings.set(
-                "launch_readiness_timeout_sec",
-                data.get("launch_readiness_timeout_sec", DEFAULT_LAUNCH_READINESS_TIMEOUT_SEC),
-            )
-            self.settings.set("operating_groups", data.get("operating_groups", []))
-            self.settings.set("local_net_profiles", data.get("local_net_profiles", []))
-            for key, value in self._mesh_settings_payload_from_ui().items():
+            for key, value in batch.items():
                 self.settings.set(key, value)
-            self.settings.set(CONDITION_ALERT_RULES_SETTING_KEY, data.get(CONDITION_ALERT_RULES_SETTING_KEY, []))
-            self.settings.set(AUTO_SOP_INVOCATION_SETTING_KEY, data.get(AUTO_SOP_INVOCATION_SETTING_KEY, False))
         elif hasattr(self.settings, "_data"):
-            # Fallback: update the internal dict only
-            self.settings._data = data  # type: ignore[attr-defined]
+            # An in-memory dict is not a durable persistence boundary.  Do
+            # not mutate it and report failure so the caller keeps dirty state.
+            log.error("SettingsTab: settings object has no durable persistence API.")
+            return False
+        else:
+            log.error("SettingsTab: settings object has no persistence API.")
+            return False
+
 
         log.info("SettingsTab: settings saved.")
         self._refresh_runtime_projection_ui(refresh_multi_radio=False)
-        self._ensure_fldigi_checkin_files()
         if show_message:
             radio_id, target = self._selected_settings_feedback_target()
             summary = f"Saved settings for {target}." if target and target != "Settings" else "Settings saved."
@@ -17376,6 +18480,7 @@ class SettingsTab(QWidget):
             meta={"operator_changed": operator_changed},
             min_ms=0.0,
         )
+        return True
 
     def _on_theme_changed(self):
         theme = self.theme_combo.currentText().strip().lower() or "light"
@@ -18404,9 +19509,67 @@ class SettingsTab(QWidget):
             )
         return f"{count} radio{'s' if count != 1 else ''}"
 
+    @staticmethod
+    def _software_administration_cached_readiness(
+        profile: Mapping[str, Any],
+        status_snapshot: Mapping[str, Mapping[str, object]],
+    ) -> Dict[str, Mapping[str, object]]:
+        """Project already-published per-radio status into family evidence.
+
+        This helper deliberately reads only the immutable status mapping passed
+        by ``DependencyStatusService.software_status_snapshot``.  It never
+        invokes ``status_snapshot``/probe APIs and keeps configuration-family
+        selection separate from runtime evidence.
+        """
+        if not isinstance(status_snapshot, Mapping):
+            return {}
+        status_rows = {
+            str(key): dict(value or {})
+            for key, value in (status_snapshot or {}).items()
+            if isinstance(value, Mapping)
+        }
+        # The model expects family-keyed evidence.  Keep the selected component
+        # row intact so config/runtime/freshness metadata remains available.
+        family_rows: Dict[str, Mapping[str, object]] = {}
+        fast_keys = tuple(
+            key
+            for flag, key in (
+                ("use_flrig", "FLRig"),
+                ("use_fldigi", "FLDigi"),
+                ("use_flmsg", "FLMsg"),
+                ("use_flamp", "FLAmp"),
+            )
+            if bool(profile.get(flag))
+        ) or ("FLRig", "FLDigi", "FLMsg", "FLAmp")
+        for family, keys in (
+            ("js8call", ("JS8Call_API",)),
+            ("fast_light", fast_keys),
+            ("varac", ("VarAC",)),
+            ("commstat", ("CommStat",)),
+            ("external_spotter", ("JS8Spotter",)),
+        ):
+            candidates = [status_rows[key] for key in keys if key in status_rows]
+            if candidates:
+                def family_rank(row: Mapping[str, object]) -> int:
+                    state = str(row.get("state") or row.get("status") or "").strip().lower()
+                    if bool(row.get("identity_conflict") or row.get("conflict") or row.get("configuration_conflict")):
+                        return 50
+                    if state in {"error", "failed", "unavailable", "offline", "warn", "warning", "needs_review", "review"}:
+                        return 40
+                    if bool(row.get("stale") or row.get("expired") or row.get("invalidated")):
+                        return 30
+                    if state in {"unknown", "unverified", "verification_unavailable"}:
+                        return 20
+                    if state in {"ok", "connected", "reachable", "running", "active", "ready", "healthy"}:
+                        return 10
+                    return 0
+                family_rows[family] = max(candidates, key=family_rank)
+        return family_rows
+
     def _refresh_software_administration_snapshot(self) -> None:
         """Refresh the bounded snapshot from the same explicit Settings load."""
 
+        self._software_configuration_load_succeeded = False
         try:
             js8_instances = tuple(self.multi_radio_store.list_js8_instances())
             fast_light_configs = tuple(self.multi_radio_store.list_fast_light_configs())
@@ -18430,6 +19593,25 @@ class SettingsTab(QWidget):
                     identity_projection_issues[(identity_radio_id, identity_family)] = tuple(
                         str(issue) for issue in issues
                     )
+            readiness_by_radio: Dict[int, Mapping[str, Mapping[str, object]]] = {}
+            status_service = getattr(self, "_status_service", None)
+            if status_service is not None and hasattr(status_service, "software_status_snapshot"):
+                for profile in self.device_profiles:
+                    if not isinstance(profile, Mapping):
+                        continue
+                    try:
+                        radio_id = int(profile.get("id", 0) or 0)
+                    except (TypeError, ValueError):
+                        radio_id = 0
+                    if radio_id <= 0:
+                        continue
+                    try:
+                        cached_status = status_service.software_status_snapshot(radio_id)
+                    except Exception:
+                        cached_status = {}
+                    readiness_by_radio[radio_id] = self._software_administration_cached_readiness(
+                        profile, cached_status
+                    )
             snapshot = build_software_administration_snapshot(
                 tuple(self.device_profiles),
                 js8_instances=js8_instances,
@@ -18438,7 +19620,9 @@ class SettingsTab(QWidget):
                 instance_manifests=manifests,
                 identity_records=identity_records,
                 identity_projection_issues=identity_projection_issues,
+                readiness_by_radio=readiness_by_radio,
             )
+            self._software_configuration_load_succeeded = True
         except Exception:
             log.exception("Failed building the software administration snapshot.")
             snapshot = SoftwareAdministrationSnapshot(families=())
@@ -18448,6 +19632,25 @@ class SettingsTab(QWidget):
             manifests = ()
             identity_records = ()
             identity_projection_issues = {}
+        # Keep the explicit configuration projection available to the cheap
+        # status-only refresh below.  The running-status boundary may fire
+        # frequently; it must never reload these rows from the store.
+        self._software_administration_cached_inputs = {
+            "js8_instances": tuple(js8_instances),
+            "fast_light_configs": tuple(fast_light_configs),
+            "varac_nodes": tuple(varac_nodes),
+            "manifests": tuple(manifests),
+            "identity_records": tuple(identity_records),
+            "identity_projection_issues": dict(identity_projection_issues),
+        }
+        self._software_component_repair_cache = {
+            int(profile.get("id", 0) or 0): self._load_fast_light_message_component_repair_needed(int(profile.get("id", 0) or 0))
+            for profile in self.device_profiles
+            if isinstance(profile, Mapping) and int(profile.get("id", 0) or 0) > 0
+            and (profile.get("fast_light_config_id") or any(
+                str(profile.get(flag, "")).lower() in {"1", "true", "yes", "on"}
+                for flag in ("use_flrig", "use_fldigi", "use_flmsg", "use_flamp")))
+        }
         inventory_by_family = {
             "js8call": self._enrich_software_instance_rows("js8call", js8_instances, manifests),
             "fast_light": self._enrich_software_instance_rows("fast_light", fast_light_configs, manifests),
@@ -18455,6 +19658,7 @@ class SettingsTab(QWidget):
         }
         self._software_administration_snapshot = snapshot
         self._software_administration_inventory_by_family = inventory_by_family
+        self._cache_configuration_attention()
         workspace = getattr(self, "software_administration_workspace", None)
         if isinstance(workspace, SoftwareAdministrationWorkspace):
             workspace.set_instance_context(
@@ -18466,6 +19670,74 @@ class SettingsTab(QWidget):
             workspace.set_snapshot(snapshot)
             self._sync_software_dirty_ui()
             self._show_software_task_editor()
+
+    def _refresh_software_administration_status_projection(self) -> bool:
+        """Apply published runtime evidence without reloading configuration.
+
+        DependencyStatusService owns the worker/probe lifecycle.  This method
+        consumes only its latest immutable cache and the configuration rows
+        captured by the explicit administration snapshot load.  Keeping this
+        projection separate prevents a tab switch or status publication from
+        recreating editors, clearing drafts, or performing database I/O.
+        """
+        cached = getattr(self, "_software_administration_cached_inputs", None)
+        if not isinstance(cached, Mapping):
+            return False
+        status_service = getattr(self, "_status_service", None)
+        snapshot_reader = getattr(status_service, "software_status_snapshot", None)
+        if not callable(snapshot_reader):
+            return False
+        try:
+            readiness_by_radio: Dict[int, Mapping[str, Mapping[str, object]]] = {}
+            status_by_radio = {}
+            for profile in tuple(getattr(self, "device_profiles", ()) or ()):
+                if not isinstance(profile, Mapping):
+                    continue
+                try:
+                    radio_id = int(profile.get("id", 0) or 0)
+                except (TypeError, ValueError):
+                    radio_id = 0
+                if radio_id <= 0:
+                    continue
+                try:
+                    status_snapshot = snapshot_reader(radio_id)
+                except Exception:
+                    log.exception(
+                        "Failed reading cached software status for radio %s.", radio_id
+                    )
+                    status_snapshot = {}
+                status_by_radio[radio_id] = status_snapshot
+                readiness_by_radio[radio_id] = self._software_administration_cached_readiness(
+                    profile, status_snapshot
+                )
+            projected = build_software_administration_snapshot(
+                tuple(getattr(self, "device_profiles", ()) or ()),
+                js8_instances=tuple(cached.get("js8_instances", ()) or ()),
+                fast_light_configs=tuple(cached.get("fast_light_configs", ()) or ()),
+                varac_nodes=tuple(cached.get("varac_nodes", ()) or ()),
+                instance_manifests=tuple(cached.get("manifests", ()) or ()),
+                identity_records=tuple(cached.get("identity_records", ()) or ()),
+                identity_projection_issues=dict(
+                    cached.get("identity_projection_issues", {}) or {}
+                ),
+                readiness_by_radio=readiness_by_radio,
+            )
+        except Exception:
+            log.exception("Failed projecting cached software administration status.")
+            return False
+        self._publish_software_reference_presentations(status_by_radio)
+        if projected == getattr(self, "_software_administration_snapshot", None):
+            return False
+        self._software_administration_snapshot = projected
+        workspace = getattr(self, "software_administration_workspace", None)
+        if isinstance(workspace, SoftwareAdministrationWorkspace):
+            # set_snapshot preserves registered task editors and their draft
+            # state.  Do not call _show_software_task_editor here: that path
+            # is reserved for an explicit route/selection change.
+            workspace.set_snapshot(projected)
+            workspace.update_runtime_status_labels(projected)
+            self._sync_software_dirty_ui()
+        return True
 
     def _effective_assignment_map(self) -> Dict[int, Dict[str, Any]]:
         mapping: Dict[int, Dict[str, Any]] = {}
@@ -18879,19 +20151,12 @@ class SettingsTab(QWidget):
         selected: bool = False,
     ) -> str:
         name = self._profile_display_name(profile)
-        status_bits: List[str] = []
-        setup_status = self._radio_selector_setup_summary(profile, readiness_report).strip()
-        if setup_status:
-            status_bits.append(setup_status)
-        status_bits.append("Enabled" if int(profile.get("enabled", 1) or 0) == 1 else "Disabled")
-        status_bits.append(self._radio_selector_operational_status(profile))
+        status_bits: List[str] = ["In use" if int(profile.get("runtime_active", 0) or 0) else "Not in use"]
         if int(profile.get("runtime_primary", 0) or 0) == 1:
             status_bits.append("Default")
         if self._profile_needs_operator_name(profile):
             status_bits.append("Name Needed")
-        if selected:
-            status_bits.insert(0, "SELECTED")
-        return f"{name} | {' | '.join(dict.fromkeys(status_bits))}"
+        return f"{name} · {' · '.join(dict.fromkeys(status_bits))}"
 
     def _radio_selector_setup_summary(
         self,
@@ -18921,6 +20186,15 @@ class SettingsTab(QWidget):
         # view; keep that uncertainty explicit instead of claiming readiness.
         return "Setup unchecked"
 
+    def _radio_selector_tooltip(self, profile, readiness_report=None, *, selected=False) -> str:
+        return (
+            ("Selected radio: " if selected else "Edit ") + self._profile_display_name(profile) + ". "
+            + self._radio_selector_setup_summary(profile, readiness_report) + ". "
+            + self._radio_selector_operational_status(profile) + ". "
+            + f"Software: {self._device_software_summary(profile)}. "
+            + f"Endpoint: {self._device_endpoint_summary(profile)}."
+        )
+
     @staticmethod
     def _radio_selector_operational_status_from_cache(cache_row: object) -> str:
         """Classify one cached operational row without doing any I/O."""
@@ -18933,17 +20207,19 @@ class SettingsTab(QWidget):
                 bool(row.get(key, False))
                 for key in ("stale", "expired", "invalidated", "closed")
             ):
-                return "Checking"
+                return "Stale"
             state = str(
                 row.get("state")
                 or row.get("operational_state")
                 or row.get("control_state")
                 or ""
             ).strip().lower()
+            if state in {"readback_mismatch", "identity_conflict", "conflict"}:
+                return "Needs review"
+            if state == "js8_verification_unavailable":
+                return "Unverified"
             if state in {
                 "on_schedule_verified",
-                "js8_verification_unavailable",
-                "readback_mismatch",
                 "connected",
                 "ok",
                 "operational",
@@ -18972,12 +20248,14 @@ class SettingsTab(QWidget):
             bool(getattr(cache_row, key, False))
             for key in ("stale", "expired", "invalidated", "closed")
         ):
-            return "Checking"
+            return "Stale"
         state = str(getattr(cache_row, "operational_state", "") or "").strip().lower()
+        if state in {"readback_mismatch", "identity_conflict", "conflict"}:
+            return "Needs review"
+        if state == "js8_verification_unavailable":
+            return "Unverified"
         if state in {
             "on_schedule_verified",
-            "js8_verification_unavailable",
-            "readback_mismatch",
             "connected",
             "ok",
             "operational",
@@ -19092,11 +20370,18 @@ class SettingsTab(QWidget):
             radio_id = int(profile.get("id", 0) or 0)
             if radio_id not in changed_ids:
                 continue
+            combo = getattr(self, "settings_radio_context_combo", None)
+            if combo is not None:
+                index = combo.findData(radio_id)
+                if index >= 0:
+                    combo.setItemData(index, self._radio_selector_tooltip(
+                        profile, readiness_report, selected=radio_id == focused_id), Qt.ToolTipRole)
             button = buttons.get(radio_id) if isinstance(buttons, Mapping) else None
             if button is None:
                 continue
             selected = radio_id == focused_id
             button.setText(self._radio_selector_button_text(profile, readiness_report, selected=selected))
+            button.setToolTip(self._radio_selector_tooltip(profile, readiness_report, selected=selected))
             button.setStyleSheet(
                 self._radio_selector_button_style(
                     profile,
@@ -19109,6 +20394,11 @@ class SettingsTab(QWidget):
         if focused_id in changed_ids:
             profile = next((item for item in profiles if int(item.get("id", 0) or 0) == focused_id), None)
             if profile is not None:
+                if hasattr(self, "selector_radio_action_reason"):
+                    self._explain_radio_action_availability(
+                        self._selected_device_profiles(),
+                        observer_selected=str(profile.get("device_class", "")) == "observer",
+                    )
                 self._refresh_device_profile_status_chips(profile, readiness_report)
                 detail_label = getattr(self, "device_profile_detail_label", None)
                 if detail_label is not None:
@@ -19161,6 +20451,23 @@ class SettingsTab(QWidget):
             readiness_report = self._current_station_readiness_report()
         self._refresh_radio_selector_operational_cache()
         theme = resolve_theme(self.settings)
+        combo = getattr(self, "settings_radio_context_combo", None)
+        if combo is not None:
+            with QSignalBlocker(combo):
+                combo.clear()
+                for profile in self.device_profiles:
+                    if not isinstance(profile, dict):
+                        continue
+                    radio_id = int(profile.get("id", 0) or 0)
+                    if radio_id <= 0:
+                        continue
+                    label = self._profile_display_name(profile)
+                    if int(profile.get("runtime_primary", 0) or 0):
+                        label += " · Default"
+                    combo.addItem(label, radio_id)
+                    combo.setItemData(combo.count() - 1, self._radio_selector_tooltip(profile, readiness_report, selected=radio_id == focused_id), Qt.ToolTipRole)
+                combo.setCurrentIndex(combo.findData(focused_id))
+                combo.setEnabled(combo.count() > 0)
         if not self.device_profiles:
             empty = QLabel("No radios are configured yet. Add a radio to start the selected-radio workflow.")
             empty.setWordWrap(True)
@@ -19186,15 +20493,7 @@ class SettingsTab(QWidget):
                 if selected
                 else f"Radio: {self._profile_display_name(profile)}"
             )
-            btn.setToolTip(
-                (
-                    f"Selected radio: {self._profile_display_name(profile)}. "
-                    if selected
-                    else f"Edit {self._profile_display_name(profile)}. "
-                )
-                + f"Software: {self._device_software_summary(profile)}. "
-                + f"Endpoint: {self._device_endpoint_summary(profile)}."
-            )
+            btn.setToolTip(self._radio_selector_tooltip(profile, readiness_report, selected=selected))
             btn.clicked.connect(lambda _checked=False, ident=radio_id: self._set_settings_radio_focus(ident))
             btn.setStyleSheet(
                 self._radio_selector_button_style(
@@ -19208,6 +20507,13 @@ class SettingsTab(QWidget):
             layout.addWidget(btn)
         layout.addStretch()
         self._refresh_radio_settings_nav_label()
+
+    def _on_radio_context_combo_changed(self, index: int) -> None:
+        if index < 0:
+            return
+        ident = self.settings_radio_context_combo.itemData(index)
+        if ident is not None:
+            self._set_settings_radio_focus(int(ident))
 
     @staticmethod
     def _profile_needs_operator_name(profile: Optional[Dict[str, Any]]) -> bool:
@@ -20584,6 +21890,74 @@ class SettingsTab(QWidget):
         if readiness_report is None:
             readiness_report = self._station_readiness_report_for_software_chips()
         radio_id = int(profile.get("id", 0) or 0) if isinstance(profile, dict) else 0
+
+        def cached_attention(
+            family: str,
+        ) -> Tuple[str, str, str, str, str] | None:
+            """Return the strongest saved configuration attention for a chip.
+
+            The cache is published by the explicit Settings load/save boundary.
+            This projection only reads it, so repainting or selecting a chip
+            cannot reopen the database, inspect a process, or probe an endpoint.
+            """
+
+            family_keys = {
+                "js8": ("js8call",),
+                "fast_light": ("fast_light",),
+                "varac": ("varac",),
+            }.get(family, ())
+            cache = getattr(self, "_configuration_attention_cache", None)
+            if not isinstance(cache, Mapping):
+                return None
+            state_reader = getattr(self, "_software_configuration_states", None)
+            state_rank = {
+                "error": 0,
+                "unsaved": 1,
+                "review": 2,
+                "unknown": 3,
+                "complete": 4,
+                "optional": 5,
+            }
+            candidates: list[tuple[tuple[int, int, str, str], str, Mapping[str, Any], str]] = []
+            for family_key in family_keys:
+                if callable(state_reader):
+                    states = state_reader(family_key, radio_id)
+                else:
+                    states = cache.get((radio_id, family_key), {})
+                if not isinstance(states, Mapping):
+                    continue
+                for task_key, raw_entry in states.items():
+                    if task_key in {"health", "advanced"} or not isinstance(raw_entry, Mapping):
+                        continue
+                    state = str(raw_entry.get("state") or "").strip().lower()
+                    if state not in state_rank:
+                        continue
+                    task_priority = (
+                        0 if state == "unknown" and task_key == "overview"
+                        else int(task_key == "overview")
+                    )
+                    candidates.append(
+                        (
+                            (state_rank[state], task_priority, family_key, str(task_key)),
+                            family_key,
+                            raw_entry,
+                            str(task_key),
+                        )
+                    )
+            if not candidates:
+                return None
+            _sort_key, family_key, entry, task_key = min(candidates, key=lambda item: item[0])
+            state = str(entry.get("state") or "").strip().lower()
+            presentation = {
+                "error": ("Review", "danger"),
+                "unsaved": ("Unsaved", "warning"),
+                "review": ("Review", "warning"),
+                "unknown": ("Not checked", "muted"),
+                "complete": ("Ready", "success"),
+                "optional": ("Optional", "muted"),
+            }[state]
+            return (*presentation, family_key, task_key, str(entry.get("reason") or "").strip())
+
         observer_mode = bool(
             isinstance(profile, dict)
             and str(profile.get("device_class", "") or "").strip().lower() == "observer"
@@ -20642,20 +22016,40 @@ class SettingsTab(QWidget):
         for label, family, target_group, enabled in chip_defs:
             if not enabled:
                 continue
-            status_label, role = self._software_family_readiness_chip(family, radio_id, readiness_report)
+            cached = cached_attention(family)
+            if cached is None:
+                if family != "launch_control" and isinstance(getattr(self, "_configuration_attention_cache", None), Mapping):
+                    status_label, role = ("Not checked", "muted")
+                else:
+                    status_label, role = self._software_family_readiness_chip(family, radio_id, readiness_report)
+                failed_family = target_group
+                failed_task = ""
+                cached_reason = ""
+            else:
+                status_label, role, failed_family, failed_task, cached_reason = cached
             btn = QPushButton(label)
             btn.setText(f"{label}: {status_label}")
             btn.setMinimumWidth(150)
             btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             btn.setStyleSheet(button_style(role, theme))
-            btn.setToolTip(f"Open {label} settings for the selected radio. Status: {status_label}.")
+            tooltip = f"Open {label} settings for the selected radio. Status: {status_label}."
+            if cached_reason:
+                tooltip += f" {cached_reason}"
+            btn.setToolTip(tooltip)
             if target_group:
-                btn.clicked.connect(
-                    lambda _checked=False, key=target_group, ident=radio_id: self.open_software_administration(
-                        family_key=key,
-                        radio_id=ident,
-                    )
-                )
+                def open_cached_route(
+                    _checked=False,
+                    *,
+                    key=failed_family or target_group,
+                    ident=radio_id,
+                    task=failed_task,
+                ):
+                    request = {"family_key": key, "radio_id": ident}
+                    if task:
+                        request["task_key"] = task
+                    self.open_software_administration(**request)
+
+                btn.clicked.connect(open_cached_route)
             else:
                 launch_group = getattr(self, "launch_control_section_group", None)
                 if isinstance(launch_group, QGroupBox):
@@ -20839,13 +22233,9 @@ class SettingsTab(QWidget):
         js8_visible = enabled("js8call") or enabled("js8spotter") or enabled("commstat")
         fast_light_visible = enabled("flrig") or enabled("fldigi") or enabled("flmsg") or enabled("flamp") or enabled("rigctld")
         varac_visible = enabled("varac")
-        launch_visible = bool(
-            has_profile
-            and (
-                self._radio_profile_launch_control_enabled(profile)
-                or self._radio_profile_has_software_option(profile)
-            )
-        )
+        # The launch destination stays discoverable for every configured
+        # radio, including an empty bundle that still needs software choices.
+        launch_visible = has_profile
 
         self._set_settings_section_visible(getattr(self, "radio_software_scope_section_group", None), False)
         self._set_settings_section_visible(getattr(self, "js8_section_group", None), js8_visible)
@@ -21242,13 +22632,6 @@ class SettingsTab(QWidget):
         return f"{self._profile_display_name(profile)} bundle"
 
     def _software_radio_profiles(self) -> List[Dict[str, Any]]:
-        profiles = [
-            dict(row)
-            for row in self.device_profiles
-            if isinstance(row, dict) and str(row.get("device_class", "") or "").strip().lower() != "observer"
-        ]
-        if profiles:
-            return profiles
         return [dict(row) for row in self.device_profiles if isinstance(row, dict)]
 
     def _preferred_software_radio_id(self) -> Optional[int]:
@@ -21753,7 +23136,10 @@ class SettingsTab(QWidget):
                 self.varac_guard_allow_trusted_chk.setChecked(bool(state.get("varac_guard_allow_operator_trusted", True)))
             self._set_varac_guard_access_policy(state.get("varac_guard_access_policy_v1", ""))
             self.varac_bbs_vault_enabled_chk_main.setChecked(bool(state.get("varac_bbs_vault_enabled", False)))
-            root_txt = compute_default_managed_root(self.varac_bbs_dir_edit.text().strip())
+            catalog = self.settings.all().get('station_bbs_catalog')
+            root_txt = (str(catalog.get('managed_root') or '') if catalog is not None else
+                        str(state.get('varac_bbs_vault_managed_root') or '').strip() or
+                        compute_default_managed_root(self.varac_bbs_dir_edit.text().strip()))
             self._set_varac_bbs_vault_root_text(root_txt)
             code_policy = str(state.get("varac_bbs_vault_global_code_policy", DEFAULT_GLOBAL_CODE_POLICY) or DEFAULT_GLOBAL_CODE_POLICY).strip()
             idx = self.varac_bbs_vault_global_code_policy_combo.findText(code_policy)
@@ -21949,6 +23335,10 @@ class SettingsTab(QWidget):
                 "Radio software settings were not saved because a staged edit belonged to a different radio. "
                 "Select the radio again and save that radio's settings."
             )
+        if '_software_save_families' in state:
+            from freqinout.core.software_administration_persistence import save_software_fields
+            return save_software_fields(self.multi_radio_store, profile,
+                                        state['_software_base_state'], state, state['_software_save_families'])
         if profile_id > 0 and source_profile_id <= 0:
             profile_state = self._radio_software_state_from_profile(profile)
             endpoint_keys = (
@@ -23594,7 +24984,7 @@ class SettingsTab(QWidget):
             self.selector_edit_apps_btn.setStyleSheet(button_style("info" if can_edit else "muted", theme))
         if hasattr(self, "selector_software_details_btn"):
             self.selector_software_details_btn.setEnabled(can_edit)
-            self.selector_software_details_btn.setVisible(not observer_selected)
+            self.selector_software_details_btn.setVisible(not observer_selected and not hasattr(self, "selector_software_menu_btn"))
             self.selector_software_details_btn.setStyleSheet(button_style("info" if can_edit else "muted", theme))
         if hasattr(self, "selector_manage_connections_btn"):
             self.selector_manage_connections_btn.setEnabled(can_edit)
@@ -23654,6 +25044,60 @@ class SettingsTab(QWidget):
         if hasattr(self, "selector_remove_device_profile_btn"):
             self.selector_remove_device_profile_btn.setEnabled(can_delete)
             self.selector_remove_device_profile_btn.setStyleSheet(button_style("warning" if can_delete else "muted", theme))
+        self._explain_radio_action_availability(selected, observer_selected=observer_selected)
+
+    def _explain_radio_action_availability(self, selected, *, observer_selected=False) -> None:
+        """Explain existing action policy from the same cached selection."""
+        count = len(selected)
+        primary = any(int(row.get("runtime_primary", 0) or 0) for row in selected)
+        active = any(int(row.get("runtime_active", 0) or 0) for row in selected)
+        inactive = any(not int(row.get("runtime_active", 0) or 0) for row in selected)
+        reasons = {
+            "activate": "Select a radio first." if not count else "Already in use." if not inactive else "Use the selected radio now.",
+            "deactivate": "Select a radio first." if not count else "Choose another default radio before stopping this one." if primary else "This radio is not in use." if not active else "Stop using this radio; keep its saved configuration.",
+            "default": "Select one radio." if count != 1 else "A receive-only radio cannot be the default command radio." if observer_selected else "Already the default radio." if primary else "Make this the default command radio.",
+            "remove": "Select a radio first." if not count else "Stop using this radio before removing it." if active else "Remove this saved radio; external application files are retained.",
+        }
+        attributes = {
+            "activate": ("activate_device_profile_btn", "selector_activate_device_profile_btn", "profile_activate_device_profile_btn"),
+            "deactivate": ("deactivate_device_profile_btn", "selector_deactivate_device_profile_btn", "profile_deactivate_device_profile_btn"),
+            "default": ("set_active_device_profile_btn", "selector_set_default_device_profile_btn"),
+            "remove": ("delete_device_profile_btn", "selector_remove_device_profile_btn"),
+        }
+        for key, names in attributes.items():
+            for name in names:
+                button = getattr(self, name, None)
+                if button is not None:
+                    button.setToolTip(reasons[key])
+                    button.setAccessibleDescription(reasons[key])
+            action = getattr(self, "_selector_radio_actions", {}).get(key)
+            button = getattr(self, names[1], None)
+            if action is not None and button is not None:
+                action.setEnabled(button.isEnabled())
+                action.setText(button.text() + (" — " + reasons[key] if not button.isEnabled() else ""))
+                action.setToolTip(reasons[key])
+        if hasattr(self, "selector_radio_action_reason"):
+            if count == 1:
+                status = "Default radio · " if primary else ""
+                status += "In use" if active else "Not in use"
+                status += " · " + self._radio_selector_operational_status(selected[0])
+                setup = self._radio_selector_setup_summary(selected[0], getattr(self, "_last_station_readiness_report", None))
+                if "needs" in setup.lower():
+                    status += " · " + setup
+                status += (". Choose another default before stopping or removing this radio." if primary else
+                           ". Stop using before removal." if active else ". Choose Use Radio in Radio actions to activate it.")
+            else:
+                status = "Select a radio to configure it." if not count else f"{count} radios selected. Radio actions apply to this selection."
+            self.selector_radio_action_reason.setText(status)
+        if hasattr(self, "selector_software_menu_btn"):
+            self.selector_software_menu_btn.setEnabled(count == 1)
+            self._selector_change_software_action.setEnabled(count == 1)
+            self._selector_change_software_action.setText("Receiver setup…" if observer_selected else "Change software used…")
+            self._selector_configure_software_action.setVisible(not observer_selected)
+            self._selector_configure_software_action.setEnabled(count == 1)
+            theme = resolve_theme(self.settings)
+            self.selector_software_menu_btn.setStyleSheet(button_style("secondary", theme))
+            self.selector_radio_actions_btn.setStyleSheet(button_style("secondary", theme))
 
     def _refresh_device_profiles_table(self, *, refresh_section_titles: bool = True) -> None:
         if not hasattr(self, "device_profiles_table"):
@@ -25215,7 +26659,7 @@ class SettingsTab(QWidget):
         )
         form.addRow("Description:", description_edit)
 
-        scheduler_enabled_chk = QCheckBox("Enable scheduler automation when primary")
+        scheduler_enabled_chk = QCheckBox("Allow CP scheduling for this operating behavior")
         scheduler_enabled_chk.setChecked(bool((existing or {}).get("scheduler_enabled", 1)))
         form.addRow("", scheduler_enabled_chk)
 
@@ -25980,8087 +27424,193 @@ class SettingsTab(QWidget):
             return "review"
         return ""
 
-    def _open_device_profile_dialog(
-        self,
-        existing: Optional[Dict[str, Any]] = None,
-        *,
-        initial_step: str = "",
-        retry_draft: Optional[Mapping[str, Any]] = None,
-    ) -> Optional[Dict[str, Any]]:
-        dlg = QDialog(self)
-        profile_seed: Mapping[str, Any] = retry_draft or existing or {}
-        guided_identity_radio_key = str(
-            profile_seed.get("system_key") or f"guided-radio-{uuid.uuid4().hex}"
-        ).strip()
-        try:
-            guided_identity_generation = (
-                self.multi_radio_store.radio_software_identity_generation(
-                    int(profile_seed.get("id", 0) or 0)
-                )
-                if int(profile_seed.get("id", 0) or 0) > 0
-                else 0
-            )
-        except Exception:
-            log.exception("Failed loading the guided software identity generation.")
-            guided_identity_generation = 0
-        retry_software_drafts = profile_seed.get("guided_software_instance_drafts", {})
-        if isinstance(retry_software_drafts, Mapping):
-            setattr(
-                dlg,
-                "_guided_software_instance_drafts",
-                {
-                    str(family): dict(value)
-                    for family, value in retry_software_drafts.items()
-                    if isinstance(value, Mapping)
-                },
-            )
-        guided_discovery_session_key = f"guided-radio-{uuid.uuid4().hex}"
-        guided_discovery_generation = 0
-        guided_discovery_revision = 0
-        dlg_title = self._device_profile_dialog_title(existing)
-        dlg.setWindowTitle(dlg_title)
-        dlg.setAccessibleName(dlg_title)
-        dlg.setSizeGripEnabled(True)
-        dlg.setMinimumSize(0, 0)
-        # Load one bounded, immutable authority snapshot for the dialog.  The
-        # previous per-family helper re-read every manifest three times, which
-        # needlessly increased Add Radio startup latency.
-        try:
-            guided_manifests = self.multi_radio_store.list_software_instance_manifests()
-        except Exception:
-            log.exception("Failed loading guided software manifests.")
-            guided_manifests = []
-        try:
-            guided_profiles = self.multi_radio_store.list_device_profiles()
-        except Exception:
-            log.exception("Failed loading guided software radio links.")
-            guided_profiles = []
-        try:
-            guided_varac_cluster_rows = self.multi_radio_store.list_varac_clusters()
-            guided_varac_membership_rows = self.multi_radio_store.list_varac_cluster_members()
-            guided_varac_topology_snapshot_available = True
-        except Exception:
-            # The arrangement presentation must fail closed.  An unavailable
-            # read-only cluster snapshot is not evidence that a cluster is
-            # absent, so only the safe standalone preparation route remains.
-            log.exception("Failed loading guided VarAC arrangement snapshot.")
-            guided_varac_cluster_rows = []
-            guided_varac_membership_rows = []
-            guided_varac_topology_snapshot_available = False
-        guided_linked_instance_ids = self._linked_software_instance_ids(guided_profiles)
-        guided_saved_instance_rows = {
-            "js8call": self._enrich_software_instance_rows(
-                "js8call", self.multi_radio_store.list_js8_instances(), guided_manifests
-            ),
-            "fast_light": self._enrich_software_instance_rows(
-                "fast_light", self.multi_radio_store.list_fast_light_configs(), guided_manifests
-            ),
-            "varac": self._enrich_software_instance_rows(
-                "varac", self.multi_radio_store.list_varac_nodes(), guided_manifests
-            ),
-        }
-        guided_instance_inventory_generation = 0
-        guided_instance_inventory_snapshot = build_guided_instance_inventory(
-            guided_saved_instance_rows,
-            linked_ids_by_family=guided_linked_instance_ids,
-            generation=guided_instance_inventory_generation,
-        )
-
-        def _refresh_guided_instance_inventory(
-            retained_drafts: Mapping[str, Mapping[str, Any]] | None = None,
-        ):
-            nonlocal guided_instance_inventory_generation, guided_instance_inventory_snapshot
-            guided_instance_inventory_generation += 1
-            guided_instance_inventory_snapshot = build_guided_instance_inventory(
-                guided_saved_instance_rows,
-                retained_drafts=retained_drafts,
-                linked_ids_by_family=guided_linked_instance_ids,
-                generation=guided_instance_inventory_generation,
-            )
-            return guided_instance_inventory_snapshot
-
-        def _guided_dialog_initial_size(
-            preferred: QSize | None = None,
-            *,
-            screen_margin: int = 40,
-        ) -> QSize:
-            preferred = preferred or QSize(760, 720)
-            app = QApplication.instance()
-            screen = app.primaryScreen() if app is not None else None
-            if screen is None:
-                return preferred
-            available = screen.availableGeometry().size()
-            return QSize(
-                min(preferred.width(), max(1, available.width() - int(screen_margin))),
-                min(preferred.height(), max(1, available.height() - int(screen_margin))),
-            )
-
-        dlg.resize(_guided_dialog_initial_size())
-        layout = QVBoxLayout(dlg)
-        intro = QLabel(self._device_profile_dialog_intro(existing))
-        intro.setAccessibleName(f"{dlg_title} guidance")
-        intro.setWordWrap(True)
-        layout.addWidget(intro)
-
-        scroll = QScrollArea(dlg)
-        scroll.setObjectName("guidedRadioSetupBodyScroll")
-        scroll.setAccessibleName("Guided radio setup body")
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        layout.addWidget(scroll, 1)
-
-        body = QWidget()
-        scroll.setWidget(body)
-        body_layout = QVBoxLayout(body)
-        body_layout.setContentsMargins(0, 0, 0, 0)
-        body_layout.setSpacing(10)
-        theme = resolve_theme(self.settings)
-
-        catalog_payload = load_radio_catalog()
-        catalog_entries = list(catalog_payload.get("entries", []) or [])
-        catalog_source = str(catalog_payload.get("source", "static-fallback") or "static-fallback")
-        radio_model_prompt = "Select or search for a radio model"
-        row_labels: Dict[QWidget, QWidget] = {}
-
-        def _show_help(btn: QWidget, text: str) -> None:
-            QToolTip.showText(btn.mapToGlobal(btn.rect().bottomLeft()), text, btn)
-
-        def _make_help_label(text: str, help_text: str = "") -> QWidget:
-            wrap = QWidget()
-            row = QHBoxLayout(wrap)
-            row.setContentsMargins(0, 0, 0, 0)
-            row.setSpacing(4)
-            label = QLabel(text)
-            label.setWordWrap(True)
-            label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
-            row.addWidget(label)
-            if help_text:
-                help_btn = QPushButton("i", wrap)
-                help_btn.setCheckable(False)
-                help_btn.setText("?")
-                help_side = button_height_for_font(help_btn, vertical_padding=4, floor=20)
-                help_btn.setFixedSize(help_side, help_side)
-                help_btn.setToolTip(help_text)
-                help_btn.setCursor(Qt.PointingHandCursor)
-                help_btn.setStyleSheet(
-                    "QPushButton {"
-                    " border: 1px solid palette(mid);"
-                    f" border-radius: {max(1, help_side // 2)}px;"
-                    " padding: 0px;"
-                    " font-weight: bold;"
-                    f" min-width: {help_side}px;"
-                    f" min-height: {help_side}px;"
-                    "}"
-                    "QPushButton:hover {"
-                    " background: palette(base);"
-                    "}"
-                )
-                help_btn.clicked.connect(lambda _checked=False, b=help_btn, t=help_text: _show_help(b, t))
-                row.addWidget(help_btn)
-            row.addStretch(1)
-            return wrap
-
-        def _add_form_row(form_layout: QFormLayout, label_text: str, field_widget: QWidget, help_text: str = "") -> None:
-            field_widget.setSizePolicy(QSizePolicy.Expanding, field_widget.sizePolicy().verticalPolicy())
-            label_widget = _make_help_label(label_text, help_text) if label_text else QWidget()
-            if label_text:
-                row_labels[field_widget] = label_widget
-                form_layout.addRow(label_widget, field_widget)
-            else:
-                form_layout.addRow("", field_widget)
-
-        def _add_full_width_row(form_layout: QFormLayout, field_widget: QWidget) -> None:
-            field_widget.setSizePolicy(QSizePolicy.Expanding, field_widget.sizePolicy().verticalPolicy())
-            form_layout.addRow(field_widget)
-
-        def _set_form_row_label_text(field_widget: QWidget, text: str) -> None:
-            """Update a help-label row without replacing its accessible help action."""
-
-            label_widget = row_labels.get(field_widget)
-            if isinstance(label_widget, QLabel):
-                label_widget.setText(text)
-                return
-            if isinstance(label_widget, QWidget):
-                labels = label_widget.findChildren(QLabel)
-                if labels:
-                    labels[0].setText(text)
-
-        def _configure_combo_width(combo: QComboBox, minimum: int = 220) -> None:
-            combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
-            combo.setMinimumContentsLength(max(12, min(28, int(minimum / 10))))
-            combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            fm = combo.fontMetrics()
-            widest = minimum
-            for idx in range(combo.count()):
-                widest = max(widest, fm.horizontalAdvance(combo.itemText(idx)) + 56)
-            try:
-                combo.view().setMinimumWidth(min(max(widest + 24, minimum), 520))
-            except Exception:
-                pass
-
-        def _configure_port_edit(edit: QLineEdit) -> None:
-            edit.setMaximumWidth(110)
-            edit.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
-
-        def _make_browse_row(
-            edit: QLineEdit,
-            *,
-            title: str,
-            mode: str = "file",
-            file_filter: str = "All Files (*)",
-        ) -> QWidget:
-            edit.setMinimumWidth(0)
-            edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            browse_btn = QPushButton("Browse")
-            browse_btn.setMinimumWidth(86)
-            browse_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-            browse_btn.setToolTip(f"Choose {title.lower()} if CommsPlan did not detect the right location.")
-            row = QHBoxLayout()
-            row.setContentsMargins(0, 0, 0, 0)
-            row.setSpacing(8)
-            row.addWidget(edit, 1)
-            row.addWidget(browse_btn)
-            wrap = QWidget()
-            wrap.setLayout(row)
-
-            def _browse() -> None:
-                start = edit.text().strip() or str(Path.home())
-                if mode == "folder" or (mode == "app" and platform.system() == "Darwin"):
-                    chosen = QFileDialog.getExistingDirectory(self, title, start)
-                else:
-                    chosen, _selected_filter = QFileDialog.getOpenFileName(self, title, start, file_filter)
-                if chosen:
-                    edit.setText(chosen)
-                    _update_dialog_readiness()
-
-            browse_btn.clicked.connect(_browse)
-            return wrap
-
-        def _configure_guided_form(form_layout: QFormLayout) -> None:
-            form_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
-            form_layout.setRowWrapPolicy(QFormLayout.WrapLongRows)
-            form_layout.setLabelAlignment(Qt.AlignLeft | Qt.AlignTop)
-            form_layout.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
-            form_layout.setHorizontalSpacing(12)
-            form_layout.setVerticalSpacing(8)
-
-        def _make_section(title: str, help_text: str = "") -> tuple[QGroupBox, QFormLayout]:
-            group = QGroupBox(title)
-            group_layout = QVBoxLayout(group)
-            group_layout.setContentsMargins(10, 10, 10, 10)
-            group_layout.setSpacing(8)
-            if help_text:
-                help_label = QLabel(help_text)
-                help_label.setWordWrap(True)
-                group_layout.addWidget(help_label)
-            form_layout = QFormLayout()
-            _configure_guided_form(form_layout)
-            group_layout.addLayout(form_layout)
-            body_layout.addWidget(group)
-            return group, form_layout
-
-        requested_initial_step = str(initial_step or "").strip().lower()
-        guided_wizard_step_id = (
-            requested_initial_step
-            if existing
-            and requested_initial_step in {"radio", "model", "software", "connection", "guard", "schedule", "review"}
-            else "radio"
-        )
-        # The shared guided-setup contract owns these stable positions.  Do
-        # not insert, remove, or renumber steps locally when the radio role
-        # changes; only the role-specific content and descriptive title adapt.
-        guided_wizard_steps: Tuple[Tuple[str, str], ...] = tuple(
-            (step_id, "CommsPlan Behavior" if step_id == "model" else label)
-            for step_id, label in guided_setup_wizard_view("radio").steps
-        )
-        guided_wizard_max_index_seen = (
-            len(guided_wizard_steps) - 1 if existing or retry_draft else 0
-        )
-        guided_wizard_group = QGroupBox("Guided Setup")
-        guided_wizard_group.setObjectName("guidedSetupWizard")
-        # This is a navigation header, not page content.  Keep it at its
-        # natural height when the dialog is maximized and give the remaining
-        # space to the single scrolling body below.
-        guided_wizard_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        guided_wizard_layout = QVBoxLayout(guided_wizard_group)
-        guided_wizard_layout.setContentsMargins(10, 8, 10, 8)
-        guided_wizard_layout.setSpacing(8)
-        guided_wizard_buttons_row = QGridLayout()
-        guided_wizard_buttons_row.setContentsMargins(0, 0, 0, 0)
-        guided_wizard_buttons_row.setHorizontalSpacing(6)
-        guided_wizard_buttons_row.setVerticalSpacing(6)
-        guided_wizard_buttons: Dict[str, QPushButton] = {}
-        for idx, (step_id, label) in enumerate(guided_wizard_steps, start=1):
-            btn = QPushButton(f"{idx}. {label}")
-            btn.setObjectName(f"guidedWizardStep_{step_id}")
-            btn.setCheckable(True)
-            btn.setAccessibleName(f"Guided setup step {idx}: {label}")
-            btn.setToolTip(f"Show the {label} setup step.")
-            btn.setMinimumWidth(0)
-            btn.setMinimumHeight(button_height_for_font(btn))
-            btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            guided_wizard_buttons[step_id] = btn
-            guided_wizard_buttons_row.addWidget(btn, (idx - 1) // 3, (idx - 1) % 3)
-        for col in range(3):
-            guided_wizard_buttons_row.setColumnStretch(col, 1)
-        guided_wizard_layout.addLayout(guided_wizard_buttons_row)
-        guided_wizard_detail_label = QLabel("Start with the radio model and setup type.")
-        guided_wizard_detail_label.setObjectName("guidedWizardDetail")
-        guided_wizard_detail_label.setWordWrap(True)
-        guided_wizard_layout.addWidget(guided_wizard_detail_label)
-        guided_wizard_back_btn = QPushButton("Back")
-        guided_wizard_back_btn.setObjectName("guidedWizardBack")
-        guided_wizard_back_btn.setAccessibleName("Previous guided setup step")
-        guided_wizard_next_btn = QPushButton("Next")
-        guided_wizard_next_btn.setObjectName("guidedWizardNext")
-        guided_wizard_next_btn.setAccessibleName("Next guided setup step")
-        # The purpose and step controls are a fixed header.  The current step
-        # body alone owns vertical scrolling; Back/Next are placed in the fixed
-        # action footer below after the button box is created.
-        layout.insertWidget(layout.indexOf(scroll), guided_wizard_group)
-
-        readiness_card = QFrame()
-        readiness_card.setFrameShape(QFrame.StyledPanel)
-        readiness_card_layout = QVBoxLayout(readiness_card)
-        readiness_card_layout.setContentsMargins(12, 10, 12, 10)
-        readiness_card_layout.setSpacing(6)
-        readiness_title = QLabel("Live Radio Readiness")
-        readiness_title_font = readiness_title.font()
-        readiness_title_font.setBold(True)
-        readiness_title.setFont(readiness_title_font)
-        readiness_card_layout.addWidget(readiness_title)
-        readiness_intro = QLabel(
-            "CommsPlan checks this radio as you edit it so the next setup step is easier to spot before you save."
-        )
-        readiness_intro.setObjectName("readinessIntro")
-        readiness_intro.setWordWrap(True)
-        readiness_card_layout.addWidget(readiness_intro)
-        dialog_readiness_status = QLabel()
-        dialog_readiness_status.setWordWrap(True)
-        dialog_readiness_detail = QLabel()
-        dialog_readiness_detail.setWordWrap(True)
-        readiness_card_layout.addWidget(dialog_readiness_status)
-        readiness_card_layout.addWidget(dialog_readiness_detail)
-        body_layout.addWidget(readiness_card)
-
-        identity_group, identity_form = _make_section(
-            "Radio Identity",
-            "Start with the actual radio model, then give the radio a station-friendly name if you want one.",
-        )
-        software_group = QGroupBox("Software Stack and Guidance")
-        software_group_layout = QVBoxLayout(software_group)
-        software_group_layout.setContentsMargins(10, 10, 10, 10)
-        software_group_layout.setSpacing(8)
-        body_layout.addWidget(software_group)
-        software_form = QFormLayout()
-        _configure_guided_form(software_form)
-        software_group_layout.addLayout(software_form)
-
-        # Observer/SDR profiles use a receive-only stack rather than the
-        # transceiver software checklist below.  Keep this in the same guided
-        # Software step so the operator can choose the receiver application
-        # and its launch behavior once, before testing the endpoint.
-        receiver_stack_group = QGroupBox("Receive-only software stack")
-        receiver_stack_group.setObjectName("guidedReceiverSoftwareStack")
-        receiver_stack_layout = QFormLayout(receiver_stack_group)
-        _configure_guided_form(receiver_stack_layout)
-        receiver_stack_hint = QLabel(
-            "Choose the receiver application and any radio-owned receive software for this SDR. "
-            "The SDR remains receive-only: these choices never enable PTT, transmit, QSY, or frequency scheduling."
-        )
-        receiver_stack_hint.setObjectName("guidedReceiverSoftwareStackHint")
-        receiver_stack_hint.setWordWrap(True)
-        _add_full_width_row(receiver_stack_layout, receiver_stack_hint)
-        existing_receiver_bundle: Dict[str, Any] = {}
-        existing_receiver_launch_item: Dict[str, Any] = {}
-        try:
-            existing_radio_id = int((profile_seed or {}).get("id", 0) or 0)
-        except (TypeError, ValueError):
-            existing_radio_id = 0
-        if existing_radio_id > 0 and str((profile_seed or {}).get("device_class", "") or "").strip().lower() == "observer":
-            try:
-                existing_receiver_bundle = dict(
-                    self.launch_orchestrator.get_radio_launch_bundle(existing_radio_id) or {}
-                )
-            except Exception:
-                log.debug("Unable to load the existing receiver launch bundle.", exc_info=True)
-            for launch_item in existing_receiver_bundle.get("items", []):
-                if isinstance(launch_item, dict) and str(launch_item.get("name", "") or "").strip() == "SDR++":
-                    existing_receiver_launch_item = dict(launch_item)
-                    break
-
-        receiver_application_combo = QComboBox()
-        receiver_application_combo.setObjectName("guidedReceiverLaunchApplication")
-        receiver_application_combo.addItem("No application launch", "")
-        receiver_application_combo.addItem("SDR++", "SDR++")
-        receiver_application_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        _add_form_row(
-            receiver_stack_layout,
-            "Receiver application:",
-            receiver_application_combo,
-            "Select the receive-only application CommsPlan should launch for this profile.",
-        )
-        existing_receiver_launch_target = str(
-            existing_receiver_launch_item.get("launch_path_override", "")
-            or existing_receiver_launch_item.get("launch_command_override", "")
-            or (profile_seed or {}).get("launch_path", "")
-            or ""
-        ).strip()
-        receiver_launch_path_edit = QLineEdit(existing_receiver_launch_target)
-        receiver_launch_path_edit.setObjectName("guidedReceiverLaunchPath")
-        receiver_launch_path_wrap = _make_browse_row(
-            receiver_launch_path_edit,
-            title="Select receiver application",
-            mode="app",
-        )
-        _add_form_row(
-            receiver_stack_layout,
-            "Launch target:",
-            receiver_launch_path_wrap,
-            "Use the suggested SDR++ command, or choose its executable/application bundle. CommsPlan stores it only in this receiver's launch recipe.",
-        )
-        receiver_launch_enabled_chk = QCheckBox("Launch this receiver application with CommsPlan")
-        receiver_launch_enabled_chk.setObjectName("guidedReceiverLaunchEnabled")
-        receiver_launch_enabled_chk.setChecked(
-            bool(
-                existing_receiver_bundle.get("launch_enabled", False)
-                and existing_receiver_launch_item.get("enabled", True)
-                and existing_receiver_launch_item.get("startup", True)
-            )
-            if existing_receiver_launch_item
-            else bool((profile_seed or {}).get("launch_enabled", 0))
-        )
-        receiver_launch_enabled_chk.setToolTip("Start the selected receive-only application when this receiver is launched.")
-        _add_full_width_row(receiver_stack_layout, receiver_launch_enabled_chk)
-        software_group_layout.addWidget(receiver_stack_group)
-        connection_group, connection_form = _make_section(
-            "Connections",
-            "Only the fields that matter for the selected role, backend, and software are shown.",
-        )
-        connection_status_label = QLabel()
-        connection_status_label.setObjectName("guidedConnectionStatus")
-        connection_status_label.setWordWrap(True)
-        _add_full_width_row(connection_form, connection_status_label)
-        managed_recipe_summary = QLabel()
-        managed_recipe_summary.setObjectName("guidedManagedRecipeSummary")
-        managed_recipe_summary.setAccessibleName("Resolved managed software details")
-        managed_recipe_summary.setWordWrap(True)
-        _add_full_width_row(connection_form, managed_recipe_summary)
-        connection_responsibility_group = QGroupBox("Connection responsibilities")
-        connection_responsibility_group.setObjectName("guidedConnectionResponsibilities")
-        connection_responsibility_layout = QVBoxLayout(connection_responsibility_group)
-        connection_responsibility_layout.setContentsMargins(8, 8, 8, 8)
-        connection_responsibility_layout.setSpacing(6)
-        receiver_control_card = QFrame()
-        receiver_control_card.setFrameShape(QFrame.StyledPanel)
-        receiver_control_card_layout = QVBoxLayout(receiver_control_card)
-        receiver_control_card_layout.setContentsMargins(8, 6, 8, 6)
-        receiver_control_title = QLabel("Receiver control")
-        receiver_control_title.setObjectName("guidedReceiverControlResponsibilityTitle")
-        receiver_control_title_font = receiver_control_title.font()
-        receiver_control_title_font.setBold(True)
-        receiver_control_title.setFont(receiver_control_title_font)
-        receiver_control_detail = QLabel()
-        receiver_control_detail.setWordWrap(True)
-        receiver_control_card_layout.addWidget(receiver_control_title)
-        receiver_control_card_layout.addWidget(receiver_control_detail)
-        connection_responsibility_layout.addWidget(receiver_control_card)
-        companion_connection_card = QFrame()
-        companion_connection_card.setFrameShape(QFrame.StyledPanel)
-        companion_connection_card_layout = QVBoxLayout(companion_connection_card)
-        companion_connection_card_layout.setContentsMargins(8, 6, 8, 6)
-        companion_connection_title = QLabel("Application companions")
-        companion_connection_title.setObjectName("guidedCompanionResponsibilityTitle")
-        companion_connection_title_font = companion_connection_title.font()
-        companion_connection_title_font.setBold(True)
-        companion_connection_title.setFont(companion_connection_title_font)
-        companion_connection_detail = QLabel()
-        companion_connection_detail.setWordWrap(True)
-        companion_connection_card_layout.addWidget(companion_connection_title)
-        companion_connection_card_layout.addWidget(companion_connection_detail)
-        connection_responsibility_layout.addWidget(companion_connection_card)
-        _add_full_width_row(connection_form, connection_responsibility_group)
-        schedule_group, schedule_form = _make_section(
-            "Schedule",
-            "Choose the plan this radio should follow after the radio profile has been saved.",
-        )
-        receive_schedule_state_card = QFrame()
-        receive_schedule_state_card.setObjectName("guidedReceiveScheduleState")
-        receive_schedule_state_card.setFrameShape(QFrame.StyledPanel)
-        receive_schedule_state_layout = QVBoxLayout(receive_schedule_state_card)
-        receive_schedule_state_layout.setContentsMargins(10, 8, 10, 8)
-        receive_schedule_state_layout.setSpacing(4)
-        receive_schedule_state_title = QLabel("Receiver state")
-        receive_schedule_state_title.setObjectName("guidedReceiveScheduleStateTitle")
-        receive_schedule_state_title.setAccessibleName("Receive Schedule receiver state")
-        receive_schedule_state_title_font = receive_schedule_state_title.font()
-        receive_schedule_state_title_font.setBold(True)
-        receive_schedule_state_title.setFont(receive_schedule_state_title_font)
-        receive_schedule_state_detail = QLabel()
-        receive_schedule_state_detail.setObjectName("guidedReceiveScheduleStateDetail")
-        receive_schedule_state_detail.setAccessibleName("Receive Schedule receiver state detail")
-        receive_schedule_state_detail.setWordWrap(True)
-        receive_schedule_state_layout.addWidget(receive_schedule_state_title)
-        receive_schedule_state_layout.addWidget(receive_schedule_state_detail)
-        receive_schedule_state_card.setVisible(False)
-        _add_full_width_row(schedule_form, receive_schedule_state_card)
-        schedule_status_label = QLabel()
-        schedule_status_label.setObjectName("guidedScheduleAssignmentStatus")
-        schedule_status_label.setWordWrap(True)
-        schedule_status_label.setText(
-            "Schedule assignment is the next step after saving this radio. Assigning a plan runs RF Guard before the radio follows it."
-        )
-        _add_full_width_row(schedule_form, schedule_status_label)
-        schedule_guard_warning_card = QFrame()
-        schedule_guard_warning_card.setObjectName("guidedScheduleRfGuardWarning")
-        schedule_guard_warning_layout = QVBoxLayout(schedule_guard_warning_card)
-        schedule_guard_warning_layout.setContentsMargins(10, 8, 10, 8)
-        schedule_guard_warning_layout.setSpacing(4)
-        schedule_guard_warning_title = QLabel("RF Guard Needs Review")
-        schedule_guard_warning_title.setObjectName("guidedScheduleRfGuardWarningTitle")
-        schedule_guard_warning_title_font = schedule_guard_warning_title.font()
-        schedule_guard_warning_title_font.setBold(True)
-        schedule_guard_warning_title.setFont(schedule_guard_warning_title_font)
-        schedule_guard_warning_detail = QLabel()
-        schedule_guard_warning_detail.setObjectName("guidedScheduleRfGuardWarningDetail")
-        schedule_guard_warning_detail.setWordWrap(True)
-        schedule_guard_warning_layout.addWidget(schedule_guard_warning_title)
-        schedule_guard_warning_layout.addWidget(schedule_guard_warning_detail)
-        schedule_guard_warning_card.setVisible(False)
-        _add_full_width_row(schedule_form, schedule_guard_warning_card)
-        schedule_path_combo = QComboBox()
-        schedule_path_combo.setObjectName("guidedSchedulePathCombo")
-        _configure_combo_width(schedule_path_combo, minimum=320)
-        _add_form_row(
-            schedule_form,
-            "Schedule Path:",
-            schedule_path_combo,
-            "Choose whether this radio uses an existing plan, a Daily with No Nets, Daily + Nets, SOP, or no schedule.",
-        )
-        schedule_plan_combo = QComboBox()
-        schedule_plan_combo.setObjectName("guidedSchedulePlanCombo")
-        _configure_combo_width(schedule_plan_combo, minimum=320)
-        _add_form_row(
-            schedule_form,
-            "Frequency Plan:",
-            schedule_plan_combo,
-            "Optional. Choose the plan this radio should follow after save, or assign it later in Radio Settings.",
-        )
-        schedule_open_plan_manager_chk = QCheckBox("Open Plan Builder after saving")
-        schedule_open_plan_manager_chk.setObjectName("guidedScheduleOpenPlanManager")
-        schedule_open_plan_manager_chk.setToolTip(
-            "Assign Plan... Use this when you still need to build a Daily, No Nets, Net, or SOP-based Frequency Plan for this radio."
-        )
-        _add_full_width_row(schedule_form, schedule_open_plan_manager_chk)
-        guided_initial_frequency_plan_id = 0
-        if existing:
-            try:
-                assignment = self.multi_radio_store.get_effective_assigned_plan_for_device(
-                    int(existing.get("id", 0) or 0)
-                )
-                guided_initial_frequency_plan_id = int((assignment or {}).get("frequency_plan_id", 0) or 0)
-            except Exception:
-                guided_initial_frequency_plan_id = 0
-        guided_schedule_plan_combo_loaded = False
-        guided_schedule_plan_role = ""
-        guided_schedule_plan_count = 0
-        try:
-            guided_frequency_plan_snapshot = tuple(
-                dict(row)
-                for row in self.multi_radio_store.list_frequency_plans()
-                if isinstance(row, dict)
-            )
-        except Exception:
-            log.debug("Failed loading the guided radio Frequency Plan snapshot.", exc_info=True)
-            guided_frequency_plan_snapshot = tuple()
-        guided_schedule_validation_cache: Dict[str, Dict[str, Any]] = {}
-        save_button: QPushButton | None = None
-        save_review_group, save_review_form = _make_section(
-            "Review & Save",
-            "Confirm the radio profile, software, RF Guard, and schedule choices before saving.",
-        )
-        save_review_label = QLabel()
-        save_review_label.setObjectName("guidedSaveReview")
-        save_review_label.setWordWrap(True)
-        save_review_label.setTextFormat(Qt.RichText)
-        save_review_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        _add_full_width_row(save_review_form, save_review_label)
-
-        inventory_review_card = QFrame()
-        inventory_review_card.setObjectName("guidedReviewedInventoryCard")
-        inventory_review_card.setFrameShape(QFrame.StyledPanel)
-        inventory_review_layout = QVBoxLayout(inventory_review_card)
-        inventory_review_layout.setContentsMargins(10, 8, 10, 8)
-        inventory_review_layout.setSpacing(3)
-        inventory_review_title = QLabel("Reviewed software inventory")
-        inventory_review_title.setObjectName("guidedReviewedInventoryTitle")
-        inventory_review_title.setAccessibleName("Reviewed software inventory")
-        inventory_review_title_font = inventory_review_title.font()
-        inventory_review_title_font.setBold(True)
-        inventory_review_title.setFont(inventory_review_title_font)
-        inventory_review_status = QLabel()
-        inventory_review_status.setObjectName("guidedReviewedInventoryStatus")
-        inventory_review_status.setAccessibleName("Reviewed inventory generation and reference")
-        inventory_review_status.setWordWrap(True)
-        inventory_review_status.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        inventory_review_why = QLabel(
-            "CommsPlan checks this same reviewed inventory again before making any change."
-        )
-        inventory_review_why.setObjectName("guidedReviewedInventoryWhy")
-        inventory_review_why.setWordWrap(True)
-        inventory_review_layout.addWidget(inventory_review_title)
-        inventory_review_layout.addWidget(inventory_review_status)
-        inventory_review_layout.addWidget(inventory_review_why)
-        _add_full_width_row(save_review_form, inventory_review_card)
-
-        app_config_review_card = QFrame()
-        app_config_review_card.setObjectName("guidedAppConfigReviewCard")
-        app_config_review_card.setFrameShape(QFrame.StyledPanel)
-        app_config_review_layout = QGridLayout(app_config_review_card)
-        app_config_review_layout.setContentsMargins(10, 8, 10, 8)
-        app_config_review_layout.setHorizontalSpacing(10)
-        app_config_review_layout.setVerticalSpacing(4)
-        app_config_review_title = QLabel("App Configuration")
-        app_config_review_title.setObjectName("guidedAppConfigReviewTitle")
-        app_config_review_title_font = app_config_review_title.font()
-        app_config_review_title_font.setBold(True)
-        app_config_review_title.setFont(app_config_review_title_font)
-        app_config_review_status = QLabel()
-        app_config_review_status.setObjectName("guidedAppConfigReviewStatus")
-        app_config_review_status.setWordWrap(True)
-        app_config_review_status.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        app_config_review_details = QLabel()
-        app_config_review_details.setObjectName("guidedAppConfigReviewDetails")
-        app_config_review_details.setWordWrap(True)
-        app_config_review_details.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        app_config_review_details.setVisible(False)
-        app_config_review_toggle_btn = QPushButton("Show Details")
-        app_config_review_toggle_btn.setObjectName("guidedAppConfigReviewToggle")
-        app_config_review_toggle_btn.setStyleSheet(button_style("secondary", theme))
-        app_config_review_toggle_btn.setToolTip("Show the app configuration details CommsPlan reviewed for this radio.")
-        app_config_apply_btn = QPushButton("Review App Setup")
-        app_config_apply_btn.setObjectName("guidedAppConfigApply")
-        app_config_apply_btn.setStyleSheet(button_style("primary", theme))
-        app_config_apply_btn.setToolTip(
-            "Preview the managed app setup plan. No folder or external application change occurs before final save."
-        )
-        app_config_apply_btn.setVisible(False)
-        app_config_review_layout.addWidget(app_config_review_title, 0, 0)
-        app_config_review_layout.addWidget(app_config_review_status, 1, 0)
-        app_config_review_layout.addWidget(app_config_apply_btn, 0, 1, 2, 1)
-        app_config_review_layout.addWidget(app_config_review_toggle_btn, 0, 2, 2, 1)
-        app_config_review_layout.addWidget(app_config_review_details, 2, 0, 1, 3)
-        app_config_review_layout.setColumnStretch(0, 1)
-        _add_full_width_row(save_review_form, app_config_review_card)
-
-        def _toggle_guided_app_config_review_details() -> None:
-            visible = not app_config_review_details.isVisible()
-            app_config_review_details.setVisible(visible)
-            app_config_review_toggle_btn.setText("Hide Details" if visible else "Show Details")
-
-        app_config_review_toggle_btn.clicked.connect(_toggle_guided_app_config_review_details)
-
-        save_progress_card = QFrame()
-        save_progress_card.setObjectName("guidedSaveProgressCard")
-        save_progress_card.setFrameShape(QFrame.StyledPanel)
-        save_progress_layout = QVBoxLayout(save_progress_card)
-        save_progress_layout.setContentsMargins(10, 8, 10, 8)
-        save_progress_layout.setSpacing(4)
-        save_progress_label = QLabel(
-            "Qualifying the reviewed inventory before handing this setup to the save transaction…"
-        )
-        save_progress_label.setObjectName("guidedSaveProgressLabel")
-        save_progress_label.setAccessibleName("Guided radio save progress")
-        save_progress_label.setWordWrap(True)
-        save_progress_bar = QProgressBar()
-        save_progress_bar.setObjectName("guidedSaveProgressBar")
-        save_progress_bar.setAccessibleName("Guided radio save is in progress")
-        save_progress_bar.setRange(0, 0)
-        save_progress_bar.setTextVisible(False)
-        save_progress_layout.addWidget(save_progress_label)
-        save_progress_layout.addWidget(save_progress_bar)
-        save_progress_card.setVisible(False)
-        _add_full_width_row(save_review_form, save_progress_card)
-
-        preserved_launch_enabled = bool((profile_seed or {}).get("launch_enabled", 0))
-        preserved_launch_path = str((profile_seed or {}).get("launch_path", "") or "").strip()
-
-        radio_model_combo = QComboBox()
-        radio_model_combo.setEditable(True)
-        radio_model_combo.setInsertPolicy(QComboBox.NoInsert)
-        if radio_model_combo.lineEdit() is not None:
-            radio_model_combo.lineEdit().setPlaceholderText(radio_model_prompt)
-        refresh_catalog_btn = QPushButton("Refresh Catalog")
-        refresh_catalog_btn.setToolTip("Reload the local rig catalog from Hamlib when available.")
-        radio_model_row = QHBoxLayout()
-        radio_model_row.setContentsMargins(0, 0, 0, 0)
-        radio_model_row.setSpacing(8)
-        radio_model_row.addWidget(radio_model_combo, 1)
-        radio_model_row.addWidget(refresh_catalog_btn)
-        radio_model_wrap = QWidget()
-        radio_model_wrap.setLayout(radio_model_row)
-        _add_form_row(
-            identity_form,
-            "Radio Model:",
-            radio_model_wrap,
-            "Choose the actual rig model when possible so CommsPlan can offer smarter setup guidance.",
-        )
-
-        model_hint_label = QLabel()
-        model_hint_label.setWordWrap(True)
-        _add_full_width_row(identity_form, model_hint_label)
-
-        name_edit = QLineEdit(str((profile_seed or {}).get("name", "") or ""))
-        name_edit.setPlaceholderText("Enter a radio name, or leave blank to use the selected model name")
-        display_name_user_edited = bool(name_edit.text().strip())
-        last_catalog_display_name = ""
-        _add_form_row(
-            identity_form,
-            "Radio Name:",
-            name_edit,
-            "Use a name that will make sense in schedules and support, such as IC-7300 Desk or JS8 Mobile.",
-        )
-
-        device_class_combo = QComboBox()
-        for label, value in DEVICE_CLASS_OPTIONS:
-            device_class_combo.addItem(label, value)
-        device_class = str((profile_seed or {}).get("device_class", "tx_rx") or "tx_rx").strip().lower()
-        if device_class and device_class_combo.findData(device_class) < 0:
-            # Preserve a legacy/advanced role when editing an existing radio,
-            # while the normal Add Radio path exposes only the two supported
-            # operator-facing roles.
-            device_class_combo.addItem("Existing advanced role", device_class)
-        class_idx = device_class_combo.findData(device_class)
-        device_class_combo.setCurrentIndex(class_idx if class_idx >= 0 else 0)
-        device_class_combo.setObjectName("guidedRadioRole")
-        device_class_combo.setAccessibleName("Radio Role")
-        _configure_combo_width(device_class_combo)
-        _add_form_row(
-            identity_form,
-            "Radio Role:",
-            device_class_combo,
-            "Choose Transceiver for a transmit/receive rig or Receive-only SDR for monitoring hardware that cannot transmit.",
-        )
-        radio_role_resolved_label = QLabel()
-        radio_role_resolved_label.setObjectName("guidedRadioRoleResolved")
-        radio_role_resolved_label.setAccessibleName("Resolved Radio Role")
-        radio_role_resolved_label.setWordWrap(True)
-        _add_full_width_row(identity_form, radio_role_resolved_label)
-        radio_role_why_label = QLabel()
-        radio_role_why_label.setObjectName("guidedRadioRoleWhy")
-        radio_role_why_label.setAccessibleName("Why this Radio Role matters")
-        radio_role_why_label.setWordWrap(True)
-        _add_full_width_row(identity_form, radio_role_why_label)
-
-        backend_combo = QComboBox()
-        for label, value in self._device_profile_backend_options():
-            backend_combo.addItem(label, value)
-        backend_idx = backend_combo.findData(str((profile_seed or {}).get("control_backend", "flrig") or "flrig").strip().lower())
-        backend_combo.setCurrentIndex(backend_idx if backend_idx >= 0 else 0)
-        _configure_combo_width(backend_combo)
-        _add_form_row(
-            identity_form,
-            "Primary Rig Control:",
-            backend_combo,
-            "This determines how CommsPlan primarily controls or follows the rig. It does not limit the rest of the software stack assigned to this radio.",
-        )
-
-        deploy_combo = QComboBox()
-        deploy_combo.addItem("Full", "full")
-        deploy_combo.addItem("Minimal", "minimal")
-        deploy_idx = deploy_combo.findData(str((profile_seed or {}).get("deployment_mode", "full") or "full").strip().lower())
-        deploy_combo.setCurrentIndex(deploy_idx if deploy_idx >= 0 else 0)
-        _configure_combo_width(deploy_combo)
-        _add_form_row(
-            identity_form,
-            "Deployment Mode:",
-            deploy_combo,
-            "Full is the normal choice. Minimal is for lighter setups where not all integrations will be used.",
-        )
-
-        setup_type_combo = QComboBox()
-        setup_type_combo.setObjectName("guidedSetupType")
-        setup_type_combo.addItem("Choose setup type...", "")
-        setup_type_combo.addItem("TriMode - FastLight/JS8Call/VarAC", LANE_TRI_MODE)
-        setup_type_combo.addItem("Custom software mix", "custom")
-        setup_type_combo.addItem("JS8Call only", LANE_JS8_ONLY)
-        setup_type_combo.addItem("Fast Light: FLDigi / FLMsg / FLAmp", LANE_FAST_LIGHT)
-        setup_type_combo.addItem("VarAC only", LANE_VARAC)
-        setup_type_combo.addItem("VarAC Cluster / BBS", LANE_VARAC_CLUSTER)
-        setup_type_combo.addItem("Receive-only SDR", LANE_SDR_OBSERVER)
-        _configure_combo_width(setup_type_combo, minimum=320)
-        _add_form_row(
-            identity_form,
-            "Setup Type:",
-            setup_type_combo,
-            "Start here. CommsPlan will show only the radio, app, and control fields that fit this setup.",
-        )
-
-        software_row = QGridLayout()
-        software_row.setContentsMargins(0, 0, 0, 0)
-        software_row.setHorizontalSpacing(24)
-        software_row.setVerticalSpacing(10)
-        use_flrig_chk = QCheckBox("FLRig")
-        use_fldigi_chk = QCheckBox("FLDigi")
-        use_flmsg_chk = QCheckBox("FLMsg")
-        use_flamp_chk = QCheckBox("FLAmp")
-        use_js8call_chk = QCheckBox("JS8Call")
-        use_js8spotter_chk = QCheckBox("CommsPlan Spotter")
-        use_js8spotter_chk.setToolTip(
-            "Use CommsPlan's built-in Spotter compose, decode, Expect, and message-viewer workflows."
-        )
-        use_external_js8spotter_chk = QCheckBox("External JS8Spotter")
-        use_external_js8spotter_chk.setToolTip(
-            "Track or launch the separate JS8Spotter app. Built-in CommsPlan Spotter does not require this."
-        )
-        use_commstat_chk = QCheckBox("CommStat")
-        use_varac_chk = QCheckBox("VarAC")
-        for family_key, checkbox in (
-            ("js8call", use_js8call_chk),
-            ("fio_spotter", use_js8spotter_chk),
-            ("commstat", use_commstat_chk),
-            ("varac", use_varac_chk),
-        ):
-            checkbox.setObjectName(f"guidedSoftwareUse_{family_key}")
-            checkbox.setAccessibleName(f"Use {checkbox.text()} for this radio")
-        software_row.addWidget(use_flrig_chk, 0, 0)
-        software_row.addWidget(use_fldigi_chk, 0, 1)
-        software_row.addWidget(use_flmsg_chk, 0, 2)
-        software_row.addWidget(use_flamp_chk, 0, 3)
-        software_row.addWidget(use_js8call_chk, 1, 0)
-        software_row.addWidget(use_js8spotter_chk, 1, 1)
-        software_row.addWidget(use_external_js8spotter_chk, 1, 2)
-        software_row.addWidget(use_commstat_chk, 1, 3)
-        software_row.addWidget(use_varac_chk, 2, 0)
-        software_wrap = QWidget()
-        software_wrap.setLayout(software_row)
-        _add_form_row(
-            software_form,
-            "Software Used:",
-            software_wrap,
-            "Choose the software bundle that belongs to this radio. A transceiver can participate in more than one operating lane, such as FLRig plus JS8Call plus VarAC.",
-        )
-
-        software_hint_label = QLabel()
-        software_hint_label.setWordWrap(True)
-        _add_full_width_row(software_form, software_hint_label)
-
-        # This compact strip reports automatic preparation.  Its button is a
-        # recovery action only; normal setup never assigns preparation to the
-        # operator as a separate task.
-        configure_auto_wrap = QFrame()
-        configure_auto_wrap.setObjectName("guidedConfigureAutomaticallyCard")
-        configure_auto_wrap.setFrameShape(QFrame.StyledPanel)
-        configure_auto_wrap.setStyleSheet(
-            "QFrame#guidedConfigureAutomaticallyCard {"
-            f" background-color: {theme.get('selection_bg', theme.get('surface_alt', '#E8F3FA'))};"
-            f" border: 1px solid {theme.get('accent', '#0076A8')};"
-            " border-radius: 6px;"
-            "}"
-        )
-        configure_auto_row = QHBoxLayout(configure_auto_wrap)
-        configure_auto_row.setContentsMargins(10, 8, 10, 8)
-        configure_auto_row.setSpacing(8)
-        configure_auto_btn = QPushButton("Prepare selected software automatically")
-        configure_auto_btn.setObjectName("guidedConfigureAutomaticallyButton")
-        configure_auto_btn.setStyleSheet(button_style("primary", theme))
-        configure_auto_btn.setToolTip(
-            "Retry automatic preparation after a recoverable discovery failure."
-        )
-        configure_auto_btn.setVisible(False)
-        configure_auto_status = QLabel(
-            "Choose software above, then let CommsPlan prepare a complete plan."
-        )
-        configure_auto_status.setObjectName("guidedConfigureAutomaticallyStatus")
-        configure_auto_status.setAccessibleName("Automatic software preparation status")
-        configure_auto_status.setWordWrap(True)
-        configure_auto_status.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        configure_auto_row.addWidget(configure_auto_btn)
-        configure_auto_row.addWidget(configure_auto_status, 1)
-        _add_full_width_row(software_form, configure_auto_wrap)
-
-        # Add Radio starts by collecting intent, then prepares a complete
-        # proposal in the background.  Do not make an operator enter native
-        # application details before CommsPlan has had an opportunity to discover
-        # and derive them.  The durable ownership/completion/launch controls
-        # remain below as draft projections, but are deliberately withheld
-        # until a prepared plan is available for review.
-        software_responsibility_group = QGroupBox("Selected software")
-        software_responsibility_group.setObjectName("guidedSoftwareResponsibilities")
-        software_responsibility_layout = QVBoxLayout(software_responsibility_group)
-        software_responsibility_layout.setContentsMargins(8, 8, 8, 8)
-        software_responsibility_layout.setSpacing(8)
-        software_responsibility_intro = QLabel(
-            "CommsPlan prepares each selected software family automatically. Ready families stay compact; "
-            "only a choice or safety issue that needs your attention expands here."
-        )
-        software_responsibility_intro.setWordWrap(True)
-        software_responsibility_layout.addWidget(software_responsibility_intro)
-        software_responsibility_cards: Dict[str, QGroupBox] = {}
-        software_source_combos: Dict[str, QComboBox] = {}
-        software_management_combos: Dict[str, QComboBox] = {}
-        software_completion_combos: Dict[str, QComboBox] = {}
-        software_launch_policy_combos: Dict[str, QComboBox] = {}
-        software_detail_buttons: Dict[str, QPushButton] = {}
-        software_responsibility_labels: Dict[str, QLabel] = {}
-        software_prepared_state_labels: Dict[str, QLabel] = {}
-        software_card_technical_widgets: Dict[str, List[QWidget]] = {}
-        # The checkbox grid is the only software-family selector.  Everything
-        # below it is a projection of that choice, never a second selection
-        # surface.  Keep the preparation state on the dialog so changing a
-        # choice while discovery is running can safely coalesce into one
-        # replacement request.
-        software_card_choice_widgets: Dict[str, List[QWidget]] = {}
-        software_card_decision_widgets: Dict[str, List[QWidget]] = {}
-        software_preparation_in_progress = False
-        software_preparation_pending = False
-        software_preparation_failed = False
-        varac_native_preparation_in_progress = False
-        software_preparation_request_context: Tuple[str, ...] = ()
-        software_preparation_focus_key: Tuple[object, ...] = ()
-        software_preparation_timer = QTimer(dlg)
-        software_preparation_timer.setSingleShot(True)
-        software_preparation_timer.setInterval(200)
-        varac_arrangement_label: Optional[QLabel] = None
-        varac_arrangement_combo: Optional[QComboBox] = None
-        varac_arrangement_hint: Optional[QLabel] = None
-        varac_arrangement_presentation: Mapping[str, Any] = {}
-        software_plan_prepared = False
-        prepared_software_families: Tuple[str, ...] = ()
-        prepared_software_context: Tuple[str, ...] = ()
-        software_family_titles = {
-            "receiver": "Receiver application",
-            "js8call": "JS8Call family",
-            "fast_light": "Fast Light",
-            "fio_spotter": "CommsPlan Spotter",
-            "external_spotter": "External JS8Spotter",
-            "commstat": "CommStat",
-            "varac": "VarAC",
-        }
-        responsibility_copy = {
-            "receiver": "Owns receive display and, after separate verification, receiver tuning.",
-            "js8call": "Owns decode/import identity, API endpoint, profile, and message paths.",
-            "fast_light": "Owns FLDigi/FLRig relationships and FLMsg/FLAmp file workflows.",
-            "fio_spotter": "Built into CommsPlan; maps watches, compose, decode, and Inbox activity to this radio without a separate install or forms-folder choice.",
-            "external_spotter": "Optional external Spotter application; separate from built-in CommsPlan Spotter.",
-            "commstat": "Binds the one station-shared CommStat process to this radio's selected or new JS8Call endpoint.",
-            "varac": "Owns a radio-scoped VarAC node. Choose standalone, create a cluster, or join a cluster before CommsPlan prepares its plan.",
-        }
-
-        for family_key, family_title in software_family_titles.items():
-            card = QGroupBox(family_title)
-            card.setObjectName(f"guidedSoftwareResponsibility_{family_key}")
-            card_layout = QGridLayout(card)
-            card_layout.setContentsMargins(8, 8, 8, 8)
-            card_layout.setHorizontalSpacing(8)
-            card_layout.setVerticalSpacing(6)
-            responsibility = QLabel(responsibility_copy[family_key])
-            responsibility.setWordWrap(True)
-            responsibility.setAccessibleName(f"{family_title} responsibility")
-            card_layout.addWidget(responsibility, 0, 0, 1, 4)
-            software_responsibility_labels[family_key] = responsibility
-
-            source_combo = QComboBox()
-            source_combo.setObjectName(f"guidedSoftwareSource_{family_key}")
-            source_combo.setAccessibleName(f"{family_title} instance source")
-            if family_key == "fio_spotter":
-                source_combo.addItem("Included with CommsPlan", "built_in")
-            elif family_key == "commstat":
-                source_combo.addItem("Use the station-shared CommStat service", "station_shared")
-            else:
-                source_combo.addItem("Create a new CommsPlan-managed instance", "create")
-                source_combo.addItem("Use an existing instance unchanged", "existing")
-                source_combo.addItem("Set up manually or connect remotely", "manual")
-                if family_key == "fast_light":
-                    source_combo.addItem("Use station-shared Fast Light tools", "shared")
-            if existing and family_key not in {"fio_spotter", "commstat"}:
-                source_combo.setCurrentIndex(max(0, source_combo.findData("existing")))
-            _configure_combo_width(source_combo, minimum=210)
-            if family_key in {"fio_spotter", "commstat"}:
-                source_combo.setEnabled(False)
-
-            management_combo = QComboBox()
-            management_combo.setObjectName(f"guidedSoftwareManagement_{family_key}")
-            management_combo.setAccessibleName(f"{family_title} setup responsibility")
-            if family_key == "fio_spotter":
-                management_combo.addItem("Managed inside CommsPlan", "fio_builtin")
-            elif family_key == "commstat":
-                management_combo.addItem("CommsPlan manages the endpoint binding", "shared_binding")
-            else:
-                management_combo.addItem("CommsPlan manages identity and launch", "fio_identity_launch")
-                management_combo.addItem("Operator completes native app setup", "operator_native")
-            _configure_combo_width(management_combo, minimum=230)
-            if family_key in {"fio_spotter", "commstat"}:
-                management_combo.setEnabled(False)
-
-            completion_combo = QComboBox()
-            completion_combo.setObjectName(f"guidedSoftwareCompletion_{family_key}")
-            completion_combo.setAccessibleName(f"{family_title} completion policy")
-            completion_combo.addItem("Required for this radio", "required")
-            completion_combo.addItem("Optional capability — complete later", "optional")
-            _configure_combo_width(completion_combo, minimum=200)
-
-            launch_combo = QComboBox()
-            launch_combo.setObjectName(f"guidedSoftwareLaunch_{family_key}")
-            launch_combo.setAccessibleName(f"{family_title} launch policy")
-            if family_key == "fio_spotter":
-                launch_combo.addItem("Available inside CommsPlan", "built_in")
-            elif family_key == "commstat":
-                launch_combo.addItem("Station-shared process; no radio launch", "station_shared")
-            else:
-                launch_combo.addItem("Launch with CommsPlan", "fio")
-                launch_combo.addItem("Operator starts this application", "operator")
-            _configure_combo_width(launch_combo, minimum=220)
-            if family_key in {"fio_spotter", "commstat"}:
-                launch_combo.setEnabled(False)
-
-            detail_btn = QPushButton("Show Details / correct…")
-            detail_btn.setObjectName(f"guidedSoftwareDetails_{family_key}")
-            detail_btn.setAccessibleName(f"Review or correct {family_title} details for this radio draft")
-            detail_btn.setToolTip(
-                "Review only the prepared details that need attention, then return to this unsaved radio draft."
-            )
-            detail_btn.setStyleSheet(button_style("secondary", theme))
-            if family_key == "fio_spotter":
-                detail_btn.setText("Show Details / mapping…")
-                detail_btn.setToolTip(
-                    "Review the JS8 transport used by built-in CommsPlan Spotter. No external install or MCF folder is required."
-                )
-            elif family_key == "commstat":
-                detail_btn.setText("Show Details / JS8 binding…")
-                detail_btn.setToolTip(
-                    "Review the JS8Call TCP endpoint that the station-shared CommStat process uses for this radio."
-                )
-
-            source_label = QLabel("Instance source")
-            card_layout.addWidget(source_label, 1, 0)
-            card_layout.addWidget(source_combo, 1, 1)
-            completion_label = QLabel("Completion policy")
-            card_layout.addWidget(completion_label, 1, 2)
-            card_layout.addWidget(completion_combo, 1, 3)
-            management_label = QLabel("Configuration responsibility")
-            card_layout.addWidget(management_label, 2, 0)
-            card_layout.addWidget(management_combo, 2, 1)
-            launch_label = QLabel("Launch policy")
-            card_layout.addWidget(launch_label, 2, 2)
-            card_layout.addWidget(launch_combo, 2, 3)
-            card_layout.addWidget(detail_btn, 3, 3)
-            prepared_state = QLabel("Needs attention — choose a source, then prepare this software.")
-            prepared_state.setObjectName(f"guidedSoftwarePreparedState_{family_key}")
-            prepared_state.setWordWrap(True)
-            prepared_state.setAccessibleName(f"{family_title} preparation status")
-            card_layout.addWidget(prepared_state, 3, 0, 1, 3)
-            # Details is the only ready-state control.  Completion,
-            # management, and launch are CommsPlan-derived policy and stay in the
-            # correction editor rather than expanding every ready card.
-            technical_widgets: List[QWidget] = [detail_btn]
-            choice_widgets: List[QWidget] = [
-                responsibility,
-                source_label,
-                source_combo,
-                completion_label,
-                completion_combo,
-                management_label,
-                management_combo,
-                launch_label,
-                launch_combo,
-            ]
-            if family_key == "varac":
-                varac_arrangement_label = QLabel("VarAC arrangement")
-                varac_arrangement_combo = QComboBox()
-                varac_arrangement_combo.setObjectName("guidedVaracArrangement")
-                varac_arrangement_combo.setAccessibleName("VarAC arrangement")
-                _configure_combo_width(varac_arrangement_combo, minimum=260)
-                varac_arrangement_hint = QLabel(
-                    "Choose the arrangement before CommsPlan prepares VarAC. Existing configuration is never changed until final review."
-                )
-                varac_arrangement_hint.setObjectName("guidedVaracArrangementHint")
-                varac_arrangement_hint.setWordWrap(True)
-                card_layout.addWidget(varac_arrangement_label, 2, 0)
-                card_layout.addWidget(varac_arrangement_combo, 2, 1, 1, 3)
-                card_layout.addWidget(varac_arrangement_hint, 3, 0, 1, 4)
-                card_layout.addWidget(prepared_state, 4, 0, 1, 3)
-                card_layout.addWidget(detail_btn, 4, 3)
-                card_layout.addWidget(management_label, 5, 0)
-                card_layout.addWidget(management_combo, 5, 1)
-                card_layout.addWidget(launch_label, 5, 2)
-                card_layout.addWidget(launch_combo, 5, 3)
-                choice_widgets.extend(
-                    [varac_arrangement_label, varac_arrangement_combo, varac_arrangement_hint]
-                )
-            card_layout.setColumnStretch(1, 1)
-            card_layout.setColumnStretch(3, 1)
-            card.setVisible(False)
-            software_responsibility_layout.addWidget(card)
-            software_responsibility_cards[family_key] = card
-            software_source_combos[family_key] = source_combo
-            software_management_combos[family_key] = management_combo
-            software_completion_combos[family_key] = completion_combo
-            software_launch_policy_combos[family_key] = launch_combo
-            software_detail_buttons[family_key] = detail_btn
-            software_prepared_state_labels[family_key] = prepared_state
-            software_card_technical_widgets[family_key] = technical_widgets
-            software_card_choice_widgets[family_key] = choice_widgets
-            decisions: List[QWidget] = [responsibility, source_label, source_combo]
-            if family_key == "varac":
-                decisions.extend([varac_arrangement_label, varac_arrangement_combo, varac_arrangement_hint])
-            software_card_decision_widgets[family_key] = decisions
-
-        _add_full_width_row(software_form, software_responsibility_group)
-
-        def _refresh_varac_arrangement_presentation(*, preserve_selection: bool = True) -> None:
-            """Render only the immutable core recommendation before preparation.
-
-            The core adapter owns classification, topology inference, labels,
-            and next-member allocation.  This dialog merely presents that
-            result; it never treats an incomplete row as cluster evidence or
-            selects a mutating route on the operator's behalf.
-            """
-
-            nonlocal varac_arrangement_presentation
-            if varac_arrangement_combo is None:
-                return
-            previous_path = str(varac_arrangement_combo.currentData() or "").strip()
-            previous_metadata = varac_arrangement_combo.itemData(
-                varac_arrangement_combo.currentIndex(), Qt.UserRole + 1
-            )
-            if not isinstance(previous_metadata, Mapping):
-                previous_metadata = {}
-            try:
-                presentation = recommend_varac_arrangement_from_snapshots(
-                    guided_instance_inventory_snapshot.rows_for("varac"),
-                    guided_varac_cluster_rows,
-                    guided_varac_membership_rows,
-                    guided_profiles,
-                    new_radio_label=name_edit.text().strip() or "new radio",
-                )
-            except Exception:
-                log.exception("Failed building guided VarAC arrangement presentation.")
-                presentation = {
-                    "default_path": "standalone",
-                    "recommended_path": "",
-                    "join_choices": (),
-                    "standalone_candidates": (),
-                    "existing_setup_summary": "Existing setup could not be classified. Standalone remains available.",
-                    "create_choice_label": "Create a new VarAC cluster",
-                    "needs_attention": True,
-                    "topology_available": False,
-                    "why": "Review the current VarAC setup before choosing a cluster arrangement.",
-                }
-            varac_arrangement_presentation = dict(presentation)
-            with QSignalBlocker(varac_arrangement_combo):
-                varac_arrangement_combo.clear()
-
-                def _add_choice(label: str, path: str, metadata: Mapping[str, Any] | None = None) -> None:
-                    varac_arrangement_combo.addItem(label, path)
-                    varac_arrangement_combo.setItemData(
-                        varac_arrangement_combo.count() - 1,
-                        dict(metadata or {}),
-                        Qt.UserRole + 1,
-                    )
-
-                default_path = str(presentation.get("default_path") or "").strip()
-                recommended_path = str(presentation.get("recommended_path") or "").strip()
-                standalone_candidates = tuple(presentation.get("standalone_candidates") or ())
-                topology_available = bool(
-                    presentation.get(
-                        "topology_available", guided_varac_topology_snapshot_available
-                    )
-                )
-                if not default_path:
-                    _add_choice("Choose VarAC arrangement…", "")
-                standalone_label = (
-                    "Create another standalone VarAC node"
-                    if recommended_path == "create_cluster" and standalone_candidates
-                    else "Standalone VarAC node"
-                )
-                _add_choice(standalone_label, "standalone")
-                if topology_available and len(standalone_candidates) > 1:
-                    for candidate in standalone_candidates:
-                        if not isinstance(candidate, Mapping):
-                            continue
-                        label = str(candidate.get("label") or "existing standalone VarAC node").strip()
-                        _add_choice(
-                            f"Create a cluster with {label} and {presentation.get('new_radio_label') or 'new radio'}",
-                            "create_cluster",
-                            {
-                                "existing_node_id": candidate.get("node_id"),
-                                "existing_device_profile_id": candidate.get("device_profile_id"),
-                                "proposed_cluster_name": candidate.get("proposed_cluster_name"),
-                                "proposed_cluster_id": candidate.get("proposed_cluster_id"),
-                            },
-                        )
-                elif topology_available:
-                    _add_choice(
-                        str(presentation.get("create_choice_label") or "Create a new VarAC cluster"),
-                        "create_cluster",
-                        {
-                            "existing_node_id": presentation.get("recommended_existing_node_id"),
-                            "existing_device_profile_id": presentation.get(
-                                "recommended_existing_device_profile_id"
-                            ),
-                            "recommended": recommended_path == "create_cluster",
-                            "proposed_cluster_name": presentation.get(
-                                "proposed_create_cluster_name"
-                            ),
-                            "proposed_cluster_id": presentation.get(
-                                "proposed_create_cluster_id"
-                            ),
-                        },
-                    )
-                if topology_available:
-                    for choice in tuple(presentation.get("join_choices") or ()):
-                        if not isinstance(choice, Mapping):
-                            continue
-                        label = str(choice.get("label") or choice.get("cluster_id") or "VarAC cluster").strip()
-                        next_number = choice.get("next_instance_number")
-                        suffix = f" (next member {next_number})" if next_number else ""
-                        if choice.get("resume_recommended"):
-                            choice_label = (
-                                f"Resume {label}: add {presentation.get('new_radio_label') or 'new radio'} "
-                                f"as member {next_number} — Recommended"
-                            )
-                        else:
-                            choice_label = f"Join {label}{suffix}"
-                        _add_choice(
-                            choice_label,
-                            "join_cluster",
-                            {
-                                "cluster_id": choice.get("cluster_id"),
-                                "cluster_db_id": choice.get("cluster_db_id"),
-                                "cluster_instance_number": next_number,
-                            },
-                        )
-
-                restore_index = -1
-                if preserve_selection and previous_path:
-                    for index in range(varac_arrangement_combo.count()):
-                        if str(varac_arrangement_combo.itemData(index) or "") != previous_path:
-                            continue
-                        metadata = varac_arrangement_combo.itemData(index, Qt.UserRole + 1)
-                        same_join = (
-                            previous_path != "join_cluster"
-                            or (
-                                isinstance(metadata, Mapping)
-                                and metadata.get("cluster_id")
-                                == previous_metadata.get("cluster_id")
-                            )
-                        )
-                        same_create = (
-                            previous_path != "create_cluster"
-                            or (
-                                isinstance(metadata, Mapping)
-                                and metadata.get("existing_node_id")
-                                == previous_metadata.get("existing_node_id")
-                            )
-                        )
-                        if same_join and same_create:
-                            restore_index = index
-                            break
-                if restore_index >= 0:
-                    varac_arrangement_combo.setCurrentIndex(restore_index)
-                elif default_path:
-                    default_index = varac_arrangement_combo.findData(default_path)
-                    varac_arrangement_combo.setCurrentIndex(default_index if default_index >= 0 else 0)
-                else:
-                    varac_arrangement_combo.setCurrentIndex(0)
-            if varac_arrangement_hint is not None:
-                summary = str(presentation.get("existing_setup_summary") or "").strip()
-                why = str(presentation.get("why") or "").strip()
-                varac_arrangement_hint.setText(
-                    " ".join(part for part in (summary, why) if part)
-                    or "Choose the arrangement before CommsPlan prepares VarAC. Existing configuration is never changed until final review."
-                )
-
-        _refresh_varac_arrangement_presentation(preserve_selection=False)
-
-        def _selected_varac_arrangement() -> Dict[str, Any]:
-            """Return the operator's selection plus opaque core metadata."""
-
-            if varac_arrangement_combo is None:
-                return {"cluster_path": "standalone"}
-            metadata = varac_arrangement_combo.itemData(
-                varac_arrangement_combo.currentIndex(), Qt.UserRole + 1
-            )
-            selection = dict(metadata) if isinstance(metadata, Mapping) else {}
-            selection["cluster_path"] = str(varac_arrangement_combo.currentData() or "").strip()
-            return selection
-
-        radio_apps_base_edit = QLineEdit(str(self.settings.get("radio_apps_base_folder", "") or ""))
-        radio_apps_base_edit.setObjectName("guidedRadioAppsBaseFolder")
-        radio_apps_base_edit.setPlaceholderText("Optional folder where radio apps are installed")
-        radio_apps_base_browse_btn = QPushButton("Browse")
-        radio_apps_base_browse_btn.setToolTip(
-            "Choose a common folder such as RadioTools/Programs that contains external radio apps."
-        )
-        radio_apps_base_row = QHBoxLayout()
-        radio_apps_base_row.setContentsMargins(0, 0, 0, 0)
-        radio_apps_base_row.setSpacing(8)
-        radio_apps_base_row.addWidget(radio_apps_base_edit, 1)
-        radio_apps_base_row.addWidget(radio_apps_base_browse_btn)
-        radio_apps_base_wrap = QWidget()
-        radio_apps_base_wrap.setLayout(radio_apps_base_row)
-        _add_form_row(
-            software_form,
-            "Radio Apps Base Folder:",
-            radio_apps_base_wrap,
-            "Optional. Point CommsPlan at the common folder where radio-owned tools such as external JS8Spotter or VarAC are installed. Station-shared CommStat is configured separately.",
-        )
-
-        app_setup_plan_group = QGroupBox("Setup Status")
-        app_setup_plan_group.setObjectName("guidedAutoAppSetupPlan")
-        app_setup_plan_group.setVisible(False)
-        app_setup_plan_layout = QVBoxLayout(app_setup_plan_group)
-        app_setup_plan_layout.setContentsMargins(8, 6, 8, 6)
-        app_setup_plan_layout.setSpacing(4)
-        guided_next_action_label = QLabel()
-        guided_next_action_label.setObjectName("guidedSetupNextAction")
-        guided_next_action_label.setWordWrap(True)
-        guided_next_action_font = guided_next_action_label.font()
-        guided_next_action_font.setBold(True)
-        guided_next_action_label.setFont(guided_next_action_font)
-        guided_next_action_label.setVisible(False)
-        guided_step_widgets: Dict[str, Tuple[QFrame, QLabel, QLabel, QLabel]] = {}
-        guided_step_stack = QWidget()
-        guided_step_stack_layout = QGridLayout(guided_step_stack)
-        guided_step_stack_layout.setContentsMargins(0, 0, 0, 0)
-        guided_step_stack_layout.setHorizontalSpacing(5)
-        guided_step_stack_layout.setVerticalSpacing(5)
-        for step_id in ("radio", "software", "connection", "guard", "schedule", "review"):
-            step_frame = QFrame()
-            step_frame.setObjectName(f"guidedSetupStep_{step_id}")
-            step_frame.setFrameShape(QFrame.StyledPanel)
-            step_frame_layout = QGridLayout(step_frame)
-            step_frame_layout.setContentsMargins(6, 3, 6, 3)
-            step_frame_layout.setHorizontalSpacing(4)
-            step_frame_layout.setVerticalSpacing(0)
-            step_frame_h = control_height_for_font(step_frame, vertical_padding=12, floor=32)
-            step_frame.setMinimumHeight(step_frame_h)
-            step_frame.setMaximumHeight(step_frame_h)
-            step_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            status_label = QLabel()
-            status_label.setObjectName(f"guidedSetupStepStatus_{step_id}")
-            status_label.setAlignment(Qt.AlignCenter)
-            status_label.setMinimumWidth(44)
-            title_label = QLabel()
-            title_label.setObjectName(f"guidedSetupStepTitle_{step_id}")
-            title_font = title_label.font()
-            title_font.setBold(True)
-            title_label.setFont(title_font)
-            title_label.setWordWrap(False)
-            title_label.setAlignment(Qt.AlignVCenter)
-            detail_label = QLabel()
-            detail_label.setObjectName(f"guidedSetupStepDetail_{step_id}")
-            detail_label.setWordWrap(True)
-            step_frame_layout.addWidget(title_label, 0, 0)
-            step_frame_layout.addWidget(status_label, 0, 1)
-            step_frame_layout.addWidget(detail_label, 1, 0, 1, 2)
-            detail_label.setVisible(False)
-            step_frame_layout.setColumnStretch(0, 1)
-            step_index = len(guided_step_widgets)
-            guided_step_stack_layout.addWidget(step_frame, step_index // 3, step_index % 3)
-            guided_step_widgets[step_id] = (step_frame, status_label, title_label, detail_label)
-        for col in range(3):
-            guided_step_stack_layout.setColumnStretch(col, 1)
-        app_setup_plan_layout.addWidget(guided_step_stack)
-        app_setup_plan_label = QLabel()
-        app_setup_plan_label.setWordWrap(True)
-        app_setup_plan_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        app_setup_plan_layout.addWidget(app_setup_plan_label)
-        guided_wizard_layout.addWidget(app_setup_plan_group)
-
-        app_choice_group = QGroupBox("Review Detected Apps")
-        app_choice_group.setObjectName("guidedDetectedAppsReview")
-        app_choice_group.setVisible(False)
-        app_choice_layout = QFormLayout(app_choice_group)
-        _configure_guided_form(app_choice_layout)
-        app_choice_combos: Dict[str, QComboBox] = {}
-        app_choice_rows: Dict[str, QWidget] = {}
-        app_choice_browse_buttons: Dict[str, QPushButton] = {}
-        app_choice_specs_primary = [
-            ("flrig", "Which FLRig controls this radio?"),
-            ("fldigi", "Which FLDigi belongs to this radio?"),
-            ("flmsg", "Which FLMsg belongs to this radio?"),
-            ("flamp", "Which FLAmp belongs to this radio?"),
-            ("js8call", "Which JS8Call belongs to this radio?"),
-        ]
-        app_choice_specs_secondary = [
-            ("js8spotter", "Which external JS8Spotter app belongs to this radio?"),
-            ("varac", "Which VarAC belongs to this radio?"),
-        ]
-
-        def _add_app_choice_row(app_id: str, prompt_text: str) -> None:
-            combo = QComboBox()
-            combo.setObjectName(f"guidedAutoAppChoice_{app_id}")
-            combo.setVisible(False)
-            combo.setToolTip("CommsPlan found more than one installed app. Choose the one this radio should use.")
-            _configure_combo_width(combo, minimum=420)
-            app_choice_combos[app_id] = combo
-            browse_btn = QPushButton("Browse")
-            browse_btn.setObjectName(f"guidedAutoAppBrowse_{app_id}")
-            browse_btn.setMinimumWidth(86)
-            browse_btn.setMaximumWidth(110)
-            browse_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-            browse_btn.setToolTip("Choose a different app or folder if CommsPlan did not find it.")
-            app_choice_browse_buttons[app_id] = browse_btn
-            choice_row = QHBoxLayout()
-            choice_row.setContentsMargins(0, 0, 0, 0)
-            choice_row.setSpacing(8)
-            choice_row.addWidget(combo, 1)
-            choice_row.addWidget(browse_btn)
-            choice_wrap = QWidget()
-            choice_wrap.setObjectName(f"guidedAutoAppChoiceRow_{app_id}")
-            choice_wrap.setLayout(choice_row)
-            choice_wrap.setVisible(False)
-            app_choice_rows[app_id] = choice_wrap
-            label_widget = _make_help_label(prompt_text, "Choose the installed app path that belongs to this radio.")
-            label_widget.setVisible(False)
-            row_labels[choice_wrap] = label_widget
-            app_choice_layout.addRow(label_widget, choice_wrap)
-
-        for app_id, prompt_text in app_choice_specs_primary:
-            _add_app_choice_row(app_id, prompt_text)
-        js8_profile_choice_combo = QComboBox()
-        js8_profile_choice_combo.setObjectName("guidedAutoJs8ProfileChoice")
-        js8_profile_choice_combo.setVisible(False)
-        js8_profile_choice_combo.setToolTip("CommsPlan found more than one JS8Call profile. Choose the profile this radio uses.")
-        _configure_combo_width(js8_profile_choice_combo, minimum=260)
-        js8_profile_choice_label = _make_help_label(
-            "Which JS8Call profile belongs to this radio?",
-            "Choose the JS8Call profile/port pair that belongs to this radio. CommsPlan will fill the TCP port, profile folder, and DIRECTED.TXT path.",
-        )
-        js8_profile_choice_label.setVisible(False)
-        row_labels[js8_profile_choice_combo] = js8_profile_choice_label
-        app_choice_layout.addRow(js8_profile_choice_label, js8_profile_choice_combo)
-        for app_id, prompt_text in app_choice_specs_secondary:
-            _add_app_choice_row(app_id, prompt_text)
-        _add_full_width_row(software_form, app_choice_group)
-
-        role_hint_label = QLabel()
-        role_hint_label.setWordWrap(True)
-        setup_guidance_heading = _make_help_label(
-            "Setup Guidance:",
-            "This section explains what the current role and control method mean for this radio.",
-        )
-        _add_full_width_row(software_form, setup_guidance_heading)
-        _add_full_width_row(software_form, role_hint_label)
-
-        rig_host_edit = QLineEdit(str((profile_seed or {}).get("rig_host", "") or ""))
-        rig_port_edit = QLineEdit(str((profile_seed or {}).get("rig_port", "") or ""))
-        rig_port_edit.setValidator(QIntValidator(1, 65535, rig_port_edit))
-        _configure_port_edit(rig_port_edit)
-        rig_row = QHBoxLayout()
-        rig_row.setContentsMargins(0, 0, 0, 0)
-        rig_row.setSpacing(8)
-        rig_row.addWidget(rig_host_edit, 1)
-        rig_row.addWidget(QLabel("Port"))
-        rig_row.addWidget(rig_port_edit)
-        rig_wrap = QWidget()
-        rig_wrap.setLayout(rig_row)
-        _add_form_row(connection_form, "RigCtlD TCP:", rig_wrap, "Host and port for the rigctld TCP service for this radio.")
-
-        flrig_host_edit = QLineEdit(str((profile_seed or {}).get("flrig_host", "") or ""))
-        flrig_port_edit = QLineEdit(str((profile_seed or {}).get("flrig_port", "") or ""))
-        flrig_port_edit.setValidator(QIntValidator(1, 65535, flrig_port_edit))
-        _configure_port_edit(flrig_port_edit)
-        flrig_row = QHBoxLayout()
-        flrig_row.setContentsMargins(0, 0, 0, 0)
-        flrig_row.setSpacing(8)
-        flrig_row.addWidget(flrig_host_edit, 1)
-        flrig_row.addWidget(QLabel("Port"))
-        flrig_row.addWidget(flrig_port_edit)
-        flrig_wrap = QWidget()
-        flrig_wrap.setLayout(flrig_row)
-        _add_form_row(connection_form, "FLRig XML RPC:", flrig_wrap, "Host and port for FLRig XML RPC control of this radio.")
-
-        flrig_path_edit = QLineEdit(str((profile_seed or {}).get("flrig_path", "") or ""))
-        flrig_path_wrap = _make_browse_row(flrig_path_edit, title="Select FLRig app", mode="folder")
-        _add_form_row(connection_form, "FLRig App:", flrig_path_wrap, "Optional FLRig executable or app path associated with this radio.")
-
-        fldigi_host_edit = QLineEdit(str((profile_seed or {}).get("fldigi_host", "") or ""))
-        fldigi_port_edit = QLineEdit(str((profile_seed or {}).get("fldigi_port", "") or ""))
-        fldigi_port_edit.setValidator(QIntValidator(1, 65535, fldigi_port_edit))
-        _configure_port_edit(fldigi_port_edit)
-        fldigi_row = QHBoxLayout()
-        fldigi_row.setContentsMargins(0, 0, 0, 0)
-        fldigi_row.setSpacing(8)
-        fldigi_row.addWidget(fldigi_host_edit, 1)
-        fldigi_row.addWidget(QLabel("Port"))
-        fldigi_row.addWidget(fldigi_port_edit)
-        fldigi_wrap = QWidget()
-        fldigi_wrap.setLayout(fldigi_row)
-        _add_form_row(connection_form, "FLDigi XML RPC:", fldigi_wrap, "Host and port for FLDigi XML RPC when this radio uses Fast Light workflows.")
-
-        fldigi_arq_port_edit = QLineEdit(
-            str(
-                (profile_seed or {}).get("arq_port")
-                or (profile_seed or {}).get("fldigi_arq_port")
-                or ""
-            )
-        )
-        fldigi_arq_port_edit.setValidator(QIntValidator(1, 65535, fldigi_arq_port_edit))
-        _configure_port_edit(fldigi_arq_port_edit)
-        _add_form_row(
-            connection_form,
-            "FLDigi ARQ Port:",
-            fldigi_arq_port_edit,
-            "Radio-scoped ARQ endpoint shared by this FLDigi instance and its FLAmp instance.",
-        )
-
-        fldigi_path_edit = QLineEdit(str((profile_seed or {}).get("fldigi_path", "") or ""))
-        fldigi_path_wrap = _make_browse_row(fldigi_path_edit, title="Select FLDigi app", mode="folder")
-        _add_form_row(connection_form, "FLDigi App:", fldigi_path_wrap, "Optional FLDigi executable or app path associated with this radio.")
-
-        flmsg_path_edit = QLineEdit(str((profile_seed or {}).get("flmsg_path", "") or ""))
-        flmsg_path_wrap = _make_browse_row(flmsg_path_edit, title="Select FLMsg app", mode="folder")
-        _add_form_row(connection_form, "FLMsg App:", flmsg_path_wrap, "Optional FLMsg executable or app path associated with this radio.")
-
-        flamp_path_edit = QLineEdit(str((profile_seed or {}).get("flamp_path", "") or ""))
-        flamp_path_wrap = _make_browse_row(flamp_path_edit, title="Select FLAmp app", mode="folder")
-        _add_form_row(connection_form, "FLAmp App:", flamp_path_wrap, "Optional FLAmp executable or app path associated with this radio.")
-
-        js8_host_edit = QLineEdit(str((profile_seed or {}).get("js8_host", "") or ""))
-        js8_port_edit = QLineEdit(str((profile_seed or {}).get("js8_port", "") or ""))
-        js8_host_edit.setObjectName("guidedJs8Host")
-        js8_port_edit.setObjectName("guidedJs8Port")
-        js8_port_edit.setValidator(QIntValidator(1, 65535, js8_port_edit))
-        _configure_port_edit(js8_port_edit)
-        js8_row = QHBoxLayout()
-        js8_row.setContentsMargins(0, 0, 0, 0)
-        js8_row.setSpacing(8)
-        js8_row.addWidget(js8_host_edit, 1)
-        js8_row.addWidget(QLabel("Port"))
-        js8_row.addWidget(js8_port_edit)
-        js8_wrap = QWidget()
-        js8_wrap.setLayout(js8_row)
-        _add_form_row(connection_form, "JS8Call TCP:", js8_wrap, "Host and port for the JS8Call TCP API for this radio.")
-
-        js8_install_edit = QLineEdit(str((profile_seed or {}).get("js8_install_path", "") or ""))
-        js8_install_edit.setObjectName("guidedJs8Application")
-        js8_install_wrap = _make_browse_row(
-            js8_install_edit,
-            title="Select JS8Call application or executable",
-            mode="app",
-        )
-        _add_form_row(connection_form, "JS8Call App:", js8_install_wrap, "Optional JS8Call executable or app path associated with this radio.")
-
-        js8_launch_enabled_chk = QCheckBox("Launch this JS8Call instance with CommsPlan")
-        js8_launch_enabled_chk.setObjectName("guidedObserverJs8LaunchEnabled")
-        js8_launch_enabled_chk.setChecked(False)
-        js8_launch_enabled_chk.setToolTip(
-            "Start only this radio-owned, receive-only JS8Call instance with CommsPlan. "
-            "This does not grant Compose, Expect, QSY, PTT, or scheduler authority."
-        )
-        _add_full_width_row(connection_form, js8_launch_enabled_chk)
-
-        js8_profile_edit = QLineEdit(str((profile_seed or {}).get("js8_profile_path", "") or ""))
-        js8_profile_edit.setObjectName("guidedJs8Profile")
-        js8_profile_wrap = _make_browse_row(js8_profile_edit, title="Select JS8Call profile folder", mode="folder")
-        _add_form_row(connection_form, "JS8 Profile:", js8_profile_wrap, "Optional JS8Call profile folder for this radio.")
-
-        js8_directed_edit = QLineEdit(str((profile_seed or {}).get("js8_directed_path", "") or ""))
-        js8_directed_edit.setObjectName("guidedJs8Directed")
-        js8_directed_wrap = _make_browse_row(
-            js8_directed_edit,
-            title="Select DIRECTED.TXT",
-            file_filter="Text Files (*.txt);;All Files (*)",
-        )
-        _add_form_row(connection_form, "DIRECTED.TXT:", js8_directed_wrap, "Optional DIRECTED.TXT path associated with this radio's JS8 setup.")
-
-        js8_forms_edit = QLineEdit(str((profile_seed or {}).get("js8_forms_path", "") or ""))
-        # Retain the legacy value in the draft/payload for compatibility, but
-        # do not expose it in Guided Add Radio.  CommsPlan Spotter is built in and
-        # resolves its bundled form catalog internally.
-        js8_forms_edit.setObjectName("guidedLegacySpotterFormsPath")
-        js8_forms_edit.setVisible(False)
-
-        operating_model_group, operating_model_form = _make_section(
-            "CommsPlan Behavior",
-            "Choose what CommsPlan may do with this radio. Timing and Frequency Plan choices remain in the Schedule step.",
-        )
-        operating_model_combo = QComboBox()
-        operating_model_combo.setObjectName("guidedOperatingModel")
-        operating_model_combo.setAccessibleName("CommsPlan Behavior for this radio")
-        operating_model_inventory = [
-            dict(row)
-            for row in (getattr(self, "operating_profiles", ()) or ())
-            if isinstance(row, Mapping)
-        ]
-        enabled_operating_models = [
-            row for row in operating_model_inventory if int(row.get("enabled", 1) or 0) == 1
-        ]
-        initial_observer_role = (
-            str(device_class_combo.currentData() or "").strip().lower() == "observer"
-        )
-        role_model_missing = not any(
-            (int(row.get("receive_only", 0) or 0) == 1) == initial_observer_role
-            for row in enabled_operating_models
-        )
-        if (
-            not enabled_operating_models
-            or role_model_missing
-        ):
-            try:
-                ensure_models = getattr(self.multi_radio_store, "ensure_builtin_operating_profiles", None)
-                if callable(ensure_models):
-                    ensure_models()
-                operating_model_inventory = [
-                    dict(row)
-                    for row in self.multi_radio_store.list_operating_profiles()
-                    if isinstance(row, Mapping)
-                ]
-            except Exception:
-                log.exception("Failed loading Operating Models for Guided Add Radio.")
-                operating_model_inventory = []
-        existing_operating_profile_id = int(
-            profile_seed.get("guided_operating_profile_id", 0) or 0
-        )
-        existing_radio_id = int((profile_seed or {}).get("id", 0) or 0)
-        if existing_radio_id > 0:
-            existing_assignment = next(
-                (
-                    row
-                    for row in (getattr(self, "device_assignments", ()) or ())
-                    if isinstance(row, Mapping)
-                    and int(row.get("device_profile_id", 0) or 0) == existing_radio_id
-                ),
-                None,
-            )
-            if isinstance(existing_assignment, Mapping):
-                existing_operating_profile_id = int(existing_assignment.get("operating_profile_id", 0) or 0)
-            if existing_operating_profile_id <= 0:
-                try:
-                    existing_assignment = self.multi_radio_store.get_effective_assignment_for_device(
-                        existing_radio_id
-                    )
-                except Exception:
-                    log.exception("Failed loading the radio's existing Operating Model assignment.")
-                    existing_assignment = None
-                if isinstance(existing_assignment, Mapping):
-                    existing_operating_profile_id = int(
-                        existing_assignment.get("operating_profile_id", 0) or 0
-                    )
-        operating_model_combo.setToolTip(
-            "Choose the CommsPlan features and safety boundary for this radio. Schedule timing is configured later."
-        )
-        _add_form_row(
-            operating_model_form,
-            "Behavior:",
-            operating_model_combo,
-            "CommsPlan saves the selected feature and safety behavior with this radio without choosing its schedule.",
-        )
-        operating_model_capabilities = QLabel()
-        operating_model_capabilities.setObjectName("guidedOperatingModelCapabilities")
-        operating_model_capabilities.setAccessibleName("Resolved CommsPlan Behavior")
-        operating_model_capabilities.setWordWrap(True)
-        _add_full_width_row(operating_model_form, operating_model_capabilities)
-        operating_model_why_label = QLabel()
-        operating_model_why_label.setObjectName("guidedOperatingModelWhy")
-        operating_model_why_label.setAccessibleName("Why this CommsPlan Behavior matters")
-        operating_model_why_label.setWordWrap(True)
-        _add_full_width_row(operating_model_form, operating_model_why_label)
-
-        def _guided_operating_model_rows() -> List[Dict[str, Any]]:
-            device_stub = {
-                "device_class": str(device_class_combo.currentData() or "tx_rx").strip().lower() or "tx_rx"
-            }
-            return self._assignment_profiles_for_devices(operating_model_inventory, [device_stub])
-
-        def _selected_guided_operating_model() -> Optional[Dict[str, Any]]:
-            try:
-                selected_id = int(operating_model_combo.currentData() or 0)
-            except (TypeError, ValueError):
-                selected_id = 0
-            selected_system_key = str(
-                operating_model_combo.currentData(Qt.UserRole + 1) or ""
-            ).strip()
-            return next(
-                (
-                    dict(row)
-                    for row in operating_model_inventory
-                    if (
-                        selected_id > 0
-                        and int(row.get("id", 0) or 0) == selected_id
-                    )
-                    or (
-                        selected_id <= 0
-                        and selected_system_key
-                        and str(row.get("system_key", "") or "").strip() == selected_system_key
-                    )
-                ),
-                None,
-            )
-
-        def _selected_guided_operating_model_id() -> int:
-            selected = _selected_guided_operating_model()
-            return int(selected.get("id", 0) or 0) if selected else 0
-
-        def _guided_fio_behavior_label(row: Mapping[str, Any]) -> str:
-            system_key = str(row.get("system_key", "") or "").strip().lower()
-            if system_key == "receive_only_sdr":
-                return "Receive-only monitoring"
-            if system_key == "default_operating":
-                return "Standard transceiver operations"
-            custom_name = str(row.get("name", "") or "").strip()
-            if custom_name:
-                return custom_name
-            if int(row.get("receive_only", 0) or 0) == 1:
-                return "Receive-only monitoring"
-            enabled_features = [
-                label
-                for field, label in (
-                    ("use_messages", "messages"),
-                    ("use_map", "map"),
-                    ("use_background_ingest", "background ingest"),
-                    ("use_launch_control", "app launch"),
-                    ("use_net_control_tabs", "net control"),
-                )
-                if int(row.get(field, 0) or 0) == 1
-            ]
-            return (
-                "Custom CommsPlan operations — " + ", ".join(enabled_features)
-                if enabled_features
-                else "Custom limited CommsPlan operations"
-            )
-
-        def _guided_fio_behavior_features(row: Mapping[str, Any]) -> str:
-            features = [
-                label
-                for field, label in (
-                    ("use_messages", "Messages"),
-                    ("use_map", "Map"),
-                    ("use_background_ingest", "Background ingest"),
-                    ("use_launch_control", "App launch"),
-                    ("use_net_control_tabs", "Net control"),
-                )
-                if int(row.get(field, 0) or 0) == 1
-            ]
-            return ", ".join(features) if features else "No optional CommsPlan workspaces"
-
-        def _update_guided_radio_role_summary() -> None:
-            observer_mode = str(device_class_combo.currentData() or "").strip().lower() == "observer"
-            if observer_mode:
-                radio_role_resolved_label.setText("Resolved role: Receive-only SDR")
-                radio_role_why_label.setText(
-                    "Why: CommsPlan keeps transmit, PTT, Compose sending, Expect replies, and transceiver QSY unavailable for this radio."
-                )
-            elif str(device_class_combo.currentData() or "").strip().lower() == "tx_rx":
-                radio_role_resolved_label.setText("Resolved role: Transceiver")
-                radio_role_why_label.setText(
-                    "Why: This radio can receive and transmit, subject to its CommsPlan Behavior, verified control, and RF Guard."
-                )
-            else:
-                radio_role_resolved_label.setText("Resolved role: Existing advanced role")
-                radio_role_why_label.setText(
-                    "Why: This compatibility-only role is preserved for the existing radio. New radios use Transceiver or Receive-only SDR."
-                )
-
-        def _refresh_guided_operating_model_summary() -> None:
-            selected = _selected_guided_operating_model()
-            observer_mode = str(device_class_combo.currentData() or "").strip().lower() == "observer"
-            if selected is None:
-                operating_model_capabilities.setText(
-                    "Resolved behavior: unavailable. Restore or create a compatible behavior in Configuration > Main."
-                )
-                operating_model_why_label.setText(
-                    "Why: CommsPlan needs an explicit feature and safety boundary before this radio can be saved."
-                )
-                return
-            behavior_label = _guided_fio_behavior_label(selected)
-            feature_text = _guided_fio_behavior_features(selected)
-            if observer_mode:
-                operating_model_capabilities.setText(
-                    f"Resolved behavior: {behavior_label} · {feature_text} · receive/import only"
-                )
-                operating_model_why_label.setText(
-                    "Why: This defines CommsPlan's receive-side features and safety boundary. Receive timing and retuning belong in Schedule."
-                )
-            else:
-                operating_model_capabilities.setText(
-                    f"Resolved behavior: {behavior_label} · {feature_text}"
-                )
-                operating_model_why_label.setText(
-                    "Why: This controls which CommsPlan features are available. When the radio operates belongs in Schedule."
-                )
-
-        def _refresh_guided_operating_model_choices(
-            *,
-            preserve_current: bool = True,
-            preserve_existing: bool = True,
-        ) -> None:
-            current_id = _selected_guided_operating_model_id() if preserve_current else 0
-            observer_mode = str(device_class_combo.currentData() or "").strip().lower() == "observer"
-            candidates = _guided_operating_model_rows()
-            preferred_system_key = "receive_only_sdr" if observer_mode else "default_operating"
-            preferred_id = current_id or (existing_operating_profile_id if preserve_existing else 0)
-            if not any(int(row.get("id", 0) or 0) == preferred_id for row in candidates):
-                preferred_id = int(
-                    next(
-                        (
-                            row.get("id", 0)
-                            for row in candidates
-                            if str(row.get("system_key", "") or "").strip().lower() == preferred_system_key
-                        ),
-                        0,
-                    )
-                    or 0
-                )
-            operating_model_combo.blockSignals(True)
-            operating_model_combo.clear()
-            for row in candidates:
-                label = _guided_fio_behavior_label(row)
-                operating_model_combo.addItem(label, int(row.get("id", 0) or 0))
-                operating_model_combo.setItemData(
-                    operating_model_combo.count() - 1,
-                    str(row.get("system_key", "") or "").strip(),
-                    Qt.UserRole + 1,
-                )
-            selected_index = operating_model_combo.findData(preferred_id)
-            if selected_index < 0 and operating_model_combo.count() > 0:
-                selected_index = 0
-            if selected_index >= 0:
-                operating_model_combo.setCurrentIndex(selected_index)
-            operating_model_combo.blockSignals(False)
-            operating_model_combo.setEnabled(operating_model_combo.count() > 0)
-            operating_model_combo.setAccessibleName("CommsPlan Behavior for this radio")
-            _refresh_guided_operating_model_summary()
-
-        _refresh_guided_operating_model_choices(preserve_current=False)
-        _update_guided_radio_role_summary()
-
-        js8spotter_launch_edit = QLineEdit(str((profile_seed or {}).get("spotter_launch_path", "") or ""))
-        js8spotter_launch_wrap = _make_browse_row(js8spotter_launch_edit, title="Select external JS8Spotter app", mode="folder")
-        _add_form_row(connection_form, "External JS8Spotter App:", js8spotter_launch_wrap, "Optional. Built-in CommsPlan Spotter does not require the separate JS8Spotter application.")
-
-        commstat_launch_edit = QLineEdit(str((profile_seed or {}).get("commstat_launch_path", "") or ""))
-        # CommStat is one station-shared process.  Keep the legacy launch path
-        # in the draft for compatibility, but configure only the radio's JS8
-        # endpoint binding in this guided flow.
-        commstat_launch_edit.setObjectName("guidedLegacyCommStatLaunchPath")
-        commstat_launch_edit.setVisible(False)
-        commstat_binding_label = QLabel()
-        commstat_binding_label.setObjectName("guidedCommStatJs8Binding")
-        commstat_binding_label.setAccessibleName("CommStat station JS8 endpoint binding")
-        commstat_binding_label.setWordWrap(True)
-        commstat_binding_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        _add_form_row(
-            connection_form,
-            "CommStat Binding:",
-            commstat_binding_label,
-            "CommStat runs once for the station. This radio adds a binding to its selected or newly created JS8Call TCP endpoint; it does not create another CommStat install or launch identity.",
-        )
-
-        varac_install_edit = QLineEdit(str((profile_seed or {}).get("varac_install_path", "") or ""))
-        varac_install_edit.setObjectName("guidedVaracExecutable")
-        varac_install_wrap = _make_browse_row(varac_install_edit, title="Select VarAC install folder", mode="folder")
-        _add_form_row(connection_form, "VarAC Install:", varac_install_wrap, "VarAC install folder used for this radio.")
-
-        varac_db_edit = QLineEdit(str((profile_seed or {}).get("varac_db_path", "") or ""))
-        varac_db_edit.setObjectName("guidedVaracDatabase")
-        varac_db_wrap = _make_browse_row(varac_db_edit, title="Select VarAC database", file_filter="Database Files (*.db);;All Files (*)")
-        _add_form_row(connection_form, "VarAC DB:", varac_db_wrap, "VarAC database path for this radio.")
-
-        varac_ini_edit = QLineEdit(str((profile_seed or {}).get("varac_ini_path", "") or ""))
-        varac_ini_edit.setObjectName("guidedVaracIni")
-        varac_ini_wrap = _make_browse_row(varac_ini_edit, title="Select VarAC INI", file_filter="INI Files (*.ini);;All Files (*)")
-        _add_form_row(connection_form, "VarAC INI:", varac_ini_wrap, "VarAC INI/config path for this radio.")
-
-        varac_incoming_edit = QLineEdit(str((profile_seed or {}).get("varac_incoming_path", "") or ""))
-        varac_incoming_edit.setObjectName("guidedVaracIncoming")
-        varac_incoming_wrap = _make_browse_row(varac_incoming_edit, title="Select VarAC incoming folder", mode="folder")
-        _add_form_row(connection_form, "VarAC Incoming:", varac_incoming_wrap, "Optional VarAC incoming-files path associated with this radio.")
-
-        varac_outbox_edit = QLineEdit(str((profile_seed or {}).get("varac_outbox_dir", "") or ""))
-        varac_outbox_edit.setObjectName("guidedVaracOutbox")
-        varac_outbox_wrap = _make_browse_row(varac_outbox_edit, title="Select VarAC outbox folder", mode="folder")
-        _add_form_row(connection_form, "VarAC Outbox:", varac_outbox_wrap, "Optional VarAC outbox path associated with this radio.")
-
-        varac_bbs_edit = QLineEdit(str((profile_seed or {}).get("varac_bbs_dir", "") or ""))
-        varac_bbs_edit.setObjectName("guidedVaracBbs")
-        varac_bbs_wrap = _make_browse_row(varac_bbs_edit, title="Select VarAC BBS folder", mode="folder")
-        _add_form_row(connection_form, "VarAC BBS:", varac_bbs_wrap, "Optional VarAC BBS folder associated with this radio.")
-
-        varac_bbs_archive_edit = QLineEdit(str((profile_seed or {}).get("varac_bbs_archive_dir", "") or ""))
-        varac_bbs_archive_edit.setObjectName("guidedVaracBbsArchive")
-        varac_bbs_archive_wrap = _make_browse_row(varac_bbs_archive_edit, title="Select VarAC BBS archive folder", mode="folder")
-        _add_form_row(
-            connection_form,
-            "VarAC BBS Archive:",
-            varac_bbs_archive_wrap,
-            "Optional VarAC BBS archive destination associated with this radio.",
-        )
-
-        varac_launch_cmd_edit = QLineEdit(str((profile_seed or {}).get("launch_cmd", "") or ""))
-        varac_launch_cmd_edit.setObjectName("guidedVaracLaunchDisplay")
-        varac_launch_cmd_wrap = _make_browse_row(varac_launch_cmd_edit, title="Select VarAC launch command", mode="folder")
-        _add_form_row(connection_form, "VarAC Launch:", varac_launch_cmd_wrap, "Optional VarAC launch override for this radio.")
-
-        # An observer endpoint is not a transceiver endpoint.  Keep its setup
-        # self-contained and expressly manual until a later receiver adapter
-        # has completed an explicit capability/readback verification.
-        sdr_wrap = QGroupBox("Receiver setup")
-        sdr_wrap.setObjectName("guidedManualReceiverSetup")
-        sdr_form = QFormLayout(sdr_wrap)
-        _configure_guided_form(sdr_form)
-
-        sdr_application_combo = QComboBox()
-        sdr_application_combo.setObjectName("guidedReceiverApplication")
-        sdr_application_combo.setEditable(True)
-        sdr_application_combo.addItem("Other / manual", "Other / manual")
-        receiver_compatibility_entries = tuple(get_sdr_compatibility_registry().manual_entries())
-        receiver_entries_by_application = {
-            str(entry.application or "").strip(): entry
-            for entry in receiver_compatibility_entries
-            if str(entry.application or "").strip()
-            and str(entry.application or "").strip() != "Operator-controlled receiver"
-        }
-        for application_name in sorted(receiver_entries_by_application, key=str.casefold):
-            sdr_application_combo.addItem(application_name, application_name)
-        existing_sdr_application = str((profile_seed or {}).get("sdr_application", "") or "").strip()
-        if existing_sdr_application:
-            application_index = sdr_application_combo.findData(existing_sdr_application)
-            if application_index < 0:
-                sdr_application_combo.addItem(existing_sdr_application, existing_sdr_application)
-                application_index = sdr_application_combo.count() - 1
-            sdr_application_combo.setCurrentIndex(application_index)
-        existing_receiver_launch_application = str(existing_receiver_launch_item.get("name", "") or "").strip()
-        if not existing_receiver_launch_application and bool((profile_seed or {}).get("launch_enabled", 0)):
-            existing_receiver_launch_application = existing_sdr_application
-        receiver_application_index = receiver_application_combo.findData(existing_receiver_launch_application)
-        if receiver_application_index >= 0:
-            receiver_application_combo.setCurrentIndex(receiver_application_index)
-        _configure_combo_width(sdr_application_combo, minimum=260)
-        sdr_form.addRow(
-            _make_help_label("Receiver application:", "The application that owns this receiver hardware. Choosing it does not claim that CommsPlan can tune it."),
-            sdr_application_combo,
-        )
-
-        # Application support and CommsPlan's adapter are intentionally separate.
-        # Selecting the adapter records intent only; an explicit worker-owned
-        # reversible tune/readback test is still required before enablement.
-        sdr_adapter_combo = QComboBox()
-        sdr_adapter_combo.setObjectName("guidedReceiverAdapter")
-        sdr_adapter_combo.addItem("Manual tuning (no CommsPlan control API)", "manual")
-        sdr_adapter_combo.addItem("SDR++ RigCTL (selected VFO)", "sdrpp_rigctl")
-        existing_sdr_adapter = str((profile_seed or {}).get("sdr_adapter", "manual") or "manual").strip().lower()
-        existing_sdr_adapter = existing_sdr_adapter.replace("-", "_") or "manual"
-        receiver_verification_state = str(
-            (profile_seed or {}).get("sdr_verification_state", "manual") or "manual"
-        ).strip().lower()
-        try:
-            parsed_receiver_evidence = json.loads(
-                str((profile_seed or {}).get("sdr_verification_json", "{}") or "{}")
-            )
-        except (TypeError, ValueError, json.JSONDecodeError):
-            parsed_receiver_evidence = {}
-        receiver_verification_evidence: Dict[str, Any] = (
-            dict(parsed_receiver_evidence) if isinstance(parsed_receiver_evidence, dict) else {}
-        )
-        receiver_test_in_progress = False
-        receiver_test_request_id = ""
-        adapter_index = sdr_adapter_combo.findData(existing_sdr_adapter)
-        if adapter_index < 0:
-            # The store will reject unknown adapters on save.  Showing the
-            # persisted value here keeps the configuration truthful and lets
-            # the operator deliberately choose a supported manual fallback.
-            sdr_adapter_combo.addItem(f"{existing_sdr_adapter} (not available)", existing_sdr_adapter)
-            adapter_index = sdr_adapter_combo.count() - 1
-        sdr_adapter_combo.setCurrentIndex(adapter_index)
-        _configure_combo_width(sdr_adapter_combo, minimum=320)
-        sdr_form.addRow(
-            _make_help_label(
-                "CommsPlan control adapter:",
-                "This is CommsPlan's application bridge, not the SDR hardware driver. SDR++ RigCTL controls the VFO currently selected inside SDR++.",
-            ),
-            sdr_adapter_combo,
-        )
-
-        sdr_target_edit = QLineEdit(str((profile_seed or {}).get("sdr_target", "") or ""))
-        sdr_target_edit.setObjectName("guidedReceiverTarget")
-        sdr_target_edit.setPlaceholderText("selected-vfo")
-        sdr_target_edit.setToolTip("Stable label for the VFO selected inside SDR++; use letters, numbers, hyphens, or underscores without spaces.")
-        sdr_form.addRow(
-            _make_help_label("Receiver target:", "Name the VFO selected inside SDR++, for example selected-vfo. SDR++ RigCTL does not expose a named VFO list."),
-            sdr_target_edit,
-        )
-
-        sdr_host_edit = QLineEdit(str((profile_seed or {}).get("sdr_host", "") or ""))
-        sdr_host_edit.setPlaceholderText("Optional application host")
-        sdr_port_edit = QLineEdit(str((profile_seed or {}).get("sdr_port", "") or ""))
-        sdr_port_edit.setValidator(QIntValidator(1, 65535, sdr_port_edit))
-        sdr_port_edit.setPlaceholderText("Port")
-        _configure_port_edit(sdr_port_edit)
-        sdr_endpoint_row = QHBoxLayout()
-        sdr_endpoint_row.setContentsMargins(0, 0, 0, 0)
-        sdr_endpoint_row.setSpacing(8)
-        sdr_endpoint_row.addWidget(sdr_host_edit, 1)
-        sdr_endpoint_row.addWidget(QLabel("Port"))
-        sdr_endpoint_row.addWidget(sdr_port_edit)
-        sdr_endpoint_wrap = QWidget()
-        sdr_endpoint_wrap.setLayout(sdr_endpoint_row)
-        sdr_form.addRow(
-            _make_help_label("Application endpoint:", "Optional saved application address. A host or port by itself is not proof that CommsPlan can control the receiver."),
-            sdr_endpoint_wrap,
-        )
-
-        sdr_verification_summary = QLabel()
-        sdr_verification_summary.setObjectName("guidedReceiverVerificationSummary")
-        sdr_verification_summary.setWordWrap(True)
-        sdr_verification_summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        sdr_verification_summary.setToolTip(
-            "This is saved verification evidence only. Opening this dialog does not contact the receiver application."
-        )
-        sdr_form.addRow(sdr_verification_summary)
-
-        sdr_control_enabled_chk = QCheckBox("Enable CommsPlan tuning after verified evidence")
-        sdr_control_enabled_chk.setObjectName("guidedReceiverControlEnabled")
-        sdr_control_enabled_chk.setToolTip(
-            "CommsPlan tuning can be enabled only after the selected application adapter has completed a successful capability and tune/readback verification."
-        )
-        sdr_control_enabled_chk.setChecked(bool(int((profile_seed or {}).get("sdr_control_enabled", 0) or 0)))
-        sdr_form.addRow(sdr_control_enabled_chk)
-
-        sdr_test_control_btn = QPushButton("Test control")
-        sdr_test_control_btn.setObjectName("guidedReceiverTestControl")
-        sdr_test_control_btn.setToolTip(
-            "Test control is unavailable until a receive-only asynchronous adapter service is installed. Manual tuning remains available."
-        )
-        sdr_form.addRow(sdr_test_control_btn)
-
-        sdr_manual_status = QLabel()
-        sdr_manual_status.setObjectName("guidedReceiverManualStatus")
-        sdr_manual_status.setWordWrap(True)
-        sdr_manual_status.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        sdr_manual_status.setToolTip("Receiver configuration is saved without scanning hardware or contacting the configured application.")
-        sdr_form.addRow(sdr_manual_status)
-
-        sdr_manual_guidance = QLabel()
-        sdr_manual_guidance.setObjectName("guidedReceiverManualGuidance")
-        sdr_manual_guidance.setWordWrap(True)
-        sdr_manual_guidance.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        sdr_form.addRow(sdr_manual_guidance)
-        _add_form_row(
-            connection_form,
-            "Observer / SDR:",
-            sdr_wrap,
-            "Choose the receiver application and save any optional connection details. CommsPlan keeps this receiver manually tuned until a verified adapter is available.",
-        )
-
-        port_prompt_group = QGroupBox("Enter App Ports")
-        port_prompt_group.setVisible(False)
-        port_prompt_layout = QFormLayout(port_prompt_group)
-        _configure_guided_form(port_prompt_layout)
-        port_prompt_specs = {
-            "flrig_port": ("What port does this radio's FLRig use?", flrig_port_edit),
-            "fldigi_port": ("What port does this radio's FLDigi use?", fldigi_port_edit),
-            "arq_port": ("What ARQ port does this radio's FLDigi and FLAmp use?", fldigi_arq_port_edit),
-            "js8_port": ("What port does this radio's JS8Call use?", js8_port_edit),
-        }
-        port_prompt_fields: Dict[str, QLineEdit] = {}
-        for field_key, (prompt_text, target_edit) in port_prompt_specs.items():
-            prompt_edit = QLineEdit()
-            prompt_edit.setObjectName(f"guidedAutoPortPrompt_{field_key}")
-            prompt_edit.setValidator(QIntValidator(1, 65535, prompt_edit))
-            prompt_edit.setPlaceholderText("Port number")
-            prompt_edit.setVisible(False)
-            prompt_edit.setToolTip("This is the number the app uses to talk to CommsPlan.")
-            _configure_port_edit(prompt_edit)
-            port_prompt_fields[field_key] = prompt_edit
-            label_widget = _make_help_label(prompt_text, "Enter the port number configured in that app for this radio.")
-            label_widget.setVisible(False)
-            row_labels[prompt_edit] = label_widget
-            port_prompt_layout.addRow(label_widget, prompt_edit)
-            prompt_edit.textChanged.connect(
-                lambda text, target=target_edit: target.setText(str(text or "").strip())
-                if target.text().strip() != str(text or "").strip()
-                else None
-            )
-            target_edit.textChanged.connect(
-                lambda text, prompt=prompt_edit: prompt.setText(str(text or "").strip())
-                if prompt.text().strip() != str(text or "").strip()
-                else None
-            )
-        _add_full_width_row(software_form, port_prompt_group)
-
-        optional_toggle = QToolButton(dlg)
-        optional_toggle.setText("RF Guard Details")
-        optional_toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        optional_toggle.setArrowType(Qt.RightArrow)
-        optional_toggle.setCheckable(True)
-        optional_toggle.setChecked(False)
-        body_layout.addWidget(optional_toggle)
-
-        optional_body = QWidget()
-        optional_layout = QVBoxLayout(optional_body)
-        optional_layout.setContentsMargins(10, 0, 10, 0)
-        optional_layout.setSpacing(6)
-        optional_form = QFormLayout()
-        _configure_guided_form(optional_form)
-        optional_layout.addLayout(optional_form)
-        body_layout.addWidget(optional_body)
-
-        rf_guard_intro = QLabel(
-            "Start with the bands this antenna path can safely use. CommsPlan checks those bands against the "
-            "assigned Frequency Plan before the radio is activated."
-        )
-        rf_guard_intro.setWordWrap(True)
-        _add_full_width_row(optional_form, rf_guard_intro)
-
-        receiver_guard_state_card = QFrame()
-        receiver_guard_state_card.setObjectName("guidedReceiverGuardState")
-        receiver_guard_state_card.setFrameShape(QFrame.StyledPanel)
-        receiver_guard_state_layout = QVBoxLayout(receiver_guard_state_card)
-        receiver_guard_state_layout.setContentsMargins(10, 8, 10, 8)
-        receiver_guard_state_layout.setSpacing(4)
-        receiver_guard_state_title = QLabel("Receiver state")
-        receiver_guard_state_title.setObjectName("guidedReceiverGuardStateTitle")
-        receiver_guard_state_title.setAccessibleName("Receiver Guard receiver state")
-        receiver_guard_state_title_font = receiver_guard_state_title.font()
-        receiver_guard_state_title_font.setBold(True)
-        receiver_guard_state_title.setFont(receiver_guard_state_title_font)
-        receiver_guard_state_detail = QLabel()
-        receiver_guard_state_detail.setObjectName("guidedReceiverGuardStateDetail")
-        receiver_guard_state_detail.setAccessibleName("Receiver Guard receiver state detail")
-        receiver_guard_state_detail.setWordWrap(True)
-        receiver_guard_state_layout.addWidget(receiver_guard_state_title)
-        receiver_guard_state_layout.addWidget(receiver_guard_state_detail)
-        receiver_guard_state_card.setVisible(False)
-        _add_full_width_row(optional_form, receiver_guard_state_card)
-
-        band_grid_widget = QWidget()
-        band_grid = QGridLayout(band_grid_widget)
-        band_grid.setContentsMargins(0, 0, 0, 0)
-        band_grid.setHorizontalSpacing(10)
-        band_grid.setVerticalSpacing(4)
-        band_checks: Dict[str, QCheckBox] = {}
-        existing_bands = set(self._band_list_from_profile_value((profile_seed or {}).get("antenna_supported_bands_json", "[]")))
-        for index, band in enumerate(COMMON_AMATEUR_BANDS):
-            checkbox = QCheckBox(band)
-            checkbox.setChecked(band in existing_bands)
-            band_checks[band] = checkbox
-            band_grid.addWidget(checkbox, index // 6, index % 6)
-        _add_form_row(
-            optional_form,
-            "Supported Bands:",
-            band_grid_widget,
-            "Choose the bands this radio and antenna can safely use. CommsPlan checks this before assigning or applying a schedule.",
-        )
-
-        antenna_band_mode_combo = QComboBox()
-        for label, value in self._rf_guard_mode_options():
-            antenna_band_mode_combo.addItem(label, value)
-        self._set_combo_current_data(
-            antenna_band_mode_combo,
-            normalize_rf_guard_mode((profile_seed or {}).get("antenna_band_guard_mode", "warn")),
-        )
-        _add_form_row(
-            optional_form,
-            "Unsupported Band:",
-            antenna_band_mode_combo,
-            "Choose whether CommsPlan should warn or block if a plan tries to use a band that is not checked above.",
-        )
-
-        rf_guard_plan_check_card = QFrame()
-        rf_guard_plan_check_card.setObjectName("guidedRfGuardPlanCheck")
-        rf_guard_plan_check_layout = QVBoxLayout(rf_guard_plan_check_card)
-        rf_guard_plan_check_layout.setContentsMargins(10, 8, 10, 8)
-        rf_guard_plan_check_layout.setSpacing(4)
-        rf_guard_plan_check_title = QLabel("Plan Check")
-        rf_guard_plan_check_title_font = rf_guard_plan_check_title.font()
-        rf_guard_plan_check_title_font.setBold(True)
-        rf_guard_plan_check_title.setFont(rf_guard_plan_check_title_font)
-        rf_guard_plan_check_detail = QLabel()
-        rf_guard_plan_check_detail.setWordWrap(True)
-        rf_guard_plan_check_layout.addWidget(rf_guard_plan_check_title)
-        rf_guard_plan_check_layout.addWidget(rf_guard_plan_check_detail)
-        _add_full_width_row(optional_form, rf_guard_plan_check_card)
-
-        shared_guard_heading = QLabel("Shared Hardware")
-        shared_guard_heading.setObjectName("guidedSharedHardwareHeading")
-        shared_guard_heading_font = shared_guard_heading.font()
-        shared_guard_heading_font.setBold(True)
-        shared_guard_heading.setFont(shared_guard_heading_font)
-        _add_full_width_row(optional_form, shared_guard_heading)
-
-        antenna_group_edit = QLineEdit(str((profile_seed or {}).get("antenna_group", "") or ""))
-        antenna_group_edit.setPlaceholderText("Optional shared antenna path, e.g. ANT-1")
-        _add_form_row(
-            optional_form,
-            "Shared Antenna:",
-            antenna_group_edit,
-            "Use the same name on radios that share one antenna, switch position, tuner, or feed line. CommsPlan treats those radios as competing for that path.",
-        )
-
-        ptt_group_edit = QLineEdit(str((profile_seed or {}).get("ptt_group", "") or ""))
-        ptt_group_edit.setPlaceholderText("Optional shared transmit/PTT path, e.g. AMP-A")
-        _add_form_row(
-            optional_form,
-            "Shared Transmit Path:",
-            ptt_group_edit,
-            "Use the same name on radios that must not transmit at the same time, such as radios sharing an amplifier, tuner, or PTT line.",
-        )
-
-        band_overlap_edit = QLineEdit(str((profile_seed or {}).get("band_overlap_guard_group", "") or ""))
-        band_overlap_edit.setPlaceholderText("Optional shared receive/front-end group, e.g. NORTH-MAST")
-        _add_form_row(
-            optional_form,
-            "Same-Band Guard:",
-            band_overlap_edit,
-            "Use the same name on radios that should not occupy the same band at the same time, even when their exact frequencies differ.",
-        )
-
-        band_overlap_mode_combo = QComboBox()
-        for label, value in self._rf_guard_mode_options():
-            band_overlap_mode_combo.addItem(label, value)
-        self._set_combo_current_data(
-            band_overlap_mode_combo,
-            normalize_rf_guard_mode((profile_seed or {}).get("band_overlap_guard_mode", "warn")),
-        )
-        _add_form_row(
-            optional_form,
-            "Same-Band Action:",
-            band_overlap_mode_combo,
-            "Choose what CommsPlan should do when another radio in this guard group is scheduled on the same band.",
-        )
-
-        advanced_frequency_group_edit = QLineEdit(str((profile_seed or {}).get("advanced_frequency_guard_group", "") or ""))
-        advanced_frequency_group_edit.setPlaceholderText("Optional close-frequency guard group, e.g. SDR-FRONTEND")
-        _add_form_row(
-            optional_form,
-            "Close-Frequency Guard:",
-            advanced_frequency_group_edit,
-            "Use the same name on radios that need close-frequency spacing protection because they share filters, front-end hardware, or antenna systems.",
-        )
-
-        advanced_frequency_mode_combo = QComboBox()
-        for label, value in self._rf_guard_mode_options():
-            advanced_frequency_mode_combo.addItem(label, value)
-        self._set_combo_current_data(
-            advanced_frequency_mode_combo,
-            normalize_rf_guard_mode((profile_seed or {}).get("advanced_frequency_guard_mode", "warn")),
-        )
-        _add_form_row(
-            optional_form,
-            "Advanced Guard Action:",
-            advanced_frequency_mode_combo,
-            "Choose what CommsPlan should do when another radio in this advanced guard group is too close in frequency.",
-        )
-
-        advanced_frequency_window_spin = QSpinBox()
-        advanced_frequency_window_spin.setRange(0, 500000)
-        advanced_frequency_window_spin.setSingleStep(50)
-        advanced_frequency_window_spin.setSuffix(" Hz")
-        advanced_frequency_window_spin.setValue(int((profile_seed or {}).get("advanced_frequency_guard_window_hz", 0) or 0))
-        _add_form_row(
-            optional_form,
-            "Close-Frequency Window:",
-            advanced_frequency_window_spin,
-            "Use 0 to disable this advanced guard. Example: 3000 Hz protects radios within 3 kHz.",
-        )
-
-        frontend_group_edit = QLineEdit(str((profile_seed or {}).get("frontend_group", "") or ""))
-        frontend_group_edit.setPlaceholderText("Optional shared receive chain, e.g. FRONT-A")
-        _add_form_row(
-            optional_form,
-            "Front-End Guard Group:",
-            frontend_group_edit,
-            "Use the same name on receivers that share a sensitive receive chain, preselector, or SDR front end.",
-        )
-
-        amplifier_group_edit = QLineEdit(str((profile_seed or {}).get("amplifier_group", "") or ""))
-        amplifier_group_edit.setPlaceholderText("Optional shared amplifier chain, e.g. AMP-MAIN")
-        _add_form_row(
-            optional_form,
-            "Amplifier Guard Group:",
-            amplifier_group_edit,
-            "Use the same name on radios that share one amplifier or high-power transmit chain.",
-        )
-
-        notes_edit = QPlainTextEdit(str((profile_seed or {}).get("notes", "") or ""))
-        notes_edit.setMaximumHeight(multiline_height_for_font(notes_edit, visible_lines=4))
-        _add_form_row(optional_form, "Notes:", notes_edit, "Optional operator notes about this radio profile.")
-
-        flrig_field_widgets = [flrig_wrap]
-        flrig_recipe_owned_widgets = [flrig_path_wrap]
-        rigctld_field_widgets = [rig_wrap]
-        js8_field_widgets = [js8_wrap]
-        js8_recipe_owned_widgets = [
-            js8_install_wrap,
-            js8_profile_wrap,
-            js8_directed_wrap,
-        ]
-        observer_field_widgets = [sdr_wrap]
-        js8_forms_field_widgets: List[QWidget] = []
-        external_spotter_field_widgets = [js8spotter_launch_wrap]
-        commstat_field_widgets = [commstat_binding_label]
-        fldigi_field_widgets = [fldigi_wrap]
-        fldigi_recipe_owned_widgets = [fldigi_path_wrap]
-        flmsg_field_widgets: List[QWidget] = []
-        flmsg_recipe_owned_widgets = [flmsg_path_wrap]
-        flamp_field_widgets: List[QWidget] = [fldigi_arq_port_edit]
-        flamp_recipe_owned_widgets = [flamp_path_wrap]
-        varac_field_widgets = [
-            varac_install_wrap,
-            varac_db_wrap,
-            varac_ini_wrap,
-            varac_incoming_wrap,
-            varac_outbox_wrap,
-            varac_bbs_wrap,
-            varac_bbs_archive_wrap,
-            varac_launch_cmd_wrap,
-        ]
-        optional_field_widgets = [
-            rf_guard_intro,
-            receiver_guard_state_card,
-            band_grid_widget,
-            antenna_band_mode_combo,
-            rf_guard_plan_check_card,
-            antenna_group_edit,
-            ptt_group_edit,
-            band_overlap_edit,
-            band_overlap_mode_combo,
-            advanced_frequency_group_edit,
-            advanced_frequency_mode_combo,
-            advanced_frequency_window_spin,
-            frontend_group_edit,
-            amplifier_group_edit,
-            notes_edit,
-        ]
-        technical_identity_widgets = [
-            device_class_combo,
-            backend_combo,
-            deploy_combo,
-        ]
-        app_choice_targets: Dict[str, QLineEdit] = {
-            "flrig": flrig_path_edit,
-            "fldigi": fldigi_path_edit,
-            "flmsg": flmsg_path_edit,
-            "flamp": flamp_path_edit,
-            "js8call": js8_install_edit,
-            "js8spotter": js8spotter_launch_edit,
-            "varac": varac_install_edit,
-        }
-
-        def _guided_software_family_selected(family_key: str) -> bool:
-            observer_mode = str(device_class_combo.currentData() or "").strip().lower() == "observer"
-            return {
-                "receiver": observer_mode,
-                "js8call": use_js8call_chk.isChecked(),
-                "fast_light": any(
-                    checkbox.isChecked()
-                    for checkbox in (use_flrig_chk, use_fldigi_chk, use_flmsg_chk, use_flamp_chk)
-                ),
-                "fio_spotter": use_js8spotter_chk.isChecked(),
-                "external_spotter": use_external_js8spotter_chk.isChecked(),
-                "commstat": use_commstat_chk.isChecked(),
-                "varac": use_varac_chk.isChecked(),
-            }.get(str(family_key or "").strip().lower(), False)
-
-        def _guided_software_plan_context() -> Tuple[str, ...]:
-            selected = tuple(
-                family_key
-                for family_key in software_responsibility_cards
-                if _guided_software_family_selected(family_key)
-            )
-            policies = tuple(
-                f"{family_key}:{str(software_source_combos[family_key].currentData() or '').strip().lower()}"
-                f":{str(software_management_combos[family_key].currentData() or '').strip().lower()}"
-                f":{str(software_completion_combos[family_key].currentData() or '').strip().lower()}"
-                f":{str(software_launch_policy_combos[family_key].currentData() or '').strip().lower()}"
-                for family_key in sorted(software_responsibility_cards)
-                if _guided_software_family_selected(family_key)
-            )
-            return selected + policies + (
-                f"name:{name_edit.text().strip()}",
-                f"role:{str(device_class_combo.currentData() or '').strip().lower()}",
-                f"setup:{str(setup_type_combo.currentData() or '').strip().lower()}",
-                f"backend:{str(backend_combo.currentData() or '').strip().lower()}",
-                f"varac_arrangement:{str(_selected_varac_arrangement().get('cluster_path') or '').strip()}",
-            )
-
-        def _update_software_responsibility_cards() -> None:
-            nonlocal software_plan_prepared
-            selected_count = 0
-            observer_mode = str(device_class_combo.currentData() or "").strip().lower() == "observer"
-            current_families = tuple(
-                family_key
-                for family_key in software_responsibility_cards
-                if _guided_software_family_selected(family_key)
-            )
-            if software_plan_prepared and _guided_software_plan_context() != prepared_software_context:
-                software_plan_prepared = False
-                # Legacy wording was "Stale — reprepare required".  The UI
-                # now makes the refresh automatic rather than assigning that
-                # recovery task to the operator.
-                configure_auto_status.setText(
-                    "Updating — software choices changed. CommsPlan will refresh the plan automatically before you continue."
-                )
-            for family_key, card in software_responsibility_cards.items():
-                selected = _guided_software_family_selected(family_key)
-                card.setVisible(selected)
-                selected_count += int(selected)
-                if family_key == "fast_light":
-                    software_responsibility_labels[family_key].setText(
-                        "Receive-only FLDigi and FLMsg/FLAmp file workflows; FLRig, CAT, PTT, and automatic send remain unavailable."
-                        if observer_mode
-                        else responsibility_copy[family_key]
-                    )
-                elif family_key == "commstat" and observer_mode:
-                    software_responsibility_labels[family_key].setText(
-                        "Binds the station-shared CommStat process to this receiver's JS8Call endpoint; this cannot grant send or PTT authority."
-                    )
-                prepared = bool(selected and software_plan_prepared)
-                # A completed card is deliberately a compact status row plus
-                # its non-mutating Details correction surface.  Before a
-                # plan exists, expose only the source (and VarAC topology),
-                # not a wall of policy fields that CommsPlan can derive itself.
-                for widget in software_card_choice_widgets[family_key]:
-                    widget.setVisible(False)
-                for widget in software_card_decision_widgets[family_key]:
-                    widget.setVisible(selected and not prepared and not software_preparation_in_progress)
-                for widget in software_card_technical_widgets[family_key]:
-                    widget.setVisible(prepared)
-                software_detail_buttons[family_key].setEnabled(prepared)
-                state_label = software_prepared_state_labels[family_key]
-                managed_draft = (
-                    dict(getattr(dlg, "_guided_software_instance_drafts", {}).get(family_key) or {})
-                    if isinstance(getattr(dlg, "_guided_software_instance_drafts", {}), Mapping)
-                    else {}
-                )
-                managed_recipe_status = str(
-                    managed_draft.get("launch_recipe_status") or ""
-                ).strip().lower()
-                managed_recipe_ready = (
-                    str(managed_draft.get("mode") or "").strip().lower() == "managed"
-                    and managed_recipe_status == "qualified_managed"
-                )
-                if not selected:
-                    state_label.setText("")
-                elif software_preparation_in_progress or (
-                    family_key == "varac" and varac_native_preparation_in_progress
-                ):
-                    state_label.setText("Preparing — CommsPlan is checking this software and deriving its isolated configuration.")
-                elif prepared:
-                    if family_key == "varac":
-                        native = managed_draft.get("varac_native_presentation")
-                        native = native if isinstance(native, Mapping) else {}
-                        native_state = str(native.get("state") or "").replace("_", " ").strip().lower()
-                        if native_state == "ready" and bool(native.get("writer_qualified")):
-                            software_detail_buttons[family_key].setText("Review Details (optional)…")
-                            if bool(native.get("apply_requires_stopped_process")):
-                                state_label.setText(
-                                    "Ready with warning — CommsPlan prepared the complete VarAC cluster bundle. "
-                                    "Close VarAC and VARA before final Save; Review Details is optional."
-                                )
-                            else:
-                                state_label.setText(
-                                    "Ready — CommsPlan prepared the complete VarAC, VARA, file, port, and structured launch bundle. Review Details is optional."
-                                )
-                        elif native_state == "standalone ready" and not bool(
-                            native.get("writer_required", True)
-                        ):
-                            software_detail_buttons[family_key].setText("Review Details (optional)…")
-                            state_label.setText(
-                                "Ready with warning — standalone VarAC is selected. "
-                                "CommsPlan prepared the distinct identity and retained discovered node-local paths; "
-                                "native standalone files remain operator-owned. You may continue or choose "
-                                "Create/Join cluster here."
-                            )
-                        elif native_state == "preparing":
-                            state_label.setText("Preparing — CommsPlan is deriving the complete VarAC and VARA bundle.")
-                        else:
-                            native_why = str(native.get("why") or "").strip()
-                            state_label.setText(
-                                "Blocked — "
-                                + (native_why or "CommsPlan could not prepare a qualified VarAC bundle safely.")
-                            )
-                    elif family_key in {"js8call", "fast_light"} and managed_recipe_ready:
-                        software_detail_buttons[family_key].setText("Review Details (optional)…")
-                        software_detail_buttons[family_key].setToolTip(
-                            "CommsPlan has prepared this complete managed instance. Review its exact identity, files, "
-                            "connections, and launch recipe if you want to learn or make a correction."
-                        )
-                        state_label.setText(
-                            "Ready — CommsPlan prepared the complete managed instance. Review Details is optional."
-                        )
-                    elif family_key in {"js8call", "fast_light"}:
-                        recipe = managed_draft.get("launch_recipe")
-                        recovery = str(
-                            recipe.get("recovery_action") if isinstance(recipe, Mapping) else ""
-                        ).strip()
-                        if managed_recipe_status == "ready_with_warnings":
-                            software_detail_buttons[family_key].setText("Review Details (optional)…")
-                            state_label.setText(
-                                "Ready with warnings — "
-                                + (recovery or "CommsPlan prepared an isolated launch plan; verify the noted assumption after launch.")
-                            )
-                        elif managed_recipe_status == "launch_pending":
-                            software_detail_buttons[family_key].setText("Review Details (optional)…")
-                            software_detail_buttons[family_key].setToolTip(
-                                "This isolated plan can be saved now. Review launch evidence only if you want to make a correction."
-                            )
-                            state_label.setText(
-                                "Ready to save · launch setup pending — "
-                                + (recovery or "Choose the application executable before enabling launch.")
-                            )
-                        elif managed_recipe_status == "blocked_for_safety":
-                            software_detail_buttons[family_key].setText("Resolve Safety Issue…")
-                            state_label.setText(
-                                "Blocked for safety — "
-                                + (recovery or "Resolve the existing configuration or resource collision before saving.")
-                            )
-                        else:
-                            software_detail_buttons[family_key].setText("Review Details…")
-                            state_label.setText(
-                                "Needs attention — "
-                                + (recovery or "CommsPlan could not prepare a safe isolated plan. Review the details, then CommsPlan will refresh the plan automatically.")
-                            )
-                    else:
-                        state_label.setText(
-                            "Ready — review or correct only the details that need attention."
-                        )
-                elif family_key == "varac":
-                    selected_arrangement = _selected_varac_arrangement()
-                    if bool(varac_arrangement_presentation.get("needs_attention")):
-                        state_label.setText(
-                            "Needs attention — choose which existing standalone VarAC node to use, then prepare this software."
-                        )
-                    elif not str(selected_arrangement.get("cluster_path") or "").strip():
-                        state_label.setText(
-                            "Needs attention — choose the VarAC arrangement, then prepare this software."
-                        )
-                    else:
-                        state_label.setText(
-                            "Needs attention — choose the VarAC arrangement, then prepare this software."
-                        )
-                else:
-                    state_label.setText("Needs attention — choose a source, then prepare this software.")
-                state_text = state_label.text().lower()
-                if not selected:
-                    card_state = "unselected"
-                elif "blocked" in state_text:
-                    card_state = "blocked"
-                elif "launch setup pending" in state_text:
-                    card_state = "launch_pending"
-                elif "warning" in state_text:
-                    card_state = "warning"
-                elif "preparing" in state_text:
-                    card_state = "preparing"
-                elif "ready" in state_text:
-                    card_state = "ready"
-                else:
-                    card_state = "needs_choice"
-                if card_state in {"ready", "warning", "launch_pending"}:
-                    compact_facts = [
-                        software_source_combos[family_key].currentText().strip(),
-                        software_launch_policy_combos[family_key].currentText().strip(),
-                    ]
-                    if family_key == "js8call":
-                        host = str(managed_draft.get("host") or "").strip()
-                        port = str(managed_draft.get("port") or "").strip()
-                        if host and port:
-                            compact_facts.append(f"API {host}:{port}")
-                    elif family_key == "fast_light":
-                        host = str(managed_draft.get("host") or "").strip()
-                        rig_port = str(managed_draft.get("port") or "").strip()
-                        fldigi_port = str(managed_draft.get("secondary_port") or "").strip()
-                        arq_port = str(
-                            managed_draft.get("arq_port")
-                            or managed_draft.get("fldigi_arq_port")
-                            or ""
-                        ).strip()
-                        if host and rig_port:
-                            compact_facts.append(f"FLRig {host}:{rig_port}")
-                        if host and fldigi_port:
-                            compact_facts.append(f"FLDigi {host}:{fldigi_port}")
-                        if host and arq_port and bool(managed_draft.get("use_flamp")):
-                            compact_facts.append(f"FLAmp ARQ {host}:{arq_port}")
-                    compact_facts = [fact for fact in compact_facts if fact]
-                    if compact_facts:
-                        state_label.setText(
-                            state_label.text() + "\n" + " · ".join(compact_facts)
-                        )
-                card.setProperty("guidedPreparationState", card_state)
-                # VarAC topology is operator intent, not a derived technical
-                # field.  Keep it available when a standalone plan is a
-                # non-blocking warning or when native cluster preparation is
-                # blocked, so the operator can switch to Create/Join without
-                # opening a hidden correction editor.
-                varac_arrangement_actionable = bool(
-                    family_key == "varac"
-                    and selected
-                    and not software_preparation_in_progress
-                    and not varac_native_preparation_in_progress
-                    and card_state in {"needs_choice", "blocked", "warning"}
-                )
-                if family_key == "varac":
-                    for widget in (
-                        varac_arrangement_label,
-                        varac_arrangement_combo,
-                        varac_arrangement_hint,
-                    ):
-                        if widget is not None:
-                            widget.setVisible(varac_arrangement_actionable)
-                card.setProperty(
-                    "guidedCardExpanded",
-                    card_state in {"needs_choice", "blocked"}
-                    or varac_arrangement_actionable,
-                )
-            software_responsibility_group.setVisible(selected_count > 0)
-
-        def _known_js8_recipe_evidence(path: str) -> Tuple[str, str]:
-            """Return only an exact supported JS8 version represented by discovery evidence."""
-
-            path_text = str(path or "").strip()
-            path_key = os.path.normcase(os.path.normpath(os.path.expanduser(path_text)))
-            for row in guided_saved_instance_rows.get("js8call", ()):
-                if not isinstance(row, Mapping):
-                    continue
-                known_path = str(
-                    row.get("install_path")
-                    or row.get("application_path")
-                    or row.get("js8_application_path")
-                    or ""
-                ).strip()
-                known_key = os.path.normcase(os.path.normpath(os.path.expanduser(known_path)))
-                if not path_key or path_key != known_key:
-                    continue
-                variant = str(
-                    row.get("variant_family")
-                    or row.get("js8_variant_family")
-                    or row.get("variant")
-                    or ""
-                ).strip()
-                version = str(
-                    row.get("variant_version")
-                    or row.get("js8_variant_version")
-                    or row.get("version")
-                    or ""
-                ).strip()
-                exact = canonical_js8_version(variant, version)
-                if exact:
-                    return variant, exact
-            normalized = path_text.replace("_", ".").replace("-", ".").lower()
-            if "improved" in normalized and "3.0.3" in normalized:
-                return "js8call_improved_3_0_3", "3.0.3"
-            if "subspace" in normalized and "4.1.0.478" in normalized:
-                return "js8call_subspace_4_1", "4.1.0.478"
-            if "2.2.0" in normalized:
-                return "js8call_2_2", "2.2.0"
-            return "", ""
-
-        def _publish_prepared_managed_instance_drafts() -> Tuple[str, ...]:
-            """Retain CommsPlan-owned managed recipes without opening the technical editor."""
-
-            retained_raw = getattr(dlg, "_guided_software_instance_drafts", {})
-            retained = {
-                str(family): dict(value)
-                for family, value in retained_raw.items()
-                if isinstance(retained_raw, Mapping) and isinstance(value, Mapping)
-            } if isinstance(retained_raw, Mapping) else {}
-            radio_label = name_edit.text().strip() or "Unsaved radio"
-            radio_role = str(device_class_combo.currentData() or "tx_rx").strip().lower()
-            needs_attention: List[str] = []
-            auto_prepared_families: List[str] = []
-            for family in ("js8call", "fast_light"):
-                if not _guided_software_family_selected(family):
-                    continue
-                source = str(software_source_combos[family].currentData() or "").strip().lower()
-                management = str(software_management_combos[family].currentData() or "").strip().lower()
-                if source != "create" or management != "fio_identity_launch":
-                    continue
-                prior = dict(retained.get(family) or {})
-                state = _guided_software_editor_state()
-                source_evidence: Dict[str, Any] = dict(prior)
-                if family == "js8call":
-                    if not source_evidence.get("application_path"):
-                        source_evidence["application_path"] = str(state.get("path_js8call") or "")
-                    if not source_evidence.get("variant") or not source_evidence.get("version"):
-                        variant, version = _known_js8_recipe_evidence(
-                            str(source_evidence.get("application_path") or "")
-                        )
-                        if not source_evidence.get("variant"):
-                            source_evidence["variant"] = variant
-                        if not source_evidence.get("version"):
-                            source_evidence["version"] = version
-                else:
-                    if not source_evidence.get("application_path"):
-                        source_evidence["application_path"] = (
-                            "" if radio_role == "observer" else str(state.get("path_flrig") or "")
-                        )
-                    if not source_evidence.get("secondary_application_path"):
-                        source_evidence["secondary_application_path"] = str(state.get("path_fldigi") or "")
-                    if not source_evidence.get("flmsg_application_path"):
-                        source_evidence["flmsg_application_path"] = str(state.get("path_flmsg") or "")
-                    if not source_evidence.get("flamp_application_path"):
-                        source_evidence["flamp_application_path"] = str(state.get("path_flamp") or "")
-                snapshot = _refresh_guided_instance_inventory(retained)
-                draft = distinct_draft_seed(
-                    family,
-                    owner_draft_key=guided_discovery_session_key,
-                    snapshot=snapshot,
-                    source=source_evidence,
-                )
-                draft.update(
-                    instance_name=radio_label,
-                    owner_label=radio_label,
-                    radio_role=radio_role,
-                    launch_at_startup=(
-                        str(software_launch_policy_combos[family].currentData() or "").strip().lower()
-                        == "fio"
-                    ),
-                )
-                if family == "fast_light":
-                    draft.update(
-                        use_flrig=bool(use_flrig_chk.isChecked()),
-                        use_fldigi=bool(use_fldigi_chk.isChecked()),
-                        use_flmsg=bool(use_flmsg_chk.isChecked()),
-                        use_flamp=bool(use_flamp_chk.isChecked()),
-                    )
-                if family == "fast_light" and radio_role == "observer":
-                    draft.update(application_path="", port=0)
-                resolution = resolve_guided_launch_recipe(
-                    draft,
-                    managed_root=str(Path(get_config_dir()) / "managed-instances"),
-                )
-                draft.update(recipe_draft_updates(resolution))
-                retained[family] = draft
-                auto_prepared_families.append(family)
-                if not resolution.qualified:
-                    needs_attention.append(f"{software_family_titles[family]}: {resolution.recovery_action}")
-                    continue
-                # These endpoints belong to the managed recipe.  Keep the
-                # Connections review truthful without asking the operator to
-                # copy CommsPlan's allocated ports into a separate form.
-                if family == "js8call":
-                    js8_host_edit.setText(str(draft.get("host") or "127.0.0.1"))
-                    js8_port_edit.setText(str(draft.get("port") or ""))
-                else:
-                    fldigi_host_edit.setText(str(draft.get("host") or "127.0.0.1"))
-                    fldigi_port_edit.setText(str(draft.get("secondary_port") or ""))
-                    fldigi_arq_port_edit.setText(
-                        str(draft.get("arq_port") or draft.get("fldigi_arq_port") or "")
-                    )
-                    if radio_role != "observer":
-                        flrig_port_edit.setText(str(draft.get("port") or ""))
-            setattr(dlg, "_guided_software_instance_drafts", retained)
-            setattr(dlg, "_guided_auto_prepared_draft_families", tuple(auto_prepared_families))
-            _update_commstat_binding_summary()
-            return tuple(needs_attention)
-
-        def _varac_parent_preparation_seed() -> Dict[str, Any]:
-            """Build the one parent-owned VarAC intent before opening details.
-
-            The nested editor is a correction surface, not the owner of the
-            prepared facts.  This seed deliberately mirrors the assistant's
-            initial intent so either surface can render the same immutable
-            native bundle when the worker returns.
-            """
-
-            retained_raw = getattr(dlg, "_guided_software_instance_drafts", {})
-            retained = (
-                dict(retained_raw.get("varac") or {})
-                if isinstance(retained_raw, Mapping)
-                and isinstance(retained_raw.get("varac"), Mapping)
-                else {}
-            )
-            radio_label = name_edit.text().strip() or "Unsaved radio"
-            state = _guided_software_editor_state()
-            selection = _selected_varac_arrangement()
-            arrangement = str(selection.get("cluster_path") or "standalone").strip() or "standalone"
-            creating_cluster = arrangement == "create_cluster"
-            cluster_route = arrangement in {"create_cluster", "join_cluster"}
-            if not retained:
-                retained = distinct_draft_seed(
-                    "varac",
-                    owner_draft_key=guided_discovery_session_key,
-                    snapshot=_refresh_guided_instance_inventory({}),
-                    source={"application_path": str(state.get("varac_path") or "")},
-                )
-            retained.update(
-                family_key="varac",
-                instance_name=radio_label,
-                owner_label=radio_label,
-                owner_draft_key=guided_discovery_session_key,
-                radio_role=str(device_class_combo.currentData() or "tx_rx").strip().lower(),
-                mode="managed",
-                ownership="fio-managed",
-                launch_at_startup=(
-                    str(software_launch_policy_combos["varac"].currentData() or "operator") == "fio"
-                ),
-                application_path=str(state.get("varac_path") or retained.get("application_path") or ""),
-                cluster_path=arrangement,
-                cluster_id=str(selection.get("cluster_id") or selection.get("proposed_cluster_id") or ""),
-                cluster_name=str(selection.get("proposed_cluster_name") or ""),
-                cluster_instance_number=int(
-                    (selection.get("cluster_instance_number") or varac_arrangement_presentation.get("new_member_instance_number") or 0)
-                    if cluster_route else 0
-                ),
-                existing_standalone_node_id=int(
-                    (selection.get("existing_node_id") or varac_arrangement_presentation.get("recommended_existing_node_id") or 0)
-                    if creating_cluster else 0
-                ),
-                existing_standalone_device_profile_id=int(
-                    (selection.get("existing_device_profile_id") or varac_arrangement_presentation.get("recommended_existing_device_profile_id") or 0)
-                    if creating_cluster else 0
-                ),
-                existing_standalone_member_number=int(
-                    varac_arrangement_presentation.get("existing_member_instance_number") or 0
-                ) if creating_cluster else 0,
-            )
-            if not cluster_route:
-                # Standalone preparation retains discovered/operator-reviewed
-                # node-local evidence.  It does not invent cluster resources
-                # and never sends this intent through the cluster-only writer.
-                retained.update(
-                    configuration_path=str(state.get("varac_ini_path") or ""),
-                    storage_path=str(state.get("varac_db_path") or ""),
-                    secondary_storage_path=str(state.get("varac_incoming_path") or ""),
-                    outbox_path=str(state.get("varac_outbox_dir") or ""),
-                    bbs_path=str(state.get("varac_bbs_dir") or ""),
-                    bbs_archive_path=str(state.get("varac_bbs_archive_dir") or ""),
-                    launch_command=str(state.get("varac_launch_cmd") or ""),
-                )
-            return retained
-
-        def _project_prepared_varac_parent_bundle(
-            result: VarACNativePreparationResult,
-            *,
-            expected_fingerprint: str,
-        ) -> None:
-            """Atomically publish native facts to Connections, Review, and Save."""
-
-            nonlocal varac_native_preparation_in_progress
-            retained_raw = getattr(dlg, "_guided_software_instance_drafts", {})
-            current = (
-                dict(retained_raw.get("varac") or {})
-                if isinstance(retained_raw, Mapping)
-                and isinstance(retained_raw.get("varac"), Mapping)
-                else {}
-            )
-            if native_draft_fingerprint(current) != expected_fingerprint:
-                log.info("Ignored stale guided VarAC preparation result for an obsolete draft.")
-                return
-            varac_native_preparation_in_progress = False
-            presentation = dict(result.presentation)
-            if not result.ready or result.plan is None:
-                current["varac_native_presentation"] = presentation
-                setattr(
-                    dlg,
-                    "_guided_software_instance_drafts",
-                    {**dict(retained_raw or {}), "varac": current},
-                )
-                detail = str(
-                    presentation.get("why")
-                    or "VarAC preparation did not produce a safe plan."
-                ).strip()
-                configure_auto_status.setText("Blocked — " + detail)
-                log.warning(
-                    "Guided VarAC preparation blocked state=%s detail=%s",
-                    str(presentation.get("state") or result.state),
-                    detail,
-                )
-                _update_software_responsibility_cards()
-                _apply_guided_wizard_visibility(connection_group.isVisible())
-                return
-            bundle = dict(current)
-
-            def _cluster_shared_path(*keys: str) -> str:
-                """Read a prepared shared resource without creating a second plan.
-
-                Native preparation owns these facts.  The compatibility aliases
-                let this projection remain useful while older presentation
-                publishers are upgraded; none of them become persistence
-                inputs here.
-                """
-
-                for key in keys:
-                    for source in (presentation, bundle):
-                        value = str(source.get(key) or "").strip()
-                        if value:
-                            return value
-                return ""
-
-            # BBS resources are cluster-shared.  Prefer the explicit cluster
-            # fact, then an existing member fact, then the canonical generic
-            # fact.  Retained/profile values are only a safe display fallback
-            # until every native publisher supplies the canonical keys.
-            bbs_path = _cluster_shared_path(
-                "cluster_bbs_path",
-                "member_bbs_path",
-                "bbs_path",
-                "bbs_directory",
-                "varac_bbs_dir",
-            ) or varac_bbs_edit.text().strip()
-            bbs_archive_path = _cluster_shared_path(
-                "cluster_bbs_archive_path",
-                "member_bbs_archive_path",
-                "bbs_archive_path",
-                "bbs_archive_directory",
-                "varac_bbs_archive_dir",
-            ) or varac_bbs_archive_edit.text().strip()
-            bundle.update(
-                application_path=str(presentation.get("application_path") or ""),
-                configuration_path=str(presentation.get("configuration_path") or ""),
-                storage_path=str(presentation.get("storage_path") or ""),
-                cluster_shared_database=str(presentation.get("storage_path") or ""),
-                secondary_storage_path=str(presentation.get("secondary_storage_path") or ""),
-                outbox_path=str(presentation.get("outbox_path") or ""),
-                working_directory=str(presentation.get("working_directory") or ""),
-                launch_command=str(presentation.get("launch_command") or ""),
-                launch_argv=tuple(presentation.get("launch_argv") or ()),
-                launch_environment=dict(presentation.get("launch_environment") or {}),
-                port=int(presentation.get("port") or 0),
-                secondary_port=int(presentation.get("secondary_port") or 0),
-                udp_port=int(presentation.get("udp_port") or 0),
-                vara_runtime_path=str(presentation.get("vara_runtime_path") or ""),
-                vara_ini_path=str(presentation.get("vara_ini_path") or ""),
-                bbs_path=bbs_path,
-                bbs_archive_path=bbs_archive_path,
-                varac_native_generation=int(result.generation),
-                varac_native_plan_fingerprint=str(result.plan.plan_fingerprint),
-            )
-            presentation["plan_fingerprint"] = str(result.plan.plan_fingerprint)
-            presentation["draft_fingerprint"] = native_draft_fingerprint(bundle)
-            bundle["varac_native_presentation"] = presentation
-            # This transient request is consumed only by the outer final-save
-            # boundary.  It is neither a native apply result nor persistence.
-            bundle["_varac_native_apply_request"] = {
-                "draft": dict(bundle),
-                "native_presentation": dict(presentation),
-            }
-            setattr(dlg, "_guided_software_instance_drafts", {**dict(retained_raw or {}), "varac": bundle})
-            for target, value in (
-                (varac_install_edit, bundle["application_path"]),
-                (varac_ini_edit, bundle["configuration_path"]),
-                (varac_db_edit, bundle["storage_path"]),
-                (varac_incoming_edit, bundle["secondary_storage_path"]),
-                (varac_outbox_edit, bundle["outbox_path"]),
-                (varac_bbs_edit, bundle["bbs_path"]),
-                (varac_bbs_archive_edit, bundle["bbs_archive_path"]),
-                (varac_launch_cmd_edit, bundle["launch_command"]),
-            ):
-                target.setText(str(value))
-            # The qualified bundle is the only authority for cluster-shared
-            # BBS resources.  They are rendered here for review, not offered
-            # as a competing member-local path editor.
-            varac_bbs_edit.setReadOnly(True)
-            varac_bbs_archive_edit.setReadOnly(True)
-            for wrapper in (varac_bbs_wrap, varac_bbs_archive_wrap):
-                for button in wrapper.findChildren(QPushButton):
-                    button.setEnabled(False)
-            if bool(presentation.get("apply_requires_stopped_process")):
-                configure_auto_status.setText(
-                    "Ready with warning — the VarAC cluster plan is complete. "
-                    "Close VarAC and VARA before final Save."
-                )
-            _update_software_responsibility_cards()
-            _update_guided_app_setup_plan_review()
-            _update_guided_save_review()
-            _apply_guided_wizard_visibility(connection_group.isVisible())
-
-        def _prepare_varac_parent_bundle() -> None:
-            """Start the generation-fenced native preparation without opening details."""
-
-            nonlocal varac_native_preparation_in_progress
-            if not use_varac_chk.isChecked():
-                return
-            seed = _varac_parent_preparation_seed()
-            arrangement = str(seed.get("cluster_path") or "standalone").strip().lower()
-            if arrangement not in {"create_cluster", "join_cluster"}:
-                # The qualified native writer is intentionally cluster-only.
-                # A standalone node remains a valid, non-mutating identity and
-                # launch plan whose native VarAC files are operator-owned.  Do
-                # not manufacture a one-member cluster or turn that limitation
-                # into an unrecoverable navigation block.
-                varac_native_preparation_in_progress = False
-                seed.update(
-                    native_management_state="operator",
-                    native_configuration_status="operator_action_required",
-                    safety_status="ready_with_warnings",
-                    save_status="ready_with_warnings",
-                    varac_native_presentation={
-                        "state": "standalone_ready",
-                        "why": (
-                            "Standalone VarAC is selected. CommsPlan prepared the distinct radio identity "
-                            "and retained discovered node-local paths; native standalone VarAC files "
-                            "remain operator-owned. Choose Create cluster or Join cluster here to use "
-                            "the qualified native cluster writer."
-                        ),
-                        "writer_qualified": False,
-                        "writer_required": False,
-                        "arrangement": "standalone",
-                    },
-                )
-                retained_raw = getattr(dlg, "_guided_software_instance_drafts", {})
-                setattr(
-                    dlg,
-                    "_guided_software_instance_drafts",
-                    {**dict(retained_raw or {}), "varac": seed},
-                )
-                _update_software_responsibility_cards()
-                _update_guided_app_setup_plan_review()
-                _update_guided_save_review()
-                _apply_guided_wizard_visibility(connection_group.isVisible())
-                return
-            fingerprint = native_draft_fingerprint(seed)
-            seed["varac_native_presentation"] = {
-                "state": "preparing",
-                "why": "CommsPlan is deriving the complete VarAC and VARA bundle in the background.",
-            }
-            retained_raw = getattr(dlg, "_guided_software_instance_drafts", {})
-            setattr(dlg, "_guided_software_instance_drafts", {**dict(retained_raw or {}), "varac": seed})
-            self._varac_native_generation = int(getattr(self, "_varac_native_generation", 0)) + 1
-            generation = self._varac_native_generation
-            varac_native_preparation_in_progress = True
-            software_prepared_state_labels["varac"].setText("Preparing — CommsPlan is deriving the complete VarAC and VARA bundle.")
-            worker = _VarACNativePrepareWorker(
-                draft=seed,
-                db_path=self.multi_radio_store.db_path,
-                managed_root=Path(get_config_dir()) / "managed-instances",
-                generation=generation,
-            )
-
-            def _ready(result: object) -> None:
-                if not isinstance(result, VarACNativePreparationResult):
-                    return
-                if (
-                    result.generation != generation
-                    or generation != int(getattr(self, "_varac_native_generation", 0))
-                ):
-                    return
-                self._varac_native_preparations[fingerprint] = result
-                _project_prepared_varac_parent_bundle(result, expected_fingerprint=fingerprint)
-
-            def _failed(detail: str) -> None:
-                nonlocal varac_native_preparation_in_progress
-                if generation != int(getattr(self, "_varac_native_generation", 0)):
-                    return
-                current_raw = getattr(dlg, "_guided_software_instance_drafts", {})
-                current = (
-                    dict(current_raw.get("varac") or {})
-                    if isinstance(current_raw, Mapping)
-                    and isinstance(current_raw.get("varac"), Mapping)
-                    else {}
-                )
-                if native_draft_fingerprint(current) != fingerprint:
-                    return
-                varac_native_preparation_in_progress = False
-                current["varac_native_presentation"] = {
-                    "state": "blocked",
-                    "why": "CommsPlan could not prepare VarAC: " + str(detail),
-                    "writer_qualified": False,
-                    "generation": generation,
-                    "draft_fingerprint": fingerprint,
-                }
-                setattr(
-                    dlg,
-                    "_guided_software_instance_drafts",
-                    {**dict(current_raw or {}), "varac": current},
-                )
-                configure_auto_status.setText(
-                    "Blocked — CommsPlan could not prepare VarAC: " + str(detail)
-                )
-                _update_software_responsibility_cards()
-                _apply_guided_wizard_visibility(connection_group.isVisible())
-                log.warning("Guided VarAC preparation failed: %s", detail)
-
-            self._start_varac_native_job(worker, on_finished=_ready, on_failed=_failed)
-
-        def _sync_software_policy_from_source(family_key: str) -> None:
-            source_combo = software_source_combos.get(family_key)
-            management_combo = software_management_combos.get(family_key)
-            launch_combo = software_launch_policy_combos.get(family_key)
-            if source_combo is None or management_combo is None or launch_combo is None:
-                return
-            source = str(source_combo.currentData() or "").strip().lower()
-            management_value = "fio_identity_launch" if source == "create" else "operator_native"
-            launch_value = "fio" if source == "create" else "operator"
-            if source == "built_in":
-                management_value = "fio_builtin"
-                launch_value = "built_in"
-            elif source == "station_shared":
-                management_value = "shared_binding"
-                launch_value = "station_shared"
-            management_idx = management_combo.findData(management_value)
-            if management_idx >= 0:
-                management_combo.setCurrentIndex(management_idx)
-            launch_idx = launch_combo.findData(launch_value)
-            if launch_idx >= 0:
-                launch_combo.setCurrentIndex(launch_idx)
-
-        def _purge_deselected_guided_software() -> None:
-            """Synchronously remove every non-current family from this dialog.
-
-            The dialog-local map is the only Add Radio draft authority.  Do
-            not let a dismissed nested editor, a previous preset, or a native
-            VarAC session survive after its checkbox no longer selects it.
-            """
-
-            retained_raw = getattr(dlg, "_guided_software_instance_drafts", {})
-            if not isinstance(retained_raw, Mapping):
-                return
-            selected = {
-                family
-                for family in ("js8call", "fast_light", "varac")
-                if _guided_software_family_selected(family)
-            }
-            retained: Dict[str, Any] = {}
-            for family, value in retained_raw.items():
-                family_key = str(family).strip().lower()
-                if family_key in selected:
-                    retained[family_key] = dict(value) if isinstance(value, Mapping) else value
-                    continue
-                if family_key == "varac" and isinstance(value, Mapping):
-                    session = value.get("_varac_native_external_session")
-                    if isinstance(session, VarACNativeExternalSession):
-                        self._rollback_varac_native_session(session)
-                    # Worker preparation is non-mutating, but retaining it
-                    # would permit a later publisher to target stale intent.
-                    try:
-                        self._varac_native_preparations.pop(
-                            native_draft_fingerprint(dict(value)), None
-                        )
-                    except Exception:
-                        log.debug("Could not discard stale VarAC preparation.", exc_info=True)
-            setattr(dlg, "_guided_software_instance_drafts", retained)
-            auto_families = tuple(
-                family
-                for family in getattr(dlg, "_guided_auto_prepared_draft_families", ())
-                if str(family).strip().lower() in selected
-            )
-            setattr(dlg, "_guided_auto_prepared_draft_families", auto_families)
-
-        def _schedule_automatic_software_preparation() -> None:
-            """Coalesce edits into one safe, dialog-owned discovery request.
-
-            This only derives an in-memory proposal.  The existing discovery
-            coordinator still owns cancellation/generation fencing and no
-            native application file is touched here.
-            """
-            nonlocal software_preparation_pending
-            if not dlg.isVisible() or guided_wizard_step_id != "software":
-                return
-            if software_preparation_failed:
-                return
-            selected = any(
-                _guided_software_family_selected(key)
-                for key in software_responsibility_cards
-            )
-            if not selected:
-                software_preparation_pending = False
-                configure_auto_status.setText("Choose software above; CommsPlan will prepare it automatically.")
-                return
-            if use_varac_chk.isChecked() and not str(
-                _selected_varac_arrangement().get("cluster_path") or ""
-            ).strip():
-                software_preparation_pending = False
-                configure_auto_status.setText("Needs choice — choose the VarAC arrangement before CommsPlan can prepare it.")
-                _update_software_responsibility_cards()
-                return
-            software_preparation_pending = True
-            if software_preparation_in_progress:
-                if guided_discovery_generation:
-                    self._guided_software_discovery.cancel(
-                        guided_discovery_session_key,
-                        guided_discovery_generation,
-                    )
-                configure_auto_status.setText("Updating — finishing the current check, then refreshing your changed software plan.")
-                return
-            configure_auto_status.setText("Preparing automatically — CommsPlan is checking the selected software in the background.")
-            software_preparation_timer.start()
-
-        def _invalidate_prepared_software_plan() -> None:
-            nonlocal software_plan_prepared, prepared_software_families, prepared_software_context, software_preparation_pending, software_preparation_failed
-            _purge_deselected_guided_software()
-            retained_raw = getattr(dlg, "_guided_software_instance_drafts", {})
-            auto_families = {
-                str(family)
-                for family in getattr(dlg, "_guided_auto_prepared_draft_families", ())
-            }
-            if isinstance(retained_raw, Mapping) and auto_families:
-                retained = {
-                    str(family): dict(value)
-                    for family, value in retained_raw.items()
-                    if isinstance(value, Mapping) and str(family) not in auto_families
-                }
-                setattr(dlg, "_guided_software_instance_drafts", retained)
-                setattr(dlg, "_guided_auto_prepared_draft_families", ())
-            if software_plan_prepared:
-                software_plan_prepared = False
-                prepared_software_families = ()
-                prepared_software_context = ()
-                configure_auto_status.setText(
-                    "Updating — software choices changed. CommsPlan will refresh the plan automatically."
-                )
-            software_preparation_pending = True
-            software_preparation_failed = False
-            _update_software_responsibility_cards()
-            _schedule_automatic_software_preparation()
-
-        def _guided_software_editor_state() -> Dict[str, Any]:
-            return {
-                "path_js8call": js8_install_edit.text().strip(),
-                "js8_profile_path": js8_profile_edit.text().strip(),
-                "js8_host": js8_host_edit.text().strip(),
-                "js8_port": js8_port_edit.text().strip(),
-                "js8_directed_path": js8_directed_edit.text().strip(),
-                "js8_forms_path": js8_forms_edit.text().strip(),
-                "path_flrig": flrig_path_edit.text().strip(),
-                "flrig_port": flrig_port_edit.text().strip(),
-                "path_fldigi": fldigi_path_edit.text().strip(),
-                "fldigi_host": fldigi_host_edit.text().strip(),
-                "fldigi_port": fldigi_port_edit.text().strip(),
-                "arq_port": fldigi_arq_port_edit.text().strip(),
-                "path_flmsg": flmsg_path_edit.text().strip(),
-                "path_flamp": flamp_path_edit.text().strip(),
-                "path_commstat": commstat_launch_edit.text().strip(),
-                "path_js8spotter": js8spotter_launch_edit.text().strip(),
-                "varac_path": varac_install_edit.text().strip(),
-                "varac_ini_path": varac_ini_edit.text().strip(),
-                "varac_db_path": varac_db_edit.text().strip(),
-                "varac_incoming_path": varac_incoming_edit.text().strip(),
-                "varac_launch_cmd": varac_launch_cmd_edit.text().strip(),
-                "varac_outbox_dir": varac_outbox_edit.text().strip(),
-                "varac_bbs_dir": varac_bbs_edit.text().strip(),
-                "varac_bbs_archive_dir": varac_bbs_archive_edit.text().strip(),
-                "message_paths": {
-                    "flmsg": "",
-                    "flamp": "",
-                    "varac": varac_incoming_edit.text().strip(),
-                },
-            }
-
-        def _apply_guided_software_editor_state(state: Mapping[str, Any]) -> None:
-            field_targets: Dict[str, QLineEdit] = {
-                "path_js8call": js8_install_edit,
-                "js8_profile_path": js8_profile_edit,
-                "js8_host": js8_host_edit,
-                "js8_port": js8_port_edit,
-                "js8_directed_path": js8_directed_edit,
-                "js8_forms_path": js8_forms_edit,
-                "path_flrig": flrig_path_edit,
-                "flrig_port": flrig_port_edit,
-                "path_fldigi": fldigi_path_edit,
-                "fldigi_host": fldigi_host_edit,
-                "fldigi_port": fldigi_port_edit,
-                "arq_port": fldigi_arq_port_edit,
-                "path_flmsg": flmsg_path_edit,
-                "path_flamp": flamp_path_edit,
-                "path_commstat": commstat_launch_edit,
-                "path_js8spotter": js8spotter_launch_edit,
-                "varac_path": varac_install_edit,
-                "varac_ini_path": varac_ini_edit,
-                "varac_db_path": varac_db_edit,
-                "varac_incoming_path": varac_incoming_edit,
-                "varac_launch_cmd": varac_launch_cmd_edit,
-                "varac_outbox_dir": varac_outbox_edit,
-                "varac_bbs_dir": varac_bbs_edit,
-                "varac_bbs_archive_dir": varac_bbs_archive_edit,
-            }
-            for key, target in field_targets.items():
-                value = str(state.get(key, "") or "")
-                if target.text() != value:
-                    target.setText(value)
-            message_paths = state.get("message_paths", {})
-            if isinstance(message_paths, Mapping):
-                varac_incoming = str(message_paths.get("varac", "") or "")
-                if varac_incoming_edit.text() != varac_incoming:
-                    varac_incoming_edit.setText(varac_incoming)
-            _update_dialog_readiness()
-
-        software_editor_tasks = {
-            "js8call": (
-                ("application_profile", "Application & Profile"),
-                ("api_radio", "API & Radio"),
-                ("message_storage", "Message Storage"),
-                ("launch", "Launch"),
-            ),
-            "fast_light": (
-                ("flrig_control", "FLRig Control"),
-                ("fldigi_modem_logs", "FLDigi Modem & Logs"),
-                ("flmsg", "FLMsg"),
-                ("flamp_signing", "FLAmp & Signing"),
-                ("launch", "Launch"),
-            ),
-            "varac": (
-                ("application_radio", "Application & Radio"),
-                ("runtime_paths", "Runtime & Paths"),
-                ("inbox_outbox", "Inbox & Outbox"),
-                ("cluster", "Cluster"),
-                ("launch", "Launch"),
-            ),
-            "commstat": (("transport_mapping", "JS8 Endpoint Binding"),),
-            "external_spotter": (("installation", "Installation"), ("launch", "Launch")),
-            "fio_spotter": (("dependencies", "Dependencies & Radio Mapping"),),
-        }
-
-        def _show_guided_software_details(family_key: str) -> None:
-            nonlocal software_plan_prepared, prepared_software_families, prepared_software_context
-            family = str(family_key or "").strip().lower()
-            if not software_plan_prepared:
-                configure_auto_status.setText(
-                    "Prepare selected software automatically before reviewing or correcting details."
-                )
-                _set_guided_wizard_step("software")
-                return
-            if family == "receiver":
-                _set_guided_wizard_step("connection")
-                return
-            if family == "fio_spotter":
-                configure_auto_status.setText(
-                    "CommsPlan Spotter is built in. Review its selected JS8 transport on Connections; "
-                    "no separate install, launch identity, or MCF forms folder is required."
-                )
-                _set_guided_wizard_step("connection")
-                return
-            if family == "commstat":
-                if not use_js8call_chk.isChecked():
-                    use_js8call_chk.setChecked(True)
-                configure_auto_status.setText(
-                    "CommStat uses one station-shared process. Review this radio's JS8Call TCP "
-                    "endpoint binding on Connections; no second CommStat install is created."
-                )
-                _set_guided_wizard_step("connection")
-                return
-            tasks = software_editor_tasks.get(family, ())
-            if not tasks:
-                return
-            family_title = software_family_titles.get(family, "Software")
-            if family in {"js8call", "fast_light", "varac"}:
-                source_value = str(software_source_combos[family].currentData() or "create")
-                mode = {
-                    "create": "managed",
-                    "existing": "discover",
-                    "manual": "remote",
-                    "shared": "discover",
-                }.get(source_value, "managed")
-                management_value = str(
-                    software_management_combos[family].currentData() or "fio_identity_launch"
-                )
-                ownership = (
-                    "fio-managed"
-                    if management_value == "fio_identity_launch"
-                    else "operator-managed"
-                )
-                launch_at_startup = (
-                    str(software_launch_policy_combos[family].currentData() or "operator") == "fio"
-                )
-                radio_draft_label = name_edit.text().strip() or "Unsaved radio"
-                radio_role = str(device_class_combo.currentData() or "tx_rx").strip().lower()
-                state = _guided_software_editor_state()
-                retained = getattr(dlg, "_guided_software_instance_drafts", {})
-                if not isinstance(retained, dict):
-                    retained = {}
-                inventory_snapshot = _refresh_guided_instance_inventory(retained)
-                seed_context: Dict[str, Any] = {
-                    "family_key": family,
-                    "instance_name": radio_draft_label,
-                    "mode": mode,
-                    "ownership": ownership,
-                    "launch_at_startup": launch_at_startup,
-                    "owner_draft_key": guided_discovery_session_key,
-                    "owner_label": radio_draft_label,
-                    "radio_role": radio_role,
-                }
-                if family == "fast_light":
-                    seed_context.update(
-                        use_flrig=bool(use_flrig_chk.isChecked()),
-                        use_fldigi=bool(use_fldigi_chk.isChecked()),
-                        use_flmsg=bool(use_flmsg_chk.isChecked()),
-                        use_flamp=bool(use_flamp_chk.isChecked()),
-                    )
-                retained_family = (
-                    dict(retained[family])
-                    if isinstance(retained.get(family), Mapping)
-                    else {}
-                )
-                if retained_family and str(retained_family.get("mode") or "").strip().lower() == mode:
-                    seed = dict(retained_family)
-                    seed.update(
-                        owner_draft_key=guided_discovery_session_key,
-                        owner_label=radio_draft_label,
-                        radio_role=radio_role,
-                    )
-                elif mode == "managed":
-                    source_evidence: Dict[str, Any] = dict(retained_family)
-                    if family == "js8call" and not source_evidence:
-                        source_evidence["application_path"] = str(state.get("path_js8call") or "")
-                    elif family == "fast_light" and not source_evidence:
-                        source_evidence.update(
-                            application_path=(
-                                "" if radio_role == "observer" else str(state.get("path_flrig") or "")
-                            ),
-                            secondary_application_path=str(state.get("path_fldigi") or ""),
-                            flmsg_application_path=str(state.get("path_flmsg") or ""),
-                            flamp_application_path=str(state.get("path_flamp") or ""),
-                        )
-                    elif family == "varac" and not source_evidence:
-                        source_evidence["application_path"] = str(state.get("varac_path") or "")
-                    seed = distinct_draft_seed(
-                        family,
-                        owner_draft_key=guided_discovery_session_key,
-                        snapshot=inventory_snapshot,
-                        source=source_evidence,
-                    )
-                    seed.update(seed_context)
-                    if family == "fast_light" and radio_role == "observer":
-                        seed["application_path"] = ""
-                        seed["port"] = 0
-                    elif family == "varac":
-                        # The core presentation owns topology inference.  The
-                        # operator's explicit arrangement and its reviewed
-                        # member metadata cross into the assistant together.
-                        arrangement_selection = _selected_varac_arrangement()
-                        arrangement = str(
-                            arrangement_selection.get("cluster_path") or "standalone"
-                        ).strip() or "standalone"
-                        is_cluster_route = arrangement in {"create_cluster", "join_cluster"}
-                        is_existing_standalone_create = (
-                            arrangement == "create_cluster"
-                            and bool(
-                                arrangement_selection.get("existing_node_id")
-                                or varac_arrangement_presentation.get(
-                                    "recommended_existing_node_id"
-                                )
-                            )
-                        )
-                        seed.update(
-                            cluster_path=arrangement,
-                            cluster_id=str(
-                                arrangement_selection.get("cluster_id")
-                                or arrangement_selection.get("proposed_cluster_id")
-                                or ""
-                            ),
-                            cluster_name=str(
-                                arrangement_selection.get("proposed_cluster_name") or ""
-                            ),
-                            cluster_shared_database="",
-                            cluster_instance_number=int(
-                                (
-                                    arrangement_selection.get("cluster_instance_number")
-                                    or varac_arrangement_presentation.get(
-                                        "new_member_instance_number"
-                                    )
-                                )
-                                if is_cluster_route
-                                else 0
-                            ),
-                            existing_standalone_node_id=int(
-                                (
-                                    arrangement_selection.get("existing_node_id")
-                                    or varac_arrangement_presentation.get(
-                                        "recommended_existing_node_id"
-                                    )
-                                )
-                                if is_existing_standalone_create
-                                else 0
-                            ),
-                            existing_standalone_device_profile_id=int(
-                                (
-                                    arrangement_selection.get("existing_device_profile_id")
-                                    or varac_arrangement_presentation.get(
-                                        "recommended_existing_device_profile_id"
-                                    )
-                                )
-                                if is_existing_standalone_create
-                                else 0
-                            ),
-                            existing_standalone_member_number=int(
-                                varac_arrangement_presentation.get(
-                                    "existing_member_instance_number"
-                                )
-                                if is_existing_standalone_create
-                                else 0
-                            ),
-                            cluster_gateway=False,
-                            cluster_ptt_lock=False,
-                        )
-                else:
-                    seed = dict(seed_context)
-                if mode == "remote" and family == "js8call":
-                    seed.update(
-                        host=str(state.get("js8_host") or "127.0.0.1"),
-                        port=str(state.get("js8_port") or "2442"),
-                        application_path=str(state.get("path_js8call") or ""),
-                        configuration_path=str(state.get("js8_profile_path") or ""),
-                        storage_path=(
-                            str(Path(str(state.get("js8_directed_path") or "")).parent)
-                            if str(state.get("js8_directed_path") or "")
-                            else ""
-                        ),
-                    )
-                elif mode == "remote" and family == "fast_light":
-                    seed.update(
-                        host=str(state.get("fldigi_host") or "127.0.0.1"),
-                        port="" if radio_role == "observer" else str(state.get("flrig_port") or "12345"),
-                        secondary_port=str(state.get("fldigi_port") or "7362"),
-                        arq_port=str(state.get("arq_port") or "7322"),
-                        application_path="" if radio_role == "observer" else str(state.get("path_flrig") or ""),
-                        secondary_application_path=str(state.get("path_fldigi") or ""),
-                        flmsg_application_path=str(state.get("path_flmsg") or ""),
-                        flamp_application_path=str(state.get("path_flamp") or ""),
-                    )
-                elif mode == "remote" and family == "varac":
-                    message_paths = state.get("message_paths")
-                    seed.update(
-                        application_path=str(state.get("varac_path") or ""),
-                        configuration_path=str(state.get("varac_ini_path") or ""),
-                        secondary_storage_path=(
-                            str(message_paths.get("varac") or "")
-                            if isinstance(message_paths, Mapping)
-                            else ""
-                        ),
-                        outbox_path=str(state.get("varac_outbox_dir") or ""),
-                        launch_command=str(state.get("varac_launch_cmd") or ""),
-                    )
-                editor_dialog = QDialog(dlg)
-                editor_dialog.setWindowTitle(f"{family_title} setup for {radio_draft_label}")
-                editor_dialog.setAccessibleName(
-                    f"Review or correct prepared {family_title} details for {radio_draft_label}"
-                )
-                # The assistant owns its own scroll area and fixed footer.
-                # Keep the native child dialog inside the available desktop;
-                # an oversized nested modal can be animated off-screen by
-                # compact Linux window managers (the visible swipe/vanish).
-                editor_dialog.resize(
-                    _guided_dialog_initial_size(QSize(780, 700), screen_margin=80)
-                )
-                editor_layout = QVBoxLayout(editor_dialog)
-                handoff_note = QLabel(
-                    "Review or correct the prepared plan for this inactive radio draft. "
-                    "CommsPlan prepared source, identity, connections, files, launch, conflicts, and review "
-                    "together. Apply returns to Add Radio; nothing is saved until Review & Save."
-                )
-                handoff_note.setWordWrap(True)
-                editor_layout.addWidget(handoff_note)
-                assistant = SoftwareInstanceAssistant(
-                    family,
-                    existing_instances=tuple(
-                        dict(row) for row in inventory_snapshot.rows_for(family)
-                    ),
-                    inventory_snapshot=inventory_snapshot,
-                    unsaved_owner_key=guided_discovery_session_key,
-                    unsaved_radio_label=radio_draft_label,
-                    radio_role=radio_role,
-                    initial_draft=seed,
-                    managed_root=str(Path(get_config_dir()) / "managed-instances"),
-                    parent=editor_dialog,
-                )
-                assistant.set_discovery_results(inventory_snapshot.rows_for(family))
-                if family == "varac" and isinstance(seed.get("varac_native_presentation"), Mapping):
-                    # The parent already owns the prepared canonical bundle.
-                    # Details is only a correction/review surface and must not
-                    # reconstruct an alternate VarAC plan.
-                    assistant.set_varac_native_presentation(seed["varac_native_presentation"])
-                # The Add Radio host forwards only a cache-only payload.  The
-                # primary integration layer owns the bounded native-plan
-                # worker and republishes its result through the assistant.
-                assistant.varac_native_prepare_requested.connect(
-                    lambda payload, target=assistant: self._on_varac_native_prepare_requested(
-                        payload,
-                        publisher=target,
-                    )
-                )
-                editor_layout.addWidget(assistant, 1)
-                completed_payload: Dict[str, Any] = {}
-
-                def _complete_instance(payload: object) -> None:
-                    if isinstance(payload, Mapping):
-                        completed_payload.update(dict(payload))
-                    editor_dialog.accept()
-
-                assistant.completed.connect(_complete_instance)
-                assistant.cancelled.connect(editor_dialog.reject)
-                def _remove_family_from_radio(removed_family: str) -> None:
-                    if str(removed_family or "").strip().lower() == "varac":
-                        use_varac_chk.setChecked(False)
-                    elif str(removed_family or "").strip().lower() == "js8call":
-                        use_js8call_chk.setChecked(False)
-                    elif str(removed_family or "").strip().lower() == "fast_light":
-                        for checkbox in (use_flrig_chk, use_fldigi_chk, use_flmsg_chk, use_flamp_chk):
-                            checkbox.setChecked(False)
-                    _purge_deselected_guided_software()
-                    editor_dialog.reject()
-
-                assistant.remove_family_requested.connect(_remove_family_from_radio)
-                assistant.discover_requested.connect(
-                    lambda _family: assistant.set_operation_status(
-                        "Use Configure Automatically in Add Radio to refresh installed software, "
-                        "then reopen this assistant to review the cached draft."
-                    )
-                )
-                if editor_dialog.exec() != QDialog.Accepted or not completed_payload:
-                    return
-                retained[family] = dict(completed_payload)
-                setattr(dlg, "_guided_software_instance_drafts", retained)
-                mode_to_source = {
-                    "managed": "create",
-                    "discover": "existing",
-                    "remote": "manual",
-                }
-                source_signal_blocker = QSignalBlocker(software_source_combos[family])
-                management_signal_blocker = QSignalBlocker(software_management_combos[family])
-                launch_signal_blocker = QSignalBlocker(software_launch_policy_combos[family])
-                source_index = software_source_combos[family].findData(
-                    mode_to_source.get(str(completed_payload.get("mode") or ""), "create")
-                )
-                if source_index >= 0:
-                    software_source_combos[family].setCurrentIndex(source_index)
-                _sync_software_policy_from_source(family)
-                launch_index = software_launch_policy_combos[family].findData(
-                    "fio" if bool(completed_payload.get("launch_at_startup")) else "operator"
-                )
-                if launch_index >= 0:
-                    software_launch_policy_combos[family].setCurrentIndex(launch_index)
-                del source_signal_blocker
-                del management_signal_blocker
-                del launch_signal_blocker
-                applied = _guided_software_editor_state()
-                if family == "js8call":
-                    applied.update(
-                        path_js8call=str(completed_payload.get("application_path") or ""),
-                        js8_profile_path=str(completed_payload.get("configuration_path") or ""),
-                        js8_host=str(completed_payload.get("host") or "127.0.0.1"),
-                        js8_port=str(completed_payload.get("port") or ""),
-                    )
-                elif family == "fast_light":
-                    applied.update(
-                        path_flrig=(
-                            "" if radio_role == "observer"
-                            else str(completed_payload.get("application_path") or "")
-                        ),
-                        flrig_port=(
-                            "" if radio_role == "observer"
-                            else str(completed_payload.get("port") or "")
-                        ),
-                        path_fldigi=str(completed_payload.get("secondary_application_path") or ""),
-                        path_flmsg=str(completed_payload.get("flmsg_application_path") or ""),
-                        path_flamp=str(completed_payload.get("flamp_application_path") or ""),
-                        fldigi_host=str(completed_payload.get("host") or "127.0.0.1"),
-                        fldigi_port=str(completed_payload.get("secondary_port") or ""),
-                        arq_port=str(
-                            completed_payload.get("arq_port")
-                            or completed_payload.get("fldigi_arq_port")
-                            or ""
-                        ),
-                    )
-                else:
-                    applied.update(
-                        varac_path=str(completed_payload.get("application_path") or ""),
-                        varac_ini_path=str(completed_payload.get("configuration_path") or ""),
-                        varac_db_path=str(completed_payload.get("storage_path") or ""),
-                        varac_incoming_path=str(
-                            completed_payload.get("secondary_storage_path") or ""
-                        ),
-                        varac_launch_cmd=str(completed_payload.get("launch_command") or ""),
-                        varac_outbox_dir=str(completed_payload.get("outbox_path") or ""),
-                    )
-                    message_paths = dict(applied.get("message_paths") or {})
-                    message_paths["varac"] = str(
-                        completed_payload.get("secondary_storage_path") or ""
-                    )
-                    applied["message_paths"] = message_paths
-                _apply_guided_software_editor_state(applied)
-                software_plan_prepared = True
-                prepared_software_families = tuple(
-                    key
-                    for key in software_responsibility_cards
-                    if _guided_software_family_selected(key)
-                )
-                prepared_software_context = _guided_software_plan_context()
-                _update_software_responsibility_cards()
-                configure_auto_status.setText(
-                    f"Applied {family_title} instance review to this inactive radio draft. "
-                    "Review & Save remains required."
-                )
-                return
-
-            editor_dialog = QDialog(dlg)
-            radio_draft_label = name_edit.text().strip() or "Unsaved radio"
-            editor_dialog.setWindowTitle(f"{family_title} setup for {radio_draft_label}")
-            editor_dialog.setAccessibleName(
-                f"Review or correct prepared {family_title} details for {radio_draft_label}"
-            )
-            editor_dialog.resize(
-                _guided_dialog_initial_size(QSize(720, 620), screen_margin=80)
-            )
-            editor_layout = QVBoxLayout(editor_dialog)
-            handoff_note = QLabel(
-                "Review or correct the prepared details for the current Add Radio draft. "
-                "The radio remains an inactive setup draft. Apply returns to this guided step without losing "
-                "work; nothing is saved until Review & Save."
-            )
-            handoff_note.setWordWrap(True)
-            editor_layout.addWidget(handoff_note)
-            task_combo = QComboBox()
-            task_combo.setAccessibleName(f"{family_title} configuration task")
-            for task_key, task_label in tasks:
-                task_combo.addItem(task_label, task_key)
-            _configure_combo_width(task_combo, minimum=300)
-            editor_layout.addWidget(task_combo)
-            editor = SoftwareTaskEditor(editor_dialog)
-            editor_layout.addWidget(editor, 1)
-            editor.save_button.setVisible(False)
-            editor.discover_button.setVisible(False)
-            draft_state: Dict[str, Any] = _guided_software_editor_state()
-
-            def _show_task() -> None:
-                editor.set_context(
-                    family_key=family,
-                    family_title=family_title,
-                    task_key=str(task_combo.currentData() or "overview"),
-                    radio_id=-1,
-                    radio_name=name_edit.text().strip() or "Radio draft",
-                    state=draft_state,
-                    status_text="Unsaved Add Radio draft",
-                )
-                editor.save_button.setVisible(False)
-                editor.discover_button.setVisible(False)
-
-            def _capture_value(field_key: str, value: object) -> None:
-                nonlocal draft_state
-                draft_state = merge_draft_value(draft_state, field_key, value)
-
-            def _browse_draft_field(field_key: str) -> None:
-                current_state = editor.state()
-                current_value: object = current_state
-                for part in field_key.split("."):
-                    current_value = current_value.get(part, "") if isinstance(current_value, Mapping) else ""
-                start = str(current_value or "")
-                if self._software_browse_uses_directory(field_key):
-                    selected = QFileDialog.getExistingDirectory(editor_dialog, "Select folder", start)
-                else:
-                    selected, _selected_filter = QFileDialog.getOpenFileName(
-                        editor_dialog, "Select application or file", start
-                    )
-                if selected:
-                    editor.apply_value(field_key, selected)
-
-            editor.value_changed.connect(_capture_value)
-            editor.browse_requested.connect(_browse_draft_field)
-            task_combo.currentIndexChanged.connect(lambda _index: _show_task())
-            footer = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
-            apply_btn = footer.button(QDialogButtonBox.Save)
-            apply_btn.setText("Apply to radio draft")
-            apply_btn.setAccessibleName(f"Apply {family_title} changes to radio draft")
-            apply_btn.setStyleSheet(button_style("primary", resolve_theme(self.settings)))
-            footer.accepted.connect(editor_dialog.accept)
-            footer.rejected.connect(editor_dialog.reject)
-            if existing and int((profile_seed or {}).get("id", 0) or 0) > 0:
-                full_workspace_btn = footer.addButton(
-                    "Open full Software workspace",
-                    QDialogButtonBox.ActionRole,
-                )
-                full_workspace_btn.setAccessibleName(
-                    f"Open full Software Administration for {family_title}"
-                )
-
-                def _open_full_software_workspace() -> None:
-                    nonlocal draft_state
-                    _apply_guided_software_editor_state(draft_state)
-                    self._guided_radio_software_resume_draft = {
-                        "family": family,
-                        "draft": _draft_radio_profile(),
-                        "resume_step": "software",
-                        "inactive": True,
-                    }
-                    editor_dialog.accept()
-                    dlg.reject()
-                    QTimer.singleShot(
-                        0,
-                        lambda: self.show_settings_context(
-                            "software",
-                            health_key="software_administration",
-                            radio_id=int((profile_seed or {}).get("id", 0) or 0),
-                        ),
-                    )
-
-                full_workspace_btn.clicked.connect(_open_full_software_workspace)
-            editor_layout.addWidget(footer)
-            _show_task()
-            if editor_dialog.exec() == QDialog.Accepted:
-                _apply_guided_software_editor_state(draft_state)
-                software_plan_prepared = True
-                prepared_software_families = tuple(
-                    key
-                    for key in software_responsibility_cards
-                    if _guided_software_family_selected(key)
-                )
-                prepared_software_context = _guided_software_plan_context()
-                _update_software_responsibility_cards()
-                configure_auto_status.setText(
-                    f"Applied {family_title} details to this unsaved radio draft. Review & Save remains required."
-                )
-
-        def _on_software_source_changed(family_key: str) -> None:
-            _sync_software_policy_from_source(family_key)
-            source = str(
-                software_source_combos[family_key].currentData() or "create"
-            ).strip().lower()
-            if family_key == "js8call" and source == "create":
-                # A distinct-instance intent may reuse the executable, never
-                # an existing profile, message root, or API endpoint bundle.
-                js8_profile_edit.clear()
-                js8_directed_edit.clear()
-                js8_port_edit.setText(_default_instance_port("js8call"))
-                js8_profile_choice_combo.setCurrentIndex(0)
-            elif family_key == "varac" and source == "create":
-                # Existing node-local VarAC files are collision evidence only.
-                # A new node receives its own reviewed targets later.
-                for edit in (
-                    varac_db_edit,
-                    varac_ini_edit,
-                    varac_incoming_edit,
-                    varac_outbox_edit,
-                    varac_bbs_edit,
-                    varac_bbs_archive_edit,
-                    varac_launch_cmd_edit,
-                ):
-                    edit.clear()
-            _invalidate_prepared_software_plan()
-            _update_app_choice_visibility()
-
-        for family_key, source_combo in software_source_combos.items():
-            source_combo.currentIndexChanged.connect(
-                lambda _index, key=family_key: _on_software_source_changed(key)
-            )
-            _sync_software_policy_from_source(family_key)
-        if varac_arrangement_combo is not None:
-            def _on_varac_arrangement_changed(_index: int) -> None:
-                _invalidate_prepared_software_plan()
-
-            def _on_varac_radio_name_changed(_value: str) -> None:
-                _refresh_varac_arrangement_presentation(preserve_selection=True)
-                _invalidate_prepared_software_plan()
-
-            varac_arrangement_combo.currentIndexChanged.connect(_on_varac_arrangement_changed)
-            name_edit.textChanged.connect(_on_varac_radio_name_changed)
-        for family_key, detail_btn in software_detail_buttons.items():
-            detail_btn.clicked.connect(
-                lambda _checked=False, key=family_key: _show_guided_software_details(key)
-            )
-
-        def _receiver_evidence_configuration_matches() -> bool:
-            evidence = receiver_verification_evidence
-            adapter = str(sdr_adapter_combo.currentData() or "manual").strip().lower()
-            host = sdr_host_edit.text().strip()
-            port = sdr_port_edit.text().strip()
-            target = sdr_target_edit.text().strip()
-            return bool(
-                evidence
-                and str(evidence.get("adapter") or "").strip().lower() == adapter
-                and str(evidence.get("host") or "").strip().casefold() == host.casefold()
-                and str(evidence.get("port") or "").strip() == port
-                and str(evidence.get("target") or "").strip().casefold() == target.casefold()
-            )
-
-        def _receiver_evidence_is_verified_for_current() -> bool:
-            return receiver_control_verification_matches(
-                {
-                    "sdr_adapter": str(sdr_adapter_combo.currentData() or "manual"),
-                    "sdr_host": sdr_host_edit.text().strip(),
-                    "sdr_port": sdr_port_edit.text().strip(),
-                    "sdr_target": sdr_target_edit.text().strip(),
-                    "sdr_verification_state": receiver_verification_state,
-                    "sdr_verification": receiver_verification_evidence,
-                }
-            )
-
-        def _update_receiver_manual_card() -> None:
-            """Render cache-only receiver setup guidance; never contact an endpoint."""
-
-            application = str(sdr_application_combo.currentText() or "Other / manual").strip()
-            adapter = str(sdr_adapter_combo.currentData() or "manual").strip().lower()
-            target = sdr_target_edit.text().strip()
-            endpoint = sdr_host_edit.text().strip()
-            port = sdr_port_edit.text().strip()
-            endpoint_detail = ""
-            if endpoint:
-                endpoint_detail = f" Saved application endpoint: {endpoint}{':' + port if port else ''}."
-            target_detail = f" Selected receiver: {target}." if target else ""
-            setup = {
-                "SDR++": "In SDR++, select the receiver and VFO, enable the RigCTL Server module, enable tuning, and confirm its bind address and port. CommsPlan opens only short-lived receive-control connections.",
-                "SDRangel": "Open SDRangel, select the receiver hardware and device set, then tune there. Do not treat an HTTP address as verified CommsPlan control.",
-                "SDRconnect": "Open SDRconnect, select the receiver and VFO, then tune there. A later verified setup will respect its application control ownership.",
-                "Gqrx": "Open Gqrx, select the receiver source, then tune there. Its remote-control address remains optional technical information until verified.",
-                "KiwiSDR": "Open the receiver in its normal browser/application workflow, then tune it manually. CommsPlan does not own that listening session.",
-            }.get(
-                application,
-                "Tune this receiver manually in its normal application. Record the hardware in Radio Model above so CommsPlan can give accurate compatibility guidance later.",
-            )
-            sdr_manual_guidance.setText(
-                setup + " You can save this profile now; manual tuning remains available even when no API is configured."
-            )
-
-            def _verification_evidence_summary(evidence: object) -> str:
-                """Return bounded display facts from saved evidence, never live state."""
-
-                if not isinstance(evidence, dict):
-                    return ""
-                labels = (
-                    ("tested_at_utc", "test date"),
-                    ("tested_at", "test date"),
-                    ("verified_at", "verification date"),
-                    ("hardware_model", "hardware"),
-                    ("hardware_family", "hardware"),
-                    ("application_version", "application"),
-                    ("api_version", "API"),
-                    ("target", "target"),
-                    ("os", "OS"),
-                )
-                facts: list[str] = []
-                seen_labels: set[str] = set()
-                for key, label in labels:
-                    value = str(evidence.get(key, "") or "").strip()
-                    if value and label not in seen_labels:
-                        facts.append(f"{label}: {value[:96]}")
-                        seen_labels.add(label)
-                    if len(facts) == 4:
-                        break
-                return "; ".join(facts)
-
-            evidence = dict(receiver_verification_evidence)
-            evidence_present = bool(evidence)
-            evidence_matches = _receiver_evidence_is_verified_for_current()
-            effective_state = receiver_verification_state
-            if adapter == "manual":
-                effective_state = "manual"
-            elif not evidence_matches:
-                effective_state = "unverified"
-            evidence_summary = _verification_evidence_summary(evidence) if evidence_matches else ""
-
-            if adapter == "manual":
-                verification_text = "Manual tuning — no CommsPlan control adapter is selected."
-            elif adapter == "sdrpp_rigctl":
-                if receiver_test_in_progress:
-                    verification_text = "Testing SDR++ control in the background; the selected VFO will move briefly and then be restored."
-                elif effective_state == "verified" and evidence_matches:
-                    verification_text = f"CommsPlan tuning ready — tune/readback and restoration passed ({evidence_summary or 'verified evidence'})."
-                elif receiver_verification_state == "failed":
-                    verification_text = "The last control test failed. Tune this receiver manually, correct the setup, and try again."
-                elif receiver_verification_state == "verified" and evidence_present:
-                    verification_text = "Verification pending — saved evidence does not match the current host, port, or target. Test this configuration again."
-                else:
-                    verification_text = "Verification pending — no successful reversible tune/readback evidence is saved for this configuration."
-            else:
-                verification_text = f"Manual tuning — adapter '{adapter}' is not available in this build."
-            sdr_verification_summary.setText(verification_text)
-
-            test_service_ready = self._receiver_control_test_service_is_ready()
-            target_is_canonical = bool(target) and not any(char.isspace() for char in target) and "|" not in target
-            can_test = bool(
-                adapter == "sdrpp_rigctl"
-                and test_service_ready
-                and endpoint
-                and port
-                and target_is_canonical
-                and not receiver_test_in_progress
-            )
-            sdr_test_control_btn.setEnabled(can_test)
-            sdr_test_control_btn.setText("Testing…" if receiver_test_in_progress else "Test control")
-            sdr_test_control_btn.setStyleSheet(
-                button_style("primary" if can_test else "muted", resolve_theme(self.settings))
-            )
-            if can_test:
-                sdr_test_control_btn.setToolTip(
-                    "Run a background receive-only test. The selected VFO moves briefly, readback is checked, and the original frequency is restored and checked."
-                )
-            elif adapter == "sdrpp_rigctl" and not target_is_canonical:
-                sdr_test_control_btn.setToolTip("Enter a receiver target without spaces, such as selected-vfo.")
-            else:
-                sdr_test_control_btn.setToolTip(
-                    "Test control is unavailable until a receive-only asynchronous adapter service is installed. Manual tuning remains available."
-                )
-
-            can_enable = bool(
-                adapter == "sdrpp_rigctl"
-                and test_service_ready
-                and effective_state == "verified"
-                and evidence_matches
-            )
-            sdr_control_enabled_chk.setEnabled(can_enable)
-            if not can_enable:
-                sdr_control_enabled_chk.setChecked(False)
-            sdr_control_enabled_chk.setToolTip(
-                "Enable scheduled CommsPlan tuning for this receive-only endpoint."
-                if can_enable
-                else "CommsPlan tuning remains disabled until reversible tune/readback and restoration pass for this exact configuration."
-            )
-            if can_enable:
-                sdr_manual_status.setText(
-                    "CommsPlan tuning ready. Manual tuning remains available whenever automatic receiver control is disabled."
-                    + target_detail
-                    + endpoint_detail
-                )
-                sdr_manual_guidance.setText(
-                    setup
-                    + " Control is verified. Select Enable CommsPlan tuning, then continue through Review and save this radio."
-                )
-            else:
-                sdr_manual_status.setText(
-                    "Manual tuning — CommsPlan is not controlling this receiver. Saved application details are configuration, not proof of control."
-                    + target_detail
-                    + endpoint_detail
-                )
-                if can_test:
-                    sdr_manual_guidance.setText(
-                        setup
-                        + " With the SDR++ RigCTL Server listening, choose Test control now. You will not need to repeat setup after saving."
-                    )
-            _update_receiver_state_cards()
-
-        def _browse_guided_app_choice(app_id: str) -> None:
-            target = app_choice_targets.get(app_id)
-            if target is None:
-                return
-            app_label = {
-                "flrig": "FLRig",
-                "fldigi": "FLDigi",
-                "flmsg": "FLMsg",
-                "flamp": "FLAmp",
-                "js8call": "JS8Call",
-                "js8spotter": "External JS8Spotter",
-                "commstat": "CommStat",
-                "varac": "VarAC",
-            }.get(str(app_id or "").strip().lower(), "app")
-            start = target.text().strip() or radio_apps_base_edit.text().strip() or str(Path.home())
-            if platform.system() == "Darwin" or app_id == "varac":
-                chosen = QFileDialog.getExistingDirectory(self, f"Select {app_label} app or folder", start)
-            else:
-                chosen, _filter = QFileDialog.getOpenFileName(
-                    self,
-                    f"Select {app_label} executable",
-                    start,
-                    "Application/executable files (*);;All Files (*)",
-                )
-            if not chosen:
-                return
-            changed = target.text().strip() != str(chosen).strip()
-            target.setText(chosen)
-            configure_auto_status.setText(
-                f"Using selected {app_label} location. CommsPlan is refreshing the launch plan automatically."
-                if changed
-                else f"Using selected {app_label} location."
-            )
-            _update_app_choice_visibility()
-            if changed:
-                _invalidate_prepared_software_plan()
-                _update_dialog_visibility()
-            else:
-                _apply_guided_wizard_visibility(connection_group.isVisible())
-                _update_dialog_readiness()
-
-        for app_id, browse_btn in app_choice_browse_buttons.items():
-            browse_btn.clicked.connect(lambda _checked=False, key=app_id: _browse_guided_app_choice(key))
-
-        app_autoconfigure_attempted = False
-
-        def _app_choice_app_selected(app_id: str) -> bool:
-            key = str(app_id or "").strip().lower()
-            backend = str(backend_combo.currentData() or "").strip().lower()
-            selected_by_app = {
-                "flrig": use_flrig_chk.isChecked() or backend == "flrig",
-                "fldigi": use_fldigi_chk.isChecked(),
-                "flmsg": use_flmsg_chk.isChecked(),
-                "flamp": use_flamp_chk.isChecked(),
-                "js8call": use_js8call_chk.isChecked() or backend == "js8call",
-                "js8spotter": use_external_js8spotter_chk.isChecked(),
-                "commstat": use_commstat_chk.isChecked(),
-                "varac": use_varac_chk.isChecked(),
-            }
-            return bool(selected_by_app.get(key, False))
-
-        def _js8_app_selected() -> bool:
-            return _app_choice_app_selected("js8call")
-
-        def _apply_detected_app_choice(
-            app_id: str,
-            *,
-            reprepare: bool = True,
-            publish: bool = True,
-        ) -> None:
-            combo = app_choice_combos.get(app_id)
-            target = app_choice_targets.get(app_id)
-            if combo is None or target is None:
-                return
-            path_text = str(combo.currentData() or "").strip()
-            if not path_text:
-                return
-            app_labels = {
-                "flrig": "FLRig",
-                "fldigi": "FLDigi",
-                "flmsg": "FLMsg",
-                "flamp": "FLAmp",
-                "js8call": "JS8Call",
-                "js8spotter": "External JS8Spotter",
-                "commstat": "CommStat",
-                "varac": "VarAC",
-            }
-            label = app_labels.get(app_id, app_id)
-            changed = target.text().strip() != path_text
-            if changed:
-                target.setText(path_text)
-            configure_auto_status.setText(
-                f"Using selected {label} app for this radio. CommsPlan is refreshing the launch plan automatically."
-                if changed and reprepare
-                else f"Using selected {label} app for this radio."
-            )
-            _update_app_choice_visibility()
-            if changed and reprepare:
-                _invalidate_prepared_software_plan()
-                _update_dialog_visibility()
-                return
-            if not publish:
-                return
-            # A choice can resolve the highlighted ambiguity without changing
-            # the already prepared path. Republish navigation immediately;
-            # readiness alone returns early outside Review and used to leave
-            # Next disabled after the operator made the requested selection.
-            _apply_guided_wizard_visibility(connection_group.isVisible())
-            _update_dialog_readiness()
-
-        def _app_choice_selected_path(app_id: str) -> str:
-            target = app_choice_targets.get(app_id)
-            if target is None:
-                return ""
-            return str(target.text() or "").strip()
-
-        def _sync_app_choice_combo_to_target(app_id: str) -> None:
-            combo = app_choice_combos.get(app_id)
-            if combo is None:
-                return
-            path_text = _app_choice_selected_path(app_id)
-            if not path_text:
-                return
-            matched_idx = -1
-            for idx in range(1, combo.count()):
-                if str(combo.itemData(idx) or "").strip() == path_text:
-                    matched_idx = idx
-                    break
-            if matched_idx < 0:
-                label = f"Using: {path_text}"
-                combo.blockSignals(True)
-                combo.addItem(label, path_text)
-                matched_idx = combo.count() - 1
-                combo.blockSignals(False)
-            combo.blockSignals(True)
-            combo.setCurrentIndex(matched_idx)
-            combo.blockSignals(False)
-
-        def _apply_js8_profile_choice() -> None:
-            payload = js8_profile_choice_combo.currentData()
-            if not isinstance(payload, Mapping):
-                return
-            port = str(payload.get("port", "") or "").strip()
-            profile_path = str(payload.get("profile_path", "") or "").strip()
-            directed_path = str(payload.get("directed_path", "") or "").strip()
-            if not any((port, profile_path, directed_path)):
-                return
-            filled: List[str] = []
-            preserved: List[str] = []
-            if port and not js8_port_edit.text().strip():
-                js8_port_edit.setText(port)
-                filled.append("JS8Call port")
-            elif port:
-                preserved.append("JS8Call port")
-            if profile_path and not js8_profile_edit.text().strip():
-                js8_profile_edit.setText(profile_path)
-                filled.append("JS8 profile folder")
-            elif profile_path:
-                preserved.append("JS8 profile folder")
-            if directed_path and not js8_directed_edit.text().strip():
-                js8_directed_edit.setText(directed_path)
-                filled.append("JS8Call DIRECTED.TXT")
-            elif directed_path:
-                preserved.append("JS8Call DIRECTED.TXT")
-            if filled:
-                configure_auto_status.setText("Using selected JS8Call profile for this radio. Filled: " + ", ".join(filled) + ".")
-            elif preserved:
-                configure_auto_status.setText(
-                    "Kept existing JS8Call profile fields. Clear a field first to use that value from the selected profile."
-                )
-            _update_app_choice_visibility()
-            _update_dialog_readiness()
-
-        def _persist_radio_apps_base_folder() -> None:
-            value = radio_apps_base_edit.text().strip()
-            try:
-                if str(self.settings.get("radio_apps_base_folder", "") or "").strip() != value:
-                    self.settings.set("radio_apps_base_folder", value)
-            except Exception:
-                log.debug("Unable to save Radio Apps Base Folder during guided setup.", exc_info=True)
-
-        def _update_app_choice_visibility() -> None:
-            nonlocal app_autoconfigure_attempted
-            observer_mode = str(device_class_combo.currentData() or "").strip().lower() == "observer"
-            any_visible = False
-            theme = resolve_theme(self.settings)
-            warning = theme.get("warning", "#C99700")
-            selection_bg = theme.get("selection_bg", theme.get("surface_alt", "#E8F3FA"))
-            attention_style = (
-                f"QComboBox {{ background-color: {selection_bg}; border: 2px solid {warning}; }}"
-            )
-            attention_row_style = (
-                f"QWidget {{ background-color: {selection_bg}; border: 1px solid {warning}; border-radius: 4px; }}"
-            )
-            for app_id, combo in app_choice_combos.items():
-                row_widget = app_choice_rows.get(app_id, combo)
-                target_edit = app_choice_targets.get(app_id)
-                target_text = str(target_edit.text() or "").strip() if target_edit is not None else ""
-                target_missing = target_edit is not None and not target_text
-                selected_for_radio = _app_choice_app_selected(app_id)
-                observer_js8 = bool(observer_mode and app_id == "js8call" and use_js8call_chk.isChecked())
-                visible = (
-                    (not observer_mode or observer_js8)
-                    and selected_for_radio
-                    and app_autoconfigure_attempted
-                    and (combo.count() > 1 or bool(target_text) or target_missing)
-                )
-                _set_row_visible(row_widget, visible)
-                combo.setVisible(visible)
-                needs_choice = visible and (
-                    (combo.count() > 2 and combo.currentIndex() <= 0)
-                    or (app_autoconfigure_attempted and combo.count() <= 1 and target_missing)
-                )
-                combo.setStyleSheet(attention_style if needs_choice else "")
-                row_widget.setStyleSheet(attention_row_style if needs_choice else "")
-                combo.setToolTip(
-                    "Choose or browse to the app that belongs to this radio before continuing."
-                    if needs_choice
-                    else "Review the detected app path for this radio."
-                )
-                browse_btn = app_choice_browse_buttons.get(app_id)
-                if browse_btn is not None:
-                    browse_btn.setVisible(visible)
-                any_visible = any_visible or visible
-            js8_profile_visible = (
-                _js8_app_selected()
-                and str(
-                    software_source_combos["js8call"].currentData() or "create"
-                ).strip().lower() == "existing"
-                and (not observer_mode or use_js8call_chk.isChecked())
-                and app_autoconfigure_attempted
-                and (
-                    js8_profile_choice_combo.count() > 1
-                    or bool(js8_profile_edit.text().strip())
-                    or bool(js8_directed_edit.text().strip())
-                )
-            )
-            _set_row_visible(js8_profile_choice_combo, js8_profile_visible)
-            js8_profile_needs_choice = (
-                js8_profile_visible
-                and js8_profile_choice_combo.count() > 2
-                and js8_profile_choice_combo.currentIndex() <= 0
-            )
-            js8_profile_choice_combo.setStyleSheet(attention_style if js8_profile_needs_choice else "")
-            js8_profile_choice_combo.setToolTip(
-                "Choose the JS8Call profile that belongs to this radio before continuing."
-                if js8_profile_needs_choice
-                else "Review the detected JS8Call profile for this radio."
-            )
-            any_visible = any_visible or js8_profile_visible
-            app_choice_group.setVisible(any_visible)
-            if any_visible:
-                group_style = (
-                    f"QGroupBox#guidedDetectedAppsReview {{ border: 2px solid {warning}; border-radius: 6px; margin-top: 8px; }}"
-                    f"QGroupBox#guidedDetectedAppsReview::title {{ subcontrol-origin: margin; left: 8px; padding: 0 4px; }}"
-                    if _detected_app_choice_needs_operator_selection()
-                    else ""
-                )
-                app_choice_group.setStyleSheet(group_style)
-
-        def _detected_app_choice_needs_operator_selection() -> bool:
-            nonlocal app_autoconfigure_attempted
-            observer_mode = str(device_class_combo.currentData() or "").strip().lower() == "observer"
-            for app_id, combo in app_choice_combos.items():
-                if observer_mode and app_id != "js8call":
-                    continue
-                if not _app_choice_app_selected(app_id):
-                    continue
-                if combo.count() > 2 and combo.currentIndex() <= 0:
-                    return True
-                # No discovered executable is launch-readiness evidence, not
-                # a collision or overwrite risk.  A create-new route keeps
-                # its isolated plan as "launch setup pending" and may be
-                # saved; only multiple detected candidates require a choice.
-            return bool(
-                _js8_app_selected()
-                and str(
-                    software_source_combos["js8call"].currentData() or "create"
-                ).strip().lower() == "existing"
-                and js8_profile_choice_combo.count() > 2
-                and js8_profile_choice_combo.currentIndex() <= 0
-            )
-
-        def _select_single_detected_choice(combo: QComboBox) -> bool:
-            if combo.count() != 2 or combo.currentIndex() > 0:
-                return False
-            was_blocked = combo.blockSignals(True)
-            combo.setCurrentIndex(1)
-            combo.blockSignals(was_blocked)
-            return True
-
-        def _update_detected_app_choices(candidates: Sequence[Any]) -> None:
-            placeholder_labels = {
-                "flrig": "Choose detected FLRig...",
-                "fldigi": "Choose detected FLDigi...",
-                "flmsg": "Choose detected FLMsg...",
-                "flamp": "Choose detected FLAmp...",
-                "js8call": "Choose detected JS8Call...",
-                "js8spotter": "Choose detected external JS8Spotter...",
-                "commstat": "Choose detected CommStat...",
-                "varac": "Choose detected VarAC...",
-            }
-            for app_id, combo in app_choice_combos.items():
-                choices = self._guided_app_candidate_choices(candidates, app_id)
-                combo.blockSignals(True)
-                combo.clear()
-                combo.addItem(placeholder_labels.get(app_id, "Choose detected app..."), "")
-                for label_text, path_text in choices:
-                    combo.addItem(label_text, path_text)
-                combo.blockSignals(False)
-                if _app_choice_app_selected(app_id):
-                    selected_single = _select_single_detected_choice(combo)
-                    if selected_single:
-                        # This runs inside the current preparation result. The
-                        # selected path is consumed by that same result and
-                        # must not invalidate it or start a duplicate worker.
-                        _apply_detected_app_choice(
-                            app_id,
-                            reprepare=False,
-                            publish=False,
-                        )
-                    _sync_app_choice_combo_to_target(app_id)
-                _configure_combo_width(combo, minimum=360)
-            _update_app_choice_visibility()
-            # Candidate publication is one atomic discovery-result batch.
-            # Rebuilding Review for every sole detected application performs
-            # redundant filesystem work and causes visible Add Radio stalls.
-            _apply_guided_wizard_visibility(connection_group.isVisible())
-            _update_dialog_readiness()
-
-        def _update_js8_profile_choices(profiles: Sequence[Any]) -> None:
-            choices = self._guided_js8_profile_choices(profiles)
-            js8_profile_choice_combo.blockSignals(True)
-            js8_profile_choice_combo.clear()
-            js8_profile_choice_combo.addItem("Choose JS8Call profile...", {})
-            for label_text, payload in choices:
-                js8_profile_choice_combo.addItem(label_text, payload)
-            js8_profile_choice_combo.blockSignals(False)
-            existing_source = str(
-                software_source_combos["js8call"].currentData() or "create"
-            ).strip().lower() == "existing"
-            if _js8_app_selected() and existing_source:
-                selected_single = _select_single_detected_choice(js8_profile_choice_combo)
-                if selected_single:
-                    _apply_js8_profile_choice()
-                elif js8_profile_edit.text().strip() or js8_directed_edit.text().strip():
-                    profile_path = js8_profile_edit.text().strip()
-                    directed_path = js8_directed_edit.text().strip()
-                    port = js8_port_edit.text().strip()
-                    matched_idx = -1
-                    for idx in range(1, js8_profile_choice_combo.count()):
-                        payload = js8_profile_choice_combo.itemData(idx)
-                        if not isinstance(payload, Mapping):
-                            continue
-                        if (
-                            (profile_path and str(payload.get("profile_path", "") or "").strip() == profile_path)
-                            or (directed_path and str(payload.get("directed_path", "") or "").strip() == directed_path)
-                        ):
-                            matched_idx = idx
-                            break
-                    if matched_idx < 0:
-                        label_parts = ["Using JS8Call profile"]
-                        if port:
-                            label_parts.append(f"API {port}")
-                        if profile_path:
-                            label_parts.append(profile_path)
-                        js8_profile_choice_combo.blockSignals(True)
-                        js8_profile_choice_combo.addItem(
-                            " | ".join(label_parts),
-                            {
-                                "port": port,
-                                "profile_path": profile_path,
-                                "directed_path": directed_path,
-                            },
-                        )
-                        matched_idx = js8_profile_choice_combo.count() - 1
-                        js8_profile_choice_combo.blockSignals(False)
-                    js8_profile_choice_combo.blockSignals(True)
-                    js8_profile_choice_combo.setCurrentIndex(matched_idx)
-                    js8_profile_choice_combo.blockSignals(False)
-            _configure_combo_width(js8_profile_choice_combo, minimum=420)
-            _update_app_choice_visibility()
-
-        def _update_port_prompt_visibility() -> None:
-            current_ports = {
-                "flrig_port": flrig_port_edit.text().strip(),
-                "fldigi_port": fldigi_port_edit.text().strip(),
-                "js8_port": js8_port_edit.text().strip(),
-            }
-            missing_keys = set(
-                self._guided_port_prompt_keys(
-                    current=current_ports,
-                    selected={
-                        "flrig": use_flrig_chk.isChecked(),
-                        "fldigi": use_fldigi_chk.isChecked(),
-                        "js8call": use_js8call_chk.isChecked(),
-                    },
-                    backend=str(backend_combo.currentData() or ""),
-                    observer_mode=str(device_class_combo.currentData() or "").strip().lower() == "observer",
-                )
-            )
-            any_visible = False
-            for field_key, prompt_edit in port_prompt_fields.items():
-                visible = field_key in missing_keys
-                _set_row_visible(prompt_edit, visible)
-                any_visible = any_visible or visible
-            port_prompt_group.setVisible(any_visible)
-
-        for app_id, combo in app_choice_combos.items():
-            combo.currentIndexChanged.connect(lambda _idx, key=app_id: _apply_detected_app_choice(key))
-        js8_profile_choice_combo.currentIndexChanged.connect(lambda _idx: _apply_js8_profile_choice())
-
-        def _populate_radio_model_combo(entries: List[Dict[str, Any]], *, selected_text: str = "") -> None:
-            current_text = selected_text or radio_model_combo.currentText().strip()
-            if current_text.casefold() == radio_model_prompt.casefold():
-                current_text = ""
-            radio_model_combo.blockSignals(True)
-            radio_model_combo.clear()
-            radio_model_combo.addItem("", {})
-            for entry in entries:
-                radio_model_combo.addItem(str(entry.get("display_name", "") or ""), dict(entry))
-            radio_model_combo.setCurrentIndex(0)
-            if current_text:
-                matched_idx = -1
-                for idx in range(1, radio_model_combo.count()):
-                    data = radio_model_combo.itemData(idx)
-                    if isinstance(data, dict) and str(data.get("display_name", "") or "").strip().casefold() == current_text.casefold():
-                        matched_idx = idx
-                        break
-                if matched_idx >= 0:
-                    radio_model_combo.setCurrentIndex(matched_idx)
-                else:
-                    radio_model_combo.setEditText(current_text)
-            radio_model_combo.blockSignals(False)
-            radio_model_completer = QCompleter([str(entry.get("display_name", "") or "") for entry in entries], dlg)
-            radio_model_completer.setCaseSensitivity(Qt.CaseInsensitive)
-            radio_model_completer.setFilterMode(Qt.MatchContains)
-            radio_model_combo.setCompleter(radio_model_completer)
-            _configure_combo_width(radio_model_combo, minimum=280)
-
-        _populate_radio_model_combo(catalog_entries)
-
-        existing_catalog_entry = find_radio_catalog_entry(
-            catalog_entries,
-            catalog_id=str((profile_seed or {}).get("radio_catalog_id", "") or ""),
-            manufacturer=str((profile_seed or {}).get("radio_manufacturer", "") or ""),
-            model_name=str((profile_seed or {}).get("radio_model", "") or ""),
-            display_name=self._device_radio_model_summary(profile_seed or {}),
-        )
-        if existing_catalog_entry:
-            for idx in range(radio_model_combo.count()):
-                data = radio_model_combo.itemData(idx)
-                if isinstance(data, dict) and str(data.get("catalog_id", "") or "") == str(
-                    existing_catalog_entry.get("catalog_id", "") or ""
-                ):
-                    radio_model_combo.setCurrentIndex(idx)
-                    break
-        else:
-            existing_model_text = self._device_radio_model_summary(profile_seed or {})
-            if existing_model_text and existing_model_text != "--":
-                radio_model_combo.setEditText(existing_model_text)
-
-        def _current_radio_model_payload() -> Dict[str, str]:
-            typed = radio_model_combo.currentText().strip()
-            if typed.casefold() == radio_model_prompt.casefold():
-                typed = ""
-            matched = find_radio_catalog_entry(catalog_entries, display_name=typed)
-            if matched:
-                return {
-                    "catalog_id": str(matched.get("catalog_id", "") or ""),
-                    "manufacturer": str(matched.get("manufacturer", "") or ""),
-                    "model_name": str(matched.get("model_name", "") or ""),
-                    "display_name": str(matched.get("display_name", "") or typed),
-                }
-            data = radio_model_combo.currentData()
-            if isinstance(data, dict) and str(data.get("catalog_id", "") or "").strip():
-                return {
-                    "catalog_id": str(data.get("catalog_id", "") or ""),
-                    "manufacturer": str(data.get("manufacturer", "") or ""),
-                    "model_name": str(data.get("model_name", "") or ""),
-                    "display_name": str(data.get("display_name", "") or typed),
-                }
-            return {
-                "catalog_id": "",
-                "manufacturer": "",
-                "model_name": typed,
-                "display_name": typed,
-            }
-
-        use_flrig_chk.setChecked(self._radio_software_enabled(existing or {}, "flrig"))
-        use_fldigi_chk.setChecked(
-            self._radio_software_enabled(existing or {}, "fldigi")
-        )
-        use_flmsg_chk.setChecked(self._radio_software_enabled(existing or {}, "flmsg"))
-        use_flamp_chk.setChecked(self._radio_software_enabled(existing or {}, "flamp"))
-        use_js8call_chk.setChecked(self._radio_software_enabled(existing or {}, "js8call"))
-        use_js8spotter_chk.setChecked(bool((profile_seed or {}).get("use_js8spotter", 0)))
-        use_external_js8spotter_chk.setChecked(bool(str((profile_seed or {}).get("spotter_launch_path", "") or "").strip()))
-        use_commstat_chk.setChecked(self._radio_software_enabled(existing or {}, "commstat"))
-        use_varac_chk.setChecked(self._radio_software_enabled(existing or {}, "varac"))
-        optional_toggle.setChecked(
-            any(
-                [
-                    ptt_group_edit.text().strip(),
-                    antenna_group_edit.text().strip(),
-                    self._band_check_values(band_checks),
-                    str(antenna_band_mode_combo.currentData() or "warn"),
-                    band_overlap_edit.text().strip(),
-                    str(band_overlap_mode_combo.currentData() or "warn"),
-                    advanced_frequency_group_edit.text().strip(),
-                    str(advanced_frequency_mode_combo.currentData() or "warn"),
-                    int(advanced_frequency_window_spin.value()),
-                    frontend_group_edit.text().strip(),
-                    amplifier_group_edit.text().strip(),
-                    notes_edit.toPlainText().strip(),
-                ]
-            )
-        )
-        applying_setup_type_choice = False
-
-        def _set_combo_data(combo: QComboBox, value: str) -> None:
-            idx = combo.findData(value)
-            if idx >= 0:
-                combo.setCurrentIndex(idx)
-
-        def _checkbox_set_checked(checkbox: QCheckBox, checked: bool) -> None:
-            if checkbox.isChecked() != bool(checked):
-                checkbox.setChecked(bool(checked))
-
-        def _current_guided_lane() -> str:
-            selected_lane = str(setup_type_combo.currentData() or "").strip()
-            if selected_lane and selected_lane != "custom":
-                return selected_lane
-            return infer_guided_setup_lane(
-                _guided_plan_enabled_apps(),
-                varac_selected=use_varac_chk.isChecked(),
-                receive_only=str(device_class_combo.currentData() or "").strip().lower() == "observer",
-            )
-
-        def _sync_setup_type_from_current_fields() -> None:
-            nonlocal applying_setup_type_choice
-            if applying_setup_type_choice:
-                return
-            selected_apps = _guided_plan_enabled_apps()
-            varac_selected = use_varac_chk.isChecked()
-            observer = str(device_class_combo.currentData() or "").strip().lower() == "observer"
-            if not selected_apps and not varac_selected and not observer:
-                _set_combo_data(setup_type_combo, "")
-                return
-            inferred = infer_guided_setup_lane(
-                selected_apps,
-                varac_selected=varac_selected,
-                receive_only=observer,
-            )
-            _set_combo_data(setup_type_combo, inferred)
-
-        def _apply_setup_type_choice() -> None:
-            nonlocal applying_setup_type_choice, guided_wizard_max_index_seen
-            _invalidate_prepared_software_plan()
-            lane = str(setup_type_combo.currentData() or "").strip()
-            if not lane or lane == "custom":
-                _update_dialog_visibility()
-                return
-            applying_setup_type_choice = True
-            try:
-                preset = guided_setup_lane_preset(lane)
-                _set_combo_data(device_class_combo, preset.device_class)
-                _set_combo_data(backend_combo, preset.backend)
-                selected_apps = preset.app_map
-                _checkbox_set_checked(use_flrig_chk, selected_apps.get("flrig", False))
-                _checkbox_set_checked(use_fldigi_chk, selected_apps.get("fldigi", False))
-                _checkbox_set_checked(use_flmsg_chk, selected_apps.get("flmsg", False))
-                _checkbox_set_checked(use_flamp_chk, selected_apps.get("flamp", False))
-                _checkbox_set_checked(use_js8call_chk, selected_apps.get("js8call", False))
-                _checkbox_set_checked(use_js8spotter_chk, selected_apps.get("js8spotter", False))
-                _checkbox_set_checked(use_external_js8spotter_chk, False)
-                _checkbox_set_checked(use_commstat_chk, selected_apps.get("commstat", False))
-                _checkbox_set_checked(use_varac_chk, selected_apps.get("varac", False))
-            finally:
-                applying_setup_type_choice = False
-            # Once the operator has selected a setup type, the software step
-            # is considered acknowledged and Connection remains a reachable
-            # quick path for experienced users; the normal Next action still
-            # presents Receiver Stack first.
-            if str(device_class_combo.currentData() or "").strip().lower() == "observer":
-                guided_wizard_max_index_seen = max(guided_wizard_max_index_seen, 1)
-            _update_guided_app_setup_plan_review()
-            _update_dialog_visibility()
-
-        def _mark_custom_mix_from_software_edit() -> None:
-            # Checkbox signals fire after the family selection has changed.
-            # Purge first even while a preset is applying, otherwise its
-            # deselected family can survive because the preset guard returns
-            # before ordinary invalidation runs.
-            _purge_deselected_guided_software()
-            if applying_setup_type_choice:
-                _update_software_responsibility_cards()
-                return
-            _invalidate_prepared_software_plan()
-            if str(device_class_combo.currentData() or "").strip().lower() == "observer":
-                # Companion receive software does not turn an observer into a
-                # custom transmit-capable lane.
-                _update_dialog_visibility()
-                return
-            lane = str(setup_type_combo.currentData() or "").strip()
-            if lane and lane != "custom":
-                _set_combo_data(setup_type_combo, "custom")
-                return
-            _update_dialog_visibility()
-
-        def _set_row_visible(widget: QWidget, visible: bool) -> None:
-            widget.setVisible(bool(visible))
-            label_widget = row_labels.get(widget)
-            if label_widget is not None:
-                label_widget.setVisible(bool(visible))
-
-        def _existing_radio_labels_for_name_generation() -> Tuple[str, ...]:
-            try:
-                current_id = int((profile_seed or {}).get("id", 0) or 0)
-            except Exception:
-                current_id = 0
-            labels: List[str] = []
-            for row in self.device_profiles or []:
-                if not isinstance(row, Mapping):
-                    continue
-                try:
-                    row_id = int(row.get("id", 0) or 0)
-                except Exception:
-                    row_id = 0
-                if current_id > 0 and row_id == current_id:
-                    continue
-                name = str(row.get("name", "") or "").strip()
-                if name:
-                    labels.append(name)
-            return tuple(labels)
-
-        def _update_radio_model_hint() -> None:
-            nonlocal display_name_user_edited, last_catalog_display_name
-            selected = _current_radio_model_payload()
-            display_name = str(selected.get("display_name", "") or "").strip()
-            matched = find_radio_catalog_entry(
-                catalog_entries,
-                catalog_id=str(selected.get("catalog_id", "") or ""),
-                manufacturer=str(selected.get("manufacturer", "") or ""),
-                model_name=str(selected.get("model_name", "") or ""),
-                display_name=display_name,
-            )
-            control_methods = catalog_entry_control_methods(matched)
-            control_labels = ", ".join(self._device_backend_label(name) for name in control_methods if name != "manual")
-            if display_name:
-                if catalog_source == "hamlib-rigctl":
-                    model_hint_label.setText(
-                        f"Using local Hamlib rig data. Selected model: {display_name}. "
-                        f"Suggested control methods: {control_labels or 'Manual'}. "
-                        "You can keep this as the radio name or give the station a more specific label."
-                    )
-                else:
-                    model_hint_label.setText(
-                        f"Using the bundled fallback radio list. Selected model: {display_name}. "
-                        f"Suggested control methods: {control_labels or 'Manual'}. "
-                        "If Hamlib is installed later, the picker can refresh to a broader local catalog."
-                    )
-                current_name = name_edit.text().strip()
-                can_replace = (
-                    not current_name
-                    or current_name == last_catalog_display_name
-                    or not display_name_user_edited
-                )
-                if can_replace:
-                    generated_name = generated_radio_label(
-                        guided_radio_label_base(selected),
-                        _existing_radio_labels_for_name_generation(),
-                    )
-                    name_edit.setText(generated_name)
-                    last_catalog_display_name = generated_name
-                    display_name_user_edited = False
-            else:
-                if catalog_source == "hamlib-rigctl":
-                    model_hint_label.setText("Search the local Hamlib rig list by manufacturer or model name.")
-                else:
-                    model_hint_label.setText("Search the bundled fallback radio list by manufacturer or model name.")
-
-        def _mark_radio_name_user_edited(_text: str) -> None:
-            nonlocal display_name_user_edited
-            display_name_user_edited = True
-
-        name_edit.textEdited.connect(_mark_radio_name_user_edited)
-        name_edit.textChanged.connect(lambda _text: _invalidate_prepared_software_plan())
-
-        def _draft_radio_profile() -> Dict[str, Any]:
-            model_choice = _current_radio_model_payload()
-            draft_id = int((profile_seed or {}).get("id", 0) or -1)
-            return {
-                "id": draft_id,
-                "system_key": guided_identity_radio_key,
-                "name": name_edit.text().strip() or str(model_choice.get("display_name", "") or "").strip() or "Radio",
-                "radio_catalog_id": str(model_choice.get("catalog_id", "") or ""),
-                "radio_manufacturer": str(model_choice.get("manufacturer", "") or ""),
-                "radio_model": str(model_choice.get("model_name", "") or ""),
-                "enabled": int((profile_seed or {}).get("enabled", 1) or 1),
-                "runtime_active": int((profile_seed or {}).get("runtime_active", 0) or 0),
-                "runtime_primary": int((profile_seed or {}).get("runtime_primary", 0) or 0),
-                "device_class": str(device_class_combo.currentData() or "tx_rx"),
-                "control_backend": str(backend_combo.currentData() or "flrig"),
-                "deployment_mode": str(deploy_combo.currentData() or "full"),
-                "use_flrig": bool(use_flrig_chk.isChecked()),
-                "use_fldigi": bool(use_fldigi_chk.isChecked()),
-                "use_flmsg": bool(use_flmsg_chk.isChecked()),
-                "use_flamp": bool(use_flamp_chk.isChecked()),
-                "use_js8call": bool(use_js8call_chk.isChecked()),
-                "use_js8spotter": bool(use_js8spotter_chk.isChecked()),
-                "use_commstat": bool(use_commstat_chk.isChecked()),
-                "use_varac": bool(use_varac_chk.isChecked()),
-                "rig_host": rig_host_edit.text().strip(),
-                "rig_port": rig_port_edit.text().strip(),
-                "flrig_host": flrig_host_edit.text().strip(),
-                "flrig_port": flrig_port_edit.text().strip(),
-                "flrig_path": flrig_path_edit.text().strip(),
-                "fldigi_host": fldigi_host_edit.text().strip(),
-                "fldigi_port": fldigi_port_edit.text().strip(),
-                "arq_port": fldigi_arq_port_edit.text().strip(),
-                "fldigi_arq_port": fldigi_arq_port_edit.text().strip(),
-                "fldigi_path": fldigi_path_edit.text().strip(),
-                "flmsg_path": flmsg_path_edit.text().strip(),
-                "flamp_path": flamp_path_edit.text().strip(),
-                "js8_host": js8_host_edit.text().strip(),
-                "js8_port": js8_port_edit.text().strip(),
-                "js8_install_path": js8_install_edit.text().strip(),
-                "js8_profile_path": js8_profile_edit.text().strip(),
-                "js8_directed_path": js8_directed_edit.text().strip(),
-                "js8_forms_path": js8_forms_edit.text().strip(),
-                "spotter_launch_path": js8spotter_launch_edit.text().strip()
-                if use_external_js8spotter_chk.isChecked()
-                else "",
-                "commstat_launch_path": commstat_launch_edit.text().strip(),
-                "varac_install_path": varac_install_edit.text().strip(),
-                "varac_db_path": varac_db_edit.text().strip(),
-                "varac_ini_path": varac_ini_edit.text().strip(),
-                "varac_incoming_path": varac_incoming_edit.text().strip(),
-                "varac_outbox_dir": varac_outbox_edit.text().strip(),
-                "varac_bbs_dir": varac_bbs_edit.text().strip(),
-                "varac_bbs_archive_dir": varac_bbs_archive_edit.text().strip(),
-                "launch_cmd": varac_launch_cmd_edit.text().strip(),
-                # The observer choice is returned separately as a launch
-                # bundle request. These legacy profile fields remain untouched
-                # until _persist_device_profile routes that request to the
-                # canonical per-radio bundle store.
-                "launch_enabled": preserved_launch_enabled,
-                "launch_path": preserved_launch_path,
-                "sdr_host": sdr_host_edit.text().strip(),
-                "sdr_port": sdr_port_edit.text().strip(),
-                "sdr_application": (
-                    str(receiver_application_combo.currentData() or "").strip()
-                    or str(sdr_application_combo.currentText() or "Other / manual").strip()
-                ),
-                "sdr_adapter": str(sdr_adapter_combo.currentData() or "manual").strip().lower(),
-                "sdr_target": sdr_target_edit.text().strip(),
-                "sdr_control_enabled": bool(sdr_control_enabled_chk.isChecked()),
-                "sdr_verification_state": (
-                    "manual"
-                    if str(sdr_adapter_combo.currentData() or "manual").strip().lower() == "manual"
-                    else (
-                        receiver_verification_state
-                        if _receiver_evidence_configuration_matches()
-                        else "unverified"
-                    )
-                ),
-                "sdr_verification_json": json.dumps(
-                    receiver_verification_evidence
-                    if _receiver_evidence_configuration_matches()
-                    else {},
-                    sort_keys=True,
-                ),
-                "ptt_group": ptt_group_edit.text().strip(),
-                "antenna_group": antenna_group_edit.text().strip(),
-                "antenna_supported_bands": self._band_check_values(band_checks),
-                "antenna_band_guard_mode": str(antenna_band_mode_combo.currentData() or "warn"),
-                "band_overlap_guard_group": band_overlap_edit.text().strip(),
-                "band_overlap_guard_mode": str(band_overlap_mode_combo.currentData() or "warn"),
-                "advanced_frequency_guard_group": advanced_frequency_group_edit.text().strip(),
-                "advanced_frequency_guard_mode": str(advanced_frequency_mode_combo.currentData() or "warn"),
-                "advanced_frequency_guard_window_hz": int(advanced_frequency_window_spin.value()),
-                "frontend_group": frontend_group_edit.text().strip(),
-                "amplifier_group": amplifier_group_edit.text().strip(),
-                "notes": notes_edit.toPlainText().strip(),
-            }
-
-        def _default_instance_port(service: str) -> str:
-            try:
-                profiles = list(self.device_profiles)
-            except Exception:
-                profiles = []
-            return self._next_default_instance_port(
-                service,
-                profiles,
-                existing_profile_id=int((profile_seed or {}).get("id", 0) or 0),
-            )
-
-        def _fill_blank(edit: QLineEdit, value: object, label: str, filled: List[str], preserved: List[str]) -> None:
-            current = edit.text().strip()
-            text = str(value or "").strip()
-            if not text:
-                return
-            if current:
-                preserved.append(label)
-                return
-            edit.setText(text)
-            filled.append(label)
-
-        def _guided_plan_instance_name() -> str:
-            model_choice = _current_radio_model_payload()
-            raw_name = (
-                name_edit.text().strip()
-                or str(model_choice.get("display_name", "") or "").strip()
-                or str((profile_seed or {}).get("name", "") or "").strip()
-                or "radio"
-            )
-            slug = re.sub(r"[^a-z0-9]+", "-", raw_name.strip().lower()).strip("-")
-            return slug or "radio"
-
-        def _guided_plan_port_assignment(service: str, port_text: str) -> PortAssignment:
-            defaults = DEFAULT_PORT_PLAN.get(service, ())
-            preferred = int(defaults[0]) if defaults else 0
-            try:
-                assigned = int(str(port_text or "").strip() or preferred)
-            except Exception:
-                assigned = preferred
-            return PortAssignment(
-                service=service,
-                host="127.0.0.1",
-                preferred_port=preferred,
-                assigned_port=assigned,
-                conflict=False,
-                conflict_checked=False,
-                note="Draft Guided Add Radio plan; live conflicts are checked before external app writes.",
-            )
-
-        def _guided_plan_enabled_apps() -> Tuple[str, ...]:
-            setup_type_choice = str(setup_type_combo.currentData() or "").strip()
-            if not setup_type_choice:
-                return tuple()
-            control_backend = "" if setup_type_choice == "custom" else str(backend_combo.currentData() or "")
-            return guided_setup_selected_apps_from_flags(
-                control_backend=control_backend,
-                use_flrig=use_flrig_chk.isChecked(),
-                use_fldigi=use_fldigi_chk.isChecked(),
-                use_flmsg=use_flmsg_chk.isChecked(),
-                use_flamp=use_flamp_chk.isChecked(),
-                use_js8call=use_js8call_chk.isChecked(),
-                use_js8spotter=use_js8spotter_chk.isChecked(),
-                use_external_js8spotter=use_external_js8spotter_chk.isChecked(),
-                use_commstat=use_commstat_chk.isChecked(),
-                use_varac=use_varac_chk.isChecked(),
-            )
-
-        def _current_guided_blueprint() -> GuidedSetupBlueprint:
-            lane = _current_guided_lane()
-            radio_name = name_edit.text().strip() or "Radio"
-            observer_mode = str(device_class_combo.currentData() or "").strip().lower() == "observer"
-            return build_guided_setup_blueprint(
-                lane=lane,
-                hamlib_short_name=radio_name,
-                setup_mode=SETUP_MODE_READ_ONLY if lane in {LANE_VARAC, LANE_VARAC_CLUSTER} else SETUP_MODE_MANAGED,
-                control_route=infer_guided_control_route(str(backend_combo.currentData() or "")),
-                js8call_uses_flrig=str(backend_combo.currentData() or "").strip().lower() == CONTROL_FLRIG,
-                receive_only=observer_mode,
-                include_spotter=use_js8spotter_chk.isChecked(),
-                include_external_spotter=use_external_js8spotter_chk.isChecked(),
-                include_commstat=use_commstat_chk.isChecked(),
-                include_varac=use_varac_chk.isChecked(),
-            )
-
-        def _guided_step_status_label(status: str) -> str:
-            status_key = str(status or "ready").strip().lower()
-            if status_key == "backup":
-                return "Backup"
-            if status_key == "complete_later":
-                return "Complete later"
-            if status_key == "review":
-                return "Review"
-            if status_key == "needs_input":
-                return "Needed"
-            return "Ready"
-
-        def _current_guided_schedule_decision() -> GuidedScheduleDecision:
-            policy = guided_setup_capability_policy(_current_guided_blueprint())
-            observer_mode = str(device_class_combo.currentData() or "").strip().lower() == "observer"
-            return guided_setup_schedule_decision(
-                # Observer plans are useful for reminders even before receiver
-                # control is verified.  Verification decides automatic retune
-                # versus reminders; it does not remove this workflow step.
-                scheduler_assignment_allowed=policy.scheduler_assignment_allowed or observer_mode,
-                selected_plan_name=_selected_guided_schedule_plan_name(),
-                plan_count=guided_schedule_plan_count,
-                open_plan_manager=schedule_open_plan_manager_chk.isChecked(),
-                selected_schedule_choice=_selected_guided_schedule_path(),
-            )
-
-        def _update_guided_step_widgets(
-            blueprint: GuidedSetupBlueprint,
-            plan: GuidedAppConfigPlan,
-            *,
-            schedule_decision: GuidedScheduleDecision | None = None,
-            setup_started: bool = True,
-        ) -> None:
-            theme = resolve_theme(self.settings)
-            text_color = theme.get("text", "#1C1F21")
-            muted_color = theme.get("text_muted", text_color)
-            status_colors = {
-                "ready": theme.get("success", "#2E7D32"),
-                "complete_later": theme.get("info", theme.get("accent", "#1565C0")),
-                "review": theme.get("warning", "#C99700"),
-                "backup": theme.get("warning", "#C99700"),
-                "needs_input": theme.get("info", theme.get("accent", "#1565C0")),
-            }
-            seen: set[str] = set()
-            for item in guided_setup_flow_items(
-                blueprint,
-                plan,
-                schedule_decision=schedule_decision,
-                setup_started=setup_started,
-            ):
-                step_id = str(item.item_id or "").strip()
-                widgets = guided_step_widgets.get(step_id)
-                if widgets is None:
-                    continue
-                seen.add(step_id)
-                frame, status_label, title_label, detail_label = widgets
-                status_key = str(item.status or "ready").strip().lower()
-                accent = QColor(status_colors.get(status_key, status_colors["ready"]))
-                bg = QColor(accent)
-                bg.setAlpha(22)
-                border = QColor(accent)
-                border.setAlpha(130)
-                frame.setVisible(True)
-                frame.setToolTip(str(item.detail or ""))
-                frame.setStyleSheet(
-                    "QFrame {"
-                    f" background-color: {bg.name(QColor.HexArgb)};"
-                    f" border: 1px solid {border.name(QColor.HexArgb)};"
-                    " border-radius: 6px;"
-                    "}"
-                    f" QLabel {{ color: {text_color}; border: none; background: transparent; }}"
-                    f" QLabel#{detail_label.objectName()} {{ color: {muted_color}; }}"
-                )
-                status_label.setText(_guided_step_status_label(status_key))
-                title_label.setText(str(item.title or "").strip())
-                detail_label.setText(str(item.detail or "").strip())
-                detail_label.setVisible(False)
-            for step_id, widgets in guided_step_widgets.items():
-                if step_id not in seen:
-                    widgets[0].setVisible(False)
-
-        def _set_guided_step_override(step_id: str, *, status: str, title: str = "", detail: str = "") -> None:
-            widgets = guided_step_widgets.get(step_id)
-            if widgets is None:
-                return
-            theme = resolve_theme(self.settings)
-            text_color = theme.get("text", "#1C1F21")
-            muted_color = theme.get("text_muted", text_color)
-            status_colors = {
-                "ready": theme.get("success", "#2E7D32"),
-                "complete_later": theme.get("info", theme.get("accent", "#1565C0")),
-                "review": theme.get("warning", "#C99700"),
-                "backup": theme.get("warning", "#C99700"),
-                "needs_input": theme.get("info", theme.get("accent", "#1565C0")),
-            }
-            status_key = str(status or "ready").strip().lower()
-            accent = QColor(status_colors.get(status_key, status_colors["ready"]))
-            bg = QColor(accent)
-            bg.setAlpha(22)
-            border = QColor(accent)
-            border.setAlpha(130)
-            frame, status_label, title_label, detail_label = widgets
-            frame.setVisible(True)
-            frame.setToolTip(detail)
-            frame.setStyleSheet(
-                "QFrame {"
-                f" background-color: {bg.name(QColor.HexArgb)};"
-                f" border: 1px solid {border.name(QColor.HexArgb)};"
-                " border-radius: 6px;"
-                "}"
-                f" QLabel {{ color: {text_color}; border: none; background: transparent; }}"
-                f" QLabel#{detail_label.objectName()} {{ color: {muted_color}; }}"
-            )
-            status_label.setText(_guided_step_status_label(status_key))
-            if title:
-                title_label.setText(title)
-            if detail:
-                detail_label.setText(detail)
-            detail_label.setVisible(False)
-
-        def _refresh_guided_schedule_step_card() -> None:
-            decision = _current_guided_schedule_decision()
-            _set_guided_step_override(
-                "schedule",
-                status=decision.status,
-                title="Schedule",
-                detail=decision.step_detail,
-            )
-
-        def _current_guided_app_config_plan() -> GuidedAppConfigPlan:
-            enabled_apps = _guided_plan_enabled_apps()
-            varac_selected = use_varac_chk.isChecked()
-            if not enabled_apps and not varac_selected:
-                return GuidedAppConfigPlan(actions=(), review_items=())
-            radio_name = name_edit.text().strip() or "Radio"
-            retained = getattr(dlg, "_guided_software_instance_drafts", {})
-            retained = retained if isinstance(retained, Mapping) else {}
-            js8_draft = (
-                dict(retained.get("js8call") or {})
-                if isinstance(retained.get("js8call"), Mapping)
-                else {}
-            )
-            fast_light_draft = (
-                dict(retained.get("fast_light") or {})
-                if isinstance(retained.get("fast_light"), Mapping)
-                else {}
-            )
-            varac_draft = (
-                dict(retained.get("varac") or {})
-                if isinstance(retained.get("varac"), Mapping)
-                else {}
-            )
-            shared_ports = (
-                _guided_plan_port_assignment("flrig", flrig_port_edit.text()),
-                _guided_plan_port_assignment("fldigi", fldigi_port_edit.text()),
-                _guided_plan_port_assignment("js8call", js8_port_edit.text()),
-            )
-
-            def _reviewed_instance_key(draft: Mapping[str, Any]) -> str:
-                return str(
-                    draft.get("draft_instance_key")
-                    or draft.get("instance_key")
-                    or _guided_plan_instance_name()
-                ).strip()
-
-            proposals: List[RadioInstanceProposal] = []
-            fast_apps = tuple(
-                app for app in enabled_apps if app in {"flrig", "fldigi", "flmsg", "flamp"}
-            )
-            if fast_apps:
-                proposals.append(
-                    RadioInstanceProposal(
-                        name=radio_name,
-                        instance_name=_reviewed_instance_key(fast_light_draft),
-                        index=0,
-                        enabled_apps=fast_apps,
-                        ports=shared_ports,
-                    )
-                )
-            if "js8call" in enabled_apps:
-                proposals.append(
-                    RadioInstanceProposal(
-                        name=radio_name,
-                        instance_name=_reviewed_instance_key(js8_draft),
-                        index=0,
-                        enabled_apps=("js8call",),
-                        ports=shared_ports,
-                    )
-                )
-            if varac_selected or not proposals:
-                proposals.append(
-                    RadioInstanceProposal(
-                        name=radio_name,
-                        instance_name=_guided_plan_instance_name(),
-                        index=0,
-                        enabled_apps=(),
-                        ports=shared_ports,
-                        varac_enabled=varac_selected,
-                    )
-                )
-            js8_settings_path = str(js8_draft.get("configuration_path") or "").strip()
-            js8_native_managed = (
-                str(js8_draft.get("ownership") or "").strip().lower() == "fio-managed"
-                and str(js8_draft.get("mode") or "").strip().lower() == "managed"
-            )
-            varac_native = varac_draft.get("varac_native_presentation")
-            varac_native = varac_native if isinstance(varac_native, Mapping) else {}
-            qualified_varac_bundle = bool(
-                varac_selected
-                and str(varac_draft.get("mode") or "").strip().lower() == "managed"
-                and str(varac_native.get("state") or "").replace("_", " ").strip().lower() == "ready"
-                and bool(varac_native.get("writer_qualified"))
-            )
-            managed_varac_route = bool(
-                varac_selected
-                and str(
-                    software_source_combos["varac"].currentData() or ""
-                ).strip().lower() == "create"
-                and str(
-                    software_management_combos["varac"].currentData() or ""
-                ).strip().lower() == "fio_identity_launch"
-                and str(_selected_varac_arrangement().get("cluster_path") or "").strip()
-                in {"create_cluster", "join_cluster"}
-            )
-            app_paths = {
-                "flrig": flrig_path_edit.text().strip(),
-                "fldigi": fldigi_path_edit.text().strip(),
-                "js8call": js8_install_edit.text().strip(),
-                "js8call_ini_path": (
-                    js8_settings_path
-                    if js8_native_managed and Path(js8_settings_path).suffix.casefold() == ".ini"
-                    else ""
-                ),
-                "js8_variant_family": (
-                    str(js8_draft.get("variant") or js8_draft.get("js8_variant_family") or "").strip()
-                    if js8_native_managed
-                    else ""
-                ),
-                "js8_variant_version": (
-                    canonical_js8_version(
-                        js8_draft.get("variant") or js8_draft.get("js8_variant_family"),
-                        js8_draft.get("version") or js8_draft.get("js8_variant_version"),
-                    )
-                    if js8_native_managed
-                    else ""
-                ),
-                "js8_writer_platform": str(js8_draft.get("writer_platform") or "").strip(),
-                "js8_writer_operation": str(js8_draft.get("writer_operation") or "create").strip(),
-                # A qualified VarAC bundle owns these facts.  Never rebuild
-                # its review from loose parent widgets or the legacy generic
-                # read/import plan.
-                "varac": str(varac_draft.get("application_path") or varac_install_edit.text()).strip(),
-                "varac_install_path": str(varac_draft.get("application_path") or varac_install_edit.text()).strip(),
-                "varac_ini_path": str(varac_draft.get("configuration_path") or varac_ini_edit.text()).strip(),
-                "varac_db_path": str(varac_draft.get("storage_path") or varac_db_edit.text()).strip(),
-                "varac_incoming_dir": str(varac_draft.get("secondary_storage_path") or varac_incoming_edit.text()).strip(),
-                "varac_outbox_dir": str(varac_draft.get("outbox_path") or varac_outbox_edit.text()).strip(),
-                "varac_bbs_dir": varac_bbs_edit.text().strip(),
-                "varac_bbs_archive_dir": varac_bbs_archive_edit.text().strip(),
-                "varac_launch_cmd": varac_launch_cmd_edit.text().strip(),
-            }
-            blueprint_for_plan = _current_guided_blueprint()
-            proposals_for_plan = tuple(proposals)
-            if managed_varac_route:
-                # Native VarAC preparation owns this family's complete
-                # immutable evidence.  The legacy read/import presenter does
-                # synchronous filesystem discovery and must not run from a
-                # render/navigation path only to be filtered out afterward.
-                blueprint_for_plan = replace(
-                    blueprint_for_plan,
-                    selected_apps=tuple(
-                        app
-                        for app in blueprint_for_plan.selected_apps
-                        if str(app).strip().lower() != "varac"
-                    ),
-                )
-                proposals_for_plan = tuple(
-                    replace(proposal, varac_enabled=False)
-                    for proposal in proposals_for_plan
-                )
-            plan = build_app_config_plan_for_blueprint(
-                blueprint_for_plan,
-                proposals_for_plan,
-                config_root=get_config_dir(),
-                app_paths=app_paths,
-            )
-            if qualified_varac_bundle:
-                # Native VarAC preparation and final transaction own this
-                # family.  Excluding the obsolete generic action keeps the
-                # parent review from claiming it is read/import-only.
-                plan = GuidedAppConfigPlan(
-                    actions=tuple(action for action in plan.actions if action.app_id != "varac"),
-                    review_items=tuple(
-                        item for item in plan.review_items
-                        if "varac guided setup is read/import only" not in str(item).casefold()
-                        and "cluster membership remains read-only" not in str(item).casefold()
-                    ),
-                    # A qualified VarAC bundle is removed only from this
-                    # legacy presenter.  Unrelated JS8/Fast Light safety
-                    # blockers remain authoritative for the final review.
-                    blocked=bool(plan.blocked),
-                )
-            return with_canonical_managed_directory_actions(plan, retained)
-
-        def _apply_guided_app_configuration() -> None:
-            plan = _current_guided_app_config_plan()
-            if not plan.actions:
-                QMessageBox.information(
-                    dlg,
-                    "Review App Setup",
-                    "There is no managed app setup action to review for this radio.",
-                )
-                return
-            preview_lines = guided_app_config_review_lines(plan)
-            QMessageBox.information(
-                dlg,
-                "Review App Setup",
-                "Preview only — no folders, profiles, or external application files were changed.\n\n"
-                + "\n".join(preview_lines),
-            )
-            _update_guided_app_setup_plan_review()
-            _update_guided_save_review()
-
-        app_config_apply_btn.clicked.connect(_apply_guided_app_configuration)
-
-        def _update_guided_app_setup_plan_review() -> None:
-            observer_mode = str(device_class_combo.currentData() or "").strip().lower() == "observer"
-            enabled_apps = _guided_plan_enabled_apps()
-            varac_selected = use_varac_chk.isChecked()
-            if not enabled_apps and not varac_selected:
-                app_setup_plan_group.setVisible(False)
-                app_setup_plan_label.setText("")
-                schedule_status_label.setText("Choose the setup type and software before assigning a Frequency Plan.")
-                return
-            blueprint = _current_guided_blueprint()
-            plan = _current_guided_app_config_plan()
-            schedule_decision = _current_guided_schedule_decision()
-            setup_started = bool(str(setup_type_combo.currentData() or "").strip())
-            guided_next_action_label.setText(
-                guided_setup_next_action_text(
-                    blueprint,
-                    plan,
-                    schedule_decision=schedule_decision,
-                    setup_started=setup_started,
-                )
-            )
-            guided_next_action_label.setVisible(False)
-            _update_guided_step_widgets(
-                blueprint,
-                plan,
-                schedule_decision=schedule_decision,
-                setup_started=setup_started,
-            )
-            software_allowed, software_reason = _guided_software_step_can_continue()
-            if any(
-                _guided_software_family_selected(family)
-                for family in software_responsibility_cards
-            ) and not software_allowed:
-                _set_guided_step_override(
-                    "software",
-                    status="needs_input",
-                    title="Software",
-                    detail=software_reason,
-                )
-            flow_lines = guided_setup_flow_summary_lines(
-                blueprint,
-                plan,
-                schedule_decision=schedule_decision,
-                setup_started=setup_started,
-            )
-            schedule_item = next(
-                (
-                    item
-                    for item in guided_setup_flow_items(
-                        blueprint,
-                        plan,
-                        schedule_decision=schedule_decision,
-                        setup_started=setup_started,
-                    )
-                    if str(item.item_id or "") == "schedule"
-                ),
-                None,
-            )
-            if schedule_item is not None:
-                schedule_status_label.setText(str(schedule_item.detail or "").strip())
-            if observer_mode:
-                schedule_status_label.setText(
-                    "Choose a receive plan for reminders. Matching verified receiver-control evidence may allow automatic retuning; "
-                    "manual or changed configurations remain reminders only."
-                )
-            app_setup_plan_label.setText("")
-            app_setup_plan_label.setToolTip("\n".join(flow_lines))
-            app_setup_plan_label.setVisible(False)
-            app_setup_plan_group.setToolTip("\n".join(flow_lines))
-            app_setup_plan_group.setVisible(True)
-            _refresh_guided_schedule_step_card()
-
-        def _selected_guided_schedule_plan_name() -> str:
-            if _selected_guided_schedule_path() != SCHEDULE_EXISTING_PLAN:
-                return ""
-            if not hasattr(schedule_plan_combo, "currentData"):
-                return ""
-            try:
-                plan_id = int(schedule_plan_combo.currentData() or 0)
-            except Exception:
-                plan_id = 0
-            if plan_id <= 0:
-                return ""
-            return str(schedule_plan_combo.currentText() or "").strip()
-
-        def _selected_guided_schedule_plan() -> Optional[Dict[str, Any]]:
-            if _selected_guided_schedule_path() != SCHEDULE_EXISTING_PLAN:
-                return None
-            try:
-                plan_id = int(schedule_plan_combo.currentData() or 0)
-            except Exception:
-                plan_id = 0
-            if plan_id <= 0:
-                return None
-            return next(
-                (
-                    dict(row)
-                    for row in guided_frequency_plan_snapshot
-                    if isinstance(row, dict) and int(row.get("id", 0) or 0) == plan_id
-                ),
-                None,
-            )
-
-        def _guided_schedule_assignment_validation() -> Dict[str, Any]:
-            plan = _selected_guided_schedule_plan()
-            if plan is None:
-                return {}
-            draft = _draft_radio_profile()
-            cache_key = json.dumps(
-                {
-                    "plan_id": int(plan.get("id", 0) or 0),
-                    "draft": draft,
-                },
-                sort_keys=True,
-                default=str,
-            )
-            cached = guided_schedule_validation_cache.get(cache_key)
-            if cached is not None:
-                return dict(cached)
-            try:
-                result = self.multi_radio_store.validate_frequency_plan_for_device_payload(
-                    draft,
-                    plan,
-                )
-                guided_schedule_validation_cache.clear()
-                guided_schedule_validation_cache[cache_key] = dict(result)
-                return dict(result)
-            except ValueError as exc:
-                return {
-                    "state": "blocked",
-                    "blocked": [str(exc)],
-                    "warnings": [],
-                    "messages": [str(exc)],
-                }
-            except Exception:
-                log.exception("Failed validating guided schedule assignment preview.")
-                return {}
-
-        def _guided_schedule_assignment_warning_lines() -> List[str]:
-            validation = _guided_schedule_assignment_validation()
-            observer_mode = str(device_class_combo.currentData() or "").strip().lower() == "observer"
-            if observer_mode:
-                return list(validation_messages(validation, observer=True))
-            blocked = [str(item).strip() for item in validation.get("blocked", []) if str(item).strip()]
-            warnings = [str(item).strip() for item in validation.get("warnings", []) if str(item).strip()]
-            lines = [f"RF Guard blocked: {item}" for item in blocked]
-            if warnings:
-                lines.append(f"RF Guard warning: {warnings[0]}")
-                lines.extend(f"RF Guard warning: {item}" for item in warnings[1:])
-            return lines
-
-        def _current_receiver_state_presentation():
-            validation = _guided_schedule_assignment_validation()
-            blocked = [
-                str(item).strip()
-                for item in validation.get("blocked", [])
-                if str(item).strip()
-            ]
-            return receiver_state_presentation(
-                application=str(sdr_application_combo.currentData() or sdr_application_combo.currentText() or ""),
-                adapter=str(sdr_adapter_combo.currentData() or "manual"),
-                host=sdr_host_edit.text().strip(),
-                port=sdr_port_edit.text().strip(),
-                target=sdr_target_edit.text().strip(),
-                verification_state=receiver_verification_state,
-                evidence_present=bool(receiver_verification_evidence),
-                evidence_matches=_receiver_evidence_is_verified_for_current(),
-                automatic_tuning_enabled=sdr_control_enabled_chk.isChecked(),
-                resource_blocks=blocked,
-            )
-
-        def _update_receiver_state_cards() -> None:
-            observer_mode = str(device_class_combo.currentData() or "").strip().lower() == "observer"
-            receiver_guard_state_card.setVisible(observer_mode)
-            receive_schedule_state_card.setVisible(observer_mode)
-            if not observer_mode:
-                return
-            presentation = _current_receiver_state_presentation()
-            theme = resolve_theme(self.settings)
-            accent = {
-                "success": theme.get("success", "#2E7D32"),
-                "warning": theme.get("warning", "#C99700"),
-                "danger": theme.get("danger", "#B3261E"),
-                "info": theme.get("info", theme.get("accent", "#1565C0")),
-            }.get(presentation.tone, theme.get("border", "#AEB7BF"))
-            bg = QColor(accent)
-            bg.setAlpha(22)
-            fg = theme.get("text", "#1C1F21")
-            style = (
-                "QFrame {"
-                f" background-color: {bg.name(QColor.HexArgb)};"
-                f" border: 2px solid {accent};"
-                " border-radius: 6px;"
-                "}"
-                f" QLabel {{ color: {fg}; border: none; background: transparent; }}"
-            )
-            for card, title_label, detail_label in (
-                (receiver_guard_state_card, receiver_guard_state_title, receiver_guard_state_detail),
-                (receive_schedule_state_card, receive_schedule_state_title, receive_schedule_state_detail),
-            ):
-                title_label.setText(presentation.title)
-                detail_label.setText(presentation.detail)
-                card.setAccessibleName(f"Receiver state: {presentation.title}")
-                card.setToolTip(presentation.detail)
-                card.setStyleSheet(style)
-
-        def _guided_schedule_assignment_warning_summary() -> Tuple[str, str, str]:
-            validation = _guided_schedule_assignment_validation()
-            blocked = [str(item).strip() for item in validation.get("blocked", []) if str(item).strip()]
-            warnings = [str(item).strip() for item in validation.get("warnings", []) if str(item).strip()]
-            if not blocked and not warnings:
-                return "", "", ""
-            observer_mode = str(device_class_combo.currentData() or "").strip().lower() == "observer"
-            guard_name = "Receiver Guard" if observer_mode else "RF Guard"
-            supported = [str(item).strip() for item in validation.get("supported_bands", []) if str(item).strip()]
-            plan_bands = [str(item).strip() for item in validation.get("plan_bands", []) if str(item).strip()]
-            unsupported = [band for band in plan_bands if supported and band not in supported]
-            plan_name = _selected_guided_schedule_plan_name() or "selected Frequency Plan"
-            radio_name = name_edit.text().strip() or "this radio"
-            detail_parts: List[str] = []
-            if unsupported and supported:
-                mismatch_label = (
-                    "Antenna and receive-plan mismatch:"
-                    if observer_mode
-                    else "Antenna and schedule mismatch:"
-                )
-                detail_parts.append(
-                    f"{mismatch_label} {radio_name} is configured for "
-                    f"{self._human_join(supported)}, but {plan_name} uses {self._human_join(unsupported)}. "
-                    + (
-                        "Choose a different plan or update the supported receive bands before automatic retuning."
-                        if observer_mode
-                        else "Choose a different plan, update the supported antenna bands, or do not transmit until the antenna path is confirmed."
-                    )
-                )
-            for message in blocked + warnings:
-                if message not in detail_parts and message not in " ".join(detail_parts):
-                    detail_parts.append(message)
-            detail = "\n".join(detail_parts)
-            if blocked:
-                return "blocked", f"{guard_name} Blocked Schedule Assignment", detail
-            return "warning", f"{guard_name} Warning: Plan Needs Review", detail
-
-        def _apply_guided_schedule_assignment_warning_ui() -> None:
-            tone, title, detail = _guided_schedule_assignment_warning_summary()
-            _apply_guided_rf_guard_plan_check_ui(tone=tone, title=title, detail=detail)
-            if not tone:
-                schedule_guard_warning_card.setVisible(False)
-                schedule_guard_warning_title.setText("")
-                schedule_guard_warning_detail.setText("")
-                schedule_guard_warning_card.setToolTip("")
-                _update_receiver_state_cards()
-                return
-            theme = resolve_theme(self.settings)
-            border = theme.get("danger", "#B3261E") if tone == "blocked" else theme.get("warning", "#C99700")
-            bg = QColor(border)
-            bg.setAlpha(28)
-            fg = theme.get("text", "#1C1F21")
-            schedule_guard_warning_title.setText(title)
-            schedule_guard_warning_detail.setText(detail)
-            schedule_guard_warning_card.setToolTip(detail)
-            schedule_guard_warning_card.setStyleSheet(
-                "QFrame#guidedScheduleRfGuardWarning {"
-                f" background-color: {bg.name(QColor.HexArgb)};"
-                f" border: 2px solid {border};"
-                " border-radius: 6px;"
-                "}"
-                f" QLabel {{ color: {fg}; border: none; background: transparent; }}"
-            )
-            schedule_guard_warning_card.setVisible(True)
-            if hasattr(optional_body, "setVisible"):
-                optional_body.setVisible(True)
-            _update_receiver_state_cards()
-
-        def _apply_guided_rf_guard_plan_check_ui(
-            *,
-            tone: str = "",
-            title: str = "",
-            detail: str = "",
-        ) -> None:
-            if not hasattr(rf_guard_plan_check_card, "setVisible"):
-                return
-            theme = resolve_theme(self.settings)
-            observer_mode = str(device_class_combo.currentData() or "").strip().lower() == "observer"
-            supported = self._band_check_values(band_checks)
-            plan = _selected_guided_schedule_plan()
-            if tone:
-                border = theme.get("danger", "#B3261E") if tone == "blocked" else theme.get("warning", "#C99700")
-                bg = QColor(border)
-                bg.setAlpha(28)
-                rf_guard_plan_check_title.setText(title or ("Receiver Guard Needs Review" if observer_mode else "RF Guard Needs Review"))
-                rf_guard_plan_check_detail.setText(detail)
-                rf_guard_plan_check_card.setToolTip(detail)
-            else:
-                border = theme.get("success", "#2E7D32") if supported else theme.get("muted_border", "#C9D3DD")
-                bg = QColor(border)
-                bg.setAlpha(18)
-                if plan is not None and supported:
-                    validation = _guided_schedule_assignment_validation()
-                    plan_bands = [str(item).strip() for item in validation.get("plan_bands", []) if str(item).strip()]
-                    rf_guard_plan_check_title.setText("Plan Check: Ready")
-                    rf_guard_plan_check_detail.setText(
-                        f"{_selected_guided_schedule_plan_name() or 'Selected plan'} uses "
-                        f"{self._human_join(plan_bands) if plan_bands else ('no scheduled receive bands' if observer_mode else 'no scheduled transmit bands')}; "
-                        f"this {'receiver' if observer_mode else 'radio'} supports {self._human_join(supported)}."
-                    )
-                elif supported:
-                    if _selected_guided_schedule_path() == SCHEDULE_EXISTING_PLAN and guided_schedule_plan_count > 0:
-                        rf_guard_plan_check_title.setText("Plan Check: Choose Frequency Plan")
-                        rf_guard_plan_check_detail.setText(
-                            f"This {'receiver' if observer_mode else 'radio'} supports {self._human_join(supported)}. "
-                            "Choose the Frequency Plan on the Schedule step so CommsPlan can warn before assignment."
-                        )
-                    else:
-                        rf_guard_plan_check_title.setText("Plan Check")
-                        rf_guard_plan_check_detail.setText(
-                            f"This {'receiver' if observer_mode else 'radio'} supports {self._human_join(supported)}. "
-                            "CommsPlan will compare these bands with the selected Frequency Plan before assignment."
-                        )
-                else:
-                    rf_guard_plan_check_title.setText("Plan Check")
-                    rf_guard_plan_check_detail.setText(
-                        "No receive bands are selected yet. Select the bands this receiver and antenna path can safely use."
-                        if observer_mode
-                        else "No antenna bands are selected yet. Select the bands this radio and antenna can safely use."
-                    )
-                rf_guard_plan_check_card.setToolTip(rf_guard_plan_check_detail.text())
-            fg = theme.get("text", "#1C1F21")
-            rf_guard_plan_check_card.setStyleSheet(
-                "QFrame#guidedRfGuardPlanCheck {"
-                f" background-color: {bg.name(QColor.HexArgb)};"
-                f" border: 2px solid {border};"
-                " border-radius: 6px;"
-                "}"
-                f" QLabel {{ color: {fg}; border: none; background: transparent; }}"
-            )
-            rf_guard_plan_check_card.setVisible(True)
-            _update_receiver_state_cards()
-
-        def _selected_guided_schedule_path() -> str:
-            if not hasattr(schedule_path_combo, "currentData"):
-                return ""
-            return str(schedule_path_combo.currentData() or "").strip()
-
-        def _refresh_guided_schedule_path_combo() -> None:
-            current_choice = _selected_guided_schedule_path()
-            blueprint = _current_guided_blueprint()
-            observer_mode = str(device_class_combo.currentData() or "").strip().lower() == "observer"
-            choices = tuple(getattr(blueprint, "schedule_choices", ()) or ())
-            schedule_path_combo.blockSignals(True)
-            schedule_path_combo.clear()
-            preferred = current_choice
-            if observer_mode:
-                observer_choices = (
-                    (
-                        SCHEDULE_EXISTING_PLAN,
-                        "Use an existing plan for receive activity",
-                        "Verified receiver control may retune automatically; otherwise CommsPlan uses the plan for reminders.",
-                    ),
-                    (
-                        SCHEDULE_NONE,
-                        "No receive schedule",
-                        "Keep this receiver available for manual tuning without scheduled reminders.",
-                    ),
-                )
-                preferred = preferred if preferred in {item[0] for item in observer_choices} else SCHEDULE_EXISTING_PLAN
-                for choice_id, label, detail in observer_choices:
-                    schedule_path_combo.addItem(label, choice_id)
-                    schedule_path_combo.setItemData(schedule_path_combo.count() - 1, detail, Qt.ToolTipRole)
-            else:
-                if not preferred:
-                    # A new radio is safe to save without a schedule.  Keep
-                    # any explicit/existing choice intact, but do not send a
-                    # first-time setup to Plan Builder merely because one is
-                    # recommended.
-                    is_new_radio = int((profile_seed or {}).get("id", 0) or 0) <= 0
-                    if is_new_radio and any(
-                        str(choice.choice_id or "").strip() == SCHEDULE_NONE
-                        for choice in choices
-                    ):
-                        preferred = SCHEDULE_NONE
-                    else:
-                        recommended = next((choice.choice_id for choice in choices if bool(choice.recommended)), "")
-                        preferred = recommended or (choices[0].choice_id if choices else "")
-                for choice in choices:
-                    label = str(choice.label or "").strip() or str(choice.choice_id or "").strip()
-                    schedule_path_combo.addItem(label, str(choice.choice_id or ""))
-                    detail = str(choice.detail or "").strip()
-                    if detail:
-                        schedule_path_combo.setItemData(schedule_path_combo.count() - 1, detail, Qt.ToolTipRole)
-            idx = schedule_path_combo.findData(preferred)
-            if idx < 0 and schedule_path_combo.count() > 0:
-                idx = 0
-            if idx >= 0:
-                schedule_path_combo.setCurrentIndex(idx)
-            schedule_path_combo.blockSignals(False)
-            _configure_combo_width(schedule_path_combo, minimum=320)
-
-        def _refresh_guided_schedule_plan_combo() -> None:
-            nonlocal guided_schedule_plan_combo_loaded, guided_schedule_plan_count, guided_schedule_plan_role
-            observer_mode = str(device_class_combo.currentData() or "").strip().lower() == "observer"
-            role_key = "observer" if observer_mode else "transceiver"
-            if guided_schedule_plan_combo_loaded and guided_schedule_plan_role == role_key:
-                return
-            current_data = schedule_plan_combo.currentData()
-            try:
-                current_plan_id = int(current_data or 0)
-            except Exception:
-                current_plan_id = 0
-            if not guided_schedule_plan_combo_loaded and current_plan_id <= 0:
-                current_plan_id = int(guided_initial_frequency_plan_id or 0)
-            schedule_plan_combo.blockSignals(True)
-            schedule_plan_combo.clear()
-            schedule_plan_combo.addItem("Assign later", 0)
-            loaded_count = 0
-            for row in guided_frequency_plan_snapshot:
-                if not isinstance(row, dict):
-                    continue
-                if int(row.get("enabled", 1) or 0) != 1:
-                    continue
-                if str(row.get("category") or "").strip().lower() in SOURCE_ONLY_FREQUENCY_PLAN_CATEGORIES:
-                    continue
-                if observer_mode and int(row.get("receive_only", 0) or 0) != 1:
-                    continue
-                label = str(row.get("name", "") or "Frequency Plan").strip()
-                if not label:
-                    continue
-                schedule_plan_combo.addItem(label, int(row.get("id", 0) or 0))
-                loaded_count += 1
-            if current_plan_id > 0:
-                idx = schedule_plan_combo.findData(current_plan_id)
-                if idx >= 0:
-                    schedule_plan_combo.setCurrentIndex(idx)
-            schedule_plan_combo.blockSignals(False)
-            guided_schedule_plan_combo_loaded = True
-            guided_schedule_plan_role = role_key
-            guided_schedule_plan_count = loaded_count
-            _configure_combo_width(schedule_plan_combo, minimum=320)
-            if loaded_count <= 0 and not schedule_open_plan_manager_chk.isChecked():
-                schedule_open_plan_manager_chk.setChecked(True)
-
-        def _update_guided_schedule_assignment_status() -> None:
-            schedule_choice = _selected_guided_schedule_path()
-            if schedule_choice and schedule_choice not in {SCHEDULE_EXISTING_PLAN, SCHEDULE_NONE}:
-                schedule_open_plan_manager_chk.setChecked(True)
-            decision = _current_guided_schedule_decision()
-            tone, title, detail = _guided_schedule_assignment_warning_summary()
-            status_text = decision.status_text
-            if detail:
-                status_text = f"{status_text}\n{detail}"
-            schedule_status_label.setText(status_text)
-            _apply_guided_schedule_assignment_warning_ui()
-            if tone:
-                _set_guided_step_override(
-                    "schedule",
-                    status="review",
-                    title="Schedule",
-                    detail=detail,
-                )
-            elif app_setup_plan_group.isVisible():
-                _refresh_guided_schedule_step_card()
-
-        def _guided_connection_step_visible() -> bool:
-            setup_type_choice = str(setup_type_combo.currentData() or "").strip()
-            device_class_value = str(device_class_combo.currentData() or "tx_rx").strip().lower()
-            visibility_state = GuidedSetupFieldVisibilityInput(
-                setup_type_choice=setup_type_choice,
-                backend=str(backend_combo.currentData() or "manual").strip().lower(),
-                device_class=device_class_value,
-                use_flrig=bool(use_flrig_chk.isChecked()),
-                use_fldigi=bool(use_fldigi_chk.isChecked()),
-                use_flmsg=bool(use_flmsg_chk.isChecked()),
-                use_flamp=bool(use_flamp_chk.isChecked()),
-                use_js8call=bool(use_js8call_chk.isChecked()),
-                use_js8spotter=bool(use_js8spotter_chk.isChecked() or use_external_js8spotter_chk.isChecked()),
-                use_commstat=bool(use_commstat_chk.isChecked()),
-                use_varac=bool(use_varac_chk.isChecked()),
-                optional_open=bool(optional_toggle.isChecked()) or guided_wizard_step_id == "guard",
-            )
-            return bool(
-                guided_setup_field_visibility(
-                    _current_guided_blueprint(),
-                    visibility_state,
-                ).connection_group
-            )
-
-        def _guided_wizard_step_applicability() -> Dict[str, bool]:
-            # Role changes adapt content, never the seven-position workflow.
-            # A step with no endpoint or automatic action still explains why
-            # and remains reachable for review.
-            return {step_id: True for step_id, _label in guided_wizard_steps}
-
-        def _guided_visible_wizard_steps() -> Tuple[Tuple[str, str], ...]:
-            """Return the stable seven-step workflow for every radio role."""
-            return guided_wizard_steps
-
-        def _guided_wizard_index(step_id: str) -> int:
-            for idx, (candidate, _label) in enumerate(_guided_visible_wizard_steps()):
-                if candidate == step_id:
-                    return idx
-            return 0
-
-        def _guided_nearest_applicable_step(step_id: str) -> str:
-            """Keep the operator near the same stable slot when applicability changes."""
-            applicable_ids = {
-                candidate for candidate, _label in _guided_visible_wizard_steps()
-            }
-            if step_id in applicable_ids:
-                return step_id
-            stable_ids = [candidate for candidate, _label in guided_wizard_steps]
-            try:
-                stable_index = stable_ids.index(step_id)
-            except ValueError:
-                stable_index = 0
-            for candidate in stable_ids[stable_index + 1 :]:
-                if candidate in applicable_ids:
-                    return candidate
-            for candidate in reversed(stable_ids[:stable_index]):
-                if candidate in applicable_ids:
-                    return candidate
-            return "radio"
-
-        def _guided_wizard_step_label(index: int) -> str:
-            try:
-                return str(_guided_visible_wizard_steps()[int(index)][1] or "").strip()
-            except Exception:
-                return ""
-
-        def _set_guided_wizard_step(step_id: str) -> None:
-            nonlocal guided_wizard_step_id, guided_wizard_max_index_seen
-            candidate = str(step_id or "").strip()
-            visible_steps = _guided_visible_wizard_steps()
-            valid_steps = {item[0] for item in visible_steps}
-            if candidate in valid_steps:
-                requested_idx = next(
-                    (idx for idx, (item_step_id, _label) in enumerate(visible_steps) if item_step_id == candidate),
-                    0,
-                )
-                allowed_idx = min(requested_idx, guided_wizard_max_index_seen + 1)
-                guided_wizard_step_id = visible_steps[allowed_idx][0]
-                guided_wizard_max_index_seen = max(guided_wizard_max_index_seen, allowed_idx)
-            elif candidate == "connection" and "guard" in valid_steps:
-                guided_wizard_step_id = "guard"
-                guided_wizard_max_index_seen = max(guided_wizard_max_index_seen, _guided_wizard_index("guard"))
-            else:
-                guided_wizard_step_id = "radio"
-            if guided_wizard_step_id == "review":
-                retained = getattr(dlg, "_guided_software_instance_drafts", {})
-                selected_retained = {
-                    family: dict(value)
-                    for family, value in retained.items()
-                    if isinstance(retained, Mapping)
-                    and isinstance(value, Mapping)
-                    and _guided_software_family_selected(str(family))
-                } if isinstance(retained, Mapping) else {}
-                _refresh_guided_instance_inventory(
-                    selected_retained
-                )
-            _update_dialog_visibility()
-
-            # Each wizard page starts at its beginning.  Retaining the prior
-            # page's scroll offset can hide the antenna/band controls at the
-            # top of Safety after the operator leaves the longer Software or
-            # Connections pages.  Repeat on the next event-loop turn because
-            # visibility changes can recalculate the scroll range lazily.
-            def _reset_guided_body_scroll() -> None:
-                scroll.verticalScrollBar().setValue(0)
-                scroll.horizontalScrollBar().setValue(0)
-
-            _reset_guided_body_scroll()
-            QTimer.singleShot(0, _reset_guided_body_scroll)
-
-        def _guided_save_allowed() -> bool:
-            if use_varac_chk.isChecked() and varac_native_preparation_in_progress:
-                return False
-            if guided_wizard_step_id != "review":
-                return False
-            if guided_wizard_max_index_seen < _guided_wizard_index("review"):
-                return False
-            if not name_edit.text().strip():
-                return False
-            if not str(setup_type_combo.currentData() or "").strip():
-                return False
-            if _selected_guided_operating_model_id() <= 0:
-                return False
-            if _detected_app_choice_needs_operator_selection():
-                return False
-            if any(
-                _guided_software_family_selected(family)
-                for family in ("js8call", "fast_light", "varac")
-            ) and (
-                not software_plan_prepared
-                or _guided_software_plan_context() != prepared_software_context
-            ):
-                return False
-            retained = getattr(dlg, "_guided_software_instance_drafts", {})
-            retained = retained if isinstance(retained, Mapping) else {}
-            assignment_columns = {
-                "js8call": "js8_instance_id",
-                "fast_light": "fast_light_config_id",
-                "varac": "varac_node_id",
-            }
-            for family, link_column in assignment_columns.items():
-                if not _guided_software_family_selected(family):
-                    continue
-                if int((profile_seed or {}).get(link_column, 0) or 0) > 0:
-                    continue
-                draft = retained.get(family)
-                if isinstance(draft, Mapping):
-                    if (
-                        family == "varac"
-                        and str(draft.get("mode") or "").strip().lower() == "managed"
-                        and str(draft.get("cluster_path") or "standalone").strip().lower()
-                        in {"create_cluster", "join_cluster"}
-                    ):
-                        native = draft.get("varac_native_presentation")
-                        native = native if isinstance(native, Mapping) else {}
-                        if (
-                            str(native.get("state") or "").replace("_", " ").strip().lower() != "ready"
-                            or not bool(native.get("writer_qualified"))
-                        ):
-                            return False
-                    # Confidence and launch readiness are not safety blocks.
-                    # Save the isolated CommsPlan identity as Ready with warnings or
-                    # launch setup pending; reserve a disabled Save for an
-                    # explicit no-damage boundary reported by preparation.
-                    safety_status = str(
-                        draft.get("safety_status")
-                        or draft.get("save_status")
-                        or draft.get("validation_status")
-                        or ""
-                    ).strip().lower().replace("-", "_").replace(" ", "_")
-                    if bool(draft.get("safety_blocked")) or safety_status in {
-                        "blocked",
-                        "blocked_for_safety",
-                        "safety_blocked",
-                    }:
-                        return False
-                    source = str(
-                        software_source_combos[family].currentData() or ""
-                    ).strip().lower()
-                    management = str(
-                        software_management_combos[family].currentData() or ""
-                    ).strip().lower()
-                    if (
-                        family in {"js8call", "fast_light"}
-                        and source == "create"
-                        and management == "fio_identity_launch"
-                        and str(draft.get("launch_recipe_status") or "").strip().lower()
-                        not in {"qualified_managed", "ready_with_warnings", "launch_pending"}
-                    ):
-                        return False
-                    continue
-                return False
-            return True
-
-        def _update_guided_save_button() -> None:
-            if save_button is None:
-                return
-            if save_activation_pending:
-                save_button.setEnabled(False)
-                return
-            allowed = _guided_save_allowed()
-            save_button.setEnabled(allowed)
-            if allowed:
-                save_button.setToolTip("Save this reviewed radio setup.")
-            elif guided_wizard_step_id != "review":
-                save_button.setToolTip("Walk through the guided setup and review before saving.")
-            elif _detected_app_choice_needs_operator_selection():
-                save_button.setToolTip("Choose the highlighted detected app/profile before saving.")
-            elif any(
-                _guided_software_family_selected(family)
-                for family in ("js8call", "fast_light", "varac")
-            ) and (
-                not software_plan_prepared
-                or _guided_software_plan_context() != prepared_software_context
-            ):
-                save_button.setToolTip(
-                    "Prepare the current software choices before saving; earlier managed drafts are no longer current."
-                )
-            else:
-                save_button.setToolTip(
-                    "Complete each selected JS8Call, Fast Light, or VarAC instance with its Configure details action before saving."
-                )
-
-        def _guided_software_step_can_continue() -> Tuple[bool, str]:
-            if (
-                software_preparation_in_progress
-                or software_preparation_pending
-                or (use_varac_chk.isChecked() and varac_native_preparation_in_progress)
-            ):
-                return False, "CommsPlan is preparing the current software choices."
-            if use_varac_chk.isChecked() and not str(
-                _selected_varac_arrangement().get("cluster_path") or ""
-            ).strip():
-                return False, "Choose the VarAC arrangement before continuing."
-            requires_preparation = any(
-                _guided_software_family_selected(family)
-                for family in ("receiver", "js8call", "fast_light", "varac", "external_spotter")
-            )
-            if requires_preparation and (
-                not software_plan_prepared
-                or _guided_software_plan_context() != prepared_software_context
-            ):
-                return False, "CommsPlan must prepare the current software choices before continuing."
-            if _detected_app_choice_needs_operator_selection():
-                return False, "Choose the highlighted detected application or profile before continuing."
-            retained = getattr(dlg, "_guided_software_instance_drafts", {})
-            retained = retained if isinstance(retained, Mapping) else {}
-            assignment_columns = {
-                "js8call": "js8_instance_id",
-                "fast_light": "fast_light_config_id",
-                "varac": "varac_node_id",
-            }
-            for family, link_column in assignment_columns.items():
-                if not _guided_software_family_selected(family):
-                    continue
-                if int((profile_seed or {}).get(link_column, 0) or 0) > 0:
-                    continue
-                draft = retained.get(family)
-                if not isinstance(draft, Mapping):
-                    return False, f"CommsPlan still needs to prepare the {software_family_titles[family]} draft."
-                if (
-                    family == "varac"
-                    and str(draft.get("mode") or "").strip().lower() == "managed"
-                    and str(draft.get("cluster_path") or "standalone").strip().lower()
-                    in {"create_cluster", "join_cluster"}
-                ):
-                    native = draft.get("varac_native_presentation")
-                    native = native if isinstance(native, Mapping) else {}
-                    if (
-                        str(native.get("state") or "").replace("_", " ").strip().lower() != "ready"
-                        or not bool(native.get("writer_qualified"))
-                    ):
-                        return False, "CommsPlan must finish preparing the qualified VarAC bundle before continuing."
-                state = str(
-                    draft.get("safety_status")
-                    or draft.get("save_status")
-                    or draft.get("validation_status")
-                    or ""
-                ).strip().lower().replace("-", "_").replace(" ", "_")
-                if bool(draft.get("safety_blocked")) or state in {"blocked", "blocked_for_safety", "safety_blocked"}:
-                    return False, "Resolve the displayed software safety issue before continuing."
-                source = str(software_source_combos[family].currentData() or "").strip().lower()
-                management = str(software_management_combos[family].currentData() or "").strip().lower()
-                if (
-                    family in {"js8call", "fast_light"}
-                    and source == "create"
-                    and management == "fio_identity_launch"
-                    and str(draft.get("launch_recipe_status") or "").strip().lower()
-                    not in {"qualified_managed", "ready_with_warnings", "launch_pending"}
-                ):
-                    return False, f"CommsPlan needs a safe launch plan for {software_family_titles[family]}."
-            return True, ""
-
-        def _move_guided_wizard(delta: int) -> None:
-            if int(delta) > 0 and guided_wizard_step_id == "software":
-                allowed, reason = _guided_software_step_can_continue()
-                if not allowed:
-                    configure_auto_status.setText(reason)
-                    _schedule_automatic_software_preparation()
-                    return
-            visible_steps = _guided_visible_wizard_steps()
-            idx = _guided_wizard_index(guided_wizard_step_id)
-            next_idx = max(0, min(len(visible_steps) - 1, idx + int(delta)))
-            _set_guided_wizard_step(visible_steps[next_idx][0])
-
-        def _update_guided_save_review() -> None:
-            def _set_app_config_review_card(
-                lines: Sequence[str],
-                *,
-                backup_required: bool,
-                manual_review_required: bool,
-                has_actions: bool,
-            ) -> None:
-                theme = resolve_theme(self.settings)
-                text_color = theme.get("text", "#1C1F21")
-                muted_color = theme.get("text_muted", text_color)
-                if backup_required:
-                    accent = QColor(theme.get("warning", "#C99700"))
-                    detail_intro = (
-                        "Final Save applies only exact qualified native writers off the UI thread, after backup, and verifies readback. "
-                        "Unsupported application/version combinations remain an explicit operator action."
-                    )
-                elif manual_review_required:
-                    accent = QColor(theme.get("info", theme.get("accent", "#1565C0")))
-                    detail_intro = "Save Radio records these selections in CommsPlan. Review any app choices before saving."
-                else:
-                    accent = QColor(theme.get("success", "#2E7D32"))
-                    detail_intro = "Final Save updates the reviewed CommsPlan radio and software identity without an external native-file write."
-                bg = QColor(accent)
-                bg.setAlpha(22)
-                border = QColor(accent)
-                border.setAlpha(130)
-                app_config_review_card.setStyleSheet(
-                    "QFrame#guidedAppConfigReviewCard {"
-                    f" background-color: {bg.name(QColor.HexArgb)};"
-                    f" border: 1px solid {border.name(QColor.HexArgb)};"
-                    " border-radius: 6px;"
-                    "}"
-                    f" QLabel {{ color: {text_color}; border: none; background: transparent; }}"
-                    f" QLabel#{app_config_review_details.objectName()} {{ color: {muted_color}; }}"
-                )
-                app_config_review_toggle_btn.setStyleSheet(button_style("secondary", theme))
-                app_config_apply_btn.setVisible(has_actions)
-                app_config_apply_btn.setEnabled(has_actions)
-                app_config_apply_btn.setStyleSheet(button_style("primary" if has_actions else "secondary", theme))
-                app_config_apply_btn.setToolTip(
-                    "Review the managed setup plan; no external write occurs before final save."
-                    if has_actions
-                    else "No managed app setup is needed for this radio."
-                )
-                summary = str(lines[0] if lines else "App Configuration: no external app setup changes.").strip()
-                if summary.startswith("App Configuration:"):
-                    summary = summary.split(":", 1)[1].strip()
-                app_config_review_status.setText(summary)
-                detail_lines = [detail_intro]
-                detail_lines.extend(str(line).strip() for line in lines[1:] if str(line).strip())
-                details = "\n".join(detail_lines)
-                app_config_review_details.setText(details)
-                app_config_review_card.setToolTip("\n".join(lines))
-                app_config_review_toggle_btn.setVisible(bool(lines[1:]))
-                app_config_review_details.setVisible(False)
-                app_config_review_toggle_btn.setText("Show Details")
-
-            def _compact_value(value: str, *, missing: str = "not set") -> str:
-                text = str(value or "").strip()
-                return text if text else missing
-
-            def _path_summary(label: str, value: str) -> str:
-                text = str(value or "").strip()
-                if not text:
-                    return f"{label}: not set"
-                path = Path(text).expanduser()
-                try:
-                    home = Path.home()
-                    if path.is_absolute():
-                        text = str(path).replace(str(home), "~", 1) if str(path).startswith(str(home)) else str(path)
-                except Exception:
-                    pass
-                return f"{label}: {text}"
-
-            def _endpoint_summary(label: str, host: str, port: str) -> str:
-                host_text = str(host or "").strip() or "127.0.0.1"
-                port_text = str(port or "").strip()
-                return f"{label}: {host_text}:{port_text}" if port_text else f"{label}: port not set"
-
-            def _line_without_prefix(value: str, prefix: str) -> str:
-                text = str(value or "").strip()
-                marker = f"{prefix}:"
-                if text.startswith(marker):
-                    return text.split(":", 1)[1].strip()
-                return text
-
-            inventory_reference = str(guided_instance_inventory_snapshot.fingerprint or "")[:12].upper()
-            if inventory_reference:
-                inventory_reference = " ".join(
-                    inventory_reference[index : index + 4]
-                    for index in range(0, len(inventory_reference), 4)
-                )
-            else:
-                inventory_reference = "Unavailable"
-            inventory_review_status.setText(
-                f"Review generation {guided_instance_inventory_snapshot.generation} · "
-                f"Reference {inventory_reference}"
-            )
-            inventory_review_card.setToolTip(
-                "This compact reference identifies the saved and retained software identities reviewed for this radio."
-            )
-
-            def _endpoint_conflict_lines() -> List[str]:
-                existing_id = int((profile_seed or {}).get("id", 0) or 0)
-                try:
-                    profiles = list(self.multi_radio_store.list_device_profiles())
-                except Exception:
-                    profiles = list(getattr(self, "device_profiles", []) or [])
-
-                endpoint_specs = [
-                    ("FLRig", flrig_host_edit.text(), flrig_port_edit.text(), "flrig_host", "flrig_port"),
-                    ("FLDigi", fldigi_host_edit.text(), fldigi_port_edit.text(), "fldigi_host", "fldigi_port"),
-                    ("JS8Call", js8_host_edit.text(), js8_port_edit.text(), "js8_host", "js8_port"),
-                    ("RigCtlD", rig_host_edit.text(), rig_port_edit.text(), "rigctld_host", "rigctld_port"),
-                ]
-                if use_flamp_chk.isChecked():
-                    endpoint_specs.append(
-                        (
-                            "FLDigi ARQ",
-                            fldigi_host_edit.text(),
-                            fldigi_arq_port_edit.text(),
-                            "fldigi_host",
-                            "arq_port",
-                        )
-                    )
-                conflicts: List[str] = []
-                for label, host, port, host_key, port_key in endpoint_specs:
-                    port_text = str(port or "").strip()
-                    if not port_text:
-                        continue
-                    host_text = str(host or "").strip() or "127.0.0.1"
-                    for profile in profiles:
-                        try:
-                            profile_id = int(profile.get("id", 0) or 0)
-                        except Exception:
-                            profile_id = 0
-                        if profile_id and profile_id == existing_id:
-                            continue
-                        other_port = str(profile.get(port_key, "") or "").strip()
-                        if other_port != port_text:
-                            continue
-                        other_host = str(profile.get(host_key, "") or "").strip() or "127.0.0.1"
-                        if other_host != host_text:
-                            continue
-                        other_name = str(
-                            profile.get("name")
-                            or profile.get("short_name")
-                            or profile.get("label")
-                            or f"radio {profile_id or '?'}"
-                        ).strip()
-                        conflicts.append(f"{label} {host_text}:{port_text} is already used by {other_name}.")
-                return conflicts
-
-            def _review_card_html(title: str, lines: Sequence[str], *, tone: str = "neutral") -> str:
-                theme = resolve_theme(self.settings)
-                colors = {
-                    "warning": theme.get("warning", "#C99700"),
-                    "success": theme.get("success", "#2E7D32"),
-                    "info": theme.get("info", theme.get("accent", "#1565C0")),
-                    "neutral": theme.get("border", "#AEB7BF"),
-                }
-                accent = colors.get(tone, colors["neutral"])
-                safe_title = html.escape(str(title or "").strip())
-                body = "".join(
-                    f"<li>{html.escape(str(line or '').strip())}</li>"
-                    for line in lines
-                    if str(line or "").strip()
-                )
-                if not body:
-                    body = "<li>Not set</li>"
-                return (
-                    "<div style='"
-                    f"border:1px solid {accent};"
-                    "border-radius:6px;"
-                    "padding:8px 10px;"
-                    "margin:0 0 8px 0;"
-                    "'>"
-                    f"<div style='font-weight:700; margin-bottom:4px;'>{safe_title}</div>"
-                    f"<ul style='margin:0 0 0 18px; padding:0;'>{body}</ul>"
-                    "</div>"
-                )
-
-            model_payload = _current_radio_model_payload()
-            radio_label = (
-                name_edit.text().strip()
-                or str(model_payload.get("display_name", "") or "").strip()
-                or str(model_payload.get("model_name", "") or "").strip()
-                or "Unnamed radio"
-            )
-            setup_label = setup_type_combo.currentText().strip()
-            if not str(setup_type_combo.currentData() or "").strip():
-                setup_label = "Setup type not selected"
-            app_labels = []
-            if use_flrig_chk.isChecked():
-                app_labels.append("FLRig")
-            if use_fldigi_chk.isChecked():
-                app_labels.append("FLDigi")
-            if use_flmsg_chk.isChecked():
-                app_labels.append("FLMsg")
-            if use_flamp_chk.isChecked():
-                app_labels.append("FLAmp")
-            if use_js8call_chk.isChecked():
-                js8_label = "JS8Call"
-                if (
-                    str(device_class_combo.currentData() or "").strip().lower() == "observer"
-                    and js8_launch_enabled_chk.isChecked()
-                ):
-                    js8_label += " (receive-only; launch with CommsPlan)"
-                app_labels.append(js8_label)
-            if use_js8spotter_chk.isChecked():
-                app_labels.append("CommsPlan Spotter")
-            if use_external_js8spotter_chk.isChecked():
-                app_labels.append("External JS8Spotter")
-            if use_commstat_chk.isChecked():
-                app_labels.append("CommStat")
-            if use_varac_chk.isChecked():
-                app_labels.append("VarAC")
-            if str(device_class_combo.currentData() or "").strip().lower() == "observer":
-                receiver_app = str(receiver_application_combo.currentData() or "").strip()
-                if receiver_app:
-                    app_labels.append(
-                        receiver_app + (" (launch with CommsPlan)" if receiver_launch_enabled_chk.isChecked() else "")
-                    )
-            backend_value = str(backend_combo.currentData() or "manual").strip().lower()
-            backend_label = self._device_backend_label(backend_value)
-            retained_for_review = getattr(dlg, "_guided_software_instance_drafts", {})
-            varac_for_review = (
-                dict(retained_for_review.get("varac") or {})
-                if isinstance(retained_for_review, Mapping)
-                and isinstance(retained_for_review.get("varac"), Mapping)
-                else {}
-            )
-            native_for_review = varac_for_review.get("varac_native_presentation")
-            native_for_review = native_for_review if isinstance(native_for_review, Mapping) else {}
-            endpoint_lines: List[str] = []
-            if backend_value == "flrig" or use_flrig_chk.isChecked():
-                endpoint_lines.append(_endpoint_summary("FLRig", flrig_host_edit.text(), flrig_port_edit.text()))
-            if backend_value == "rigctld":
-                endpoint_lines.append(_endpoint_summary("RigCtlD", rig_host_edit.text(), rig_port_edit.text()))
-            if use_fldigi_chk.isChecked():
-                endpoint_lines.append(_endpoint_summary("FLDigi", fldigi_host_edit.text(), fldigi_port_edit.text()))
-            if use_flamp_chk.isChecked():
-                endpoint_lines.append(
-                    _endpoint_summary("FLAmp ARQ", fldigi_host_edit.text(), fldigi_arq_port_edit.text())
-                )
-            if backend_value == "js8call" or use_js8call_chk.isChecked():
-                endpoint_lines.append(_endpoint_summary("JS8Call", js8_host_edit.text(), js8_port_edit.text()))
-            if str(device_class_combo.currentData() or "").strip().lower() == "observer":
-                endpoint_lines.append(_endpoint_summary("Observer SDR", sdr_host_edit.text(), sdr_port_edit.text()))
-            if use_varac_chk.isChecked():
-                ports = str(native_for_review.get("ports_summary") or "").strip()
-                endpoint_lines.append(
-                    "VarAC / VARA ports: " + (ports or "not prepared")
-                )
-            if not endpoint_lines:
-                endpoint_lines.append("No app endpoint selected")
-            file_lines: List[str] = []
-            if use_js8call_chk.isChecked():
-                file_lines.append(_path_summary("JS8 profile", js8_profile_edit.text()))
-                file_lines.append(_path_summary("DIRECTED.TXT", js8_directed_edit.text()))
-            if use_external_js8spotter_chk.isChecked():
-                file_lines.append(_path_summary("External JS8Spotter", js8spotter_launch_edit.text()))
-            if use_varac_chk.isChecked():
-                file_lines.append(_path_summary("VarAC executable", str(varac_for_review.get("application_path") or varac_install_edit.text())))
-                file_lines.append(_path_summary("VarAC INI", str(varac_for_review.get("configuration_path") or varac_ini_edit.text())))
-                file_lines.append(_path_summary("VarAC DB", str(varac_for_review.get("storage_path") or varac_db_edit.text())))
-                file_lines.append(_path_summary("VarAC incoming", str(varac_for_review.get("secondary_storage_path") or varac_incoming_edit.text())))
-                file_lines.append(_path_summary("VarAC outbox", str(varac_for_review.get("outbox_path") or varac_outbox_edit.text())))
-                file_lines.append(_path_summary("VARA runtime", str(varac_for_review.get("vara_runtime_path") or "")))
-                file_lines.append(_path_summary("VARA INI", str(varac_for_review.get("vara_ini_path") or "")))
-                file_lines.append(_path_summary("VarAC BBS", varac_bbs_edit.text()))
-                file_lines.append(_path_summary("VarAC BBS archive", varac_bbs_archive_edit.text()))
-            if radio_apps_base_edit.text().strip():
-                file_lines.append(_path_summary("Radio Apps Base Folder", radio_apps_base_edit.text()))
-            if not file_lines:
-                file_lines.append("No message/forms paths selected")
-            app_config_plan = _current_guided_app_config_plan()
-            app_config_lines = guided_app_config_review_lines(app_config_plan)
-            if use_varac_chk.isChecked() and bool(native_for_review.get("writer_qualified")):
-                varac_bundle_lines = [
-                    "App Configuration: VarAC native bundle is prepared; no external file changes occur until Save Radio and Software.",
-                    "VarAC executable: " + str(varac_for_review.get("application_path") or "not set"),
-                    "VarAC INI: " + str(varac_for_review.get("configuration_path") or "not set"),
-                    "Working directory: " + str(varac_for_review.get("working_directory") or "not set"),
-                    "Structured arguments: " + str(list(varac_for_review.get("launch_argv") or ())),
-                ]
-                app_config_lines = varac_bundle_lines + list(app_config_lines)
-            app_config_summary = _line_without_prefix(
-                app_config_lines[0] if app_config_lines else "App Configuration: no external app setup changes.",
-                "App Configuration",
-            )
-            _set_app_config_review_card(
-                app_config_lines,
-                backup_required=bool(app_config_plan.backup_required),
-                manual_review_required=bool(app_config_plan.manual_review_required),
-                has_actions=bool(app_config_plan.actions),
-            )
-            configured_file_lines = [
-                line
-                for line in file_lines
-                if str(line or "").strip() and not str(line or "").strip().endswith("not set")
-            ]
-            missing_file_lines = [
-                line
-                for line in file_lines
-                if str(line or "").strip().endswith("not set")
-            ]
-            files_review_lines = [
-                f"Paths configured: {len(configured_file_lines)}",
-            ]
-            if missing_file_lines:
-                files_review_lines.append(f"Needs review: {len(missing_file_lines)} path(s)")
-            else:
-                files_review_lines.append("No missing paths for the selected software.")
-            # Files is a review surface, not merely a count: include the
-            # canonical VarAC INI and every prepared file fact so the parent
-            # can be approved without opening the nested correction dialog.
-            files_review_lines.extend(file_lines)
-            files_review_lines.append(app_config_summary)
-
-            policy = guided_setup_capability_policy(_current_guided_blueprint())
-            observer_mode = str(device_class_combo.currentData() or "").strip().lower() == "observer"
-            schedule_line = _current_guided_schedule_decision().review_text
-
-            if not policy.fio_frequency_control_allowed:
-                frequency_line = "Monitor/import only. CommsPlan will not offer scheduler or QSY controls."
-            elif backend_value in {"manual", "none"}:
-                frequency_line = "Manual/external control. CommsPlan will not tune this radio until a control endpoint is selected."
-            else:
-                frequency_line = f"{backend_label} controls scheduler and QSY actions."
-
-            enabled_text = "Enabled" if int((profile_seed or {}).get("enabled", 1) or 1) == 1 else "Not enabled"
-            active_text = "Active now" if int((profile_seed or {}).get("runtime_active", 0) or 0) == 1 else "Inactive until you choose Use Radio"
-
-            conflict_lines = _endpoint_conflict_lines()
-            guard_lines = [
-                "Supported bands: "
-                + (self._human_join(self._band_check_values(band_checks)) or "not selected"),
-                "Shared antenna/transmit/front-end groups are used by RF Guard when configured.",
-            ]
-            _guard_tone, _guard_title, guard_detail = _guided_schedule_assignment_warning_summary()
-            if guard_detail:
-                guard_lines.append(guard_detail)
-            elif _selected_guided_schedule_path() == SCHEDULE_EXISTING_PLAN and _selected_guided_schedule_plan() is None:
-                guard_lines.append("No plan selected yet, so RF Guard cannot compare antenna bands to a schedule.")
-            if conflict_lines:
-                guard_lines.extend(conflict_lines)
-            guard_tone = "warning" if conflict_lines or guard_detail else "success"
-            selected_operating_model = _selected_guided_operating_model()
-            selected_fio_behavior = (
-                _guided_fio_behavior_label(selected_operating_model)
-                if selected_operating_model is not None
-                else "Not selected"
-            )
-            selected_family_keys = [
-                family_key
-                for family_key in software_family_titles
-                if _guided_software_family_selected(family_key)
-            ]
-            canonical_selected_families = [
-                "external_js8spotter" if family_key == "external_spotter" else family_key
-                for family_key in selected_family_keys
-                if family_key != "receiver"
-            ]
-            identity_profile = _draft_radio_profile()
-            if observer_mode:
-                canonical_selected_families.insert(0, "sdrpp")
-                # The first option deliberately means "no application
-                # launch".  Its display text is guidance, not an application
-                # identity, so never feed it to the receiver recipe builder.
-                receiver_name = str(
-                    receiver_application_combo.currentData() or ""
-                ).strip()
-                receiver_items = (
-                    build_receiver_launch_items(
-                        identity_profile,
-                        [
-                            {
-                                "name": receiver_name,
-                                "launch_path_override": receiver_launch_path_edit.text().strip(),
-                                "startup": bool(receiver_launch_enabled_chk.isChecked()),
-                            }
-                        ],
-                    )
-                    if receiver_name
-                    else ()
-                )
-                receiver_item = dict(receiver_items[0]) if receiver_items else {}
-                identity_profile["receiver_launch_item"] = {
-                    **receiver_item,
-                    "path_override": receiver_item.get("launch_path_override", ""),
-                    "launch_at_startup": receiver_item.get("startup", False),
-                    "readiness": receiver_item.get("readiness_policy", {}),
-                }
-                identity_profile["receiver_launch_enabled"] = bool(
-                    receiver_launch_enabled_chk.isChecked()
-                )
-            identity_review_lines: List[str] = []
-            try:
-                identity_drafts = {
-                    str(family): dict(value)
-                    for family, value in dict(retained_for_review or {}).items()
-                    if isinstance(value, Mapping)
-                }
-                if "js8call" in identity_drafts:
-                    identity_drafts["js8call"][
-                        "external_spotter_launch_at_startup"
-                    ] = bool(
-                        use_external_js8spotter_chk.isChecked()
-                        and str(
-                            software_launch_policy_combos["external_spotter"].currentData()
-                            or ""
-                        ).strip().lower()
-                        == "fio"
-                    )
-                guided_identity_records = build_guided_identity_records(
-                    identity_profile,
-                    identity_drafts,
-                    tuple(canonical_selected_families),
-                )
-                setattr(dlg, "_guided_software_identity_records", guided_identity_records)
-                for identity in guided_identity_records:
-                    component_text = ", ".join(
-                        component.component_id for component in identity.components
-                    ) or "binding only"
-                    identity_review_lines.append(
-                        f"{software_family_titles.get(identity.family_key, identity.family_key)} identity "
-                        f"{identity.bundle_id}; components: {component_text}; fingerprint: "
-                        f"{identity.fingerprint[:12]}."
-                    )
-            except (TypeError, ValueError) as exc:
-                setattr(dlg, "_guided_software_identity_records", ())
-                if software_plan_prepared:
-                    identity_review_lines.append(
-                        "Canonical software identity needs review before Save: " + str(exc)
-                    )
-            responsibility_lines: List[str] = []
-            launch_plan_lines: List[str] = []
-            family_launch_targets = {
-                "receiver": receiver_launch_path_edit.text().strip(),
-                "js8call": js8_install_edit.text().strip(),
-                "external_spotter": js8spotter_launch_edit.text().strip(),
-                "varac": str(varac_for_review.get("application_path") or varac_install_edit.text()).strip(),
-            }
-            for family_key in selected_family_keys:
-                family_title = software_family_titles.get(family_key, family_key)
-                source_text = software_source_combos[family_key].currentText().strip()
-                management_text = software_management_combos[family_key].currentText().strip()
-                completion_text = software_completion_combos[family_key].currentText().strip()
-                launch_text = software_launch_policy_combos[family_key].currentText().strip()
-                responsibility_lines.append(
-                    f"{family_title} — Instance source: {source_text}; Configuration responsibility: {management_text}; "
-                    f"Completion policy: {completion_text}; Launch policy: {launch_text}."
-                )
-                if family_key == "fio_spotter":
-                    launch_plan_lines.append(
-                        "CommsPlan Spotter — Launch policy: available inside CommsPlan; Effective command: built in; "
-                        f"Working directory: not applicable; Dependencies: JS8Call TCP "
-                        f"{js8_host_edit.text().strip() or '127.0.0.1'}:{js8_port_edit.text().strip() or 'not set'}; "
-                        "Readiness policy: follows CommsPlan and transport health."
-                    )
-                    continue
-                if family_key == "commstat":
-                    launch_plan_lines.append(
-                        "CommStat — Launch policy: station-shared process; Effective command: not radio-owned; "
-                        "Working directory: station configuration; Dependencies: JS8Call TCP "
-                        f"{js8_host_edit.text().strip() or '127.0.0.1'}:{js8_port_edit.text().strip() or 'not set'}; "
-                        "Execution scope: station-shared with a radio endpoint binding; "
-                        "Readiness policy: shared CommStat health plus bound endpoint health."
-                    )
-                    continue
-                if family_key == "fast_light":
-                    component_paths = (
-                        ("FLRig", flrig_path_edit.text().strip(), use_flrig_chk.isChecked()),
-                        ("FLDigi", fldigi_path_edit.text().strip(), use_fldigi_chk.isChecked()),
-                        ("FLMsg", flmsg_path_edit.text().strip(), use_flmsg_chk.isChecked()),
-                        ("FLAmp", flamp_path_edit.text().strip(), use_flamp_chk.isChecked()),
-                    )
-                    for component_name, component_path, selected in component_paths:
-                        if not selected:
-                            continue
-                        execution_scope = (
-                            "receive-only"
-                            if str(device_class_combo.currentData() or "").strip().lower() == "observer"
-                            else "radio-scoped"
-                        )
-                        effective = component_path or "application path still required"
-                        launch_plan_lines.append(
-                            f"{component_name} — Launch policy: {launch_text}; Effective command: {effective}; "
-                            f"Working directory: application default; Dependencies: reviewed per component; "
-                            f"Execution scope: {execution_scope}; Readiness policy: checked after start."
-                        )
-                    continue
-                if family_key == "varac":
-                    argv = tuple(str(value) for value in (varac_for_review.get("launch_argv") or ()) if str(value))
-                    executable = argv[0] if argv else str(varac_for_review.get("application_path") or "")
-                    arguments = argv[1:] if len(argv) > 1 else ()
-                    launch_plan_lines.append(
-                        "VarAC — Launch policy: " + launch_text
-                        + "; Executable: " + (executable or "not prepared")
-                        + "; Arguments: " + (str(list(arguments)) if arguments else "None")
-                        + "; Working directory: " + str(varac_for_review.get("working_directory") or "not set")
-                        + "; Dependencies: distinct VARA runtime; Readiness policy: process and endpoint health."
-                    )
-                    continue
-                target = family_launch_targets.get(family_key, "")
-                effective = target or "application path still required"
-                execution_scope = (
-                    "receive-only"
-                    if str(device_class_combo.currentData() or "").strip().lower() == "observer"
-                    else "radio-scoped"
-                )
-                launch_plan_lines.append(
-                    f"{family_title} — Launch policy: {launch_text}; Effective command: {effective}; "
-                    f"Working directory: application default; Dependencies: none declared; Execution scope: {execution_scope}; "
-                    "Readiness policy: process readiness is separate from endpoint verification."
-                )
-            if not responsibility_lines:
-                responsibility_lines.append("No software capability selected.")
-            responsibility_lines.extend(identity_review_lines)
-            varac_stop_before_save = bool(
-                use_varac_chk.isChecked()
-                and native_for_review.get("apply_requires_stopped_process")
-            )
-            if varac_stop_before_save:
-                responsibility_lines.append(
-                    "VarAC apply prerequisite — Close VarAC and VARA before Save. "
-                    "The reviewed plan is complete; CommsPlan will recheck the live process state before writing anything."
-                )
-            if not launch_plan_lines:
-                launch_plan_lines.append("No external launch item selected.")
-
-            receiver_presentation = _current_receiver_state_presentation() if observer_mode else None
-            receiver_verified = bool(
-                observer_mode
-                and receiver_presentation is not None
-                and receiver_presentation.automatic_retune_allowed
-            )
-            retained_software_drafts = getattr(dlg, "_guided_software_instance_drafts", {})
-            verification_pending_apps: List[str] = []
-            receiver_verification_pending = bool(
-                observer_mode
-                and receiver_presentation is not None
-                and receiver_presentation.key != "resource_blocked"
-                and (
-                    receiver_presentation.key == "verification_changed"
-                    or str(receiver_verification_state or "").strip().lower() == "failed"
-                    or (
-                        sdr_control_enabled_chk.isChecked()
-                        and not receiver_presentation.automatic_retune_allowed
-                    )
-                )
-            )
-            if receiver_verification_pending:
-                verification_pending_apps.append(
-                    str(sdr_application_combo.currentData() or sdr_application_combo.currentText() or "Receiver control").strip()
-                    or "Receiver control"
-                )
-            if isinstance(retained_software_drafts, Mapping):
-                for family_key, draft in retained_software_drafts.items():
-                    if not isinstance(draft, Mapping):
-                        continue
-                    if str(draft.get("native_configuration_status") or "").strip() == "operator_action_required":
-                        verification_pending_apps.append(
-                            software_family_titles.get(str(family_key), str(family_key))
-                        )
-            operator_start_apps = [
-                software_family_titles.get(family_key, family_key)
-                for family_key in selected_family_keys
-                if family_key not in {"fio_spotter", "commstat"}
-                and str(software_launch_policy_combos[family_key].currentData() or "operator") != "fio"
-            ]
-            recovery = guided_recovery_presentation(
-                operator_start_apps=operator_start_apps,
-                verification_pending_apps=verification_pending_apps,
-            )
-            permission_lines = (
-                [
-                    "Receive/import: allowed for the selected receive-only applications.",
-                    "Tune: verified receiver control" if receiver_verified else "Tune: manual/reminders only until receiver control is verified.",
-                    "QSY, PTT, transmit, Compose sending, Expect replies, and retrieval transmissions: not allowed.",
-                    "Schedule: automatic receive retune only with matching evidence; otherwise reminders only.",
-                ]
-                if observer_mode
-                else [
-                    f"Frequency control: {frequency_line}",
-                    "PTT/transmit remain subject to the selected CommsPlan Behavior, RF Guard, and final preflight.",
-                    *(
-                        ["VarAC remains application-owned for QSY and scheduled transmit when selected."]
-                        if _guided_software_family_selected("varac")
-                        else []
-                    ),
-                ]
-            )
-            review_html = [
-                _review_card_html(
-                    "Radio Profile",
-                    [
-                        f"Radio: {radio_label}",
-                        "Role: " + (
-                            "Receive-only SDR"
-                            if observer_mode
-                            else "Transceiver"
-                            if str(device_class_combo.currentData() or "").strip().lower() == "tx_rx"
-                            else "Existing advanced role"
-                        ),
-                        f"Setup: {setup_label}",
-                        f"Use in CommsPlan: {enabled_text}; {active_text}",
-                    ],
-                    tone="info",
-                ),
-                _review_card_html(
-                    "Software and Control",
-                    [
-                        "Software: " + (", ".join(app_labels) if app_labels else "Monitor only"),
-                        f"Frequency Control: {frequency_line}",
-                        f"CommsPlan Behavior: {selected_fio_behavior}",
-                        *(
-                            [
-                                "Safety: no Compose/Expect sending, QSY, PTT, or scheduler authority",
-                            ]
-                            if str(device_class_combo.currentData() or "").strip().lower() == "observer"
-                            else []
-                        ),
-                    ],
-                    tone="info",
-                ),
-                _review_card_html(
-                    "Software Responsibilities",
-                    responsibility_lines,
-                    tone="warning" if varac_stop_before_save else "info",
-                ),
-                _review_card_html(
-                    "Endpoints",
-                    endpoint_lines,
-                    tone="warning" if conflict_lines else "neutral",
-                ),
-                _review_card_html(
-                    "Receiver Guard and Receive Schedule" if observer_mode else "RF Guard and Radio Schedule",
-                    (
-                        [
-                            "Shared antenna/front-end resources: "
-                            + self._human_join(
-                                [
-                                    value
-                                    for value in (
-                                        antenna_group_edit.text().strip(),
-                                        frontend_group_edit.text().strip(),
-                                        band_overlap_edit.text().strip(),
-                                    )
-                                    if value
-                                ]
-                            )
-                            if any(
-                                value
-                                for value in (
-                                    antenna_group_edit.text().strip(),
-                                    frontend_group_edit.text().strip(),
-                                    band_overlap_edit.text().strip(),
-                                )
-                            )
-                            else "Shared antenna/front-end resources: none selected.",
-                            "Receiver control: "
-                            + (receiver_presentation.title if receiver_presentation is not None else "Not configured"),
-                            receiver_presentation.detail if receiver_presentation is not None else "No receiver control is configured.",
-                            "Receive Schedule: " + schedule_line,
-                            *_guided_schedule_assignment_warning_lines(),
-                        ]
-                        if observer_mode
-                        else guard_lines + ["Radio Schedule: " + schedule_line]
-                    ),
-                    tone=guard_tone,
-                ),
-                _review_card_html("Permissions", permission_lines, tone="warning" if observer_mode else "neutral"),
-                _review_card_html(
-                    "Recovery and follow-up",
-                    [
-                        recovery.status,
-                        recovery.detail,
-                        *( ["Resume at: " + recovery.retry_route] if recovery.retry_route else [] ),
-                    ],
-                    tone=recovery.tone,
-                ),
-                _review_card_html(
-                    "Launch plan",
-                    launch_plan_lines,
-                    tone="warning" if any("still required" in line for line in launch_plan_lines) else "success",
-                ),
-                _review_card_html(
-                    "Files",
-                    files_review_lines,
-                    tone="neutral",
-                ),
-            ]
-            save_review_label.setText("".join(review_html))
-            save_review_label.setToolTip("\n".join(list(file_lines) + list(app_config_lines)))
-
-        def _apply_guided_wizard_visibility(connection_visible: bool) -> None:
-            nonlocal guided_wizard_step_id
-            theme = resolve_theme(self.settings)
-            observer_mode = str(device_class_combo.currentData() or "").strip().lower() == "observer"
-            visible_steps = _guided_visible_wizard_steps()
-            visible_step_ids = {step_id for step_id, _label in visible_steps}
-            step_applicability = _guided_wizard_step_applicability()
-            if guided_wizard_step_id not in visible_step_ids:
-                guided_wizard_step_id = _guided_nearest_applicable_step(guided_wizard_step_id)
-            wizard_view = guided_setup_wizard_view(guided_wizard_step_id)
-            stable_step_labels = {
-                "radio": "Radio",
-                "model": "CommsPlan Behavior",
-                "software": "Software",
-                "connection": "Connections",
-                "guard": "Safety",
-                "schedule": "Schedule",
-                "review": "Review & Save",
-            }
-            current_idx = next(
-                (idx for idx, (step_id, _label) in enumerate(visible_steps) if step_id == guided_wizard_step_id),
-                0,
-            )
-            for display_index, (step_id, label) in enumerate(guided_wizard_steps, start=1):
-                btn = guided_wizard_buttons[step_id]
-                applicable = bool(step_applicability.get(step_id, False))
-                display_label = stable_step_labels.get(step_id, label)
-                btn.setVisible(True)
-                btn.setProperty("guidedStepApplicable", applicable)
-                btn.setText(f"{display_index}. {display_label}")
-                checked = applicable and step_id == guided_wizard_step_id
-                step_idx = next(
-                    (idx for idx, (item_step_id, _label) in enumerate(visible_steps) if item_step_id == step_id),
-                    0,
-                )
-                btn.setEnabled(applicable and step_idx <= guided_wizard_max_index_seen + 1)
-                btn.setChecked(checked)
-                btn.setStyleSheet(
-                    button_style("primary" if checked else "secondary" if applicable else "muted", theme)
-                )
-                if applicable:
-                    role_detail = "Receiver Guard" if observer_mode and step_id == "guard" else (
-                        "Receive Schedule" if observer_mode and step_id == "schedule" else display_label
-                    )
-                    btn.setToolTip(f"Show the {role_detail} setup step.")
-                    btn.setAccessibleDescription(f"Guided setup step {display_index}: {role_detail}.")
-                else:
-                    if observer_mode and step_id in {"guard", "schedule"}:
-                        reason = "This step is skipped because a receive-only observer radio does not transmit or own a transmit schedule."
-                    elif step_id == "model":
-                        reason = "Transmit-capable radios receive operating-model assignments after save; this step is skipped here."
-                    elif step_id == "connection":
-                        reason = "The current software and control choices require no connection endpoint; this step is skipped."
-                    else:
-                        reason = "This step is not applicable to the selected radio setup and is skipped."
-                    btn.setToolTip(reason)
-                    btn.setAccessibleDescription(
-                        f"Guided setup step {display_index}: {label}. Not applicable; skipped."
-                    )
-            guided_wizard_back_btn.setEnabled(current_idx > 0)
-            software_next_allowed, software_next_reason = _guided_software_step_can_continue()
-            next_enabled = current_idx < len(visible_steps) - 1 and (
-                guided_wizard_step_id != "software" or software_next_allowed
-            )
-            guided_wizard_next_btn.setEnabled(next_enabled)
-            guided_wizard_back_btn.setStyleSheet(button_style("secondary", theme))
-            guided_wizard_next_btn.setStyleSheet(button_style("primary", theme))
-            previous_label = (
-                stable_step_labels.get(visible_steps[current_idx - 1][0], visible_steps[current_idx - 1][1])
-                if current_idx > 0
-                else ""
-            )
-            next_label = (
-                stable_step_labels.get(visible_steps[current_idx + 1][0], visible_steps[current_idx + 1][1])
-                if current_idx < len(visible_steps) - 1
-                else ""
-            )
-            guided_wizard_back_btn.setText(f"Back: {previous_label}" if previous_label else "Back")
-            guided_wizard_next_btn.setText(f"Next: {next_label}" if next_label else "Next")
-            guided_wizard_next_btn.setToolTip(
-                software_next_reason if guided_wizard_step_id == "software" and not software_next_allowed
-                else (f"Continue to {next_label} setup." if next_label else "This is the final guided setup step.")
-            )
-            guided_wizard_back_btn.setToolTip(
-                f"Return to {previous_label} setup." if previous_label else "This is the first guided setup step."
-            )
-
-            identity_group.setVisible(guided_wizard_step_id == "radio")
-            software_group.setVisible(guided_wizard_step_id == "software")
-            connection_group.setVisible(guided_wizard_step_id == "connection")
-            operating_model_group.setVisible(guided_wizard_step_id == "model")
-            rf_guard_visible = guided_wizard_step_id == "guard"
-            optional_toggle.setVisible(False)
-            with QSignalBlocker(optional_toggle):
-                optional_toggle.setChecked(rf_guard_visible)
-                optional_toggle.setArrowType(Qt.DownArrow if rf_guard_visible else Qt.RightArrow)
-            optional_body.setVisible(rf_guard_visible)
-            rf_guard_intro.setText(
-                "Receiver Guard records shared antenna, front-end, preselector, and converter resources. "
-                "It never grants or checks PTT and does not imply transmit protection."
-                if observer_mode
-                else (
-                    "Start with the bands this antenna path can safely use. CommsPlan checks those bands against the "
-                    "assigned Frequency Plan before the radio is activated."
-                )
-            )
-            _set_form_row_label_text(
-                band_grid_widget,
-                "Receive Bands:" if observer_mode else "Supported Bands:",
-            )
-            _set_form_row_label_text(
-                antenna_band_mode_combo,
-                "Outside Receive Bands:" if observer_mode else "Unsupported Band:",
-            )
-            _set_form_row_label_text(
-                schedule_path_combo,
-                "Receive Schedule Path:" if observer_mode else "Schedule Path:",
-            )
-            _set_form_row_label_text(
-                schedule_plan_combo,
-                "Receive Frequency Plan:" if observer_mode else "Frequency Plan:",
-            )
-            _apply_guided_schedule_assignment_warning_ui()
-            schedule_group.setTitle("Receive Schedule" if observer_mode else "Radio Schedule")
-            schedule_group.setVisible(guided_wizard_step_id == "schedule")
-            connection_group.setTitle("Connections")
-            save_review_group.setTitle("Review & Save")
-            save_review_group.setVisible(guided_wizard_step_id == "review")
-            if guided_wizard_step_id != "review":
-                readiness_card.setVisible(False)
-            else:
-                _update_dialog_readiness()
-
-            detail_by_step = {
-                "radio": "Choose the radio model, station name, role, and setup type.",
-                "model": (
-                    "Choose CommsPlan's receive-side features and confirm the safety boundary; timing belongs in Schedule."
-                    if observer_mode
-                    else "Choose which CommsPlan features and controls are available; timing belongs in Schedule."
-                ),
-                "software": "Select the software for this radio. CommsPlan prepares it automatically and asks only for choices it cannot safely infer.",
-                "connection": (
-                    "Review receiver control and receive/decode companion identities separately."
-                    if observer_mode
-                    else "Review the connection fields grouped by the software responsible for them."
-                ),
-                "guard": (
-                    "Receiver Guard records shared receive resources without granting PTT or transmit authority."
-                    if observer_mode
-                    else "RF Guard confirms supported bands and shared RF resources before scheduling."
-                ),
-                "schedule": (
-                    "Choose automatic receive retuning only after matching verification; otherwise use reminders."
-                    if observer_mode
-                    else "Choose the Frequency Plan after RF Guard details are known."
-                ),
-                "review": "Review the complete radio, software, launch, safety, and schedule plan before saving.",
-            }
-            guided_wizard_detail_label.setText(detail_by_step.get(guided_wizard_step_id, wizard_view.detail))
-            _update_guided_save_review()
-            _update_guided_save_button()
-
-        def _apply_dialog_autoconfigure_results(payload: Mapping[str, Any]) -> None:
-            nonlocal app_autoconfigure_attempted, software_plan_prepared, prepared_software_families, prepared_software_context, software_preparation_pending, software_preparation_focus_key
-            filled: List[str] = []
-            preserved: List[str] = []
-            observer_mode = str(device_class_combo.currentData() or "").strip().lower() == "observer"
-            install_candidates = tuple(payload.get("install_candidates") or ())
-            fast_results = dict(payload.get("fast_results") or {})
-            js8_results = dict(payload.get("js8_results") or {})
-            varac_results = dict(payload.get("varac_results") or {})
-            js8_file_profiles = tuple(payload.get("js8_file_profiles") or ())
-            app_autoconfigure_attempted = True
-            software_preparation_pending = False
-            configure_auto_btn.setVisible(False)
-            software_plan_prepared = True
-            prepared_software_families = tuple(
-                family_key
-                for family_key in software_responsibility_cards
-                if _guided_software_family_selected(family_key)
-            )
-            _update_detected_app_choices(install_candidates)
-            _update_js8_profile_choices(js8_file_profiles)
-            suggestions, review_items = self._guided_radio_autofill_suggestions(
-                current={
-                    "js8_port": js8_port_edit.text().strip(),
-                },
-                selected={
-                    "flrig": use_flrig_chk.isChecked(),
-                    "fldigi": use_fldigi_chk.isChecked(),
-                    "flmsg": use_flmsg_chk.isChecked(),
-                    "flamp": use_flamp_chk.isChecked(),
-                    "js8call": use_js8call_chk.isChecked(),
-                    "fio_spotter": use_js8spotter_chk.isChecked(),
-                    "external_js8spotter": use_external_js8spotter_chk.isChecked(),
-                    "js8spotter": use_external_js8spotter_chk.isChecked(),
-                    "commstat": use_commstat_chk.isChecked(),
-                    "varac": use_varac_chk.isChecked(),
-                },
-                backend=str(backend_combo.currentData() or ""),
-                observer_mode=observer_mode,
-                install_candidates=install_candidates,
-                fast_results=fast_results,
-                js8_results=js8_results,
-                varac_results=varac_results,
-                js8_file_profiles=js8_file_profiles,
-                default_ports={
-                    "flrig": _default_instance_port("flrig"),
-                    "fldigi": _default_instance_port("fldigi"),
-                    "js8call": _default_instance_port("js8call"),
-                },
-                profile_name=name_edit.text().strip(),
-                source_modes={
-                    family_key: str(combo.currentData() or "create")
-                    for family_key, combo in software_source_combos.items()
-                },
-            )
-            field_targets: Dict[str, Tuple[QLineEdit, str]] = {
-                "sdr_host": (sdr_host_edit, "Observer SDR host"),
-                "flrig_host": (flrig_host_edit, "FLRig host"),
-                "flrig_port": (flrig_port_edit, "FLRig port"),
-                "flrig_path": (flrig_path_edit, "FLRig app"),
-                "fldigi_host": (fldigi_host_edit, "FLDigi host"),
-                "fldigi_port": (fldigi_port_edit, "FLDigi port"),
-                "arq_port": (fldigi_arq_port_edit, "FLDigi/FLAmp ARQ port"),
-                "fldigi_path": (fldigi_path_edit, "FLDigi app"),
-                "flmsg_path": (flmsg_path_edit, "FLMsg app"),
-                "flamp_path": (flamp_path_edit, "FLAmp app"),
-                "js8_host": (js8_host_edit, "JS8Call host"),
-                "js8_port": (js8_port_edit, "JS8Call port"),
-                "js8_install_path": (js8_install_edit, "JS8Call app"),
-                "js8_directed_path": (js8_directed_edit, "JS8Call DIRECTED.TXT"),
-                "js8_profile_path": (js8_profile_edit, "JS8 profile folder"),
-                "spotter_launch_path": (js8spotter_launch_edit, "External JS8Spotter app"),
-                "commstat_launch_path": (commstat_launch_edit, "CommStat app"),
-                "varac_install_path": (varac_install_edit, "VarAC install"),
-                "varac_db_path": (varac_db_edit, "VarAC DB"),
-                "varac_ini_path": (varac_ini_edit, "VarAC INI"),
-                "varac_incoming_path": (varac_incoming_edit, "VarAC incoming"),
-                "varac_outbox_dir": (varac_outbox_edit, "VarAC outbox"),
-                "varac_bbs_dir": (varac_bbs_edit, "VarAC BBS"),
-                "varac_bbs_archive_dir": (varac_bbs_archive_edit, "VarAC BBS archive"),
-            }
-            for field_key, value in suggestions.items():
-                target = field_targets.get(field_key)
-                if target is None:
-                    continue
-                edit, label = target
-                _fill_blank(edit, value, label, filled, preserved)
-            for app_id in app_choice_combos:
-                if _app_choice_app_selected(app_id):
-                    _sync_app_choice_combo_to_target(app_id)
-            _update_app_choice_visibility()
-            if _js8_app_selected() and (js8_profile_edit.text().strip() or js8_directed_edit.text().strip()):
-                _update_js8_profile_choices(js8_file_profiles)
-            managed_recipe_attention = _publish_prepared_managed_instance_drafts()
-            # Publish the discovery context before the VarAC projection.  The
-            # standalone route completes synchronously and renders cards from
-            # inside that projection; without this ordering it would compare
-            # against the prior context and immediately invalidate itself.
-            prepared_software_context = _guided_software_plan_context()
-            if (
-                use_varac_chk.isChecked()
-                and str(software_source_combos["varac"].currentData() or "").strip().lower() == "create"
-                and str(software_management_combos["varac"].currentData() or "").strip().lower() == "fio_identity_launch"
-            ):
-                _prepare_varac_parent_bundle()
-            review = guided_setup_autofill_review(
-                filled=filled,
-                preserved=preserved,
-                detection_notes=review_items,
-                radio_apps_base_used=bool(radio_apps_base_edit.text().strip()),
-            )
-            if _detected_app_choice_needs_operator_selection() or managed_recipe_attention:
-                attention_status = (
-                    "Needs attention — CommsPlan prepared what it could. Review the highlighted family before continuing."
-                )
-                if managed_recipe_attention:
-                    attention_status = f"{attention_status} {managed_recipe_attention[0]}"
-                configure_auto_status.setText(attention_status)
-            else:
-                configure_auto_status.setText(
-                    "Ready — CommsPlan prepared the selected software plan. Review only the details that need attention."
-                )
-            configure_auto_status.setToolTip("\n".join(review.detail_lines))
-            _update_software_responsibility_cards()
-            # Keep the footer fixed and only reveal the first unresolved card
-            # once for this finished plan.  Re-renders must not steal an
-            # operator's scroll position while they inspect a correction.
-            unresolved = next(
-                (
-                    key for key in software_responsibility_cards
-                    if _guided_software_family_selected(key)
-                    and software_prepared_state_labels[key].text().startswith(
-                        ("Needs", "Blocked")
-                    )
-                ),
-                "",
-            )
-            focus_key = (prepared_software_context, unresolved)
-            if unresolved and focus_key != software_preparation_focus_key:
-                software_preparation_focus_key = focus_key
-                QTimer.singleShot(
-                    0,
-                    lambda key=unresolved: scroll.ensureWidgetVisible(
-                        software_responsibility_cards[key], 0, 18
-                    ) if key in software_responsibility_cards else None,
-                )
-            _update_guided_app_setup_plan_review()
-            _update_port_prompt_visibility()
-            _set_guided_wizard_step("software")
-
-        def _start_dialog_autoconfigure() -> None:
-            nonlocal guided_discovery_generation, guided_discovery_revision, software_plan_prepared, prepared_software_families, prepared_software_context, software_preparation_in_progress, software_preparation_pending, software_preparation_failed, software_preparation_request_context
-            if software_preparation_in_progress:
-                return
-            observer_mode = str(device_class_combo.currentData() or "").strip().lower() == "observer"
-            if use_varac_chk.isChecked() and not str(
-                _selected_varac_arrangement().get("cluster_path") or ""
-            ).strip():
-                configure_auto_status.setText(
-                    "Needs choice — choose the VarAC arrangement before CommsPlan prepares its plan."
-                )
-                _update_software_responsibility_cards()
-                return
-            _persist_radio_apps_base_folder()
-            software_plan_prepared = False
-            prepared_software_families = ()
-            prepared_software_context = ()
-            _update_software_responsibility_cards()
-            software_preparation_in_progress = True
-            software_preparation_pending = False
-            software_preparation_failed = False
-            software_preparation_request_context = _guided_software_plan_context()
-            configure_auto_btn.setVisible(False)
-            guided_wizard_next_btn.setEnabled(False)
-            guided_wizard_next_btn.setToolTip("CommsPlan is preparing the current software choices.")
-            configure_auto_status.setText(
-                "Discovery in progress — preparing in the background. You can continue reviewing this radio while CommsPlan checks installed apps and profiles."
-            )
-            _update_software_responsibility_cards()
-            selected_families = set()
-            if observer_mode:
-                selected_families.add(SoftwareFamily.SDRPP)
-            if use_flrig_chk.isChecked():
-                selected_families.add(SoftwareFamily.FLRIG_CONTROL)
-            if any(check.isChecked() for check in (use_fldigi_chk, use_flmsg_chk, use_flamp_chk)):
-                selected_families.add(SoftwareFamily.FAST_LIGHT)
-            if use_js8call_chk.isChecked():
-                selected_families.add(SoftwareFamily.JS8CALL)
-            if use_external_js8spotter_chk.isChecked():
-                selected_families.add(SoftwareFamily.EXTERNAL_JS8SPOTTER)
-            if use_varac_chk.isChecked():
-                selected_families.add(SoftwareFamily.VARAC)
-            guided_discovery_generation += 1
-            guided_discovery_revision += 1
-            discovery_request = DiscoveryRequest(
-                session_key=guided_discovery_session_key,
-                request_key=f"{guided_discovery_session_key}-autofill",
-                generation=guided_discovery_generation,
-                draft_revision=guided_discovery_revision,
-                radio_role=RadioRole.OBSERVER if observer_mode else RadioRole.TRANSCEIVER,
-                families=tuple(selected_families),
-                inputs=_guided_discovery_input_snapshot(
-                    self.settings.all(),
-                    apps_base=radio_apps_base_edit.text().strip(),
-                ),
-            )
-            if not self._guided_software_discovery.register_request(discovery_request):
-                software_preparation_in_progress = False
-                software_preparation_failed = True
-                configure_auto_btn.setText("Retry preparation")
-                configure_auto_btn.setVisible(True)
-                configure_auto_btn.setEnabled(True)
-                configure_auto_status.setText("Preparation could not start. Existing settings were not changed.")
-                _update_software_responsibility_cards()
-                _apply_guided_wizard_visibility(connection_group.isVisible())
-                return
-            worker = _GuidedRadioAutofillWorker(
-                self._guided_software_discovery,
-                discovery_request,
-            )
-            thread = QThread(self)
-            job_id = id(thread)
-            self._guided_radio_autofill_jobs[job_id] = (thread, worker)
-            worker.moveToThread(thread)
-
-            def _finish(payload: object) -> None:
-                nonlocal software_preparation_in_progress, software_preparation_failed
-                result = dict(payload) if isinstance(payload, Mapping) else {}
-                result_request = result.get("guided_discovery_request")
-                software_preparation_in_progress = False
-                current_context = _guided_software_plan_context()
-                if (
-                    result_request != discovery_request
-                    or not self._guided_software_discovery.result_is_current(discovery_request)
-                    or current_context != software_preparation_request_context
-                ):
-                    if dlg.isVisible():
-                        _schedule_automatic_software_preparation()
-                    return
-                if result.get("cancelled"):
-                    configure_auto_status.setText("Preparation cancelled. Existing settings were not changed; CommsPlan will refresh the current choices.")
-                    _schedule_automatic_software_preparation()
-                    return
-                try:
-                    if dlg.isVisible():
-                        _apply_dialog_autoconfigure_results(result)
-                except RuntimeError:
-                    return
-
-            def _fail(detail: str) -> None:
-                nonlocal software_preparation_in_progress, software_preparation_failed
-                try:
-                    software_preparation_in_progress = False
-                    software_preparation_failed = True
-                    configure_auto_btn.setText("Retry preparation")
-                    configure_auto_btn.setVisible(True)
-                    configure_auto_btn.setEnabled(True)
-                    configure_auto_status.setText(
-                        "Preparation could not complete. Existing settings were not changed; paths can still be entered manually."
-                    )
-                    _update_software_responsibility_cards()
-                    _apply_guided_wizard_visibility(connection_group.isVisible())
-                except RuntimeError:
-                    return
-                log.warning("Guided Add Radio discovery failed: %s", detail)
-
-            self._guided_radio_autofill_callbacks[job_id] = (_finish, _fail)
-            thread.started.connect(worker.run)
-            worker.finished.connect(
-                lambda payload, ident=job_id: self._guided_radio_autofill_finished.emit(ident, payload)
-            )
-            worker.failed.connect(
-                lambda detail, ident=job_id: self._guided_radio_autofill_failed.emit(ident, detail)
-            )
-            worker.finished.connect(thread.quit)
-            worker.failed.connect(thread.quit)
-            worker.finished.connect(worker.deleteLater)
-            worker.failed.connect(worker.deleteLater)
-            thread.finished.connect(
-                lambda ident=job_id: self._guided_radio_autofill_released.emit(ident)
-            )
-            thread.finished.connect(thread.deleteLater)
-            thread.start()
-
-        configure_auto_btn.clicked.connect(_start_dialog_autoconfigure)
-        software_preparation_timer.timeout.connect(_start_dialog_autoconfigure)
-
-        def _close_guided_discovery_session(_result: int = 0) -> None:
-            software_preparation_timer.stop()
-            if guided_discovery_generation:
-                self._guided_software_discovery.cancel(
-                    guided_discovery_session_key,
-                    guided_discovery_generation,
-                )
-            self._guided_software_discovery.close_session(guided_discovery_session_key)
-
-        dlg.finished.connect(_close_guided_discovery_session)
-
-        def _update_commstat_binding_summary() -> None:
-            host = js8_host_edit.text().strip() or "127.0.0.1"
-            port = js8_port_edit.text().strip() or "not set"
-            if use_commstat_chk.isChecked() and use_js8call_chk.isChecked():
-                commstat_binding_label.setText(
-                    f"Station CommStat → JS8Call TCP {host}:{port}. "
-                    "This radio adds only the endpoint binding; the station-shared CommStat process is not duplicated."
-                )
-            else:
-                commstat_binding_label.setText(
-                    "Select CommStat to bind the station-shared process to this radio's JS8Call TCP endpoint."
-                )
-
-        def _on_commstat_selection_changed(_state: int) -> None:
-            if use_commstat_chk.isChecked() and not use_js8call_chk.isChecked():
-                use_js8call_chk.setChecked(True)
-                configure_auto_status.setText(
-                    "JS8Call was selected because CommStat binds to a radio-owned JS8 TCP endpoint. "
-                    "CommsPlan will not create another CommStat install or launch identity."
-                )
-            _update_commstat_binding_summary()
-            _mark_custom_mix_from_software_edit()
-
-        def _update_dialog_readiness() -> None:
-            if guided_wizard_step_id != "review":
-                readiness_card.setVisible(False)
-                return
-
-            def _set_readiness_card_style(level: str) -> None:
-                theme = resolve_theme(self.settings)
-                level_key = (level or "info").strip().lower()
-                color_map = {
-                    "success": theme.get("success", "#2E7D32"),
-                    "warning": theme.get("warning", "#C99700"),
-                    "danger": theme.get("danger", "#C62828"),
-                    "info": theme.get("info", theme.get("accent", "#1565C0")),
-                }
-                accent = QColor(color_map.get(level_key, color_map["info"]))
-                bg = QColor(accent)
-                bg.setAlpha(24)
-                border = QColor(accent)
-                border.setAlpha(140)
-                text_color = theme.get("text", "#1C1F21")
-                muted_color = theme.get("text_muted", text_color)
-                readiness_card.setStyleSheet(
-                    "QFrame {"
-                    f" background-color: {bg.name(QColor.HexArgb)};"
-                    f" border: 1px solid {border.name(QColor.HexArgb)};"
-                    " border-radius: 8px;"
-                    "}"
-                    f" QLabel {{ color: {text_color}; border: none; background: transparent; }}"
-                    f" QLabel#readinessIntro {{ color: {muted_color}; }}"
-                )
-
-            draft = _draft_radio_profile()
-            try:
-                other_profiles = [
-                    dict(row)
-                    for row in self.device_profiles
-                    if isinstance(row, dict) and int(row.get("id", 0) or 0) != int(draft.get("id", 0) or 0)
-                ]
-            except Exception:
-                other_profiles = []
-            readiness = build_station_readiness_report(
-                self._settings_snapshot_for_readiness(),
-                device_profiles=other_profiles + [draft],
-                operating_groups=self.operating_groups,
-            )
-            summary = readiness.summary_for_radio(int(draft.get("id", 0) or 0))
-            global_items = [
-                issue.message
-                for issue in readiness.issues
-                if issue.scope == "global" and issue.severity in {"required", "recommended"}
-            ]
-            if summary is None:
-                readiness_card.setVisible(True)
-                _set_readiness_card_style("info")
-                dialog_readiness_status.setText("Radio readiness is not available yet.")
-                dialog_readiness_detail.setText("")
-                return
-            readiness_card.setVisible(str(summary.overall_state or "").strip().lower() != "ready")
-            if not readiness_card.isVisible():
-                return
-            _set_readiness_card_style(readiness_state_card_level(summary.overall_state))
-            dialog_readiness_status.setText(readiness_summary_status_text(summary, subject="This radio"))
-            detail_parts = list(summary.messages[:4])
-            if global_items:
-                detail_parts.append("Station prerequisites: " + "; ".join(global_items[:2]))
-            if detail_parts:
-                dialog_readiness_detail.setText(
-                    f"{readiness_state_description(summary.overall_state)} " + " | ".join(detail_parts)
-                )
-            else:
-                dialog_readiness_detail.setText(readiness_state_description(summary.overall_state))
-
-        def _update_dialog_visibility() -> None:
-            backend = str(backend_combo.currentData() or "flrig").strip().lower()
-            device_class_value = str(device_class_combo.currentData() or "tx_rx").strip().lower()
-            setup_type_choice = str(setup_type_combo.currentData() or "").strip()
-            setup_started = bool(setup_type_choice)
-            observer_mode = device_class_value == "observer"
-            use_flrig = bool(use_flrig_chk.isChecked())
-            use_fldigi = bool(use_fldigi_chk.isChecked())
-            use_js8call = bool(use_js8call_chk.isChecked())
-            use_js8spotter = bool(use_js8spotter_chk.isChecked())
-            use_external_js8spotter = bool(use_external_js8spotter_chk.isChecked())
-            use_commstat = bool(use_commstat_chk.isChecked())
-            use_varac = bool(use_varac_chk.isChecked())
-            js8_managed = (
-                use_js8call
-                and str(software_source_combos["js8call"].currentData() or "") == "create"
-                and str(software_management_combos["js8call"].currentData() or "") == "fio_identity_launch"
-            )
-            fast_light_selected = any(
-                checkbox.isChecked()
-                for checkbox in (use_flrig_chk, use_fldigi_chk, use_flmsg_chk, use_flamp_chk)
-            )
-            fast_light_managed = (
-                fast_light_selected
-                and str(software_source_combos["fast_light"].currentData() or "") == "create"
-                and str(software_management_combos["fast_light"].currentData() or "") == "fio_identity_launch"
-            )
-
-            use_flrig_chk.setEnabled(not observer_mode)
-            use_fldigi_chk.setEnabled(True)
-            use_flmsg_chk.setEnabled(True)
-            use_flamp_chk.setEnabled(True)
-            use_js8call_chk.setEnabled(True)
-            # Built-in CommsPlan Spotter is useful to an observer for decode, forms,
-            # watches, and Inbox projection.  The receive-only CommsPlan Behavior
-            # removes Compose/Expect transmit authority; do not hide the safe
-            # receive-side integration merely because the radio cannot transmit.
-            use_js8spotter_chk.setEnabled(True)
-            use_external_js8spotter_chk.setEnabled(not observer_mode)
-            use_commstat_chk.setEnabled(True)
-            use_varac_chk.setEnabled(not observer_mode)
-            if setup_started:
-                normalized_apps = set(_guided_plan_enabled_apps())
-                if "flrig" in normalized_apps and not use_flrig_chk.isChecked():
-                    use_flrig_chk.setChecked(True)
-                    use_flrig = True
-                if "js8call" in normalized_apps and not use_js8call_chk.isChecked():
-                    use_js8call_chk.setChecked(True)
-                    use_js8call = True
-
-            blueprint = _current_guided_blueprint()
-            visibility_state = GuidedSetupFieldVisibilityInput(
-                setup_type_choice=setup_type_choice,
-                backend=backend,
-                device_class=device_class_value,
-                use_flrig=use_flrig,
-                use_fldigi=use_fldigi,
-                use_flmsg=bool(use_flmsg_chk.isChecked()),
-                use_flamp=bool(use_flamp_chk.isChecked()),
-                use_js8call=use_js8call,
-                use_js8spotter=use_js8spotter or use_external_js8spotter,
-                use_commstat=use_commstat,
-                use_varac=use_varac,
-                optional_open=optional_toggle.isChecked() or guided_wizard_step_id == "guard",
-            )
-            visibility = guided_setup_field_visibility(blueprint, visibility_state)
-            for widget in flrig_field_widgets:
-                _set_row_visible(widget, visibility.flrig_fields)
-            for widget in flrig_recipe_owned_widgets:
-                _set_row_visible(widget, visibility.flrig_fields and not fast_light_managed)
-            for widget in rigctld_field_widgets:
-                _set_row_visible(widget, visibility.rigctld_fields)
-            for widget in js8_field_widgets:
-                _set_row_visible(widget, visibility.js8_fields or (observer_mode and use_js8call_chk.isChecked()))
-            for widget in js8_recipe_owned_widgets:
-                _set_row_visible(
-                    widget,
-                    (visibility.js8_fields or (observer_mode and use_js8call_chk.isChecked()))
-                    and not js8_managed,
-                )
-            _set_row_visible(
-                js8_launch_enabled_chk,
-                observer_mode and use_js8call_chk.isChecked(),
-            )
-            for widget in js8_forms_field_widgets:
-                _set_row_visible(widget, visibility.js8_fields and use_js8spotter)
-            for widget in external_spotter_field_widgets:
-                _set_row_visible(widget, visibility.js8_fields and use_external_js8spotter)
-            for widget in commstat_field_widgets:
-                _set_row_visible(widget, visibility.js8_fields and use_commstat)
-            _update_commstat_binding_summary()
-            for widget in observer_field_widgets:
-                _set_row_visible(widget, visibility.observer_fields)
-            if observer_mode:
-                _update_receiver_manual_card()
-            for widget in fldigi_field_widgets:
-                _set_row_visible(widget, visibility.fldigi_fields)
-            for widget in fldigi_recipe_owned_widgets:
-                _set_row_visible(widget, visibility.fldigi_fields and not fast_light_managed)
-            for widget in flmsg_field_widgets:
-                _set_row_visible(widget, visibility.flmsg_fields)
-            for widget in flmsg_recipe_owned_widgets:
-                _set_row_visible(widget, visibility.flmsg_fields and not fast_light_managed)
-            for widget in flamp_field_widgets:
-                _set_row_visible(widget, visibility.flamp_fields)
-            for widget in flamp_recipe_owned_widgets:
-                _set_row_visible(widget, visibility.flamp_fields and not fast_light_managed)
-            managed_families = [
-                label
-                for enabled, label in (
-                    (js8_managed, "JS8Call"),
-                    (fast_light_managed, "Fast Light"),
-                )
-                if enabled
-            ]
-            managed_recipe_summary.setText(
-                "Resolved by CommsPlan: "
-                + ", ".join(managed_families)
-                + ". Application, profile, data-root, and command details are owned by the managed recipe and shown exactly in Review. "
-                "Use Software > Configure details > Advanced only when CommsPlan reports an unsupported recipe."
-                if managed_families
-                else ""
-            )
-            _set_row_visible(managed_recipe_summary, bool(managed_families))
-            for widget in varac_field_widgets:
-                _set_row_visible(widget, visibility.varac_fields)
-            rf_guard_step_active = guided_wizard_step_id == "guard"
-            guard_fields_visible = bool(visibility.optional_fields or rf_guard_step_active)
-            shared_guard_heading.setVisible(guard_fields_visible)
-            for widget in optional_field_widgets:
-                transmit_only = widget in {ptt_group_edit, amplifier_group_edit}
-                _set_row_visible(widget, guard_fields_visible and not (observer_mode and transmit_only))
-            shared_guard_heading.setText("Shared Receive Resources" if observer_mode else "Shared Hardware")
-
-            for widget in technical_identity_widgets:
-                _set_row_visible(widget, visibility.technical_identity_fields)
-
-            if observer_mode:
-                _set_row_visible(receiver_stack_group, setup_started)
-                _set_row_visible(software_wrap, setup_started)
-                for checkbox in (
-                    use_flrig_chk,
-                    use_external_js8spotter_chk,
-                    use_varac_chk,
-                ):
-                    checkbox.setEnabled(False)
-                    checkbox.setToolTip("Unavailable for this receive-only SDR profile.")
-                for checkbox in (use_fldigi_chk, use_flmsg_chk, use_flamp_chk):
-                    checkbox.setEnabled(True)
-                    checkbox.setToolTip(
-                        "Available as a receive-only Fast Light component. This never grants FLRig, CAT, PTT, or automatic-send authority."
-                    )
-                use_commstat_chk.setEnabled(True)
-                use_commstat_chk.setToolTip(
-                    "Available only as a receive-only transport mapping for this observer radio."
-                )
-                use_js8call_chk.setEnabled(True)
-                use_js8call_chk.setToolTip(
-                    "Create or update a distinct JS8Call instance owned by this SDR. "
-                    "It remains excluded from transmit, compose, QSY, and scheduler targets."
-                )
-                use_js8spotter_chk.setEnabled(True)
-                use_js8spotter_chk.setToolTip(
-                    "Enable CommsPlan Spotter receive, decode, forms, watches, and Inbox projection for this SDR. "
-                    "The receive-only CommsPlan Behavior keeps Compose and Expect sending unavailable."
-                )
-                _set_row_visible(radio_apps_base_wrap, setup_started and use_js8call_chk.isChecked())
-                _set_row_visible(configure_auto_wrap, setup_started and use_js8call_chk.isChecked())
-                _set_row_visible(software_hint_label, setup_started)
-                software_hint_label.setText(
-                    "Choose receive-only JS8Call, Fast Light, CommsPlan Spotter, or CommStat capabilities for this SDR. "
-                    "VarAC, FLRig, CAT, PTT, Compose sending, and automatic-send authority remain unavailable."
-                )
-            else:
-                _set_row_visible(receiver_stack_group, False)
-                _set_row_visible(software_wrap, setup_started and not observer_mode)
-                for checkbox in (
-                    use_flrig_chk,
-                    use_fldigi_chk,
-                    use_flmsg_chk,
-                    use_flamp_chk,
-                    use_js8call_chk,
-                    use_js8spotter_chk,
-                    use_external_js8spotter_chk,
-                    use_commstat_chk,
-                    use_varac_chk,
-                ):
-                    checkbox.setEnabled(True)
-                _set_row_visible(radio_apps_base_wrap, visibility.configure_automatically)
-                _set_row_visible(configure_auto_wrap, visibility.configure_automatically)
-                _set_row_visible(software_hint_label, True)
-                software_hint_label.setText(
-                    guided_setup_software_hint(
-                        setup_type_choice=setup_type_choice,
-                        setup_type_label=setup_type_combo.currentText().strip(),
-                        selected_apps=_guided_plan_enabled_apps(),
-                    )
-                )
-                if app_setup_plan_group.isVisible():
-                    _update_guided_app_setup_plan_review()
-
-            _update_software_responsibility_cards()
-
-            role_hint_label.setText(guided_setup_role_hint(blueprint, visibility_state))
-            if observer_mode and use_js8call_chk.isChecked():
-                receiver_application_name = str(
-                    receiver_application_combo.currentData() or sdr_application_combo.currentText() or "Receiver application"
-                ).strip()
-                receiver_control_title.setText(f"Receiver control — {receiver_application_name}")
-                receiver_control_detail.setText(
-                    "Adapter, stable target/VFO, host, port, matching verification evidence, and CommsPlan-tuning opt-in. "
-                    "Test control applies only to this receiver application."
-                )
-                companion_connection_title.setText("Receive/decode companion — JS8Call")
-                companion_connection_detail.setText(
-                    "Variant, executable, profile identity, API endpoint, message paths, and launch policy remain one radio-owned bundle."
-                )
-                connection_status_label.setText(
-                    "Configure the distinct JS8Call app, profile, message files, and API port owned by this SDR. "
-                    "The instance remains receive/import only in CommsPlan."
-                )
-            elif observer_mode:
-                receiver_application_name = str(
-                    receiver_application_combo.currentData() or sdr_application_combo.currentText() or "Receiver application"
-                ).strip()
-                receiver_control_title.setText(f"Receiver control — {receiver_application_name}")
-                receiver_control_detail.setText(
-                    "Adapter, stable target/VFO, host, port, matching verification evidence, and CommsPlan-tuning opt-in."
-                )
-                companion_connection_title.setText("Receive/decode companions")
-                companion_connection_detail.setText(
-                    "Review the Fast Light, Spotter, or CommStat paths selected for this receiver. No companion grants transmit authority."
-                )
-                connection_status_label.setText(
-                    "Review receiver control separately from the applications that decode, import, or display traffic."
-                )
-            elif visibility.connection_group:
-                receiver_control_title.setText("Radio control")
-                receiver_control_detail.setText(
-                    "Review the selected FLRig, RigCtlD, or application-owned control endpoint and its radio ownership."
-                )
-                companion_connection_title.setText("Application companions")
-                companion_connection_detail.setText(
-                    "Review each selected app endpoint, profile, message/log paths, and launch identity."
-                )
-                connection_status_label.setText("Review the endpoint fields below for the selected software stack.")
-            else:
-                receiver_control_title.setText("Control responsibility")
-                receiver_control_detail.setText("No CommsPlan frequency-control endpoint is required for this setup.")
-                companion_connection_title.setText("Application companions")
-                companion_connection_detail.setText("No application connection is required for the current selections.")
-                connection_status_label.setText("No CommsPlan frequency-control endpoint is required for this setup type.")
-            optional_body.setVisible(guard_fields_visible)
-            optional_toggle.setVisible(False)
-            optional_toggle.setArrowType(Qt.DownArrow if guard_fields_visible else Qt.RightArrow)
-            connection_group.setVisible(visibility.connection_group)
-            assignment_allowed = observer_mode or guided_setup_capability_policy(blueprint).scheduler_assignment_allowed
-            _set_row_visible(schedule_path_combo, assignment_allowed)
-            if assignment_allowed:
-                _refresh_guided_schedule_path_combo()
-                _refresh_guided_schedule_plan_combo()
-            schedule_choice = _selected_guided_schedule_path()
-            _set_row_visible(schedule_plan_combo, assignment_allowed and schedule_choice == SCHEDULE_EXISTING_PLAN)
-            _set_row_visible(schedule_open_plan_manager_chk, assignment_allowed and schedule_choice != SCHEDULE_NONE)
-            _update_guided_schedule_assignment_status()
-            _update_app_choice_visibility()
-            _update_port_prompt_visibility()
-            _update_dialog_readiness()
-            _apply_guided_wizard_visibility(visibility.connection_group)
-            if guided_wizard_step_id == "software" and (
-                software_preparation_pending
-                or not software_plan_prepared
-                or _guided_software_plan_context() != prepared_software_context
-            ):
-                _schedule_automatic_software_preparation()
-            # The receiver stack is nested in the Software page. Republish
-            # its visibility after the wizard page transition so a stale
-            # parent-layout pass cannot leave the selected stack hidden.
-            receiver_stack_group.setVisible(
-                bool(observer_mode and setup_started and guided_wizard_step_id == "software")
-            )
-
-        def _on_varac_state_changed(_state: int) -> None:
-            _purge_deselected_guided_software()
-            if not applying_setup_type_choice:
-                lane = str(setup_type_combo.currentData() or "").strip()
-                if lane and lane != "custom":
-                    _set_combo_data(setup_type_combo, "custom")
-                    return
-            _invalidate_prepared_software_plan()
-            if use_varac_chk.isChecked():
-                fast_or_js8_selected = any(
-                checkbox.isChecked()
-                for checkbox in (
-                    use_fldigi_chk,
-                    use_flmsg_chk,
-                    use_flamp_chk,
-                    use_js8call_chk,
-                    use_js8spotter_chk,
-                    use_external_js8spotter_chk,
-                    use_commstat_chk,
-                )
-            )
-                backend = str(backend_combo.currentData() or "").strip().lower()
-                if not fast_or_js8_selected and backend == "flrig":
-                    manual_idx = backend_combo.findData("manual")
-                    if manual_idx >= 0:
-                        backend_combo.setCurrentIndex(manual_idx)
-                    use_flrig_chk.setChecked(False)
-            _update_dialog_visibility()
-
-        def _refresh_guided_schedule_guard_review() -> None:
-            _update_guided_schedule_assignment_status()
-            _apply_guided_schedule_assignment_warning_ui()
-            _update_guided_save_review()
-            _update_dialog_readiness()
-
-        def _on_guided_schedule_path_changed() -> None:
-            _update_dialog_visibility()
-
-        def _on_js8call_selection_changed(_state: int) -> None:
-            observer_mode = str(device_class_combo.currentData() or "").strip().lower() == "observer"
-            if observer_mode and use_js8call_chk.isChecked():
-                if not js8_host_edit.text().strip():
-                    js8_host_edit.setText("127.0.0.1")
-                if not js8_port_edit.text().strip():
-                    js8_port_edit.setText(_default_instance_port("js8call"))
-                connection_status_label.setText(
-                    "Configure the distinct JS8Call app, profile, message files, and API port owned by this SDR. "
-                    "The instance remains receive/import only in CommsPlan."
-                )
-            _mark_custom_mix_from_software_edit()
-
-        def _on_guided_device_class_changed(_index: int) -> None:
-            # A role change is a compatibility boundary. Re-select that role's
-            # preferred model instead of carrying an observer's receive-only
-            # choice into a newly transmit-capable draft (or vice versa).
-            _invalidate_prepared_software_plan()
-            _refresh_guided_operating_model_choices(
-                preserve_current=False,
-                preserve_existing=False,
-            )
-            _update_guided_radio_role_summary()
-            _update_dialog_visibility()
-
-        def _on_guided_operating_model_changed(_index: int) -> None:
-            _refresh_guided_operating_model_summary()
-            _update_guided_save_review()
-            _update_dialog_readiness()
-
-        setup_type_combo.currentIndexChanged.connect(lambda _index: _apply_setup_type_choice())
-        for step_id, btn in guided_wizard_buttons.items():
-            btn.clicked.connect(lambda _checked=False, sid=step_id: _set_guided_wizard_step(sid))
-        guided_wizard_back_btn.clicked.connect(lambda _checked=False: _move_guided_wizard(-1))
-        guided_wizard_next_btn.clicked.connect(lambda _checked=False: _move_guided_wizard(1))
-        backend_combo.currentIndexChanged.connect(
-            lambda _index: (_invalidate_prepared_software_plan(), _update_dialog_visibility())
-        )
-        device_class_combo.currentIndexChanged.connect(_on_guided_device_class_changed)
-        operating_model_combo.currentIndexChanged.connect(_on_guided_operating_model_changed)
-        use_flrig_chk.stateChanged.connect(lambda _state: _mark_custom_mix_from_software_edit())
-        use_fldigi_chk.stateChanged.connect(lambda _state: _mark_custom_mix_from_software_edit())
-        use_flmsg_chk.stateChanged.connect(lambda _state: _mark_custom_mix_from_software_edit())
-        use_flamp_chk.stateChanged.connect(lambda _state: _mark_custom_mix_from_software_edit())
-        use_js8call_chk.stateChanged.connect(_on_js8call_selection_changed)
-        use_js8spotter_chk.stateChanged.connect(lambda _state: _mark_custom_mix_from_software_edit())
-        use_external_js8spotter_chk.stateChanged.connect(lambda _state: _mark_custom_mix_from_software_edit())
-        use_commstat_chk.stateChanged.connect(_on_commstat_selection_changed)
-        use_varac_chk.stateChanged.connect(_on_varac_state_changed)
-        schedule_path_combo.currentIndexChanged.connect(lambda _index: _on_guided_schedule_path_changed())
-        schedule_plan_combo.currentIndexChanged.connect(lambda _index: _refresh_guided_schedule_guard_review())
-        for checkbox in band_checks.values():
-            checkbox.stateChanged.connect(lambda _state: _refresh_guided_schedule_guard_review())
-        antenna_band_mode_combo.currentIndexChanged.connect(
-            lambda _index: _refresh_guided_schedule_guard_review()
-        )
-        schedule_open_plan_manager_chk.stateChanged.connect(
-            lambda _state: _refresh_guided_schedule_guard_review()
-        )
-        radio_model_combo.currentTextChanged.connect(lambda _text: _update_radio_model_hint())
-        radio_model_combo.currentTextChanged.connect(lambda _text: _update_dialog_readiness())
-        optional_toggle.toggled.connect(lambda _checked: _update_dialog_visibility())
-        js8_host_edit.textChanged.connect(lambda _text: _update_commstat_binding_summary())
-        js8_port_edit.textChanged.connect(lambda _text: _update_commstat_binding_summary())
-        for family_key, source_combo in software_source_combos.items():
-            source_combo.currentIndexChanged.connect(
-                lambda _index: _update_dialog_visibility()
-            )
-            software_management_combos[family_key].currentIndexChanged.connect(
-                lambda _index: (_invalidate_prepared_software_plan(), _update_dialog_visibility())
-            )
-            software_completion_combos[family_key].currentIndexChanged.connect(
-                lambda _index: (_invalidate_prepared_software_plan(), _update_dialog_visibility())
-            )
-            software_launch_policy_combos[family_key].currentIndexChanged.connect(
-                lambda _index: _invalidate_prepared_software_plan()
-            )
-        _sync_setup_type_from_current_fields()
-        _update_radio_model_hint()
-        _update_dialog_visibility()
-
-        def _refresh_radio_catalog() -> None:
-            nonlocal catalog_entries, catalog_source
-            selected_text = radio_model_combo.currentText().strip()
-            payload = load_radio_catalog(force_refresh=True)
-            catalog_entries = list(payload.get("entries", []) or [])
-            catalog_source = str(payload.get("source", "static-fallback") or "static-fallback")
-            _populate_radio_model_combo(catalog_entries, selected_text=selected_text)
-            _update_radio_model_hint()
-            _update_dialog_readiness()
-
-        refresh_catalog_btn.clicked.connect(_refresh_radio_catalog)
-
-        def _browse_radio_apps_base_folder() -> None:
-            start = radio_apps_base_edit.text().strip() or str(Path.home() / "RadioTools" / "Programs")
-            folder = QFileDialog.getExistingDirectory(self, "Select Radio Apps Base Folder", start)
-            if folder:
-                radio_apps_base_edit.setText(folder)
-                _update_dialog_readiness()
-
-        radio_apps_base_browse_btn.clicked.connect(_browse_radio_apps_base_folder)
-
-        for widget in [
-            name_edit,
-            rig_host_edit,
-            rig_port_edit,
-            flrig_host_edit,
-            flrig_port_edit,
-            flrig_path_edit,
-            fldigi_host_edit,
-            fldigi_port_edit,
-            fldigi_path_edit,
-            flmsg_path_edit,
-            flamp_path_edit,
-            js8_host_edit,
-            js8_port_edit,
-            js8_install_edit,
-            js8_profile_edit,
-            js8_directed_edit,
-            js8_forms_edit,
-            js8spotter_launch_edit,
-            commstat_launch_edit,
-            radio_apps_base_edit,
-            varac_install_edit,
-            varac_db_edit,
-            varac_ini_edit,
-            varac_incoming_edit,
-            varac_outbox_edit,
-            varac_bbs_edit,
-            varac_bbs_archive_edit,
-            varac_launch_cmd_edit,
-            sdr_host_edit,
-            sdr_port_edit,
-            sdr_target_edit,
-            ptt_group_edit,
-            antenna_group_edit,
-            advanced_frequency_group_edit,
-            frontend_group_edit,
-            amplifier_group_edit,
-        ]:
-            widget.textChanged.connect(lambda _text: _update_dialog_readiness())
-        sdr_application_combo.currentTextChanged.connect(lambda _text: _update_receiver_manual_card())
-        sdr_application_combo.currentTextChanged.connect(lambda _text: _update_dialog_readiness())
-
-        def _on_receiver_launch_application_changed(_index: int) -> None:
-            """Keep the receiver stack choice and connection guidance aligned."""
-
-            selected = str(receiver_application_combo.currentData() or "").strip()
-            if selected:
-                app_index = sdr_application_combo.findData(selected)
-                if app_index < 0:
-                    sdr_application_combo.addItem(selected, selected)
-                    app_index = sdr_application_combo.count() - 1
-                sdr_application_combo.setCurrentIndex(app_index)
-                if not receiver_launch_path_edit.text().strip():
-                    system_name = platform.system()
-                    suggested_target = (
-                        "open -a SDR++"
-                        if system_name == "Darwin"
-                        else ("sdrpp.exe" if system_name == "Windows" else "sdrpp")
-                    )
-                    receiver_launch_path_edit.setText(suggested_target)
-                    receiver_launch_enabled_chk.setChecked(True)
-            else:
-                receiver_launch_enabled_chk.setChecked(False)
-            receiver_launch_enabled_chk.setEnabled(bool(selected and receiver_launch_path_edit.text().strip()))
-            _update_receiver_manual_card()
-            _update_dialog_readiness()
-
-        receiver_application_combo.currentIndexChanged.connect(_on_receiver_launch_application_changed)
-        receiver_launch_path_edit.textChanged.connect(
-            lambda _text: receiver_launch_enabled_chk.setEnabled(
-                bool(
-                    str(receiver_application_combo.currentData() or "").strip()
-                    and receiver_launch_path_edit.text().strip()
-                )
-            )
-        )
-        receiver_launch_enabled_chk.setEnabled(
-            bool(
-                str(receiver_application_combo.currentData() or "").strip()
-                and receiver_launch_path_edit.text().strip()
-            )
-        )
-
-        def _on_receiver_adapter_changed(_index: int) -> None:
-            if str(sdr_adapter_combo.currentData() or "manual") == "sdrpp_rigctl":
-                if sdr_application_combo.currentText().strip() in {"", "Other / manual"}:
-                    application_index = sdr_application_combo.findData("SDR++")
-                    if application_index >= 0:
-                        sdr_application_combo.setCurrentIndex(application_index)
-                if not sdr_host_edit.text().strip():
-                    sdr_host_edit.setText("127.0.0.1")
-                if not sdr_port_edit.text().strip():
-                    sdr_port_edit.setText("4532")
-                if not sdr_target_edit.text().strip():
-                    sdr_target_edit.setText("selected-vfo")
-            _update_receiver_manual_card()
-
-        sdr_adapter_combo.currentIndexChanged.connect(_on_receiver_adapter_changed)
-        sdr_adapter_combo.currentIndexChanged.connect(lambda _index: _update_dialog_readiness())
-        sdr_target_edit.textChanged.connect(lambda _text: _update_receiver_manual_card())
-        sdr_host_edit.textChanged.connect(lambda _text: _update_receiver_manual_card())
-        sdr_port_edit.textChanged.connect(lambda _text: _update_receiver_manual_card())
-        sdr_control_enabled_chk.stateChanged.connect(lambda _state: _update_dialog_readiness())
-
-        def _queue_receiver_control_test() -> None:
-            """Publish a draft to an installed worker without endpoint I/O here."""
-
-            nonlocal receiver_test_in_progress, receiver_test_request_id
-            if not sdr_test_control_btn.isEnabled():
-                return
-            draft = _draft_radio_profile()
-            draft["id"] = int((profile_seed or {}).get("id", 0) or 0)
-            receiver_test_request_id = uuid.uuid4().hex
-            draft["qualification_request_id"] = receiver_test_request_id
-            receiver_test_in_progress = True
-            _update_receiver_manual_card()
-            QTimer.singleShot(0, lambda payload=draft: self.receiver_control_test_requested.emit(payload))
-
-        def _on_receiver_control_test_completed(result: Dict[str, Any]) -> None:
-            nonlocal receiver_test_in_progress, receiver_test_request_id, receiver_verification_state, receiver_verification_evidence
-            expected_profile_id = int((profile_seed or {}).get("id", 0) or 0)
-            try:
-                result_profile_id = int(result.get("profile_id", 0) or 0)
-            except (TypeError, ValueError):
-                result_profile_id = 0
-            result_request_id = str(result.get("qualification_request_id", "") or "").strip()
-            if (
-                not receiver_test_in_progress
-                or not receiver_test_request_id
-                or result_request_id != receiver_test_request_id
-            ):
-                return
-            if expected_profile_id > 0 and result_profile_id != expected_profile_id:
-                return
-            if expected_profile_id <= 0 and result_profile_id != 0:
-                return
-            receiver_test_in_progress = False
-            receiver_test_request_id = ""
-            state = str(result.get("verification_state") or "failed").strip().lower()
-            receiver_verification_state = state if state in {"verified", "failed"} else "failed"
-            evidence = result.get("verification")
-            receiver_verification_evidence = dict(evidence) if isinstance(evidence, dict) else {}
-            detail = str(result.get("detail") or "").strip()
-            if detail and receiver_verification_state != "verified":
-                receiver_verification_evidence.setdefault("failure_detail", detail[:240])
-            _update_receiver_manual_card()
-            _update_dialog_readiness()
-
-        sdr_test_control_btn.clicked.connect(_queue_receiver_control_test)
-        self.receiver_control_test_completed.connect(_on_receiver_control_test_completed)
-        advanced_frequency_mode_combo.currentIndexChanged.connect(lambda _index: _update_dialog_readiness())
-        advanced_frequency_window_spin.valueChanged.connect(lambda _value: _update_dialog_readiness())
-        for widget in [js8_port_edit, js8_profile_edit, js8_directed_edit]:
-            widget.textChanged.connect(lambda _text: _update_app_choice_visibility())
-        for widget in [
-            flrig_port_edit,
-            fldigi_port_edit,
-            fldigi_arq_port_edit,
-            js8_port_edit,
-            *port_prompt_fields.values(),
-        ]:
-            widget.textChanged.connect(lambda _text: _update_port_prompt_visibility())
-        notes_edit.textChanged.connect(_update_dialog_readiness)
-        use_flrig_chk.stateChanged.connect(lambda _state: _update_dialog_readiness())
-        use_fldigi_chk.stateChanged.connect(lambda _state: _update_dialog_readiness())
-        use_flmsg_chk.stateChanged.connect(lambda _state: _update_dialog_readiness())
-        use_flamp_chk.stateChanged.connect(lambda _state: _update_dialog_readiness())
-        use_js8call_chk.stateChanged.connect(lambda _state: _update_dialog_readiness())
-        use_js8spotter_chk.stateChanged.connect(lambda _state: _update_dialog_readiness())
-        use_external_js8spotter_chk.stateChanged.connect(lambda _state: _update_dialog_readiness())
-        use_commstat_chk.stateChanged.connect(lambda _state: _update_dialog_readiness())
-        use_varac_chk.stateChanged.connect(lambda _state: _update_dialog_readiness())
-        backend_combo.currentIndexChanged.connect(lambda _idx: _update_dialog_readiness())
-        deploy_combo.currentIndexChanged.connect(lambda _idx: _update_dialog_readiness())
-
-        body_layout.addStretch(1)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
-        buttons.setObjectName("guidedRadioSetupActionFooter")
-        buttons.setAccessibleName("Guided radio setup actions")
-        buttons.addButton(guided_wizard_back_btn, QDialogButtonBox.ActionRole)
-        buttons.addButton(guided_wizard_next_btn, QDialogButtonBox.ActionRole)
-        save_button = buttons.button(QDialogButtonBox.Save)
-        cancel_button = buttons.button(QDialogButtonBox.Cancel)
-        if cancel_button is not None:
-            cancel_button.setAccessibleName("Cancel guided radio setup")
-            cancel_button.setToolTip("Close without saving the radio or software draft.")
-        if save_button is not None:
-            guided_save_text = "Save Changes" if existing else "Save Radio and Software"
-            save_button.setText(guided_save_text)
-            save_button.setAccessibleName(guided_save_text)
-            save_button.setEnabled(False)
-            save_button.setToolTip("Walk through the guided setup and review before saving.")
-        layout.addWidget(buttons)
-
-        out: Dict[str, Any] = {}
-        save_activation_pending = False
-
-        def _set_save_activation_pending(active: bool) -> None:
-            nonlocal save_activation_pending
-            save_activation_pending = bool(active)
-            save_progress_card.setVisible(save_activation_pending)
-            if save_button is not None:
-                save_button.setEnabled(not save_activation_pending and _guided_save_allowed())
-                save_button.setText(
-                    "Qualifying…"
-                    if save_activation_pending
-                    else ("Save Changes" if existing else "Save Radio and Software")
-                )
-                save_button.setToolTip(
-                    "Qualification is in progress; this setup can be activated only once."
-                    if save_activation_pending
-                    else "Save this reviewed radio setup."
-                )
-            if cancel_button is not None:
-                cancel_button.setEnabled(not save_activation_pending)
-
-        def _save() -> None:
-            if save_activation_pending:
-                return
-            if not _guided_save_allowed():
-                if _detected_app_choice_needs_operator_selection():
-                    _set_guided_wizard_step("software")
-                    guided_wizard_detail_label.setText(
-                        "Choose the highlighted detected app or profile, then continue to Review before saving."
-                    )
-                elif _selected_guided_operating_model_id() <= 0:
-                    _set_guided_wizard_step("model")
-                    guided_wizard_detail_label.setText(
-                        "Choose a compatible CommsPlan Behavior before saving this radio."
-                    )
-                else:
-                    _set_guided_wizard_step("review")
-                    guided_wizard_detail_label.setText("Review the guided setup before saving this radio.")
-                _update_guided_save_button()
-                return
-            _set_save_activation_pending(True)
-            # Yield once so the busy indicator is painted and duplicate
-            # activation is disabled before the payload crosses into the
-            # transaction-owning save route.
-            QTimer.singleShot(0, _complete_save_activation)
-
-        def _complete_save_activation() -> None:
-            model_choice = _current_radio_model_payload()
-            name = name_edit.text().strip() or str(model_choice.get("display_name", "") or "").strip()
-            if name and not name_edit.text().strip():
-                name_edit.setText(name)
-            if not name:
-                _set_save_activation_pending(False)
-                QMessageBox.warning(self, "Validation", "Radio name is required.")
-                return
-            _persist_radio_apps_base_folder()
-            payload = _draft_radio_profile()
-            payload["id"] = (profile_seed or {}).get("id")
-            payload["name"] = name
-            out.update(normalize_guided_radio_profile_payload(payload))
-            operating_profile_id = _selected_guided_operating_model_id()
-            if operating_profile_id > 0:
-                out["guided_operating_profile_id"] = operating_profile_id
-            if str(device_class_combo.currentData() or "").strip().lower() == "observer":
-                existing_js8_id = int((profile_seed or {}).get("js8_instance_id", 0) or 0)
-                if use_js8call_chk.isChecked() and existing_js8_id <= 0:
-                    js8_host = js8_host_edit.text().strip() or "127.0.0.1"
-                    try:
-                        js8_port = int(js8_port_edit.text().strip() or 2442)
-                    except (TypeError, ValueError):
-                        js8_port = 2442
-                    js8_profile_path = js8_profile_edit.text().strip()
-                    js8_directed_path = js8_directed_edit.text().strip()
-                    js8_data_root = (
-                        str(Path(js8_directed_path).expanduser().parent)
-                        if js8_directed_path
-                        else js8_profile_path
-                    )
-                    out["guided_js8_instance_draft"] = {
-                        "instance_name": f"{name} JS8Call",
-                        "host": js8_host,
-                        "port": js8_port,
-                        "application_path": js8_install_edit.text().strip(),
-                        "configuration_path": js8_profile_path,
-                        "directed_path": js8_directed_path,
-                        "forms_path": js8_forms_edit.text().strip(),
-                        "storage_path": js8_data_root,
-                        "launch_at_startup": bool(js8_launch_enabled_chk.isChecked()),
-                    }
-                    # The observer must first have a real radio id.  The
-                    # reviewed JS8 instance is atomically created and adopted
-                    # after that save; never create a provisional row here.
-                    out["use_js8call"] = False
-                    out["js8_instance_id"] = None
-                    for field_name in (
-                        "js8_host",
-                        "js8_port",
-                        "js8_install_path",
-                        "js8_profile_path",
-                        "js8_directed_path",
-                        "js8_forms_path",
-                    ):
-                        out[field_name] = ""
-                launch_app = str(receiver_application_combo.currentData() or "").strip()
-                launch_path = receiver_launch_path_edit.text().strip()
-                launch_requested = bool(receiver_launch_enabled_chk.isChecked() and launch_app and launch_path)
-                # This is intentionally a dialog result, not a database field.
-                # The owning settings flow persists it through LaunchBundleStore
-                # only after the radio profile has a real id.
-                out["receiver_launch_bundle"] = {
-                    "launch_enabled": launch_requested,
-                    "items": build_receiver_launch_items(
-                        payload,
-                        [{
-                            "name": launch_app,
-                            "launch_path_override": launch_path,
-                            "startup": launch_requested,
-                        }]
-                        if launch_app and launch_path
-                        else [],
-                    ),
-                }
-            retained_software_drafts = getattr(dlg, "_guided_software_instance_drafts", {})
-            if isinstance(retained_software_drafts, Mapping):
-                selected_families = {
-                    family
-                    for family in ("js8call", "fast_light", "varac")
-                    if _guided_software_family_selected(family)
-                }
-                saved_guided_drafts = {
-                    family: dict(value)
-                    for family, value in retained_software_drafts.items()
-                    if family in selected_families and isinstance(value, Mapping)
-                }
-                if "js8call" in saved_guided_drafts:
-                    saved_guided_drafts["js8call"][
-                        "external_spotter_launch_at_startup"
-                    ] = bool(
-                        use_external_js8spotter_chk.isChecked()
-                        and str(
-                            software_launch_policy_combos["external_spotter"].currentData()
-                            or ""
-                        ).strip().lower()
-                        == "fio"
-                    )
-                out["guided_software_instance_drafts"] = saved_guided_drafts
-            out["guided_external_app_config_plan"] = _current_guided_app_config_plan()
-            try:
-                guided_plan_id = int(schedule_plan_combo.currentData() or 0)
-            except Exception:
-                guided_plan_id = 0
-            schedule_choice = _selected_guided_schedule_path()
-            observer_mode = str(device_class_combo.currentData() or "").strip().lower() == "observer"
-            assignment_allowed = (
-                guided_setup_capability_policy(_current_guided_blueprint()).scheduler_assignment_allowed
-                or observer_mode
-            )
-            if guided_plan_id > 0 and assignment_allowed and schedule_choice == SCHEDULE_EXISTING_PLAN:
-                out["guided_frequency_plan_id"] = guided_plan_id
-            elif (
-                schedule_open_plan_manager_chk.isChecked()
-                and assignment_allowed
-                and schedule_choice != SCHEDULE_NONE
-            ):
-                out["guided_open_plan_manager_after_save"] = True
-                out["guided_schedule_choice"] = schedule_choice
-            out["guided_inventory_generation"] = int(
-                guided_instance_inventory_snapshot.generation
-            )
-            out["guided_inventory_fingerprint"] = str(
-                guided_instance_inventory_snapshot.fingerprint or ""
-            )
-            out["guided_inventory_retry_step"] = "software"
-            # This is the generation the operator reviewed when Add/Edit Radio
-            # opened.  Final persistence must reject a concurrent identity
-            # change instead of silently replacing it.
-            out["guided_software_identity_generation"] = guided_identity_generation
-            dlg.accept()
-
-        buttons.accepted.connect(_save)
-        buttons.rejected.connect(dlg.reject)
-        _update_guided_save_button()
-        try:
-            dialog_result = dlg.exec()
-        finally:
-            try:
-                self.receiver_control_test_completed.disconnect(_on_receiver_control_test_completed)
-            except (RuntimeError, TypeError):
-                pass
-        retained_at_close = getattr(dlg, "_guided_software_instance_drafts", {})
-        retained_session = self._varac_native_session_from_guided_profile(
-            {"guided_software_instance_drafts": retained_at_close}
-            if isinstance(retained_at_close, Mapping)
-            else {}
-        )
-        accepted_session = (
-            self._varac_native_session_from_guided_profile(out)
-            if dialog_result == QDialog.Accepted
-            else None
-        )
-        if (
-            retained_session is not None
-            and (
-                accepted_session is None
-                or accepted_session.journal_id != retained_session.journal_id
-            )
-        ):
-            # Native files may already have been applied by the nested VarAC
-            # assistant.  Closing Add/Edit Radio or removing that reviewed
-            # draft must compensate immediately rather than waiting for the
-            # startup recovery scan.
-            self._rollback_varac_native_session(retained_session)
-        if dialog_result != QDialog.Accepted:
+    def _open_device_profile_dialog(self, existing=None, *, initial_step='', retry_draft=None):
+        """All Add/Change/Edit radio routes share one operator-owned draft."""
+        from freqinout.gui.operator_radio_editor import OperatorRadioEditor
+        if getattr(self, '_operator_radio_dialog', None) is not None:
+            self._operator_radio_dialog.raise_()
             return None
-        return out
+        editor = OperatorRadioEditor(profile={**dict(existing or {}), **dict(retry_draft or {})},
+                                     initial_step=initial_step or 'radio',parent=self)
+        self._operator_radio_dialog = editor
+        self._operator_radio_result = None
+        self._operator_radio_pending_owner_route = None
+        editor.save_requested.connect(self._operator_radio_save_requested)
+        editor.application_find_requested.connect(self._operator_nested_discovery_requested)
+        editor.discard_unfinished_requested.connect(self._operator_radio_discard_requested)
+        owner_signal = getattr(editor, "application_owner_requested", None)
+        if owner_signal is not None:
+            owner_signal.connect(
+                lambda request, dialog=editor, was_new=not bool((existing or {}).get("id")):
+                self._operator_radio_owner_route_requested(request, dialog, was_new=was_new)
+            )
+        self._start_operator_radio_job({'radio_id':(existing or {}).get('id')}, action='radio_load')
+        try:
+            accepted = editor.exec() == QDialog.Accepted
+            saved = self._operator_radio_result
+            pending_owner_route = self._operator_radio_pending_owner_route
+        finally:
+            self._operator_radio_dialog = None
+            self._operator_radio_pending_owner_route = None
+            editor.deleteLater()
+        if pending_owner_route and not accepted:
+            if not bool(pending_owner_route.get("awaiting_save")):
+                route_profile = pending_owner_route.get("saved_radio")
+                self._open_owner_software_route(pending_owner_route, route_profile or existing or {})
+            return None
+        if not accepted or not isinstance(saved, Mapping):
+            return None
+        self._replace_cached_device_profile(dict(saved))
+        self._refresh_multi_radio_tables()
+        self._emit_device_profiles_changed()
+        self._operator_station_request_review()
+        if pending_owner_route:
+            self._open_owner_software_route(pending_owner_route, saved)
+        return {**dict(saved), '_operator_saved':True}
+
+    def _operator_radio_owner_route_requested(
+        self,
+        request: object,
+        editor: object,
+        *,
+        was_new: bool = False,
+    ) -> None:
+        """Guard the radio editor → Software settings handoff.
+
+        A clean saved radio can close and route after the dialog exits.  A new
+        or dirty draft must choose Save & Open or Cancel; the route is held
+        until the radio worker acknowledges a complete save.  No host page is
+        changed while the editor remains open.
+        """
+
+        if not isinstance(request, Mapping) or editor is not getattr(self, "_operator_radio_dialog", None):
+            return
+        if getattr(self, "_operator_radio_pending_owner_route", None) is not None:
+            return
+        route = dict(request)
+        needs_save = bool(was_new or getattr(editor, "is_dirty", lambda: False)())
+        route["awaiting_save"] = needs_save
+        if not needs_save:
+            self._operator_radio_pending_owner_route = route
+            editor._allow_close = True
+            editor.reject()
+            return
+        box = QMessageBox(editor)
+        box.setWindowTitle("Save before opening software settings?")
+        label = str(route.get("label") or "This software")
+        box.setText(f"{label} is configured in Software settings.")
+        box.setInformativeText("Save this radio draft before opening that page, or cancel to keep editing here.")
+        save_open = box.addButton("Save & Open", QMessageBox.ButtonRole.AcceptRole)
+        cancel = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel)
+        box.exec()
+        if box.clickedButton() is not save_open:
+            editor.set_status("Still editing this radio. Save or cancel the draft before opening Software settings.")
+            return
+        self._operator_radio_pending_owner_route = route
+        editor.set_status("Saving this radio before opening Software settings…")
+        editor._emit_save()
+
+    @staticmethod
+    def _owner_route_family(field_key: object) -> str:
+        return {
+            "use_js8call": "js8call",
+            "use_flrig": "fast_light",
+            "use_fldigi": "fast_light",
+            "use_flmsg": "fast_light",
+            "use_flamp": "fast_light",
+            "use_varac": "varac",
+            "use_js8spotter": "fio_spotter",
+            "use_external_js8spotter": "external_spotter",
+            "use_commstat": "commstat",
+        }.get(str(field_key or "").strip(), "")
+
+    def _open_owner_software_route(self, request: Mapping[str, Any], profile: object) -> None:
+        """Open the existing Software administration owner after dialog close."""
+
+        family_key = self._owner_route_family(request.get("field_key"))
+        if not family_key:
+            return
+        radio_id = request.get("radio_id")
+        if radio_id in (None, "") and isinstance(profile, Mapping):
+            radio_id = profile.get("id") or profile.get("radio_id") or profile.get("device_profile_id")
+        try:
+            radio_id = int(radio_id) if radio_id not in (None, "") else None
+        except (TypeError, ValueError):
+            radio_id = None
+        self.open_software_administration(family_key=family_key, radio_id=radio_id)
+
+    def _operator_nested_discovery_requested(self, request):
+        assistant = request.get('assistant')
+        family = str(request.get('family_key') or '')
+        if assistant is None:
+            return
+        self._operator_nested_discovery_target = weakref.ref(assistant)
+        cached = getattr(self, '_software_administration_inventory_by_family', {})
+        assistant.set_discovery_results(cached.get(family, ()))
+        self._request_software_autofill({'js8call':'js8','fast_light':'fast_light','varac':'varac'}[family],(),
+            target='operator_nested_assistant',family_key=family,assistant_token=id(assistant))
+
+    def _operator_discovery_assistant(self, target):
+        if target == 'operator_nested_assistant':
+            reference = getattr(self, '_operator_nested_discovery_target', None)
+            assistant = reference() if reference else None
+            try:
+                from shiboken6 import isValid
+                if assistant is not None and isValid(assistant) and assistant.isVisible():
+                    return assistant
+            except RuntimeError:
+                pass
+            return None
+        return getattr(getattr(self, 'software_administration_workspace', None), '_instance_assistant', None)
+
+    def _operator_radio_save_requested(self, payload):
+        self._start_operator_radio_job(payload, action='radio_save')
+
+    def _operator_radio_discard_requested(self, payload):
+        editor = self._operator_radio_dialog
+        self._start_operator_radio_job({**dict(payload),'radio_id':editor.base().get('id')}, action='radio_discard')
+
+    def _start_operator_radio_job(self, payload, *, action):
+        from freqinout.gui.operator_configuration_job import OperatorConfigurationJob
+        editor = getattr(self, '_operator_radio_dialog', None)
+        if editor is None or getattr(self, '_operator_radio_job', None) is not None:
+            return
+        editor.set_busy(True)
+        job = OperatorConfigurationJob(self.multi_radio_store.db_path,payload,action=action)
+        self._operator_radio_job = job
+        job.result_ready.connect(self._operator_radio_saved)
+        job.finished.connect(self._operator_radio_job_finished)
+        job.start()
+
+    def _operator_radio_job_finished(self):
+        if self.sender() is getattr(self, '_operator_radio_job', None):
+            self._operator_radio_job = None
+
+    def _operator_radio_saved(self, response):
+        job = getattr(self, '_operator_radio_job', None)
+        editor = getattr(self, '_operator_radio_dialog', None)
+        if job is None or editor is None or response.get('job_token') != job.token:
+            return
+        self._operator_radio_job = None
+        editor.set_busy(False)
+        if response.get('unfinished',{}).get('payload'):
+            editor.set_unfinished(response['unfinished'])
+        if response.get('error'):
+            editor.set_status(response['error'])
+            return
+        if response.get('discarded'):
+            editor.set_unfinished(None)
+            editor.set_status('Saved unfinished work discarded. Active settings remain unchanged.')
+            return
+        if 'application_seeds' in response:
+            editor.set_context(response)
+            return
+        result=response.get('result')
+        if result is not None:
+            if result.state == 'saved':
+                self._operator_radio_result = response.get('profile')
+            editor.set_result({'state':result.state,'draft_revision':result.draft_revision,'message':'Saved in CommsPlan.' if result.state == 'saved' else 'Saved · incomplete. ' + ' '.join(result.issues)})
 
     def _apply_runtime_projection_widgets(self, data: Dict[str, Any]) -> None:
         ctrl = data.get("control_via", "FLRig") or "FLRig"
@@ -35909,75 +29459,13 @@ class SettingsTab(QWidget):
         self.show_settings_context("radios", health_key="radio_profiles")
         self._add_device_profile()
 
-    def _add_device_profile(
-        self,
-        *,
-        retry_draft: Optional[Mapping[str, Any]] = None,
-        initial_step: str = "",
-    ) -> None:
+    def _add_device_profile(self, *, retry_draft=None, initial_step='') -> None:
+        """The shared editor's worker owns the complete Save boundary."""
         try:
-            created = self._open_device_profile_dialog(
-                existing=None,
-                initial_step=initial_step,
-                retry_draft=retry_draft,
-            )
+            self._open_device_profile_dialog(existing=None,initial_step=initial_step,retry_draft=retry_draft)
         except Exception:
-            log.exception("Failed opening Guided Add Radio dialog.")
-            QMessageBox.warning(
-                self,
-                "Guided Add Radio",
-                "CommsPlan could not open Guided Add Radio. Check the log for details, then try Configuration > Radios again.",
-            )
-            return
-        if not created:
-            return
-        varac_session = self._varac_native_session_from_guided_profile(created)
-        if not self._guided_radio_review_is_current(created):
-            if varac_session is not None:
-                self._rollback_varac_native_session(varac_session)
-            retry_step = self._present_guided_stale_review_recovery(
-                "The saved software inventory no longer matches the reviewed generation."
-            )
-            if retry_step:
-                self._add_device_profile(retry_draft=created, initial_step=retry_step)
-            return
-        native_plan = created.pop("guided_external_app_config_plan", None)
-        if isinstance(native_plan, GuidedAppConfigPlan) and native_plan.actions:
-            payload = dict(created)
-
-            def _native_ready(result: object) -> None:
-                if not isinstance(result, GuidedAppConfigApplyResult) or not result.ok:
-                    if varac_session is not None:
-                        self._rollback_varac_native_session(varac_session)
-                    QMessageBox.warning(
-                        self,
-                        "App Configuration",
-                        "CommsPlan could not safely apply and verify the reviewed native application configuration. "
-                        "The backup was restored and the radio was not saved.",
-                    )
-                    return
-                self._continue_add_device_profile_after_guided_native(
-                    payload,
-                    native_result=result,
-                )
-
-            def _native_failed(detail: str) -> None:
-                if varac_session is not None:
-                    self._rollback_varac_native_session(varac_session)
-                QMessageBox.warning(
-                    self,
-                    "App Configuration",
-                    "CommsPlan could not prepare the reviewed application configuration. "
-                    f"The radio was not saved. {detail}",
-                )
-
-            self._start_guided_native_config_job(
-                plan=native_plan,
-                on_finished=_native_ready,
-                on_failed=_native_failed,
-            )
-            return
-        self._continue_add_device_profile_after_guided_native(created)
+            log.exception('Failed opening radio setup.')
+            QMessageBox.warning(self,'Add Radio','Radio setup could not be opened. Check the log and try again.')
 
     def _continue_add_device_profile_after_guided_native(
         self,
@@ -36481,68 +29969,8 @@ class SettingsTab(QWidget):
             return
         self._edit_device_profile_at_step(selected[0])
 
-    def _edit_device_profile_at_step(
-        self,
-        existing: Dict[str, Any],
-        *,
-        initial_step: str = "",
-        retry_draft: Optional[Mapping[str, Any]] = None,
-    ) -> None:
-        updated = self._open_device_profile_dialog(
-            existing=existing,
-            initial_step=initial_step,
-            retry_draft=retry_draft,
-        )
-        if not updated:
-            return
-        varac_session = self._varac_native_session_from_guided_profile(updated)
-        if not self._guided_radio_review_is_current(updated):
-            if varac_session is not None:
-                self._rollback_varac_native_session(varac_session)
-            retry_step = self._present_guided_stale_review_recovery(
-                "The saved software inventory no longer matches the reviewed generation."
-            )
-            if retry_step:
-                self._edit_device_profile_at_step(
-                    existing,
-                    initial_step=retry_step,
-                    retry_draft=updated,
-                )
-            return
-        native_plan = updated.pop("guided_external_app_config_plan", None)
-        if isinstance(native_plan, GuidedAppConfigPlan) and native_plan.actions:
-            payload = dict(updated)
-
-            def _native_ready(result: object) -> None:
-                if not isinstance(result, GuidedAppConfigApplyResult) or not result.ok:
-                    if varac_session is not None:
-                        self._rollback_varac_native_session(varac_session)
-                    QMessageBox.warning(
-                        self,
-                        "App Configuration",
-                        "CommsPlan could not safely apply and verify the reviewed native application configuration. "
-                        "The backup was restored and the radio changes were not saved.",
-                    )
-                    return
-                self._complete_edit_device_profile(existing, payload, native_result=result)
-
-            def _native_failed(detail: str) -> None:
-                if varac_session is not None:
-                    self._rollback_varac_native_session(varac_session)
-                QMessageBox.warning(
-                    self,
-                    "App Configuration",
-                    "CommsPlan could not prepare the reviewed application configuration. "
-                    f"The radio changes were not saved. {detail}",
-                )
-
-            self._start_guided_native_config_job(
-                plan=native_plan,
-                on_finished=_native_ready,
-                on_failed=_native_failed,
-            )
-            return
-        self._complete_edit_device_profile(existing, updated)
+    def _edit_device_profile_at_step(self, existing, *, initial_step='', retry_draft=None) -> None:
+        self._open_device_profile_dialog(existing=existing,initial_step=initial_step,retry_draft=retry_draft)
 
     def _complete_edit_device_profile(
         self,
@@ -37653,6 +31081,11 @@ class SettingsTab(QWidget):
         if not radio_id:
             label.setText("Startup preview: select a radio to review.")
             return
+        if not self.launch_all_with_startup_chk.isChecked():
+            checked_count = sum(1 for item in self._launch_items_cache
+                                if isinstance(item, dict) and item.get("startup"))
+            label.setText(f"Automatic startup is off · {checked_count} apps checked for startup. Start buttons launch on demand.")
+            return
         try:
             self._sync_launch_cache_from_table()
             plan = self.launch_orchestrator.preview_startup_plan(
@@ -37838,6 +31271,10 @@ class SettingsTab(QWidget):
         self.launch_order_up_btn.setEnabled(bool(can_move and row > 0))
         self.launch_order_down_btn.setEnabled(bool(can_move and row < self.launch_control_table.rowCount() - 1))
         self.launch_reset_order_btn.setEnabled(has_rows)
+        for button in (self.launch_order_up_btn, self.launch_order_down_btn, self.launch_reset_order_btn):
+            action = button.property("launchOrderAction")
+            if isinstance(action, QAction):
+                action.setEnabled(button.isEnabled())
         has_startup_rows = False
         visible_names = set(getattr(self, "_launch_visible_names", []))
         if has_rows:
@@ -37853,6 +31290,17 @@ class SettingsTab(QWidget):
             has_rows and has_startup_rows and not self.launch_orchestrator.is_active()
         )
         self.launch_stop_btn.setEnabled(self.launch_orchestrator.is_active())
+        theme = resolve_theme(self.settings)
+        self.launch_configured_now_btn.setStyleSheet(button_style("primary" if self.launch_configured_now_btn.isEnabled() else "muted", theme))
+        self.launch_stop_btn.setStyleSheet(button_style("warning" if self.launch_stop_btn.isEnabled() else "muted", theme))
+        if hasattr(self, "launch_order_menu_btn"):
+            self.launch_order_menu_btn.setStyleSheet(button_style("secondary", theme))
+        self.launch_configured_now_btn.setToolTip(
+            "A launch sequence is already running." if self.launch_orchestrator.is_active() else
+            "Configure this radio's software first." if not has_rows else
+            "Check Launch at Startup for one or more apps, or use an individual Start button." if not has_startup_rows else
+            "Start the checked startup apps now; the automatic startup switch only applies when CommsPlan opens."
+        )
         for row in range(self.launch_control_table.rowCount() if has_rows else 0):
             widget = self.launch_control_table.cellWidget(row, 3)
             if isinstance(widget, QPushButton):
@@ -37889,7 +31337,7 @@ class SettingsTab(QWidget):
             runtime_allowed = bool(self.launch_orchestrator.launch_allowed())
         except Exception:
             pass
-        level = "success" if launch_enabled and runtime_allowed else "warning"
+        level = "success" if launch_enabled and runtime_allowed else "info"
         text = (
             f"Selected radio: {radio_name}. Frequency control: {backend_label}. "
             f"Software: {bundle}. Endpoints: {endpoint}. "
@@ -38387,6 +31835,10 @@ class SettingsTab(QWidget):
             and (now_ts - float(self._last_running_status_refresh_ts or 0.0))
             < float(self._running_status_refresh_interval_sec)
         ):
+            # A dependency publication can change the administration cards
+            # even while the launch-status paint is cadence-throttled.  Read
+            # only the published cache here; never reload configuration rows.
+            self._refresh_software_administration_status_projection()
             return
         snapshot = self._selected_radio_status_snapshot(
             force=force,
@@ -38402,6 +31854,7 @@ class SettingsTab(QWidget):
             for name, value in dict(snapshot or {}).items()
         }
         self._paint_running_status_snapshot(self._last_running_status_snapshot, theme)
+        self._refresh_software_administration_status_projection()
         emit_span(
             "settings.refresh_running_status",
             (time.perf_counter() - _perf_t0) * 1000.0,
@@ -38515,6 +31968,10 @@ class SettingsTab(QWidget):
                     "target": target,
                     "arguments": tuple(str(value) for value in arguments),
                     "instance_key": str(item.get("instance_key") or "").strip(),
+                    "local_expected": str(readiness.get('local_expected', 'true')).lower() not in {'false','0'} and str(readiness.get('launch_control') or '') != 'remote',
+                    "process_executable": str(readiness.get("process_executable") or ""),
+                    "process_ini": str(readiness.get("process_ini") or readiness.get("profile_selector") or ""),
+                    "wine_prefix": str(readiness.get("wine_prefix") or (readiness.get("environment") or {}).get("WINEPREFIX") or ""),
                 }
         return identities
 
@@ -38541,7 +31998,12 @@ class SettingsTab(QWidget):
                 return {key: {"state": "idle", "running": False, "reachable": False, "stale": True,
                               "tooltip": "Software status worker is unavailable."}
                         for key, _label in self._current_visible_status_items()}
+            try:
+                status_radio_id = self._selected_launch_radio_id()
+            except Exception:
+                status_radio_id = None
             status_kwargs = dict(
+                radio_id=status_radio_id,
                 force=force,
                 host_override=js8_host or None,
                 port_override=js8_port,
@@ -38590,6 +32052,15 @@ class SettingsTab(QWidget):
                 # locally styled controls from receiving the new palette.
                 log.debug("Settings theme refresh failed for %s", label, exc_info=True)
 
+        editor = getattr(self, '_operator_radio_dialog', None)
+        if editor is not None:
+            _attempt('active radio editor', lambda: editor.apply_theme(theme))
+            from freqinout.gui.operator_instance_assistant import OperatorInstanceAssistant
+            for child in editor.findChildren(OperatorInstanceAssistant):
+                _attempt('active application editor', lambda target=child: target.apply_theme(theme))
+        station_setup = getattr(self, "_operator_station_setup", None)
+        if station_setup is not None:
+            _attempt("station setup", lambda: station_setup.apply_theme(theme))
         # Navigation owns explicit button styles, so refresh it before any
         # optional runtime painter that may be unavailable during startup.
         if hasattr(self, "sections_nav_list"):
@@ -38684,6 +32155,8 @@ class SettingsTab(QWidget):
 
     def _flush_resize_update(self) -> None:
         self._settings_resize_update_pending = False
+        self._apply_mesh_core_responsive_layout()
+        self._apply_mesh_saved_device_actions_layout()
         self._update_logging_actions_layout()
         self._sync_current_section_scroll_size()
 
@@ -39543,6 +33016,7 @@ class SettingsTab(QWidget):
     def _persist_operating_groups_quiet(self) -> None:
         try:
             self.settings.set("operating_groups", self._table_to_operating_groups())
+            self._cache_configuration_attention()
             self._settings_dirty = False
             self._set_save_button_state("success")
             self._emit_operating_groups_changed()

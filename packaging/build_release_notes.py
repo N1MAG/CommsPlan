@@ -49,7 +49,7 @@ def build_release_notes(
         "can instead use GitHub's automatically generated **Source code (zip)** or "
         "**Source code (tar.gz)** archive, or pull the tagged source manually.",
         "",
-        "CommsPlan, formerly FreqInOut, retains existing station data and technical "
+        "CommsPlan retains existing station data and technical "
         "profile/package identities. Follow the guided upgrade instructions for your "
         "installation before replacing an existing app.",
         "",

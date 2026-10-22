@@ -38,6 +38,7 @@ export default defineConfig({
       { text: "Install or upgrade", link: "/install/" },
       { text: "Set up a radio", link: "/guide/first-radio" },
       { text: "Operate the station", link: "/guide/operating-picture" },
+      { text: "What's new in 2.0.6", link: "/guide/whats-new" },
       { text: "Mesh", link: "/integrations/mesh" },
       { text: "Support", link: "/support" },
     ],
@@ -55,7 +56,10 @@ export default defineConfig({
       },
       {
         text: "Operate your station",
-        items: [{ text: "Operating picture", link: "/guide/operating-picture" }],
+        items: [
+          { text: "Operating picture", link: "/guide/operating-picture" },
+          { text: "What's new in 2.0.6", link: "/guide/whats-new" },
+        ],
       },
       {
         text: "Integrations",

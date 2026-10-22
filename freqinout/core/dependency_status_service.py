@@ -21,6 +21,9 @@ LEGACY_PRIMARY_DEPENDENCY_SCOPE = "legacy_primary"
 PROCESS_STATUS_CADENCE_SEC = 10.0
 PROCESS_STATUS_STALE_AFTER_SEC = 30.0
 SCOPED_STATUS_STALE_AFTER_SEC = 15.0
+# Request a replacement before the current observation expires. The routine
+# process publication is every 10s, leaving room for the scoped worker to finish.
+SCOPED_STATUS_REFRESH_AFTER_SEC = 5.0
 
 
 def _status_program_name(status_key: str) -> str:
@@ -87,6 +90,10 @@ class DependencyStatus:
             out["duration_ms"] = self.duration_ms
         if self.meta:
             out.update(dict(self.meta))
+        if not self.is_fresh_enough():
+            out.update(state='unknown',value='unknown',stale=True,running=False,
+                       process_running=None,reachable=None,
+                       tooltip=('Last confirmed: ' + self.tooltip + ' · Observation stale; checking…') if self.checked_at else 'Checking application status…')
         return out
 
 
@@ -179,6 +186,7 @@ class DependencyStatusService(QObject):
         self._latest_snapshot = _initial_snapshot()
         self._scoped_snapshots: Dict[str, DependencySnapshot] = {}
         self._scoped_pending: set[str] = set()
+        self._radio_scopes = {}
         self._active_futures: set[Future] = set()
         self._sequence = 0
         self._worker_pending = False
@@ -203,7 +211,14 @@ class DependencyStatusService(QObject):
         with self._lock:
             return self._latest_snapshot
 
-    def software_status_snapshot(self) -> Dict[str, Dict[str, object]]:
+    def software_status_snapshot(self, radio_id=None) -> Dict[str, Dict[str, object]]:
+        if radio_id:
+            with self._lock:
+                scope = self._radio_scopes.get(int(radio_id))
+                snapshot = self._scoped_snapshots.get(scope)
+            if snapshot is not None:
+                return snapshot.to_software_status_snapshot()
+            return {key:_unknown_status_dict(key) for key in STATUS_KEYS}
         return self.latest_snapshot().to_software_status_snapshot()
 
     def is_stopped(self) -> bool:
@@ -213,6 +228,7 @@ class DependencyStatusService(QObject):
     def status_snapshot(
         self,
         *,
+        radio_id: Optional[int] = None,
         force: bool = False,
         force_process_snapshot: bool = True,
         port_override: Optional[int] = None,
@@ -257,12 +273,14 @@ class DependencyStatusService(QObject):
             overrides["instance_identities"] = exact_identities
         scope = self._endpoint_scope(overrides)
         with self._lock:
+            if radio_id:
+                self._radio_scopes[int(radio_id)] = scope
             cached = self._scoped_snapshots.get(scope)
             stopped = self._stopped
             pending = scope in self._scoped_pending
         if stopped:
             return cached.to_software_status_snapshot() if cached is not None else self.software_status_snapshot()
-        if cached is not None and cached.is_fresh_enough(SCOPED_STATUS_STALE_AFTER_SEC) and not force:
+        if cached is not None and cached.is_fresh_enough(SCOPED_STATUS_REFRESH_AFTER_SEC) and not force:
             return cached.to_software_status_snapshot()
         if not pending:
             with self._lock:
@@ -578,7 +596,7 @@ class DependencyStatusService(QObject):
                 return (
                     "JS8Call process is running. Endpoint readiness refreshes separately."
                     if running
-                    else "JS8Call is not running."
+                    else "No local JS8Call process observed; connection is checked separately."
                 )
             return self._js8_capability_tooltip(capability or {}, running=running)
         if status_key in {"FLRig", "FLDigi"}:
@@ -640,7 +658,7 @@ class DependencyStatusService(QObject):
             return f"JS8Call API support is limited at {endpoint}; CommsPlan will use log/database fallbacks.{version_part}"
         if running:
             return f"JS8Call is running, but CommsPlan could not verify the TCP API at {endpoint}."
-        return "JS8Call is not running."
+        return "JS8Call connection is unverified; no local process observed."
 
 
 _SERVICE_LOCK = threading.Lock()

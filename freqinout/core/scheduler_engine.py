@@ -452,6 +452,7 @@ class SchedulerEngine(QObject):
         self.station_runtime_manager = station_runtime_manager
         self._monotonic_clock = monotonic_clock
         self._utc_now = utc_now
+        self._require_operator_schedule_approval = True
         self._runtime_scheduler_enabled_override: Optional[bool] = None
         self._runtime_timer_policy_override: Dict[str, str] = {}
         self._launch_initializing_radio_ids: Set[int] = set()
@@ -807,9 +808,23 @@ class SchedulerEngine(QObject):
             self._operator_sources_pending = pending
             self._request_active_schedule_lane_rows_refresh(force=True)
 
+    def configuration_review_pending(self, radio_id: int) -> None:
+        """Immediately fence a Disable click while its durable save is queued."""
+        self._invalidate_command_authority(int(radio_id))
+        pending = set(getattr(self, '_operator_approval_pending', set()))
+        pending.add(int(radio_id))
+        self._operator_approval_pending = pending
+
     def _automatic_source_enabled(self, radio_id: Optional[int], source: str) -> bool:
         if source not in {"HF", "NET", "SOP"}:
             return True
+        if radio_id in getattr(self, '_operator_approval_pending', set()):
+            return False
+        if getattr(self, '_require_operator_schedule_approval', False):
+            review = next((lane.get('schedule_review') or {} for lane in self._cached_active_schedule_lane_rows()
+                           if int(lane.get('device_profile_id') or 0) == int(radio_id or 0)), {})
+            if not review.get('enabled'):
+                return False
         if radio_id in getattr(self, "_operator_sources_pending", set()):
             return False
         choices = self.radio_operator_choices(int(radio_id or 0))
@@ -1396,7 +1411,7 @@ class SchedulerEngine(QObject):
             startup_offset = int(self.settings.get("js8_offset_hz", 0) or 0)
         except Exception:
             startup_offset = 0
-        if startup_offset > 0 and self.js8 is not None:
+        if startup_offset > 0 and self.js8 is not None and not getattr(self, "_require_operator_schedule_approval", False):
             try:
                 self._status_executor.submit(
                     lambda: self._apply_js8_offset_startup(offset=startup_offset)
@@ -1499,6 +1514,10 @@ class SchedulerEngine(QObject):
         raise RuntimeError("SchedulerEngine must be constructed and started on the Qt application thread.")
 
     def _apply_js8_offset_startup(self, *, offset: Optional[int] = None) -> None:
+        # The reviewed schedule lane owns automatic offsets. Application startup
+        # alone cannot bypass scheduling approval or endpoint/RF preflight.
+        if getattr(self, '_require_operator_schedule_approval', False):
+            return
         if not self.js8:
             return
         if offset is None:
@@ -3869,9 +3888,22 @@ class SchedulerEngine(QObject):
         keys = dict(getattr(self, "_endpoint_keys_by_profile", {}) or {})
         statuses = getattr(self, "_endpoint_status", None)
 
+        approval_required = bool(getattr(self, '_require_operator_schedule_approval', False) and source in {'HF','NET','SOP'})
+        approval_token = str(((lane_rows[0].get('schedule_review') or {}).get('approval_token') if lane_rows else '') or '')
+        approval_db_path = getattr(getattr(self, 'settings', None), 'db_path', None)
+
         def _authority() -> Optional[str]:
             if not gate.current(radio_id, stamp):
                 return "command_authority_changed"
+            if control_mode == 'JS8CALL':
+                host = str(getattr(js8, 'host', '') or '')
+                port = js8._get_port() if hasattr(js8, '_get_port') else getattr(js8, 'port', None)
+                if port and SoftwareStatusService.cached_endpoint_identity_conflict(host,port):
+                    return 'application_identity_conflict'
+            if approval_required:
+                from freqinout.core.operator_schedule_authorization import dispatch_approval_current
+                if not approval_db_path or not dispatch_approval_current(approval_db_path, radio_id, approval_token):
+                    return 'schedule_review_required'
             # Endpoint reconciliation invalidates this radio's locked stamp.
             # Workers never borrow a mutable Qt-owned epoch dictionary.
             if identity is not None and source in {"HF", "NET", "SOP"}:
@@ -8330,6 +8362,8 @@ class SchedulerEngine(QObject):
             if not isinstance(ref, dict):
                 continue
             row = dict(ref)
+            if row.get('enabled') in (False, 0, '0', 'false'):
+                continue
             row["target_scope"] = "device_profile"
             row["target_device_profile_id"] = device_profile_id
             row.setdefault("frequency_plan_id", plan.get("id"))
@@ -8481,6 +8515,7 @@ class SchedulerEngine(QObject):
         sop_rows = [normalize_schedule_target_fields(row) for row in sop_layer if isinstance(row, dict)]
         policy_rows = [dict(row) for row in policies if isinstance(row, dict)]
 
+        from freqinout.core.operator_schedule_authorization import review_schedule
         lanes: List[Dict[str, object]] = []
         for profile in active_profiles:
             try:
@@ -8533,6 +8568,7 @@ class SchedulerEngine(QObject):
                                  if int(row.get("sop_profile_id") or 0) in declared_sop_ids]
             lanes.append(
                 {
+                    "schedule_review": review_schedule(store, device_id),
                     "device_profile": dict(profile),
                     "device_profile_id": device_id,
                     "device_name": str(profile.get("name") or ""),
@@ -8744,6 +8780,11 @@ class SchedulerEngine(QObject):
                     if old_lanes.get(radio_id) != new_lanes.get(radio_id):
                         self._invalidate_command_authority(radio_id)
                 self._schedule_publication_revision = int(getattr(self, "_schedule_publication_revision", 0)) + 1
+                pending_approval = set(getattr(self, '_operator_approval_pending', set()))
+                for lane in rows:
+                    if not (lane.get('schedule_review') or {}).get('enabled'):
+                        pending_approval.discard(int(lane.get('device_profile_id') or 0))
+                self._operator_approval_pending = pending_approval
                 self._active_schedule_lane_rows_cache = {
                     "checked_ts": float(result.get("completed_monotonic") or self._monotonic_clock()),
                     "data": tuple(dict(row) for row in rows if isinstance(row, dict)),

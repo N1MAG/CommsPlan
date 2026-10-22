@@ -38,6 +38,7 @@ class MapLayerControls(QWidget):
         self._grid.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
         self._checks: dict[str, QCheckBox] = {}
         self._columns = 0
+        self._visible_keys = {key for key, _label, _description in self.LAYERS}
 
         for key, label, description in self.LAYERS:
             checkbox = QCheckBox(label, self)
@@ -58,6 +59,14 @@ class MapLayerControls(QWidget):
         width = max(box.minimumSizeHint().width() for box in self._checks.values())
         height = max(box.minimumSizeHint().height() for box in self._checks.values())
         return QSize(width + margins.left() + margins.right(), height + margins.top() + margins.bottom())
+
+    def set_visible_layers(self, keys: Iterable[str]) -> None:
+        """Keep compatibility state; one visible owner for each control."""
+        self._visible_keys = set(keys) & set(self._checks)
+        for key, checkbox in self._checks.items():
+            checkbox.setVisible(key in self._visible_keys)
+        self._columns = 0
+        self._reflow()
 
     def selection(self) -> set[str]:
         """Return the keys of currently selected layers."""
@@ -89,7 +98,7 @@ class MapLayerControls(QWidget):
         margins = self._grid.contentsMargins()
         available = max(1, self.contentsRect().width() - margins.left() - margins.right())
         widest = max(
-            (checkbox.sizeHint().width() for checkbox in self._checks.values()),
+            (checkbox.sizeHint().width() for key, checkbox in self._checks.items() if key in self._visible_keys),
             default=1,
         )
         spacing = self._grid.horizontalSpacing()
@@ -97,13 +106,13 @@ class MapLayerControls(QWidget):
             spacing = self.style().pixelMetric(QStyle.PixelMetric.PM_LayoutHorizontalSpacing)
         cell_width = max(1, widest)
         columns = max(1, (available + spacing) // (cell_width + spacing))
-        columns = min(columns, len(self._checks))
+        columns = max(1, min(columns, len(self._visible_keys)))
         if columns == self._columns:
             return
 
         while self._grid.count():
             self._grid.takeAt(0)
-        for index, checkbox in enumerate(self._checks.values()):
+        for index, checkbox in enumerate(box for key, box in self._checks.items() if key in self._visible_keys):
             self._grid.addWidget(checkbox, index // columns, index % columns)
         for col in range(columns):
             self._grid.setColumnStretch(col, 0)

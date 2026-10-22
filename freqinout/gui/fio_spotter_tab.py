@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import datetime as dt
 from pathlib import Path
+import sqlite3
 import time
 from typing import Any, Callable, Mapping
 
@@ -40,11 +41,15 @@ from freqinout.core.js8_expect_store import (
 from freqinout.core.js8_spotter_forms import (
     MAPPER_SETTINGS_KEY,
     PURPOSE_OPTIONS,
-    discover_spotter_forms,
+    cp_spotter_forms_library_dir,
+    choose_effective_spotter_forms_catalog,
+    discover_effective_spotter_forms,
     effective_mapping_rows,
     factory_mapping_for_form,
+    import_spotter_forms_to_library,
     normalize_mapping_row,
-    resolve_spotter_forms_dir,
+    preview_spotter_forms_import,
+    resolve_effective_spotter_forms_dir,
 )
 from freqinout.core.js8spotter_importer import import_js8spotter_database, preview_js8spotter_import
 from freqinout.core.perf_metrics import emit_span
@@ -292,6 +297,7 @@ class FioSpotterTab(QWidget):
         open_map: Callable[[dict[str, Any]], None] | None = None,
         open_operator: Callable[[dict[str, Any]], None] | None = None,
         radio_store: object | None = None,
+        legacy_form_sources: object | None = None,
     ) -> None:
         super().__init__(parent)
         self.settings = settings or SettingsManager()
@@ -300,6 +306,8 @@ class FioSpotterTab(QWidget):
         self._open_map = open_map
         self._open_operator = open_operator
         self._radio_store_override = radio_store
+        self._legacy_form_sources: list[tuple[str, str]] = []
+        self._set_legacy_form_sources_model(legacy_form_sources)
         self._built: set[int] = set()
         self._loaded: set[int] = set()
         self._policy_rows: list[dict[str, Any]] = []
@@ -373,6 +381,52 @@ class FioSpotterTab(QWidget):
         self.tabs.setCurrentIndex(expect_index)
         if already_built:
             self.refresh_expect()
+
+    def open_forms(self) -> None:
+        """Select the Forms workspace and refresh its bounded catalog."""
+        index = _TAB_INDEX["Forms"]
+        self.tabs.setCurrentIndex(index)
+        if index in self._built:
+            self.refresh_forms()
+
+    def _set_legacy_form_sources_model(self, rows: object) -> None:
+        choices: list[tuple[str, str]] = []
+        for row in rows or ():
+            if isinstance(row, Mapping):
+                path = _text(row.get("path") or row.get("forms_path") or row.get("js8_forms_path"))
+                label = _text(row.get("label") or row.get("radio_name") or row.get("name") or path)
+            else:
+                path = _text(row)
+                label = path
+            if path and (label, path) not in choices:
+                choices.append((label, path))
+        self._legacy_form_sources = choices
+
+    def set_legacy_form_sources(self, rows: object) -> None:
+        """Publish cached per-radio form paths for an explicit fallback choice."""
+        self._set_legacy_form_sources_model(rows)
+        combo = getattr(self, "forms_legacy_combo", None)
+        if isinstance(combo, QComboBox):
+            selected_path = str(combo.currentData() or "")
+            combo.blockSignals(True)
+            combo.clear()
+            for label, path in self._legacy_form_sources:
+                combo.addItem(f"{label} — {path}", path)
+            selected_index = combo.findData(selected_path)
+            if selected_index >= 0:
+                combo.setCurrentIndex(selected_index)
+            combo.setVisible(bool(self._legacy_form_sources))
+            combo.blockSignals(False)
+        if _TAB_INDEX["Forms"] in self._built:
+            self._refresh_forms_state()
+            self.refresh_forms()
+
+    def open_imports(self) -> None:
+        """Select the bounded External Spotter import snapshot workspace."""
+        index = _TAB_INDEX["Imports"]
+        self.tabs.setCurrentIndex(index)
+        if index in self._built:
+            self.refresh_imports()
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         compact = self.width() <= 1000
@@ -468,6 +522,7 @@ class FioSpotterTab(QWidget):
             "forms_refresh_btn": "muted",
             "forms_browse_btn": "secondary",
             "forms_use_folder_btn": "secondary",
+            "forms_add_btn": "secondary",
             "forms_classify_btn": "secondary",
             "forms_save_btn": "primary",
             "forms_preview_btn": "secondary",
@@ -2682,16 +2737,34 @@ class FioSpotterTab(QWidget):
         path_row = QHBoxLayout()
         path_row.addWidget(QLabel("1. Forms folder"))
         self.forms_path = QLineEdit(); self.forms_path.setPlaceholderText("MCF forms folder")
+        self._forms_draft_dirty = False
+        self.forms_path.textEdited.connect(self._mark_forms_path_draft_dirty)
         self.forms_browse_btn = QPushButton("Browse…")
         self.forms_browse_btn.setAccessibleName("Choose MCF forms folder")
         self.forms_browse_btn.clicked.connect(self._choose_forms_folder)
         self.forms_use_folder_btn = QPushButton("Use folder")
         self.forms_use_folder_btn.setAccessibleName("Use selected MCF forms folder")
         self.forms_use_folder_btn.clicked.connect(self._use_forms_folder)
+        self.forms_add_btn = QPushButton("Add forms…")
+        self.forms_add_btn.setAccessibleName("Add forms to the CP Forms Library")
+        self.forms_add_btn.setToolTip("Review existing MCF files or a folder, then explicitly copy them into the station-owned CP Forms Library.")
+        add_menu = QMenu(self.forms_add_btn)
+        add_menu.addAction("Choose MCF files…", self._choose_forms_files)
+        add_menu.addAction("Choose a forms folder…", self._choose_forms_import_folder)
+        self.forms_add_btn.setMenu(add_menu)
         path_row.addWidget(self.forms_path, 1)
         path_row.addWidget(self.forms_browse_btn)
         path_row.addWidget(self.forms_use_folder_btn)
+        path_row.addWidget(self.forms_add_btn)
         layout.addLayout(path_row)
+        self.forms_legacy_combo = QComboBox()
+        self.forms_legacy_combo.setAccessibleName("Legacy per-radio MCF forms source")
+        self.forms_legacy_combo.setToolTip("Shown only when no station-global CP Forms Library is selected. This legacy source is read-only until you choose Use folder.")
+        for label, path in self._legacy_form_sources:
+            self.forms_legacy_combo.addItem(f"{label} — {path}", path)
+        self.forms_legacy_combo.setVisible(bool(self._legacy_form_sources))
+        self.forms_legacy_combo.currentIndexChanged.connect(self._on_legacy_forms_source_changed)
+        layout.addWidget(self.forms_legacy_combo)
 
         self.forms_state = QLabel()
         self.forms_state.setWordWrap(True)
@@ -2781,15 +2854,111 @@ class FioSpotterTab(QWidget):
         if not hasattr(self, "forms_state"):
             return
         path = _text(self.settings.get("js8_forms_path", ""))
-        if hasattr(self, "forms_path") and not self.forms_path.hasFocus():
+        if hasattr(self, "forms_path") and not self._forms_draft_dirty and not self.forms_path.hasFocus():
             self.forms_path.setText(path)
-        self.forms_state.setText(f"Forms folder: {path or 'Not configured'}. Refresh catalog scans this folder only when requested.")
+        legacy = _text(getattr(self, "forms_legacy_combo", None).currentData()) if self._legacy_form_sources and hasattr(self, "forms_legacy_combo") else ""
+        choice = choose_effective_spotter_forms_catalog(path, legacy)
+        owner = choice.ownership
+        if hasattr(self, "forms_legacy_combo"):
+            self.forms_legacy_combo.setEnabled(not bool(path))
+        self.forms_state.setText(
+            f"Active CP Forms Library: {choice.path} ({owner}). "
+            "Browse only drafts a path; Use folder explicitly saves it. Refresh scans the selected catalog when requested."
+        )
+
+    def _on_legacy_forms_source_changed(self, *_args) -> None:
+        self._refresh_forms_state()
+
+    def _mark_forms_path_draft_dirty(self, *_args) -> None:
+        self._forms_draft_dirty = True
 
     def _choose_forms_folder(self) -> None:
         selected = QFileDialog.getExistingDirectory(self, "Select MCF forms folder", self.forms_path.text().strip())
         if selected:
             self.forms_path.setText(selected)
-            self._use_forms_folder()
+            self._forms_draft_dirty = True
+            self.forms_state.setText("Forms folder drafted. Choose Use folder to save it, or Add forms… to copy reviewed files into the CP Forms Library.")
+
+    def _choose_forms_files(self) -> None:
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "Select MCF forms", self.forms_path.text().strip(), "MCF forms (MCF*.txt);;Text files (*.txt);;All files (*)"
+        )
+        if files:
+            self._review_forms_import(files)
+
+    def _choose_forms_import_folder(self) -> None:
+        selected = QFileDialog.getExistingDirectory(self, "Select MCF forms folder to import", self.forms_path.text().strip())
+        if selected:
+            self._review_forms_import([selected])
+
+    def _review_forms_import(self, sources: list[str]) -> None:
+        """Preview an import, then require an explicit operator commit."""
+
+        current = _text(self.settings.get("js8_forms_path", ""))
+        legacy = _text(self.forms_legacy_combo.currentData()) if self._legacy_form_sources and hasattr(self, "forms_legacy_combo") else ""
+        preserve_choice = choose_effective_spotter_forms_catalog(current, legacy)
+        preserve = Path(preserve_choice.path).expanduser()
+        if not preserve.is_dir():
+            preserve = None
+        target = cp_spotter_forms_library_dir(getattr(self.settings, "config_dir", None))
+        preview = preview_spotter_forms_import(sources, existing_dir=target, existing_dirs=(preserve,))
+        if not preview.items:
+            self.forms_state.setText("No MCF*.txt files were found in the selected source.")
+            return
+        lines = []
+        for item in preview.items:
+            state = "ready" if item.valid and not item.duplicate else "duplicate" if item.duplicate else "rejected"
+            detail = f" — {item.reason}" if item.reason else ""
+            lines.append(f"{item.name}: {state}{detail}")
+        summary = (
+            f"Review {preview.source_count} MCF form(s): {preview.valid_count} new, "
+            f"{preview.duplicate_count} duplicate(s), {preview.rejected_count} rejected.\n\n"
+            + "\n".join(lines[:_MAX_ROWS])
+        )
+        if preview.bounded:
+            summary += "\n\nThe source exceeded the bounded import limit; only the first 200 files were reviewed."
+        if preview.existing_bounded:
+            summary += "\n\nAn existing catalog exceeds the bounded import limit; no import will be started."
+        if preview.rejected_count:
+            self.forms_state.setText(
+                "Forms import was not started. Resolve the rejected form(s), then preview the complete batch again."
+            )
+            self.forms_preview.setPlainText(summary)
+            return
+        if preview.bounded or preview.existing_bounded:
+            self.forms_state.setText("Forms import was not started because a catalog exceeds the bounded limit.")
+            self.forms_preview.setPlainText(summary)
+            return
+        answer = QMessageBox.question(
+            self, "Review forms import", summary + f"\n\nCopy valid new forms into the CP-owned library at:\n{target}?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            self.forms_state.setText("Forms import cancelled. No files or mappings were changed.")
+            return
+        result = import_spotter_forms_to_library(preview, target_dir=target, preserve_dir=preserve)
+        if not result.committed:
+            self.forms_state.setText(f"Forms import failed; no catalog change was saved: {'; '.join(result.errors)}")
+            return
+        try:
+            self.settings.set("js8_forms_path", str(target))
+            if hasattr(self.settings, "save"):
+                self.settings.save()
+        except Exception as exc:
+            try:
+                self.settings.set("js8_forms_path", current)
+            except Exception:
+                pass
+            self.forms_path.setText(current)
+            self._forms_draft_dirty = False
+            self.forms_state.setText(f"Forms were copied but the CP Forms Library is not active; previous catalog was restored: {exc}")
+            return
+        self.forms_path.setText(str(target))
+        self._forms_draft_dirty = False
+        self.forms_state.setText(
+            f"Saved CP Forms Library at {target}: copied {len(result.copied)} form(s), skipped {len(result.skipped)} duplicate(s)."
+        )
+        self.refresh_forms()
 
     def _use_forms_folder(self) -> None:
         path = _text(self.forms_path.text())
@@ -2799,24 +2968,32 @@ class FioSpotterTab(QWidget):
         if not Path(path).expanduser().is_dir():
             self.forms_state.setText("Forms folder was not found.")
             return
+        old_path = _text(self.settings.get("js8_forms_path", ""))
         try:
             self.settings.set("js8_forms_path", path)
             if hasattr(self.settings, "save"):
                 self.settings.save()
         except Exception as exc:
+            try:
+                self.settings.set("js8_forms_path", old_path)
+            except Exception:
+                pass
             self.forms_state.setText(f"Forms folder was not saved: {exc}")
             return
+        self._forms_draft_dirty = False
         self.forms_state.setText("Forms folder saved. Refresh catalog to scan it; existing form mappings are preserved.")
 
     def refresh_forms(self) -> None:
         if not hasattr(self, "forms_table"): return
         selected = self._selected_form_row()
         selected_code = _text((selected or {}).get("form_code")).upper()
-        configured_path = _text(self.forms_path.text() or self.settings.get("js8_forms_path", ""))
-        path = str(resolve_spotter_forms_dir(configured_path))
-        definitions = discover_spotter_forms(configured_path)[:_MAX_ROWS]
+        configured_path = _text(self.settings.get("js8_forms_path", ""))
+        legacy_path = _text(self.forms_legacy_combo.currentData()) if self._legacy_form_sources and hasattr(self, "forms_legacy_combo") else ""
+        choice = choose_effective_spotter_forms_catalog(configured_path, legacy_path)
+        path = str(resolve_effective_spotter_forms_dir(configured_path, legacy_path))
+        definitions = discover_effective_spotter_forms(configured_path, legacy_path)[:_MAX_ROWS]
         paths = {form.form_code: form.path for form in definitions}
-        mappings = effective_mapping_rows(self.settings, configured_path)[:_MAX_ROWS]
+        mappings = effective_mapping_rows(self.settings, choice.path)[:_MAX_ROWS]
         try:
             expect_by_key = {
                 _text(entry.get("expect_key")).upper(): entry
@@ -2976,6 +3153,7 @@ class FioSpotterTab(QWidget):
             (getattr(self, "forms_refresh_btn", None), "muted"),
             (getattr(self, "forms_browse_btn", None), "secondary"),
             (getattr(self, "forms_use_folder_btn", None), "secondary"),
+            (getattr(self, "forms_add_btn", None), "secondary"),
             (getattr(self, "forms_classify_btn", None), "secondary"),
         ):
             if isinstance(button, QPushButton):
@@ -3070,8 +3248,36 @@ class FioSpotterTab(QWidget):
             source = _text(self.settings.get("js8spotter_import_db_path", ""))
             if hasattr(self, "import_source") and not self.import_source.hasFocus():
                 self.import_source.setText(source)
-            self.imports_state.setText(f"External JS8Spotter database: {source or 'Not configured'}. Choose Preview import to inspect bounded counts before changing station data.")
+            last_import = self._published_import_freshness(source)
+            self.imports_state.setText(
+                f"External Spotter source: {source or 'Not configured'}. "
+                "This page shows an explicit import snapshot; it does not watch the external database or enable CP automation. "
+                f"{last_import} Choose Preview import to inspect bounded counts before changing station data."
+            )
             self._refresh_import_action_state()
+
+    @staticmethod
+    def _published_import_freshness(source: str) -> str:
+        """Read existing import-log freshness without creating schema or polling."""
+        if not source:
+            return "No published import source is configured."
+        db_path = default_expect_db_path()
+        if not db_path.is_file():
+            return "No published import is recorded."
+        try:
+            source_db = str(Path(source).expanduser().resolve())
+            with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+                row = conn.execute(
+                    "SELECT MAX(imported_ts) FROM js8spotter_import_log WHERE source_db=?",
+                    (source_db,),
+                ).fetchone()
+            value = float(row[0]) if row and row[0] else 0.0
+            if value <= 0:
+                return "No published import is recorded."
+            stamp = dt.datetime.fromtimestamp(value).astimezone().strftime("%Y-%m-%d %H:%M")
+            return f"Last published import: {stamp}."
+        except Exception:
+            return "Published import freshness is unavailable."
 
     def _on_import_source_changed(self, *_args) -> None:
         self._import_preview = None

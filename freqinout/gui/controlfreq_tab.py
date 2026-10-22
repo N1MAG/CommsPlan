@@ -4316,7 +4316,8 @@ class ControlFreqTab(QWidget):
         visible_keys = [key for key, _label in self._current_visible_status_items()]
         if visible_keys != list(self.status_labels.keys()):
             self._rebuild_status_indicators()
-        snapshot = self._status_service.software_status_snapshot()
+        profile = self._runtime_hold_duration_profile() or {}
+        snapshot = self._status_service.software_status_snapshot(radio_id=profile.get('id'))
         for program_name, lbl in self.status_labels.items():
             info = snapshot.get(program_name, {})
             state = str(info.get("state", "idle"))

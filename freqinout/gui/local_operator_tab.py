@@ -406,6 +406,8 @@ class LocalOperatorTab(QWidget):
     def _dialog_profile(self, existing: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         dlg = QDialog(self)
         dlg.setWindowTitle("Edit Local Operator" if existing else "Add Local Operator")
+        if (existing or {}).get("_fcc_reference"):
+            dlg.setWindowTitle("Review callsign reference — Add Local Operator")
         dialog_layout = QVBoxLayout(dlg)
         form_scroll = QScrollArea(dlg)
         form_scroll.setWidgetResizable(True)
@@ -417,6 +419,8 @@ class LocalOperatorTab(QWidget):
         dialog_layout.addWidget(form_scroll)
 
         callsign_edit = QLineEdit(str((existing or {}).get("callsign", "")))
+        if (existing or {}).get("_fcc_reference"):
+            callsign_edit.setReadOnly(True)
         first_name_edit = QLineEdit(str((existing or {}).get("first_name", "")))
         last_name_edit = QLineEdit(str((existing or {}).get("last_name", "")))
         city_edit = QLineEdit(str((existing or {}).get("city", "")))
@@ -505,6 +509,23 @@ class LocalOperatorTab(QWidget):
             increment_checkins=False,
         )
         self._load_data()
+
+    def review_fcc_license(self, record) -> None:
+        from freqinout.core.local_ops_store import insert_reference_operator
+        row = self._dialog_profile({
+            "_fcc_reference": True, "callsign": record.callsign,
+            "first_name": record.first_name if record.kind == "Individual" else record.name,
+            "last_name": record.last_name if record.kind == "Individual" else "",
+            "state": record.state, "category": "GMRS" if record.service == "GMRS" else "Other",
+            "notes": f"{'ISED Canada' if getattr(record, 'jurisdiction', '') == 'CA' else 'FCC'} {record.service} reference; source {record.source_date or 'unknown date'}. Licensee/mailing region; not confirmed operating identity/location.",
+        })
+        if not row:
+            return
+        if not insert_reference_operator(row):
+            QMessageBox.information(self, "Operator already exists", "This callsign is already managed. Review it in Local Callsigns; reference data has not replaced it.")
+            return
+        self._load_data()
+        self.local_operator_updated.emit()
 
     def _edit_selected(self) -> None:
         selected = self._selected_callsigns()

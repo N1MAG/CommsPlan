@@ -16,7 +16,7 @@ SETTINGS_TABLES = (
     'kv', 'device_profiles', 'operating_profiles',
     'operating_profile_assignments', 'assigned_plans', 'frequency_plans',
     'daily_schedule_tab', 'runtime_policies', 'js8_instances',
-    'fast_light_configs', 'varac_nodes',
+    'fast_light_configs', 'varac_nodes', 'operator_schedule_authorizations', 'radio_software_identity_records', 'radio_launch_bundle_items',
 )
 NETS_TABLES = ('net_schedule_tab', 'net_schedule', 'sop_profiles',
                'sop_schedule_layer', 'sop_net_conflict_policy', 'net_resources')

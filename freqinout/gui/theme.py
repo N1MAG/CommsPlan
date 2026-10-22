@@ -4,13 +4,14 @@ from typing import Dict, Tuple
 from functools import lru_cache
 
 from PySide6.QtCore import QSize, Qt
-from PySide6.QtGui import QColor, QFont, QPalette
+from PySide6.QtGui import QColor, QFont, QPalette, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractButton,
     QAbstractItemView,
     QAbstractSpinBox,
     QComboBox,
+    QCheckBox,
     QGroupBox,
     QHeaderView,
     QLayout,
@@ -24,7 +25,61 @@ from PySide6.QtWidgets import (
     QTextEdit,
     QTreeView,
     QWidget,
+    QStyle,
+    QStyleOptionButton,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
 )
+
+
+class CellControlDelegate(QStyledItemDelegate):
+    """Retain item data while a real accessible widget owns its check control."""
+
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+        option.features &= ~QStyleOptionViewItem.HasCheckIndicator
+
+    def sizeHint(self, option, index):
+        size = super().sizeHint(option, index)
+        view = self.parent()
+        control = view.indexWidget(index) if hasattr(view, "indexWidget") else None
+        if control is not None:
+            size = size.expandedTo(control.minimumSizeHint()).expandedTo(control.minimumSize())
+        return size
+
+
+class ThemedCheckBox(QCheckBox):
+    """Shared checkbox with an explicit mark, including stylesheet themes.
+
+    Native/stylesheet checkbox backgrounds alone can become a color-only state.
+    Retain Qt focus, hit testing and accessibility, then paint the shared mark
+    in the style's actual indicator rect. Painting consumes only cached theme.
+    """
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self.isChecked():
+            return
+        option = QStyleOptionButton()
+        self.initStyleOption(option)
+        rect = self.style().subElementRect(QStyle.SE_CheckBoxIndicator, option, self)
+        if rect.isEmpty():
+            return
+        theme = active_app_theme()
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        pen = QPen(QColor(contrast_text_for_background(theme['accent'], theme)))
+        pen.setWidthF(max(1.0, rect.height() / 8.0))
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        if not self.isEnabled():
+            painter.setOpacity(0.55)
+        painter.setPen(pen)
+        path = QPainterPath()
+        path.moveTo(rect.x() + rect.width() * .22, rect.y() + rect.height() * .52)
+        path.lineTo(rect.x() + rect.width() * .43, rect.y() + rect.height() * .72)
+        path.lineTo(rect.x() + rect.width() * .79, rect.y() + rect.height() * .27)
+        painter.drawPath(path)
 
 
 THEMES: Dict[str, Dict[str, str]] = {

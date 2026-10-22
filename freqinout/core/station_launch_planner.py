@@ -546,6 +546,32 @@ class StationLaunchPlanner:
             or readiness.get("settings_identity_mode")
             or ""
         ).strip().casefold()
+        if _truthy(readiness.get('operator_recipe_v1')):
+            # Operator-selected argv is the saved authority. Labels and legacy
+            # projection defaults must never manufacture a native namespace.
+            arguments = readiness.get('launch_arguments', ())
+            if not isinstance(arguments, (list,tuple)):
+                raise ValueError('The reviewed JS8Call argument vector is invalid.')
+            arguments = tuple(str(arg) for arg in arguments)
+            selectors = []
+            for index,arg in enumerate(arguments):
+                if arg in {'--rig-name','-r'}:
+                    if index + 1 >= len(arguments):
+                        raise ValueError('The reviewed JS8Call profile argument has no value.')
+                    selectors.append(arguments[index+1])
+                elif arg.startswith('--rig-name='):
+                    selectors.append(arg.split('=',1)[1])
+            if settings_identity_mode == 'default' and selectors:
+                raise ValueError('Default JS8Call profile cannot include a named-profile argument.')
+            selected_name = str(readiness.get('rig_name') or '')
+            if settings_identity_mode == 'isolated' and selectors != [selected_name]:
+                raise ValueError('The reviewed named JS8Call profile and arguments disagree.')
+            rig_name = selected_name if settings_identity_mode == 'isolated' else selectors[0] if len(selectors) == 1 else ''
+            return {'launch_arguments':arguments,'rig_name':rig_name,
+                    'rig_name_source':'settings_default' if settings_identity_mode == 'default' else 'operator_recipe',
+                    'application_data_root':str(profile.get('js8_message_storage_root') or profile.get('application_data_root') or ''),
+                    'storage_mode':str(profile.get('js8_storage_mode') or profile.get('storage_mode') or 'unverified'),
+                    'expected_storage_mode':str(profile.get('js8_storage_mode') or profile.get('storage_mode') or 'unverified')}
         explicit_default = settings_identity_mode == "default"
         if command:
             rig_name = StationLaunchPlanner._rig_name_from_command(command)

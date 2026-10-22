@@ -32,10 +32,10 @@ Usage: bash install-commsplan.sh [setup|update|repair|desktop|uninstall|profile]
   desktop   Refresh launcher/icon from local assets; no Git or dependency update.
   profile   Preview/copy profiles: profile plan or profile copy --help.
   uninstall Use the guarded uninstaller; profile data is retained.
-Default directory: the folder containing this script, including existing FreqInOut folders.
+Default directory: the folder containing this script, including existing installation folders.
 Options: --dir PATH, --config-root PATH, --relocate-from OLD_PATH (setup only), --dry-run, --yes; legacy installer options supported.
 An explicit --repo/--branch selects another update source. Otherwise update requires an upstream.
-Profile default stays ~/.freqinout; an explicit/remembered profile is preserved.
+The existing profile location is preserved, including explicit or remembered selections.
 No profile directory or database files are renamed. Close the application before setup/update/repair.
 EOF
   exit 0

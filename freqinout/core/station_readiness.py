@@ -603,6 +603,8 @@ def build_station_readiness_report(
     operating_groups: Optional[Iterable[Any]] = None,
     assigned_schedule_status: Optional[Iterable[Mapping[str, Any]]] = None,
 ) -> ReadinessReport:
+    from freqinout.core.station_bbs_state import project_station_bbs_settings
+    settings = project_station_bbs_settings(settings, settings.get('station_bbs_catalog'))
     issues: List[ReadinessIssue] = []
     profiles = _enabled_profiles(device_profiles or [])
     runtime_profiles = [profile for profile in profiles if _profile_is_primary_or_active(profile)] or profiles
@@ -899,20 +901,10 @@ def build_station_readiness_report(
                 state_key="needs_setup",
             )
         )
-    profile_js8_forms = _profile_text_any(runtime_profiles, "js8_forms_path")
-    if js8spotter_enabled and not (js8_forms or profile_js8_forms):
-        issues.append(
-            ReadinessIssue(
-                severity="required",
-                section_key="js8call",
-                scope="global",
-                integration_key="js8spotter",
-                message="Spotter MCF forms folder missing",
-                resolution_hint="Set the MCF forms folder in JS8Call / Spotter settings.",
-                deep_link_target=_issue_deep_link("js8call", None),
-                state_key="needs_setup",
-            )
-        )
+    # CP ships a usable forms catalog. A custom or legacy catalog is an
+    # optional source choice, not a prerequisite for enabling the service.
+    # Catalog/file health is checked in the Forms Library, never inferred from
+    # the absence of a user override here.
 
     path_flrig = _text(settings, "path_flrig")
     path_fldigi = _text(settings, "path_fldigi")
@@ -1103,6 +1095,12 @@ def build_station_readiness_report(
                 state_key="needs_setup",
             )
         )
+    if settings.get('station_bbs_catalog') is not None and not varac_bbs_dir:
+        # With several active radios the global compatibility mirror is
+        # intentionally absent; each radio retains its own live service folder.
+        varac_bbs_dir = next((str(profile.get('varac_bbs_dir') or '').strip()
+                              for profile in runtime_profiles if _profile_software_enabled(profile, 'varac')
+                              and profile.get('varac_bbs_enabled') and profile.get('varac_bbs_dir')), '')
     if varac_enabled and varac_bbs_vault_enabled and not varac_bbs_dir:
         issues.append(
             ReadinessIssue(

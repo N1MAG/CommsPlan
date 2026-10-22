@@ -482,6 +482,8 @@ def upsert_operator_metadata(
     conn: sqlite3.Connection | None = None,
     *,
     raise_on_error: bool = False,
+    insert_only: bool = False,
+    provenance: str = "operator_metadata",
 ) -> int:
     """
     Insert or update operator identity metadata without incrementing check-in counts.
@@ -508,6 +510,10 @@ def upsert_operator_metadata(
     try:
         assert conn is not None
         _ensure_table(conn)
+        if insert_only:
+            # Schema assurance commits. Acquire the insertion guard afterward so
+            # a concurrent roster writer cannot turn reference import into edit.
+            conn.execute("BEGIN IMMEDIATE")
         cur = conn.cursor()
 
         for entry in entries:
@@ -530,7 +536,7 @@ def upsert_operator_metadata(
                 conn,
                 cs,
                 at_utc=last_seen or first_seen or None,
-                provenance="operator_metadata",
+                provenance=provenance,
             )
             cs = identity.current_callsign
             operator_id = identity.operator_id
@@ -568,6 +574,8 @@ def upsert_operator_metadata(
                 (cs,),
             )
             existing = cur.fetchone()
+            if existing and insert_only:
+                continue
             if existing:
                 (
                     existing_name,

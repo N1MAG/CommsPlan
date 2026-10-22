@@ -12,23 +12,27 @@ import json
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QEvent, QTimer, Qt, Signal
+from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFormLayout,
     QFrame,
     QGridLayout,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
-from freqinout.gui.theme import button_height_for_font
+from freqinout.gui.theme import active_app_theme, button_height_for_font, button_style
 from freqinout.gui.bbs_access_editor import BbsAccessEditor
 
 
@@ -70,9 +74,9 @@ SOFTWARE_EDITOR_TASKS: dict[str, dict[str, SoftwareEditorTask]] = {
         "message_storage": T("Message Storage", "DIRECTED.TXT is an ingest source. The Save folder does not relocate JS8Call message storage.", (
             F("js8_directed_path", "DIRECTED.TXT", "path", "Path to this instance's directed log", browse=True),
         )),
-        "ingest_forms": T("Ingest & Forms", "Configure directed-message ingest. CommsPlan Spotter owns form administration.", (
+        "ingest_forms": T("Message ingest", "Review directed-message ingest. CommsPlan Spotter owns form administration.", (
             F("js8_directed_path", "DIRECTED.TXT", "path", "Path to this instance's directed log", browse=True),
-        ), action="fio_spotter", action_label="Open CommsPlan Spotter"),
+        ), action="fio_spotter_forms", action_label="Manage CommsPlan Spotter forms…"),
         "launch": T("Launch", "Configure the application CommsPlan launches for this radio.", (
             F("path_js8call", "JS8Call application", "path", "Application or executable path", browse=True),
         )),
@@ -93,9 +97,9 @@ SOFTWARE_EDITOR_TASKS: dict[str, dict[str, SoftwareEditorTask]] = {
         )),
         "fldigi_modem_logs": T("FLDigi Modem & Logs", "Configure the modem endpoint and the folders used for logs and check-ins.", (
             F("path_fldigi", "FLDigi application", "path", browse=True),
-            F("fldigi_host", "FLDigi XML-RPC host", placeholder="127.0.0.1"),
+            F("fldigi_host", "FLDigi host", placeholder="127.0.0.1"),
             F("fldigi_port", "FLDigi XML-RPC port", "integer", "7362"),
-            F("arq_port", "FLDigi / FLAmp ARQ port", "integer", "7322"),
+            F("arq_port", "FLDigi / FLAmp ARQ port", "readonly", help_text="This endpoint is owned by the saved Fast Light application identity and launch recipe. Use Add/Replace instance or the available FLMsg/FLAmp repair action to change it."),
             F("fldigi_log_path", "FLDigi log folder", "path", browse=True),
             F("fldigi_checkin_dir", "Check-in folder", "path", browse=True),
         )),
@@ -103,7 +107,7 @@ SOFTWARE_EDITOR_TASKS: dict[str, dict[str, SoftwareEditorTask]] = {
             F("path_flmsg", "FLMsg application", "path", browse=True),
             F("message_paths.flmsg", "ICS messages folder", "path", browse=True),
         )),
-        "flamp_signing": T("FLAmp & Signing", "Review this radio's FLAmp application, native receive source, and paired FLDigi ARQ endpoint. Signing identities are managed centrally.", (
+        "flamp_signing": T("FLAmp & Signing", "Manage FLAmp paths and the paired ARQ endpoint. Signing applies station-wide.", (
             F("path_flamp", "FLAmp application", "path", browse=True),
             F("message_paths.flamp", "FLAMP receive folder", "path", browse=True),
         ), action="message_signing", action_label="Manage signing identities"),
@@ -122,7 +126,7 @@ SOFTWARE_EDITOR_TASKS: dict[str, dict[str, SoftwareEditorTask]] = {
             F("flrig_port", "FLRig XML-RPC port", "integer", "12345"),
             F("fldigi_host", "FLDigi XML-RPC host", placeholder="127.0.0.1"),
             F("fldigi_port", "FLDigi XML-RPC port", "integer", "7362"),
-            F("arq_port", "FLDigi / FLAmp ARQ port", "integer", "7322"),
+            F("arq_port", "FLDigi / FLAmp ARQ port", "readonly", help_text="This endpoint is owned by the saved Fast Light application identity and launch recipe. Use Add/Replace instance or the available FLMsg/FLAmp repair action to change it."),
             F("fldigi_log_path", "FLDigi log folder", "path", browse=True),
             F("fldigi_checkin_dir", "Check-in folder", "path", browse=True),
         )),
@@ -177,8 +181,8 @@ SOFTWARE_EDITOR_TASKS: dict[str, dict[str, SoftwareEditorTask]] = {
         "installation": T("Installation", "Choose the optional external Spotter launcher or shortcut.", (
             F("path_js8spotter", "External Spotter application", "path", browse=True),
         )),
-        "profile": T("Profile", "Importing an external Spotter profile is an explicit operation.", action="external_spotter_import", action_label="Import external Spotter data"),
-        "forms": T("Form Synchronization", "CommsPlan Spotter owns active form administration; external data can be imported explicitly.", action="fio_spotter", action_label="Open CommsPlan Spotter forms"),
+        "profile": T("Activity & imports", "Review external activity and import external Spotter data explicitly.", action="external_spotter_activity", action_label="Review external activity…"),
+        "forms": T("Form Synchronization", "CommsPlan Spotter owns active form administration; external data can be imported explicitly.", action="fio_spotter_forms", action_label="Manage CommsPlan Spotter forms…"),
         "launch": T("Launch", "Choose the external Spotter application CommsPlan may launch.", (
             F("path_js8spotter", "External Spotter application", "path", browse=True),
         )),
@@ -194,6 +198,7 @@ SOFTWARE_EDITOR_TASKS: dict[str, dict[str, SoftwareEditorTask]] = {
             F("js8_port", "JS8 transport port", "readonly"),
         ), action="fio_spotter", action_label="Open CommsPlan Spotter"),
         "operational_workspace": T("CommsPlan Spotter workspace", "Manage rules, Expect queries, watches, forms, and activity in the operational workspace.", action="fio_spotter", action_label="Open CommsPlan Spotter"),
+        "forms": T("Forms Library", "Manage CommsPlan Spotter forms in the shared station workspace.", action="fio_spotter_forms", action_label="Open Forms Library…"),
     },
 }
 
@@ -243,6 +248,15 @@ class SoftwareTaskEditor(QWidget):
         self._radio_name = ""
         self._state: dict[str, Any] = {}
         self._dirty = False
+        self._status_identity_text = ""
+        self._status_shared_text = ""
+        self._runtime_status_text = ""
+        self._operation_status_text = ""
+        self._embedded_context = False
+        self._component_repair_available = False
+        self._reference_summary: dict[str, Any] = {}
+        self._theme: dict[str, str] = active_app_theme()
+        self.setFocusPolicy(Qt.StrongFocus)
         self._field_widgets: dict[str, QWidget] = {}
         self._browse_buttons: dict[str, QPushButton] = {}
         self._canonical_identity_managed = False
@@ -259,7 +273,21 @@ class SoftwareTaskEditor(QWidget):
         font.setBold(True)
         self.title_label.setFont(font)
         self.title_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
-        root.addWidget(self.title_label)
+        self.edit_configuration_button = QPushButton("Edit configuration…")
+        self.edit_configuration_button.setAccessibleName("Edit this software configuration")
+        self.edit_configuration_button.setToolTip(
+            "Open the complete prefilled editor with conflict review and atomic save"
+        )
+        self.edit_configuration_button.clicked.connect(
+            lambda: self.action_requested.emit("edit_canonical_configuration")
+        )
+        self.edit_configuration_button.setMinimumHeight(button_height_for_font(self.edit_configuration_button))
+        self.edit_configuration_button.hide()
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.addWidget(self.title_label, 1)
+        title_row.addWidget(self.edit_configuration_button)
+        root.addLayout(title_row)
         self.description_label = QLabel()
         self.description_label.setWordWrap(True)
         self.description_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
@@ -275,17 +303,53 @@ class SoftwareTaskEditor(QWidget):
         self.identity_notice_label.hide()
         root.addWidget(self.identity_notice_label)
 
+        self.reference_summary_frame = QFrame()
+        self.reference_summary_frame.setObjectName("softwareReferenceSummary")
+        self.reference_summary_frame.setMinimumWidth(0)
+        self.reference_summary_frame.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        reference_layout = QGridLayout(self.reference_summary_frame)
+        reference_layout.setContentsMargins(0, 2, 0, 2)
+        reference_layout.setHorizontalSpacing(10)
+        reference_layout.setVerticalSpacing(3)
+        self.signing_summary_label = QLabel()
+        self.signing_summary_label.setWordWrap(True)
+        self.signing_summary_label.setAccessibleName("Station-wide signing key summary")
+        self.arq_summary_label = QLabel()
+        self.arq_summary_label.setWordWrap(True)
+        self.arq_summary_label.setAccessibleName("Paired FLDigi ARQ endpoint summary")
+        self.edit_flamp_arq_button = QPushButton("Edit FLDigi Modem & Logs…")
+        self.edit_flamp_arq_button.setAccessibleName("Edit paired FLDigi ARQ endpoint")
+        self.edit_flamp_arq_button.setToolTip("Open the FLDigi Modem & Logs task for this radio")
+        self.edit_flamp_arq_button.clicked.connect(
+            lambda: self.action_requested.emit("edit_flamp_arq")
+        )
+        reference_layout.addWidget(QLabel("Signing"), 0, 0)
+        reference_layout.addWidget(self.signing_summary_label, 0, 1)
+        reference_layout.addWidget(QLabel("FLDigi ARQ"), 1, 0)
+        reference_layout.addWidget(self.arq_summary_label, 1, 1)
+        reference_layout.addWidget(self.edit_flamp_arq_button, 1, 2)
+        reference_layout.setColumnStretch(1, 1)
+        self.reference_summary_frame.hide()
+
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QFrame.NoFrame)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.form_widget = QWidget()
+        self.form_widget.setMinimumWidth(0)
+        self.form_widget.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.form = QFormLayout(self.form_widget)
         self.form.setContentsMargins(0, 4, 0, 4)
         self.form.setHorizontalSpacing(10)
         self.form.setVerticalSpacing(7)
         self.form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         self.form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        self.reference_summary_host = QWidget(self)
+        self.reference_summary_host.setMinimumWidth(0)
+        self.reference_summary_host.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        reference_host_layout = QVBoxLayout(self.reference_summary_host)
+        reference_host_layout.setContentsMargins(0, 0, 0, 0)
+        reference_host_layout.addWidget(self.reference_summary_frame)
         self.scroll.setWidget(self.form_widget)
         root.addWidget(self.scroll, 1)
 
@@ -305,18 +369,18 @@ class SoftwareTaskEditor(QWidget):
         self.task_action_button.clicked.connect(self._emit_action)
         self.task_action_button.setMinimumHeight(button_height_for_font(self.task_action_button))
         self.task_action_button.hide()
-        self.edit_configuration_button = QPushButton("Edit configuration…")
-        self.edit_configuration_button.setAccessibleName("Edit this software configuration")
-        self.edit_configuration_button.setToolTip(
-            "Open the complete prefilled editor with conflict review and atomic save"
+        self.repair_button = QPushButton("Repair FLMsg / FLAmp components…")
+        self.repair_button.setAccessibleName("Repair Fast Light message components")
+        self.repair_button.setToolTip("Review the narrow FLMsg and FLAmp component repair")
+        self.repair_button.clicked.connect(
+            lambda: self.action_requested.emit("repair_fast_light_message_components")
         )
-        self.edit_configuration_button.clicked.connect(
-            lambda: self.action_requested.emit("edit_canonical_configuration")
-        )
-        self.edit_configuration_button.setMinimumHeight(
-            button_height_for_font(self.edit_configuration_button)
-        )
-        self.edit_configuration_button.hide()
+        self.repair_button.hide()
+        self.repair_reason_label = QLabel()
+        self.repair_reason_label.setWordWrap(True)
+        self.repair_reason_label.setAccessibleName("Fast Light component repair reason")
+        self.repair_reason_label.hide()
+        root.addWidget(self.repair_reason_label)
         self.dirty_label = QLabel("No unsaved changes")
         self.dirty_label.setAccessibleName("Software draft state")
         self.save_button = QPushButton("Save selected software")
@@ -329,45 +393,120 @@ class SoftwareTaskEditor(QWidget):
 
     def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override
         super().resizeEvent(event)
-        self._layout_actions(compact=event.size().width() < 700)
+        self._layout_actions(compact=self._action_layout_requires_reflow())
         # The workspace identity banner already carries radio, instance,
         # status, shared-use, and dirty context. At short heights, remove this
         # duplicate line so form rows and their Browse controls remain whole.
-        self.status_label.setVisible(event.size().height() >= 240)
+        self.status_label.setVisible(
+            bool(self._operation_status_text)
+            or (not self._embedded_context and event.size().height() >= 240)
+        )
+        self._fit_action_attention()
+
+    def _fit_action_attention(self) -> None:
+        """Publish a font-derived floor so wrapped form warnings stay readable."""
+        task = task_definition(self._family_key, self._task_key)
+        label = getattr(self, 'configuration_attention_label', None)
+        if task is None or label is None:
+            return
+        margins = self.form.contentsMargins()
+        width = max(1, self.scroll.width() - self.scroll.verticalScrollBar().sizeHint().width()
+                    - 2 * self.scroll.frameWidth() - margins.left() - margins.right())
+        height = max(0, label.heightForWidth(width)) if label.text() else 0
+        if label.minimumHeight() != height:
+            label.setMinimumHeight(height)
+        floor = height + margins.top() + margins.bottom() if height else 0
+        if task.fields:
+            floor = max(floor, self.form.minimumSize().height())
+        if self.form_widget.minimumHeight() != floor:
+            self.form_widget.setMinimumHeight(floor)
 
     def _layout_actions(self, *, compact: bool) -> None:
-        if self._compact_actions is compact:
-            return
         self._compact_actions = compact
+        self.actions_layout.setVerticalSpacing(2 if compact else 4)
         for widget in (
             self.discover_button,
             self.task_action_button,
-            self.edit_configuration_button,
+            self.repair_button,
             self.save_button,
         ):
             widget.setMinimumHeight(button_height_for_font(widget, vertical_padding=10 if compact else 12))
         for widget in (
             self.discover_button,
             self.task_action_button,
-            self.edit_configuration_button,
+            self.repair_button,
             self.dirty_label,
             self.save_button,
         ):
             self.actions_layout.removeWidget(widget)
         if compact:
-            self.actions_layout.addWidget(self.discover_button, 0, 0)
-            self.actions_layout.addWidget(self.task_action_button, 0, 1)
-            self.actions_layout.addWidget(self.edit_configuration_button, 0, 2)
-            self.actions_layout.addWidget(self.dirty_label, 1, 0)
-            self.actions_layout.addWidget(self.save_button, 1, 1, 1, 2)
-            self.actions_layout.setColumnStretch(3, 1)
+            action_widgets = [
+                widget for widget in (
+                self.discover_button,
+                self.task_action_button,
+                self.repair_button,
+                ) if not widget.isHidden()
+            ]
+            row = 0
+            index = 0
+            while index < len(action_widgets):
+                widget = action_widgets[index]
+                if widget is self.repair_button:
+                    self.actions_layout.addWidget(widget, row, 0, 1, 2)
+                    row += 1
+                    index += 1
+                    continue
+                partner = action_widgets[index + 1] if index + 1 < len(action_widgets) else None
+                pair_width = 0
+                if partner is not None and partner is not self.repair_button:
+                    pair_width = widget.sizeHint().width() + partner.sizeHint().width() + 6
+                if partner is not None and pair_width <= max(1, self.width() - 12):
+                    self.actions_layout.addWidget(widget, row, 0)
+                    self.actions_layout.addWidget(partner, row, 1)
+                    row += 1
+                    index += 2
+                else:
+                    self.actions_layout.addWidget(widget, row, 0, 1, 2)
+                    row += 1
+                    index += 1
+            # Keep hidden controls attached to the layout for a later context
+            # publication, without reserving visible space for them.
+            for widget in (
+                self.discover_button,
+                self.task_action_button,
+                self.repair_button,
+            ):
+                if widget.isHidden():
+                    self.actions_layout.addWidget(widget, row, 0)
+            self.actions_layout.addWidget(self.dirty_label, row, 0)
+            self.actions_layout.addWidget(self.save_button, row, 1)
+            self.actions_layout.setColumnStretch(0, 1)
+            self.actions_layout.setColumnStretch(1, 1)
         else:
             self.actions_layout.addWidget(self.discover_button, 0, 0)
             self.actions_layout.addWidget(self.task_action_button, 0, 1)
-            self.actions_layout.addWidget(self.edit_configuration_button, 0, 2)
+            self.actions_layout.addWidget(self.repair_button, 0, 2)
             self.actions_layout.setColumnStretch(3, 1)
-            self.actions_layout.addWidget(self.dirty_label, 0, 4)
-            self.actions_layout.addWidget(self.save_button, 0, 5)
+            self.actions_layout.addWidget(self.dirty_label, 0, 5)
+            self.actions_layout.addWidget(self.save_button, 0, 6)
+        self._apply_button_roles()
+
+    def _action_layout_requires_reflow(self) -> bool:
+        """Use measured font widths instead of a fixed breakpoint."""
+        actions = [
+            widget for widget in (
+                self.discover_button,
+                self.task_action_button,
+                self.repair_button,
+            ) if not widget.isHidden()
+        ]
+        if not actions:
+            actions = []
+        natural = sum(widget.sizeHint().width() for widget in actions)
+        if actions:
+            natural += 6 * (len(actions) - 1)
+        natural += self.dirty_label.sizeHint().width() + self.save_button.sizeHint().width() + 6
+        return natural > max(1, self.width() - 12)
 
     @staticmethod
     def _clear_form(form: QFormLayout) -> None:
@@ -392,8 +531,25 @@ class SoftwareTaskEditor(QWidget):
         self._radio_name = str(radio_name or "").strip()
         self._state = deepcopy(dict(state or {}))
         self._dirty = False
+        self._operation_status_text = ""
+        self._reference_summary = {}
+        self._component_repair_available = False
+        self._canonical_identity_managed = False
+        self.identity_notice_label.hide()
+        self.edit_configuration_button.hide()
         task = task_definition(self._family_key, self._task_key)
+        previous_attention = getattr(self, 'configuration_attention_label', None)
+        if previous_attention is not None and self.form.indexOf(previous_attention) < 0:
+            previous_attention.hide()
+            previous_attention.deleteLater()
+        if self.form.rowCount() and self.form.itemAt(0).widget() is self.reference_summary_host:
+            # Reparent before removing the row so Qt does not destroy the
+            # persistent summary host while switching tasks.
+            self.reference_summary_host.setParent(self)
+            self.form.removeRow(0)
         self._clear_form(self.form)
+        self.form_widget.setMinimumHeight(0)
+        self.configuration_attention_label = None
         self._field_widgets = {}
         self._browse_buttons = {}
 
@@ -403,6 +559,20 @@ class SoftwareTaskEditor(QWidget):
         else:
             self.title_label.setText(task.title)
             self.description_label.setText(task.description)
+            if self._family_key == "fast_light" and self._task_key == "flamp_signing":
+                self.reference_summary_host.setParent(self.form_widget)
+                self.form.addRow(self.reference_summary_host)
+            self.configuration_attention_label = QLabel()
+            self.configuration_attention_label.setWordWrap(True)
+            self.configuration_attention_label.setTextFormat(Qt.PlainText)
+            self.configuration_attention_label.setAccessibleName("Saved configuration attention")
+            self.configuration_attention_label.hide()
+            # Keep action-only tasks genuinely compact.  The attention row is
+            # added lazily if the host publishes a real warning for such a
+            # task; a permanently hidden form row otherwise defeats the
+            # bounded no-field surface contract.
+            if task.fields:
+                self.form.addRow(self.configuration_attention_label)
             for field in task.fields:
                 self._add_field(field)
         has_fields = bool(task and task.fields)
@@ -411,13 +581,11 @@ class SoftwareTaskEditor(QWidget):
         self.root_layout.setStretchFactor(self.scroll, 1 if has_fields else 0)
         self.root_layout.setAlignment(Qt.Alignment() if has_fields else Qt.AlignTop)
         identity = f"{family_title} for {self._radio_name}" if self._radio_name else f"All radios using {family_title}"
-        status_parts = [identity]
-        if status_text:
-            status_parts.append(f"Status: {status_text}")
+        self._status_identity_text = identity
         others = tuple(name for name in shared_radio_names if name and name != self._radio_name)
-        if others:
-            status_parts.append("Shared with: " + ", ".join(others))
-        self.status_label.setText(" · ".join(status_parts))
+        self._status_shared_text = "Shared with: " + ", ".join(others) if others else ""
+        self._runtime_status_text = str(status_text or "")
+        self._render_runtime_status()
         self.task_action_button.setVisible(bool(task and task.action))
         self.discover_button.setVisible(
             bool(task and self._radio_id is not None and any(field.browse for field in task.fields))
@@ -425,11 +593,50 @@ class SoftwareTaskEditor(QWidget):
         if task:
             self.task_action_button.setText(task.action_label or "Open")
             self.task_action_button.setProperty("software_action", task.action)
+        self._set_reference_summary_visible(self._family_key == "fast_light" and self._task_key == "flamp_signing")
         self.save_button.setText(f"Save {family_title} for {self._radio_name}" if self._radio_name else "Select one radio to save")
         self.dirty_label.setVisible(has_editable_fields)
         self.save_button.setVisible(has_editable_fields)
         self.save_button.setEnabled(self._radio_id is not None and has_editable_fields)
         self._refresh_dirty_label()
+        self._update_repair_presentation()
+        self._apply_button_roles()
+
+    def set_configuration_attention(self, entry: Mapping[str, object]) -> None:
+        """Explain cached saved-configuration evidence inside the content scroll."""
+        label = getattr(self, "configuration_attention_label", None)
+        if label is None:
+            return
+        text = f"Configuration: {entry.get('label', '')}. {entry.get('reason', '')}" if entry else ""
+        if entry and entry.get("state") == "complete":
+            text = "Saved settings complete; see Health for runtime checks."
+        label.setToolTip(str(entry.get("reason", "")) if entry else "")
+        task = task_definition(self._family_key, self._task_key)
+        if text and self.form.indexOf(label) < 0:
+            label.setParent(self.form_widget)
+            self.form.addRow(label)
+        if task and not task.fields:
+            # Empty action pages stay compact. A real explanation gets the
+            # bounded scroll owner so long warnings cannot hide the action.
+            self.scroll.setVisible(bool(text))
+            self.root_layout.setStretchFactor(self.scroll, 1 if text else 0)
+            self.root_layout.setAlignment(Qt.Alignment() if text else Qt.AlignTop)
+        if label.text() != text:
+            label.setText(text)
+        label.setVisible(bool(text))
+        # Overview pages are read-only summaries.  When saved evidence says
+        # review is required, place the canonical edit route beside the title
+        # so the operator can act immediately without hunting through tasks.
+        state = str(entry.get("state", "") or "").strip().lower() if entry else ""
+        overview_edit = (
+            bool(text)
+            and state in {"review", "unsaved", "error", "unknown"}
+            and self._task_key == "overview"
+            and self._family_key in {"js8call", "fast_light", "varac"}
+        )
+        if not self._canonical_identity_managed:
+            self.edit_configuration_button.setVisible(overview_edit)
+        self._fit_action_attention()
 
     def set_canonical_identity_managed(
         self,
@@ -446,9 +653,13 @@ class SoftwareTaskEditor(QWidget):
         legacy field projection to save independently would create split state.
         """
 
-        self._canonical_identity_managed = bool(managed) and not (
-            self._family_key == "varac" and self._task_key == "inbound_guard"
+        from freqinout.core.configuration_attention import REFERENCE_TASKS
+        self._canonical_identity_managed = (
+            bool(managed)
+            and self._task_key not in REFERENCE_TASKS.get(self._family_key, ())
+            and not (self._family_key == "varac" and self._task_key == "inbound_guard")
         )
+        self._component_repair_available = bool(component_repair_available)
         self.identity_notice_label.setVisible(self._canonical_identity_managed)
         self.edit_configuration_button.setVisible(self._canonical_identity_managed)
         for widget in self._field_widgets.values():
@@ -468,33 +679,14 @@ class SoftwareTaskEditor(QWidget):
         for button in self._browse_buttons.values():
             button.setVisible(not self._canonical_identity_managed)
         if self._canonical_identity_managed:
-            repair_note = (
-                " A component-only FLMsg/FLAmp repair is available below; it preserves the "
-                "existing FLRig profile and the FLDigi profile/XML-RPC identity."
-                if component_repair_available
-                else ""
-            )
             self.identity_notice_label.setText(
-                f"These are the saved {self._radio_name or 'radio'} software values. "
-                "Choose Edit configuration… to change paths, endpoints, defaults, or launch details "
-                f"in one reviewed transaction.{repair_note}"
+                f"Saved settings for {self._radio_name or 'this radio'}. "
+                "Choose Edit configuration… to make changes."
             )
             self.identity_notice_label.setToolTip("")
             self.discover_button.hide()
             self.save_button.hide()
             self.dirty_label.hide()
-            if component_repair_available:
-                self.task_action_button.setText("Repair FLMsg / FLAmp components…")
-                self.task_action_button.setProperty(
-                    "software_action", "repair_fast_light_message_components"
-                )
-                self.task_action_button.show()
-            else:
-                task = task_definition(self._family_key, self._task_key)
-                self.task_action_button.setVisible(bool(task and task.action))
-                if task and task.action:
-                    self.task_action_button.setText(task.action_label or "Open")
-                    self.task_action_button.setProperty("software_action", task.action)
         else:
             self.edit_configuration_button.hide()
             task = task_definition(self._family_key, self._task_key)
@@ -504,19 +696,120 @@ class SoftwareTaskEditor(QWidget):
             self.dirty_label.setVisible(has_editable_fields)
             self.save_button.setVisible(has_editable_fields)
             self.save_button.setEnabled(self._radio_id is not None and has_editable_fields)
-            if component_repair_available:
+        self._update_repair_presentation()
+        self._apply_button_roles()
+
+    def _update_repair_presentation(self) -> None:
+        """Update the independent repair affordance on every state transition."""
+        available = bool(self._component_repair_available)
+        self.repair_button.setVisible(available)
+        self.repair_reason_label.setVisible(available)
+        if available:
+            self.repair_reason_label.setText(
+                "Repair available: FLMsg/FLAmp wiring is incomplete; saved identities stay unchanged."
+            )
+            self.repair_reason_label.setToolTip("")
+            if not self._canonical_identity_managed and self._task_key == "flamp":
                 self.identity_notice_label.setText(
-                    "This radio uses an older or incomplete Fast Light launch identity. "
-                    "Repair only FLMsg/FLAmp wiring while retaining the saved FLRig and "
-                    "FLDigi identity, endpoints, and unrelated launch choices."
+                    "This radio has an older or incomplete Fast Light message-component identity. "
+                    "Repair only FLMsg/FLAmp wiring while retaining the saved FLRig and FLDigi identity."
                 )
                 self.identity_notice_label.setToolTip("")
                 self.identity_notice_label.show()
+            # ``flamp`` was the pre-OCS-9 task alias. Keep its historical
+            # repair action for callers that still address that alias while
+            # the canonical ``flamp_signing`` task keeps signing management
+            # and repair as independent actions.
+            if self._task_key == "flamp":
+                if self._canonical_identity_managed:
+                    self.identity_notice_label.setText(
+                        self.identity_notice_label.text()
+                        + " A component-only repair is available below; it preserves the saved "
+                        "FLRig and FLDigi identity."
+                    )
                 self.task_action_button.setText("Repair FLMsg / FLAmp components…")
                 self.task_action_button.setProperty(
                     "software_action", "repair_fast_light_message_components"
                 )
-                self.task_action_button.show()
+                self.task_action_button.setVisible(True)
+        elif self._task_key == "flamp":
+            # Retain the old alias route's visibility behavior, but clear its
+            # repair action payload so a later click cannot emit stale repair.
+            self.task_action_button.setText("")
+            self.task_action_button.setProperty("software_action", "")
+            self.task_action_button.setVisible(False)
+            self.identity_notice_label.clear()
+            self.identity_notice_label.hide()
+        elif not self._canonical_identity_managed:
+            self.identity_notice_label.clear()
+            self.identity_notice_label.hide()
+        self._layout_actions(compact=self._action_layout_requires_reflow())
+
+    def _apply_button_roles(self) -> None:
+        """Apply shared theme roles without introducing screen-local styling."""
+        theme = self._theme
+        for button, role in (
+            # Save is the one affirmative action for every editable task.
+            # Its enabled state still follows the existing radio/field policy;
+            # the role must not turn gray merely because the draft is clean.
+            (self.save_button, "primary"),
+            (self.discover_button, "secondary"),
+            (self.task_action_button, "secondary"),
+            (self.repair_button, "secondary"),
+            (self.edit_configuration_button, "secondary"),
+            (self.edit_flamp_arq_button, "secondary"),
+        ):
+            button.setProperty("button_role", role)
+            button.setStyleSheet(button_style(role, theme))
+        for button in self._browse_buttons.values():
+            button.setProperty("button_role", "secondary")
+            button.setStyleSheet(button_style("secondary", theme))
+
+    def apply_theme(self, theme: Mapping[str, str] | None = None) -> None:
+        """Publish shared theme tokens without changing draft or dirty state."""
+        palette = active_app_theme()
+        if theme:
+            palette.update(dict(theme))
+        self._theme = palette
+        self._apply_button_roles()
+        self._fit_action_attention()
+
+    def set_theme(self, theme: Mapping[str, str] | None = None) -> None:
+        """Compatibility alias for hosts that publish themes by setter name."""
+        self.apply_theme(theme)
+
+    def _set_reference_summary_visible(self, visible: bool) -> None:
+        self.reference_summary_host.setVisible(bool(visible))
+        self.reference_summary_frame.setVisible(bool(visible))
+        if visible:
+            self._render_reference_summary()
+
+    @staticmethod
+    def _display_reference(value: Any) -> str:
+        if isinstance(value, Mapping):
+            for key in ("display", "summary", "value", "label", "name"):
+                candidate = value.get(key)
+                if candidate not in (None, ""):
+                    return str(candidate)
+            return "Unknown"
+        text = str(value or "").strip()
+        return text or "Unknown"
+
+    def _render_reference_summary(self) -> None:
+        summary = self._reference_summary
+        self.signing_summary_label.setText(
+            self._display_reference(summary.get("signing_identity", "Unknown"))
+        )
+        self.arq_summary_label.setText(
+            self._display_reference(summary.get("arq_endpoint", "Unknown"))
+        )
+
+    def set_reference_summary(self, mapping: Mapping[str, Any] | None) -> None:
+        """Publish host-owned signing/ARQ display facts without changing the draft."""
+        self._reference_summary = deepcopy(dict(mapping or {}))
+        self._set_reference_summary_visible(
+            self._family_key == "fast_light" and self._task_key == "flamp_signing"
+        )
 
     def _add_field(self, field: SoftwareEditorField) -> None:
         value = _value_at(self._state, field.key)
@@ -594,6 +887,7 @@ class SoftwareTaskEditor(QWidget):
         self._state = merge_draft_value(self._state, key, value)
         self._dirty = True
         self._refresh_dirty_label()
+        self._apply_button_roles()
         self.value_changed.emit(key, value)
 
     def _refresh_dirty_label(self) -> None:
@@ -603,6 +897,7 @@ class SoftwareTaskEditor(QWidget):
     def set_dirty(self, dirty: bool) -> None:
         self._dirty = bool(dirty)
         self._refresh_dirty_label()
+        self._apply_button_roles()
 
     def set_state(self, state: Mapping[str, Any], *, dirty: Optional[bool] = None) -> None:
         """Refresh visible values from a host-owned draft without emitting edits."""
@@ -622,7 +917,45 @@ class SoftwareTaskEditor(QWidget):
             self.set_dirty(dirty)
 
     def set_operation_status(self, text: str) -> None:
-        self.status_label.setText(str(text or ""))
+        """Show an operation/validation result even when embedded context is hidden."""
+        self._operation_status_text = str(text or "")
+        self._render_runtime_status()
+        self.status_label.setVisible(bool(self._operation_status_text) or not self._embedded_context)
+
+    def _render_runtime_status(self) -> None:
+        if self._operation_status_text:
+            self.status_label.setText(self._operation_status_text)
+            self.status_label.setVisible(True)
+            return
+        if self._embedded_context:
+            self.status_label.clear()
+            self.status_label.hide()
+            return
+        parts = [self._status_identity_text]
+        if self._runtime_status_text:
+            parts.append(f"Status: {self._runtime_status_text}")
+        if self._status_shared_text:
+            parts.append(self._status_shared_text)
+        self.status_label.setText(" · ".join(part for part in parts if part))
+
+    def set_runtime_status(self, text: str) -> None:
+        """Refresh cached runtime status without touching draft widgets."""
+        self._runtime_status_text = str(text or "")
+        self._render_runtime_status()
+
+    def set_embedded_context(self, embedded: bool) -> None:
+        """Hide duplicate identity/runtime context when a workspace owns it.
+
+        Operation and validation results remain visible because they explain the
+        focused editor's current action. Standalone editors retain the existing
+        identity and cached runtime summary.
+        """
+        self._embedded_context = bool(embedded)
+        self._render_runtime_status()
+        self.status_label.setVisible(
+            bool(self._operation_status_text)
+            or (not self._embedded_context and self.height() >= 240)
+        )
 
     def is_dirty(self) -> bool:
         return self._dirty
@@ -661,10 +994,316 @@ class SoftwareTaskEditor(QWidget):
             self.save_requested.emit(self._family_key, self._radio_id)
 
 
+class FastLightOverview(QWidget):
+    """Cache-only overview of the four Fast Light components.
+
+    The Settings host publishes the rows through :meth:`set_component_summary`.
+    Rendering and task navigation only consume that bounded snapshot; this
+    widget never discovers files, opens endpoints, reads keyrings, or reloads a
+    store.
+    """
+
+    task_navigation_requested = Signal(str)
+    details_requested = Signal(str, object)
+    _COMPONENT_LABELS = ("FLRig", "FLDigi", "FLMsg", "FLAmp")
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._component_rows: tuple[dict[str, Any], ...] = ()
+        self._component_details: dict[str, object] = {}
+        self._theme: dict[str, str] = active_app_theme()
+        self.title_label = QLabel("Fast Light overview")
+        title_font = self.title_label.font()
+        title_font.setBold(True)
+        self.title_label.setFont(title_font)
+        self.description_label = QLabel(
+            "Review the saved component identity and published status for this radio."
+        )
+        self.description_label.setWordWrap(True)
+        self.attention_label = QLabel()
+        self.attention_label.setObjectName("fastLightOverviewAttention")
+        self.attention_label.setWordWrap(True)
+        self.attention_label.setAccessibleName("Fast Light configuration attention")
+        self.attention_label.hide()
+        self.component_table = QTableWidget(0, 6)
+        self.component_table.setHorizontalHeaderLabels(
+            ("Component", "Use", "Settings folder / launch", "Status", "Configure", "Details")
+        )
+        self.component_table.setObjectName("fastLightComponentTable")
+        self.component_table.setAccessibleName("Fast Light component summary")
+        self.component_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.component_table.setSelectionMode(QTableWidget.NoSelection)
+        self.component_table.setFocusPolicy(Qt.NoFocus)
+        self.component_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.component_table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.component_table.setWordWrap(True)
+        self.component_table.setTextElideMode(Qt.ElideNone)
+        self.component_table.verticalHeader().setVisible(False)
+        self._initial_scroll_reset_timer = QTimer(self)
+        self._initial_scroll_reset_timer.setSingleShot(True)
+        self._initial_scroll_reset_timer.timeout.connect(self._reset_horizontal_scroll)
+        header = self.component_table.horizontalHeader()
+        header.setStretchLastSection(False)
+        # Keep the overview readable in the narrow Settings detail pane. The
+        # table owns horizontal overflow locally, so identity/status text and
+        # both actions retain usable widths without widening the page. Actual
+        # widths are derived from the active font and content below.
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        self._apply_column_metrics()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        heading = QHBoxLayout()
+        heading.addWidget(self.title_label, 1)
+        self.review_configuration_button = QPushButton("Review setup…")
+        self.review_configuration_button.setAccessibleName("Review Fast Light launch choices")
+        self.review_configuration_button.setStyleSheet(button_style("secondary", self._theme))
+        self.review_configuration_button.clicked.connect(lambda: self.task_navigation_requested.emit("launch"))
+        self.review_configuration_button.hide()
+        heading.addWidget(self.review_configuration_button)
+        layout.addLayout(heading)
+        layout.addWidget(self.description_label)
+        layout.addWidget(self.attention_label)
+        layout.addWidget(self.component_table)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.set_component_summary(())
+
+    def _apply_column_metrics(self) -> None:
+        """Size summary columns from active font/content metrics only."""
+        header = self.component_table.horizontalHeader()
+        metrics = QFontMetrics(self.component_table.font())
+
+        def text_width(values: tuple[str, ...], padding: int = 24) -> int:
+            return max(metrics.horizontalAdvance(value) for value in values) + padding
+
+        widths = (
+            text_width(("Component", *self._COMPONENT_LABELS)),
+            text_width(("Use", "Unknown", "Not selected")),
+            text_width(("Settings folder / launch", "Default settings / CommsPlan"), 28),
+            text_width(("Status", "Ready", "Needs review", "Unavailable")),
+            max(text_width(("Configure",)), self._action_width("Configure")),
+            max(text_width(("Details",)), self._action_width("Details")),
+        )
+        header.setMinimumSectionSize(metrics.horizontalAdvance("WW") + 16)
+        for column, width in enumerate(widths):
+            header.resizeSection(column, width)
+
+    def _action_width(self, text: str) -> int:
+        button = self.component_table.cellWidget(0, 4 if text == "Configure" else 5)
+        if button is not None:
+            return button.sizeHint().width() + 16
+        return QFontMetrics(self.component_table.font()).horizontalAdvance(text) + 32
+
+    @staticmethod
+    def _row_value(row: Mapping[str, Any], key: str, fallback: Any = "") -> Any:
+        value = row.get(key, fallback)
+        return fallback if value is None else value
+
+    def set_component_summary(self, rows: Any) -> None:
+        """Replace the bounded published component table without side effects."""
+        by_label: dict[str, Mapping[str, Any]] = {}
+        if isinstance(rows, Mapping):
+            mapped_rows: list[Mapping[str, Any]] = []
+            for key, value in rows.items():
+                if isinstance(value, Mapping):
+                    row = dict(value)
+                    row.setdefault("label", key)
+                    mapped_rows.append(row)
+            iterable = mapped_rows
+        elif isinstance(rows, (list, tuple)):
+            iterable = rows
+        else:
+            iterable = ()
+        for raw in iterable:
+            if not isinstance(raw, Mapping):
+                continue
+            label = str(raw.get("label", "")).strip()
+            if label:
+                by_label[label.casefold()] = raw
+
+        normalized: list[dict[str, Any]] = []
+        for label in self._COMPONENT_LABELS:
+            raw = by_label.get(label.casefold(), {})
+            enabled_raw = raw.get("enabled", None)
+            enabled = None if enabled_raw is None else bool(enabled_raw)
+            identity = self._display_value(self._row_value(raw, "identity", "Unknown"))
+            status = self._display_value(self._row_value(raw, "status", "Unknown"))
+            task_key = str(self._row_value(raw, "task_key", "")).strip()
+            identity_detail = self._display_value(self._row_value(raw, "identity_detail", ""))
+            item = {
+                "label": label,
+                "enabled": enabled,
+                "identity": identity,
+                "status": status,
+                "task_key": task_key,
+                "identity_detail": identity_detail,
+                "launch_owner": str(raw.get("launch_owner") or ""),
+            }
+            normalized.append(item)
+
+        normalized_rows = tuple(normalized)
+        if normalized_rows == self._component_rows:
+            return
+
+        for row_index, item in enumerate(normalized_rows):
+            label = item["label"]
+            enabled = item["enabled"]
+            identity = item["identity"]
+            status = item["status"]
+            task_key = item["task_key"]
+            identity_detail = item["identity_detail"]
+            availability = "Unknown" if enabled is None else ("Use" if enabled else "Not selected")
+            if self.component_table.rowCount() <= row_index:
+                self.component_table.insertRow(row_index)
+                self.component_table.setItem(row_index, 0, QTableWidgetItem(label))
+                self.component_table.setItem(row_index, 1, QTableWidgetItem())
+                self.component_table.setItem(row_index, 2, QTableWidgetItem())
+                self.component_table.setItem(row_index, 3, QTableWidgetItem())
+                configure = QPushButton("Configure")
+                configure.setAccessibleName(f"Configure {label}")
+                configure.setProperty("button_role", "secondary")
+                configure.setStyleSheet(button_style("secondary", self._theme))
+                configure.clicked.connect(
+                    lambda _checked=False, index=row_index: self._emit_component_navigation(index)
+                )
+                self.component_table.setCellWidget(row_index, 4, configure)
+                details = QPushButton("Details")
+                details.setAccessibleName(f"Show {label} saved identity details")
+                details.setProperty("button_role", "secondary")
+                details.setStyleSheet(button_style("secondary", self._theme))
+                details.clicked.connect(
+                    lambda _checked=False, index=row_index: self._emit_component_details(index)
+                )
+                self.component_table.setCellWidget(row_index, 5, details)
+            self.component_table.item(row_index, 1).setText(availability)
+            self.component_table.item(row_index, 2).setText("\n".join(part for part in (identity, item["launch_owner"]) if part))
+            self.component_table.item(row_index, 2).setToolTip(identity_detail or identity)
+            self.component_table.item(row_index, 3).setText(status)
+            self.component_table.item(row_index, 3).setToolTip(status)
+            configure = self.component_table.cellWidget(row_index, 4)
+            if configure is not None:
+                configure.setEnabled(bool(task_key))
+                configure.setMinimumHeight(button_height_for_font(configure))
+            details = self.component_table.cellWidget(row_index, 5)
+            if details is not None:
+                details.setEnabled(bool(identity_detail and identity_detail != "Unknown"))
+                details.setMinimumHeight(button_height_for_font(details))
+        # Keep the row/widget identities stable across cache publications.
+        while self.component_table.rowCount() > len(self._COMPONENT_LABELS):
+            self.component_table.removeRow(self.component_table.rowCount() - 1)
+        self._component_rows = normalized_rows
+        self._component_details = {
+            str(item["label"]): item["identity_detail"] for item in normalized_rows
+        }
+        self._apply_column_metrics()
+        self.component_table.resizeRowsToContents()
+        self._apply_font_derived_height()
+
+    def showEvent(self, event) -> None:  # noqa: N802 - Qt override
+        super().showEvent(event)
+        self.setFocus(Qt.OtherFocusReason)
+        # QTableWidget may auto-reveal the last Details button while its
+        # child controls are polished. Start each newly shown overview at the
+        # component/name columns; operators can still use the local scrollbar
+        # to reach Configure and Details.
+        self._initial_scroll_reset_timer.start(0)
+
+    def _reset_horizontal_scroll(self) -> None:
+        """Return a newly shown overview to its readable leading columns."""
+        if not self.isVisible():
+            return
+        self.component_table.horizontalScrollBar().setValue(0)
+
+    @staticmethod
+    def _display_value(value: Any) -> str:
+        if isinstance(value, Mapping):
+            for key in ("display", "summary", "value", "label", "name"):
+                candidate = value.get(key)
+                if candidate not in (None, ""):
+                    return str(candidate)
+            return "Unknown"
+        text = str(value or "").strip()
+        return text or "Unknown"
+
+    def component_summary(self) -> tuple[dict[str, Any], ...]:
+        return deepcopy(self._component_rows)
+
+    def _apply_font_derived_height(self) -> None:
+        # The table owns its local vertical overflow. Do not force all four
+        # rows into the parent page's minimum height on compact windows.
+        for row in range(self.component_table.rowCount()):
+            button = self.component_table.cellWidget(row, 4)
+            if button is not None:
+                button.setMinimumHeight(button_height_for_font(button))
+        self.component_table.setMinimumHeight(0)
+
+    def _emit_component_navigation(self, row_index: int) -> None:
+        if 0 <= row_index < len(self._component_rows):
+            task_key = str(self._component_rows[row_index].get("task_key", "")).strip()
+            if task_key:
+                self.task_navigation_requested.emit(task_key)
+
+    def _emit_component_details(self, row_index: int) -> None:
+        if 0 <= row_index < len(self._component_rows):
+            item = self._component_rows[row_index]
+            self.details_requested.emit(str(item.get("label", "")), item.get("identity_detail", ""))
+
+    def set_configuration_attention(self, entry: Mapping[str, object] | None) -> None:
+        """Show a compact saved-state reason without exposing raw paths."""
+        self.review_configuration_button.setVisible(bool(entry) and str(entry.get("state", "")) in {"unknown", "review", "error"})
+        if not entry:
+            self.attention_label.clear()
+            self.attention_label.hide()
+            return
+        label = str(entry.get("label", "Review")).strip() or "Review"
+        reason = str(entry.get("reason", "")).strip()
+        self.attention_label.setText(f"{label}: {reason}" if reason else label)
+        self.attention_label.setToolTip(reason)
+        self.attention_label.show()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        super().resizeEvent(event)
+        # Four rows are bounded and this synchronous recalculation does not
+        # recurse into the parent layout. It keeps wrapped identities and
+        # Configure hit targets aligned after a real viewport-width change.
+        self.component_table.resizeRowsToContents()
+        self._apply_font_derived_height()
+
+    def changeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        super().changeEvent(event)
+        if event.type() == QEvent.FontChange:
+            self._apply_column_metrics()
+            self.component_table.resizeRowsToContents()
+            self._apply_font_derived_height()
+
+    def apply_theme(self, theme: Mapping[str, str] | None = None) -> None:
+        """Refresh shared button roles and font-derived rows cache-only."""
+        palette = active_app_theme()
+        if theme:
+            palette.update(dict(theme))
+        self._theme = palette
+        self.review_configuration_button.setStyleSheet(button_style("secondary", palette))
+        for row in range(self.component_table.rowCount()):
+            button = self.component_table.cellWidget(row, 4)
+            if button is not None:
+                button.setStyleSheet(button_style("secondary", palette))
+            details = self.component_table.cellWidget(row, 5)
+            if details is not None:
+                details.setStyleSheet(button_style("secondary", palette))
+        self._apply_column_metrics()
+        self.component_table.resizeRowsToContents()
+        self._apply_font_derived_height()
+
+    def set_theme(self, theme: Mapping[str, str] | None = None) -> None:
+        """Compatibility alias used by hosts that name theme publication directly."""
+        self.apply_theme(theme)
+
+
 __all__ = [
     "SOFTWARE_EDITOR_TASKS",
     "SoftwareEditorField",
     "SoftwareEditorTask",
+    "FastLightOverview",
     "SoftwareTaskEditor",
     "merge_draft_value",
     "task_definition",

@@ -276,6 +276,8 @@ def build_legacy_fast_light_repair_inputs(
                 "environment",
                 "execution_scope",
                 "operator_starts",
+                "evidence",
+                "confidence",
             }
         }
         component.update(
@@ -291,6 +293,8 @@ def build_legacy_fast_light_repair_inputs(
                 "effective_command": [executable, *arguments] if executable else [],
                 "effective_command_text": shlex.join([executable, *arguments]) if executable else "",
                 "readiness": component_readiness,
+                "evidence": dict(readiness.get("evidence") or component.get("evidence") or {}),
+                "confidence": _text(readiness.get("confidence") or component.get("confidence")) or "verified",
                 "operator_starts": bool(readiness.get("operator_starts", not executable)),
             }
         )
@@ -544,9 +548,20 @@ def build_fast_light_component_repair_plan(
     # Preserve FLRig exactly.  For FLDigi, only argv changes to add the shared
     # NBEMS root and distinct ARQ listener required by the repaired children.
     repaired_identity_components = dict(old_identity_components)
+    fldigi_readiness = dict(old_identity_components["fldigi"].get("readiness") or {})
+    derived_readiness = {
+        "launch_arguments": list(repaired_components["fldigi"]["arguments"]),
+        "effective_command": list(modern_identity_components["fldigi"]["argv"]),
+        "effective_command_text": shlex.join(modern_identity_components["fldigi"]["argv"]),
+    }
+    for key, value in derived_readiness.items():
+        if key in fldigi_readiness:
+            # LaunchComponentRecord's readiness contract stores scalar text.
+            fldigi_readiness[key] = str(value)
     repaired_identity_components["fldigi"] = {
         **old_identity_components["fldigi"],
         "argv": list(modern_identity_components["fldigi"]["argv"]),
+        "readiness": fldigi_readiness,
     }
     for key in _MESSAGE_COMPONENTS:
         if key in modern_identity_components:
@@ -599,9 +614,9 @@ def build_fast_light_component_repair_plan(
                 section_value[key] = modern_section[key]
         repaired_launch[section] = section_value
     modern_readiness = dict(modern_mapping.get("readiness") or {})
-    for key in ("flmsg", "flamp"):
+    for key in ("fldigi", "flmsg", "flamp"):
         if key in modern_readiness:
-            repaired_readiness[key] = modern_readiness[key]
+            repaired_readiness[key] = repaired_identity_components[key]["readiness"]
     repaired_record_mapping["launch"] = repaired_launch
     repaired_record_mapping["readiness"] = repaired_readiness
     verification = dict(repaired_record_mapping.get("verification") or {})

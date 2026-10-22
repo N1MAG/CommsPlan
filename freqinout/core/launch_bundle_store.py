@@ -14,6 +14,7 @@ from freqinout.core.receiver_software_stack import (
     STANDARD_EXECUTION_SCOPE,
     execution_scope,
 )
+from freqinout.core.guided_radio_software_model import ExecutionScope
 from freqinout.core.sqlite_utils import connect_sqlite, connect_sqlite_readonly
 
 
@@ -57,7 +58,7 @@ def normalize_launch_items(items: Any) -> List[Dict[str, Any]]:
         if not isinstance(readiness, Mapping):
             readiness = {}
         normalized_scope = execution_scope(raw)
-        if normalized_scope not in {STANDARD_EXECUTION_SCOPE, RECEIVE_ONLY_EXECUTION_SCOPE}:
+        if normalized_scope not in {scope.value for scope in ExecutionScope}:
             normalized_scope = STANDARD_EXECUTION_SCOPE
         normalized_readiness = dict(readiness)
         # ``readiness_json`` is the existing durable extension seam.  Carry the

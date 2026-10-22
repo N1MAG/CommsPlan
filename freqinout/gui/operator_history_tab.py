@@ -2544,6 +2544,12 @@ class OperatorHistoryTab(QWidget):
         dlg.setWindowTitle("Operator")
         form = QFormLayout(dlg)
 
+        if defaults.get("_fcc_reference"):
+            source_label = QLabel(str(defaults["_fcc_reference"]))
+            source_label.setTextFormat(Qt.PlainText)
+            source_label.setWordWrap(True)
+            form.addRow(source_label)
+
         cs_edit = QLineEdit(defaults.get("callsign", ""))
         if defaults.get("callsign"):
             cs_edit.setReadOnly(True)
@@ -2624,6 +2630,27 @@ class OperatorHistoryTab(QWidget):
             self._load_data(show_toast=True)
             self._schedule_history_update()
             self._sync_varac_callsign_tags()
+
+    def review_fcc_license(self, record) -> None:
+        data = self._collect_dialog_data({
+            "callsign": record.callsign, "name": record.name, "state": record.state,
+            "_fcc_reference": f"{'ISED Canada' if getattr(record, 'jurisdiction', '') == 'CA' else 'FCC'} {record.service} reference; source {record.source_date or 'unknown date'}. Review licensee name and mailing region. No check-in or trust is implied.",
+        })
+        if not data:
+            return
+        db_path = self._db_path()
+        if not db_path:
+            return
+        with sqlite3.connect(db_path) as conn:
+            written = upsert_operator_metadata(
+                [data], conn=conn, raise_on_error=True, insert_only=True,
+                provenance=f"fcc_reference:{record.service}:{record.source_date}",
+            )
+            if not written:
+                QMessageBox.information(self, "Operator already exists", "This callsign is already managed. Review it in HF Callsigns; reference data has not replaced it.")
+                return
+        self._load_data(show_toast=True)
+        self._schedule_history_update()
 
     def _show_selected_callsign_history(self) -> None:
         calls = self._selected_callsigns()

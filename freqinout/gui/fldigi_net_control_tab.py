@@ -670,6 +670,19 @@ class FldigiNetControlTab(QWidget):
         self.known_op_edit.setMaximumWidth(520)
         self.known_op_edit.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         known_row.addWidget(self.known_op_edit)
+        from freqinout.gui.fcc_identity_lookup import NcsIdentityPrefetch
+        self._fcc_identity = NcsIdentityPrefetch(
+            self, self.known_op_edit, self._split_checkin_with_extra,
+            known=lambda: self._known_operator_by_callsign,
+        )
+        from freqinout.gui.call_finder_dialog import open_ncs_draft_picker
+        self.fcc_lookup_btn = QPushButton("FCC lookup…")
+        self.fcc_lookup_btn.setToolTip("Review offline FCC licensee details for this draft; does not add or transmit a check-in.")
+        self.fcc_lookup_btn.clicked.connect(lambda: open_ncs_draft_picker(
+            self, self.known_op_edit, self._split_checkin_with_extra, self._format_entry,
+            lambda: self._known_operator_by_callsign,
+        ))
+        known_row.addWidget(self.fcc_lookup_btn)
         known_row.addStretch(1)
         layout.addLayout(known_row)
 
@@ -2261,6 +2274,11 @@ class FldigiNetControlTab(QWidget):
         cs = (callsign or "").strip().upper()
         if not cs:
             return -1
+        # Exact FCC fallback is memory-only here. A cold/missing reference never
+        # delays roster entry or changes its eligibility.
+        prefetch = getattr(self, "_fcc_identity", None)
+        if prefetch is not None:
+            name, state = prefetch.fill(cs, name, state, self._known_operator_by_callsign.get(cs, {}))
         keyword, parsed_traffic, parsed_category = self._split_keyword_and_traffic(traffic)
         traffic_value = parsed_traffic
         category_value = (category or "TFC").strip().upper() or "TFC"

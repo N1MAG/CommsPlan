@@ -43,6 +43,7 @@ class RadioSoftwareAssignment:
     canonical_binding_ids: tuple[str, ...] = ()
     canonical_parity_state: str = ""
     canonical_parity_detail: str = ""
+    launch_summary: str = ""
 
     @property
     def is_shared(self) -> bool:
@@ -67,7 +68,11 @@ class SoftwareFamilySummary:
         return sum(
             1
             for assignment in self.assignments
-            if assignment.status_text in {"Needs setup", "Needs attention", "Unavailable"}
+            if assignment.status_text in {
+                "Needs setup", "Needs attention", "Needs review", "Unavailable",
+                "Stale", "Unverified", "Unknown",
+            }
+            or "runtime unverified" in assignment.status_text.casefold()
         )
 
 
@@ -130,21 +135,102 @@ def _instance_index(rows: Iterable[Any]) -> dict[int, Mapping[str, Any]]:
     return indexed
 
 
-def _readiness_text(
+def _readiness_evidence(
     readiness_by_radio: Optional[Mapping[Any, Any]],
     radio_id: int,
     family_key: str,
-) -> str:
+) -> Any:
     if not readiness_by_radio:
-        return ""
+        return None
     direct = readiness_by_radio.get((radio_id, family_key))
     if direct is None:
         per_radio = readiness_by_radio.get(radio_id)
         if isinstance(per_radio, Mapping):
             direct = per_radio.get(family_key)
+    return direct
+
+
+def _readiness_text(
+    readiness_by_radio: Optional[Mapping[Any, Any]],
+    radio_id: int,
+    family_key: str,
+) -> str:
+    """Return the raw operator evidence label for the public read model."""
+
+    direct = _readiness_evidence(readiness_by_radio, radio_id, family_key)
     if isinstance(direct, Mapping):
         direct = direct.get("label") or direct.get("status") or direct.get("state")
     return _text(direct)
+
+
+def software_runtime_status(evidence: Any, raw: str = "") -> str:
+    """Normalize cached evidence without treating unknown as runtime success.
+
+    Status service rows carry both endpoint/process state and freshness metadata.
+    The administration read model keeps the raw label in ``readiness`` while
+    projecting one concise, conservative status for the operator-facing card.
+    """
+    row = evidence if isinstance(evidence, Mapping) else {}
+    state = _text(row.get("state") or row.get("status") or row.get("label") or raw).casefold()
+    value = _text(row.get("value")).casefold()
+    configuration_state = _text(
+        row.get("configuration_state") or row.get("config_state") or row.get("configuration")
+    ).casefold()
+    runtime_state = _text(row.get("runtime_state") or row.get("process_state")).casefold()
+    conflict = _enabled(
+        row.get("identity_conflict")
+        or row.get("conflict")
+        or row.get("configuration_conflict")
+    ) or state in {"conflict", "readback_mismatch", "mismatch", "needs_review", "review"}
+    if conflict:
+        return "Needs review"
+
+    # Verification is intentionally distinct from an unknown cache.  These
+    # aliases are published by different endpoint/readback paths but have the
+    # same operator meaning in the Software Administration selector.
+    verification_state = state.replace("-", "_").replace(" ", "_")
+    verification_value = value.replace("-", "_").replace(" ", "_")
+    if verification_state in {
+        "unverified", "verification_unavailable", "js8_verification_unavailable",
+    } or verification_value in {
+        "unverified", "verification_unavailable", "js8_verification_unavailable",
+    }:
+        return "Unverified"
+
+    unavailable = state in {"error", "failed", "unavailable", "offline"} or value in {
+        "error", "failed", "unavailable", "offline"
+    }
+    if unavailable:
+        return "Unavailable"
+
+    stale = _enabled(row.get("stale") or row.get("expired") or row.get("invalidated"))
+    checked_at = row.get("checked_at") or row.get("observed_at") or row.get("updated_at")
+    if stale:
+        # Initial cache rows have no observation and are neutral until the
+        # worker publishes its first result.  A previously observed row is
+        # explicitly stale and must remain visible as such.
+        if checked_at not in (None, "", 0, 0.0) or state not in {"", "idle", "unknown"}:
+            return "Stale"
+        return ""
+
+    # Configuration evidence and runtime evidence are separate.  If a caller
+    # supplies both, preserve that distinction in the visible state rather
+    # than presenting configuration as a connected/running process.
+    if configuration_state in {"configured", "valid", "ready", "reviewed"}:
+        if runtime_state in {"", "unknown", "unverified", "not_checked"}:
+            return "Unverified"
+
+    if state in {"", "idle", "unknown", "unverified", "verification_unavailable", "not_checked"}:
+        return "Unknown" if state and state not in {"idle", "not_checked"} else ""
+    if state in {"connected", "ok", "reachable"} or value in {"connected", "ok", "reachable"}:
+        return "Connected"
+    if state in {"running", "active"} or value in {"running", "active"}:
+        return "Running"
+    if state in {"ready", "healthy"} or value in {"ready", "healthy"}:
+        return "Ready"
+    if state in {"configured", "valid", "reviewed"}:
+        return "Configured" if state != "reviewed" else "Reviewed"
+    return _text(raw)
 
 
 def _family_link(profile: Mapping[str, Any], family_key: str) -> tuple[bool, Optional[int]]:
@@ -174,6 +260,31 @@ def _family_link(profile: Mapping[str, Any], family_key: str) -> tuple[bool, Opt
     return False, _integer(profile.get("js8_instance_id"))
 
 
+def _launch_summary(components: Sequence[Any]) -> str:
+    """Project saved native selectors, never the CommsPlan display label."""
+    parts: list[str] = []
+    for component in components:
+        if not isinstance(component, Mapping):
+            continue
+        launch = component.get("launch") or {}
+        readiness = component.get("readiness") or {}
+        if not isinstance(launch, Mapping) or not isinstance(readiness, Mapping):
+            continue
+        argv = component.get("argv") or ()
+        selector = _text(launch.get("profile_selector") or readiness.get("profile_selector"))
+        mode = _text(readiness.get("settings_identity_mode"))
+        if not selector and isinstance(argv, (list, tuple)):
+            for index, arg in enumerate(argv):
+                if arg in {"--rig-name", "-r", "--config-dir"} and index + 1 < len(argv):
+                    selector = _text(argv[index + 1])
+                elif str(arg).startswith("--rig-name="):
+                    selector = str(arg).partition("=")[2]
+        identity = selector or ("Existing launcher" if mode == "custom_launcher" else
+                                "Default settings" if mode == "default" else "Settings identity unverified")
+        parts.append(f'{_text(component.get("component_id"))}: {identity}')
+    return "; ".join(parts)
+
+
 def _status_text(
     *,
     radio_enabled: bool,
@@ -182,6 +293,7 @@ def _status_text(
     instance_id: Optional[int],
     instance_found: bool,
     readiness: str,
+    readiness_evidence: Any = None,
 ) -> str:
     if not radio_enabled:
         return "Radio inactive"
@@ -189,13 +301,15 @@ def _status_text(
         return "Not enabled"
     if instance_required and (instance_id is None or not instance_found):
         return "Needs setup"
-    normalized = readiness.strip().lower()
+    normalized = software_runtime_status(readiness_evidence, readiness)
     if normalized in {"error", "failed", "unavailable", "offline"}:
         return "Unavailable"
-    if normalized in {"warning", "warn", "needs attention", "attention", "review"}:
+    if normalized in {
+        "warning", "warn", "needs attention", "attention",
+    }:
         return "Needs attention"
-    if readiness:
-        return readiness
+    if normalized:
+        return normalized
     return "Not yet verified"
 
 
@@ -309,14 +423,18 @@ def build_software_administration_snapshot(
             )
 
             if family_key == "external_spotter":
-                software_enabled = bool(instance_row and _text(instance_row.get("spotter_launch_path")))
-            if canonical_matches:
+                selected = profile.get("use_external_js8spotter")
+                software_enabled = (_enabled(selected) if selected is not None else
+                                    bool(instance_row and _text(instance_row.get("spotter_launch_path"))))
+            if canonical_matches and family_key == "receiver":
                 software_enabled = True
 
             # Retain disabled linked application instances so the workspace can
             # explain the assignment instead of making it disappear.
             linked = instance_id is not None and family_key in {"js8call", "fast_light", "varac"}
-            if not software_enabled and not linked:
+            if family_key == "external_spotter" and instance_id is not None:
+                linked = bool(instance_row and _text(instance_row.get("spotter_launch_path")))
+            if not software_enabled and not linked and not canonical_matches:
                 continue
 
             if instance_id is not None:
@@ -324,6 +442,9 @@ def build_software_administration_snapshot(
             instance_name = _text((instance_row or {}).get("name"))
             if not instance_name and instance_id is not None:
                 instance_name = f"Missing instance {instance_id}"
+            readiness_evidence = _readiness_evidence(
+                readiness_by_radio, radio_id, family_key
+            )
             readiness = _readiness_text(readiness_by_radio, radio_id, family_key)
             manifest_state = _text((manifest or {}).get("verification_state")).casefold()
             if not readiness and manifest_state:
@@ -379,7 +500,7 @@ def build_software_administration_snapshot(
                     readiness=readiness,
                     status_text=(
                         "Needs attention"
-                        if canonical_parity_state in {"missing", "needs_attention"}
+                        if software_enabled and canonical_parity_state in {"missing", "needs_attention"}
                         else _status_text(
                             radio_enabled=radio_enabled,
                             software_enabled=software_enabled,
@@ -387,6 +508,7 @@ def build_software_administration_snapshot(
                             instance_id=instance_id,
                             instance_found=instance_row is not None,
                             readiness=readiness,
+                            readiness_evidence=readiness_evidence,
                         )
                     ),
                     manifest_instance_key=_text((manifest or {}).get("instance_key")),
@@ -414,6 +536,7 @@ def build_software_administration_snapshot(
                     ),
                     canonical_parity_state=canonical_parity_state,
                     canonical_parity_detail="; ".join(str(item) for item in projection_issues),
+                    launch_summary=_launch_summary(canonical_components),
                 )
             )
 

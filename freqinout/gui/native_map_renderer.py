@@ -18,6 +18,7 @@ from PySide6.QtQml import QJSValue
 from PySide6.QtQuickWidgets import QQuickWidget
 from PySide6.QtWidgets import QLabel, QSizePolicy, QStackedLayout, QWidget
 
+from freqinout.gui.map_marker_presentation import marker_tooltip_text
 from freqinout.gui.theme import active_app_theme
 
 
@@ -25,7 +26,7 @@ _QML_SOURCE = Path(__file__).with_name("qml") / "native_map_renderer.qml"
 _MAX_MARKERS = 1200
 _MAX_PATHS = 600
 _MAX_POLYGONS = 180
-_MAX_BASE_POLYGONS = 220
+_MAX_BASE_POLYGONS = 512
 _MAX_LABELS = 400
 _MAX_FILLS = 300
 _MAX_LEGEND_ITEMS = 12
@@ -51,7 +52,7 @@ def _coordinate(value: object) -> dict[str, float] | None:
         return None
     lat = _number(value.get("lat", value.get("latitude")))
     lon = _number(value.get("lon", value.get("lng", value.get("longitude"))))
-    if lat is None or lon is None or not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+    if lat is None or lon is None or not (-85.05112878 <= lat <= 85.05112878 and -180.0 <= lon <= 180.0):
         return None
     return {"lat": lat, "lon": lon}
 
@@ -91,6 +92,7 @@ class _NativeMapBridge(QObject):
     visible_changed = Signal()
     action_requested = Signal(object)
     view_state_changed = Signal(object)
+    viewport_changed = Signal(object)
 
     def __init__(self, theme: Mapping[str, object]) -> None:
         super().__init__()
@@ -119,6 +121,19 @@ class _NativeMapBridge(QObject):
     @Property("QVariantList", notify=markers_changed)
     def markers(self) -> list[dict[str, object]]:
         return list(self._markers)
+
+    @Property("QVariantList", notify=markers_changed)
+    def visualMarkers(self) -> list[dict[str, object]]:  # noqa: N802 - QML API
+        """Transfer rendering fields only; retain full evidence for ID selection.
+
+        QML delegates repeatedly access modelData through QVariant. Nested source
+        payloads are inspector evidence and need not cross that hot boundary.
+        """
+        fields = ("id", "lat", "lon", "min_zoom", "kind", "is_own_station",
+                  "is_mesh_self", "qsy_soon", "qsy_text", "color", "color_role",
+                  "icon", "topic", "source_kind", "event_count", "label", "tooltip_text")
+        return [{key: marker[key] for key in fields if key in marker}
+                for marker in self._markers]
 
     @Property("QVariantList", notify=paths_changed)
     def paths(self) -> list[dict[str, object]]:
@@ -218,7 +233,7 @@ class _NativeMapBridge(QObject):
         zoom = _number(view.get("zoom"))
         if lat is None or lon is None or not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
             return
-        next_view = {"lat": lat, "lon": lon, "zoom": max(1.0, min(18.0, zoom if zoom is not None else self._view["zoom"]))}
+        next_view = {"lat": max(-85.05112878,min(85.05112878,lat)), "lon": lon, "zoom": max(0.0, min(18.0, zoom if zoom is not None else self._view["zoom"]))}
         if all(abs(float(next_view[key]) - float(self._view[key])) < 0.00001 for key in ("lat", "lon", "zoom")):
             return
         self._view = next_view
@@ -291,6 +306,11 @@ class _NativeMapBridge(QObject):
     def resetView(self) -> None:  # noqa: N802 - QML API
         self.set_view(self._home_view, report=True)
 
+    @Slot(float,float)
+    def fitWorld(self, width, height):  # noqa: N802
+        zoom = max(0.0,min(18.0,math.log2(max(1,min(width-32,height-32))/256)))
+        self.set_view({"lat":0,"lon":0,"zoom":zoom},report=True)
+
     @Slot("QVariant", name="selectMarker")
     def select_marker(self, marker: object) -> None:
         normalized = _variant_mapping(marker)
@@ -326,6 +346,33 @@ class _NativeMapBridge(QObject):
     @Slot(str)
     def selectPolygonById(self, item_id: str) -> None:  # noqa: N802 - QML API
         self._select_by_id(self._polygons, item_id, "select_polygon", "polygon")
+
+    @Slot()
+    def invalidate_viewport(self):
+        if getattr(self,"_viewport",None):
+            self._viewport = {}
+            self.viewport_changed.emit({})
+
+    @Slot("QVariant")
+    def report_viewport(self, value):
+        value = _variant_mapping(value)
+        if not value:
+            return
+        try:
+            clean={k:float(value[k]) for k in ('west','south','east','north')}
+            if (not all(math.isfinite(number) for number in clean.values())
+                    or not -180 <= clean['west'] <= 180 or not -180 <= clean['east'] <= 180
+                    or not -85.052 <= clean['south'] < clean['north'] <= 85.052
+                    or not (int(value['width']) > 0 and int(value['height']) > 0)):
+                return
+            clean.update(width=int(value['width']),height=int(value['height']),full_world=bool(value.get('full_world')))
+        except (KeyError,TypeError,ValueError,OverflowError):
+            return
+        old={k:v for k,v in getattr(self,'_viewport',{}).items() if k!='revision'}
+        if clean != old:
+            self._viewport_revision = getattr(self,'_viewport_revision',0)+1
+            self._viewport = dict(clean,revision=self._viewport_revision)
+            self.viewport_changed.emit(dict(self._viewport))
 
     @Slot(float, float, float)
     def report_view(self, lat: float, lon: float, zoom: float) -> None:
@@ -385,6 +432,7 @@ class NativeMapRenderer(QWidget):
     unavailable = Signal(str)
     action_requested = Signal(object)
     view_state_changed = Signal(object)
+    viewport_changed = Signal(object)
 
     def __init__(self, parent: QWidget | None = None, *, theme: Mapping[str, object] | None = None) -> None:
         super().__init__(parent)
@@ -398,6 +446,7 @@ class NativeMapRenderer(QWidget):
         # can recurse when a QML pointer handler invokes the bridge on PySide.
         self._bridge.action_requested.connect(self._relay_action_requested)
         self._bridge.view_state_changed.connect(self._relay_view_state_changed)
+        self._bridge.viewport_changed.connect(self.viewport_changed)
         self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self.setMinimumSize(0, 0)
 
@@ -483,11 +532,14 @@ class NativeMapRenderer(QWidget):
         markers.extend(self._normalise_event_markers(payload.get("weather_events"), "weather"))
         markers.extend(self._normalise_event_markers(payload.get("alert_events"), "alert"))
         markers.extend(self._normalise_event_markers(payload.get("infrastructure_events"), "infrastructure"))
-        markers = markers[:_MAX_MARKERS]
-        paths = self._normalise_paths(payload.get("paths", payload.get("links")), markers)
+        self._operational_markers = markers[:_MAX_MARKERS]
+        if "license_references" in payload:
+            self._license_reference_markers = self._normalise_event_markers(payload.get("license_references"), "license_reference")[:200]
+        markers = self._operational_markers + list(getattr(self,"_license_reference_markers",()))[:max(0,_MAX_MARKERS-len(self._operational_markers))]
+        paths = self._normalise_paths(payload.get("paths", payload.get("links")), self._operational_markers)
         view = payload.get("view", payload.get("center"))
         if not isinstance(view, Mapping) and bool(payload.get("auto_fit")):
-            view = self._fit_view(markers, paths)
+            view = self._fit_view(self._operational_markers, paths, self.width(), self.height())
         self._bridge.set_projection(markers, paths, view if isinstance(view, Mapping) else None)
         direction_indicators = bool(
             payload.get("link_direction_markers", payload.get("direction_indicators", False))
@@ -500,6 +552,7 @@ class NativeMapRenderer(QWidget):
         city_source = payload.get("city_labels", payload.get("cities"))
         show_cities = bool(payload.get("show_cities", city_source is not None))
         show_city_labels = bool(payload.get("show_city_labels", show_cities))
+        self._operational_legend = self._normalise_legend(payload.get("legend"), self._operational_markers, fills)[:_MAX_LEGEND_ITEMS]
         self._bridge.set_layers(
             base_polygons=self._normalise_polygons(
                 payload.get("base_polygons"),
@@ -515,7 +568,7 @@ class NativeMapRenderer(QWidget):
             city_labels=(self._normalise_city_labels(city_source) if show_cities and show_city_labels else []),
             fills=fills[:_MAX_FILLS],
             directions=(self._direction_indicators(paths) if direction_indicators else []),
-            legend=self._normalise_legend(payload.get("legend"), markers, fills)[:_MAX_LEGEND_ITEMS],
+            legend=self._combined_reference_legend(bool(len(markers) > len(self._operational_markers))),
             summary=self._projection_summary(payload, regional),
             direction_indicators=direction_indicators,
         )
@@ -523,6 +576,44 @@ class NativeMapRenderer(QWidget):
         # snapshot are installed. QML paints after this synchronous call, so
         # the first exposed native frame is coherent rather than empty.
         self._projection_applied = True
+        self._reveal_projected_surface()
+
+    def _combined_reference_legend(self, visible):
+        items = list(getattr(self,"_operational_legend",()))
+        if visible:
+            return items[:_MAX_LEGEND_ITEMS-1] + [{"label":"License references (estimated)","color_role":"text_muted","symbol_only":True,
+                "tooltip":"Postal estimate, not a station status or operating location. May differ from self-reported location."}]
+        return items
+
+    def apply_license_references(self, values):
+        """Publish bounded reference values without rebuilding operational layers."""
+        if self._closed:
+            return
+        self._license_reference_markers = self._normalise_event_markers(values,"license_reference")[:200]
+        operational = list(getattr(self,"_operational_markers",()))[:_MAX_MARKERS]
+        references = self._license_reference_markers[:max(0,_MAX_MARKERS-len(operational))]
+        replacement = operational + references
+        if replacement != self._bridge._markers:
+            self._bridge._markers = replacement
+            self._bridge.markers_changed.emit()
+        legend = self._combined_reference_legend(bool(references))
+        if legend != self._bridge._legend:
+            self._bridge._legend = legend
+            self._bridge.legend_changed.emit()
+        self._projection_applied = True
+        self._reveal_projected_surface()
+
+    def apply_geography(self, payload):
+        """Replace decorative geography only; preserve live reports and selection."""
+        if self._closed:
+            return
+        for name, values, signal in (
+            ("_base_polygons",self._normalise_polygons(payload.get("base_polygons"),limit=_MAX_BASE_POLYGONS),self._bridge.base_polygons_changed),
+            ("_city_labels",self._normalise_city_labels(payload.get("city_labels")),self._bridge.city_labels_changed),
+        ):
+            if getattr(self._bridge,name) != values:
+                setattr(self._bridge,name,values)
+                signal.emit()
         self._reveal_projected_surface()
 
     def set_view_center(self, latitude: object, longitude: object, zoom: object | None = None) -> None:
@@ -533,6 +624,15 @@ class NativeMapRenderer(QWidget):
         if zoom is not None:
             view["zoom"] = zoom
         self._bridge.set_view(view, report=False)
+
+    def set_home_view(self, view) -> None:
+        from freqinout.gui.map_camera_preferences import validated_view
+        value = validated_view(view)
+        if value and not self._closed:
+            self._bridge._home_view = value
+
+    def viewport_state(self):
+        return dict(getattr(self._bridge,'_viewport',{}))
 
     def view_state(self) -> dict[str, float]:
         return dict(self._bridge.view)
@@ -666,6 +766,7 @@ class NativeMapRenderer(QWidget):
             marker["color_role"] = NativeMapRenderer._semantic_color_role(marker, "station")
             marker["_original_payload"] = dict(item)
             marker.setdefault("label", str(marker.get("callsign") or marker.get("name") or ""))
+            marker["tooltip_text"] = marker_tooltip_text(marker)
             output.append(marker)
         return output
 
@@ -689,6 +790,7 @@ class NativeMapRenderer(QWidget):
             marker["_original_payload"] = dict(item)
             marker.setdefault("label", str(marker.get("title") or marker.get("callsign") or ""))
             marker.setdefault("event_count", int(marker.get("count") or 0))
+            marker["tooltip_text"] = marker_tooltip_text(marker)
             output.append(marker)
         return output
 
@@ -729,7 +831,9 @@ class NativeMapRenderer(QWidget):
             if not str(path.get("color") or "").strip() and path.get("evidence_kind") not in {"cached_route", "observed_packet_path"}:
                 path["color"] = NativeMapRenderer._link_snr_color(path.get("snr"))
             path["_original_payload"] = dict(item)
-            output.append(path)
+            from freqinout.gui.world_geography import split_path
+            for part_index, part in enumerate(split_path(normalized)):
+                output.append({**path,"points":part,"id":path["id"] if part_index==0 else f"{path['id']}:wrap:{part_index}"})
         return output[:_MAX_PATHS]
 
     @staticmethod
@@ -756,7 +860,12 @@ class NativeMapRenderer(QWidget):
             polygon["id"] = NativeMapRenderer._stable_id("polygon", polygon, index, seen_ids)
             polygon["color_role"] = NativeMapRenderer._semantic_color_role(polygon, "boundary")
             polygon["_original_payload"] = dict(item)
-            output.append(polygon)
+            from freqinout.gui.world_geography import split_ring
+            if any(abs(a["lon"]-b["lon"])>180 for a,b in zip(points,points[1:])):
+                for part_index, part in enumerate(split_ring(points)):
+                    output.append({**polygon,"points":part,"id":polygon["id"] if part_index==0 else f"{polygon['id']}:wrap:{part_index}"})
+            else:
+                output.append(polygon)
         return output[: max(0, int(limit))]
 
     @staticmethod
@@ -791,6 +900,8 @@ class NativeMapRenderer(QWidget):
         labels so zooming back in restores labels without another worker job.
         """
         labels = NativeMapRenderer._normalise_labels(value, "city")
+        for label in labels:
+            label["color_role"] = "text_muted"
         labels.sort(
             key=lambda item: (
                 -(_number(item.get("population")) or 0.0),
@@ -1011,7 +1122,7 @@ class NativeMapRenderer(QWidget):
         return "accent"
 
     @staticmethod
-    def _fit_view(markers: Sequence[Mapping[str, object]], paths: Sequence[Mapping[str, object]]) -> dict[str, float] | None:
+    def _fit_view(markers: Sequence[Mapping[str, object]], paths: Sequence[Mapping[str, object]], width=1000, height=700) -> dict[str, float] | None:
         """Return a calm bounded center for an intentional focused projection."""
         points: list[dict[str, float]] = []
         for marker in markers:
@@ -1026,7 +1137,13 @@ class NativeMapRenderer(QWidget):
             return None
         latitudes = [point["lat"] for point in points]
         longitudes = [point["lon"] for point in points]
-        span = max(max(latitudes) - min(latitudes), max(longitudes) - min(longitudes))
+        ordered = sorted({(lon+360)%360 for lon in longitudes})
+        gaps = [((ordered[(i+1)%len(ordered)]-value)%360,i) for i,value in enumerate(ordered)]
+        gap,index = max(gaps)
+        lon_span = 0 if len(ordered)==1 else 360-gap
+        lon_start = ordered[(index+1)%len(ordered)]
+        center_lon = (lon_start+lon_span/2+180)%360-180
+        span = max(max(latitudes) - min(latitudes),lon_span)
         if span < 0.25:
             zoom = 9.0
         elif span < 1.0:
@@ -1037,4 +1154,10 @@ class NativeMapRenderer(QWidget):
             zoom = 4.0
         else:
             zoom = 3.0
-        return {"lat": sum(latitudes) / len(latitudes), "lon": sum(longitudes) / len(longitudes), "zoom": zoom}
+        projected_latitudes = [math.asinh(math.tan(math.radians(lat))) for lat in latitudes]
+        y_min,y_max = min(projected_latitudes),max(projected_latitudes)
+        for extent,available in ((lon_span/360,max(1,width-80)),((y_max-y_min)/(2*math.pi),max(1,height-120))):
+            if extent > 0:
+                zoom = min(zoom,max(0,math.log2(available/(256*extent))))
+        center_lat = math.degrees(math.atan(math.sinh((y_min+y_max)/2)))
+        return {"lat": center_lat, "lon": center_lon, "zoom": zoom}

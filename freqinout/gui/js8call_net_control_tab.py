@@ -41,11 +41,10 @@ from freqinout.core.js8_spotter_forms import (
     MAPPER_SETTINGS_KEY,
     PURPOSE_NET_CHECKIN,
     PURPOSE_NET_NOTIFICATION,
-    discover_spotter_forms,
+    discover_effective_spotter_forms,
     extract_form_codes,
     forms_enabled_for,
     legacy_default_forms_for,
-    resolve_spotter_forms_dir,
 )
 from freqinout.core.message_ingest import MessageIngestor
 from freqinout.core.ingest_runtime_status import active_runtime_ingest_inventory
@@ -222,6 +221,15 @@ class JS8CallNetControlTab(QWidget):
         self._polling_directed = False
         self._polling_rx = False
         self._active = False
+
+        # FCC enrichment is deliberately passive: it only fills blank
+        # check-in name/state fields after the row already exists.  The
+        # broker owns the worker lane and its memory cache; this tab owns only
+        # session-scoped pending identity application.
+        from freqinout.gui.fcc_identity_lookup import identity_broker
+        self._fcc_identity_broker = identity_broker()
+        self._fcc_identity_broker.identities_ready.connect(self._on_fcc_identities_ready)
+        self._fcc_identity_pending: Dict[str, tuple[str, Optional[int], bool]] = {}
 
         self._poll_timer: QTimer | None = None
         self._clock_timer: QTimer | None = None
@@ -513,6 +521,11 @@ class JS8CallNetControlTab(QWidget):
         self.checkin_filter_combo.addItems(["Mapped Check-ins", "Any Spotter", "All Callsigns"])
         fit_combo_box_to_contents(self.checkin_filter_combo)
         filter_row.addWidget(self.checkin_filter_combo)
+        from freqinout.gui.call_finder_dialog import open_call_finder
+        self.fcc_lookup_btn = QPushButton("FCC lookup…")
+        self.fcc_lookup_btn.setToolTip("Review the selected callsign offline; does not alter check-ins or send RF.")
+        self.fcc_lookup_btn.clicked.connect(lambda: open_call_finder(self, self._selected_callsign() or ""))
+        filter_row.addWidget(self.fcc_lookup_btn)
         filter_row.addStretch()
         table_layout.addLayout(filter_row)
         self.checkin_table = QTableWidget(0, 10)
@@ -708,6 +721,7 @@ class JS8CallNetControlTab(QWidget):
     def set_tab_active(self, active: bool) -> None:
         self._active = bool(active)
         if self._active:
+            self._apply_pending_fcc_identities()
             if self._clock_timer and not self._clock_timer.isActive():
                 self._clock_timer.start(1000)
             if self._poll_timer and not self._poll_timer.isActive():
@@ -786,10 +800,11 @@ class JS8CallNetControlTab(QWidget):
             self._poll_timer.setInterval(refresh * 1000)
 
         # Spotter forms dropdown
-        forms_dir = resolve_spotter_forms_dir(data.get("js8_forms_path", ""))
+        global_forms_path = str(self.settings.get("js8_forms_path", "") or "").strip()
+        legacy_forms_path = str(data.get("js8_forms_path", "") or "").strip() if not global_forms_path else ""
         self.spotter_combo.clear()
         forms = []
-        for definition in discover_spotter_forms(forms_dir):
+        for definition in discover_effective_spotter_forms(global_forms_path, legacy_forms_path):
             label = definition.form_code
             if definition.title:
                 label = f"{definition.form_code} - {definition.title}"
@@ -1211,6 +1226,7 @@ class JS8CallNetControlTab(QWidget):
         self._waiting_for_completion = False
         self._current_query = None
         self._pending_grid_queries.clear()
+        getattr(self, "_fcc_identity_pending", {}).clear()
         self._grid_waiting = False
         self._awaiting_ack_for = None
         self._call_last_rx_ts.clear()
@@ -1328,6 +1344,7 @@ class JS8CallNetControlTab(QWidget):
         self._checkins.clear()
         self._checkin_rows.clear()
         self._checkins_saved.clear()
+        getattr(self, "_fcc_identity_pending", {}).clear()
         self._clear_table()
         QMessageBox.information(self, "Net Ended", "JS8Call net ended and log saved.")
 
@@ -1613,6 +1630,125 @@ class JS8CallNetControlTab(QWidget):
         self.checkin_table.setRowCount(0)
         self._update_checkin_empty_state()
 
+    def _fcc_session_token(self) -> tuple[str, Optional[int], bool]:
+        return (
+            str(getattr(self, "_ncs_session_id", "") or ""),
+            getattr(self, "_ncs_session_radio_id", None),
+            bool(getattr(self, "_net_in_progress", False)),
+        )
+
+    def _drop_fcc_pending(self, callsign: str) -> None:
+        call = str(callsign or "").strip().upper()
+        if call:
+            self._fcc_identity_pending.pop(call, None)
+
+    def _queue_fcc_identity(self, callsign: str, token: tuple[str, Optional[int], bool]) -> None:
+        call = str(callsign or "").strip().upper()
+        if not call:
+            return
+        pending = getattr(self, "_fcc_identity_pending", None)
+        if pending is None:
+            return
+        if call not in pending and len(pending) >= 512:
+            oldest = next(iter(pending), "")
+            if oldest:
+                pending.pop(oldest, None)
+        pending[call] = token
+
+    @staticmethod
+    def _fcc_record_fields(record) -> tuple[str, str]:
+        kind = str(getattr(record, "kind", "") or "").strip()
+        first = str(getattr(record, "first_name", "") or "").strip()
+        last = str(getattr(record, "last_name", "") or "").strip()
+        name = " ".join(part for part in (first, last) if part).strip()
+        if kind != "Individual" or not name:
+            name = str(getattr(record, "name", "") or "").strip()
+        return name, str(getattr(record, "state", "") or "").strip().upper()
+
+    def _store_fcc_metadata(self, data: Dict, record) -> None:
+        name, state = self._fcc_record_fields(record)
+        data.update(
+            {
+                "fcc_name": name,
+                "fcc_state": state,
+                "fcc_service": str(getattr(record, "service", "") or "").strip(),
+                "fcc_source_date": str(getattr(record, "source_date", "") or "").strip(),
+            }
+        )
+
+    def _apply_fcc_identity(
+        self,
+        callsign: str,
+        records: tuple,
+        token: tuple[str, Optional[int], bool],
+        *,
+        update_widget: bool,
+    ) -> bool:
+        call = str(callsign or "").strip().upper()
+        if token != self._fcc_session_token() or not token[2]:
+            self._drop_fcc_pending(call)
+            return False
+        if call not in self._checkins or len(records) != 1:
+            self._drop_fcc_pending(call)
+            return False
+        data = self._checkins[call]
+        record = records[0]
+        fcc_name, fcc_state = self._fcc_record_fields(record)
+        previous_name = str(data.get("name") or "").strip()
+        previous_state = str(data.get("state") or "").strip().upper()
+        self._store_fcc_metadata(data, record)
+        if not previous_name and fcc_name:
+            data["name"] = fcc_name
+            data["_fcc_name_fallback"] = True
+        if not previous_state and fcc_state:
+            data["state"] = fcc_state
+            data["_fcc_state_fallback"] = True
+        self._drop_fcc_pending(call)
+        changed = bool((not previous_name and fcc_name) or (not previous_state and fcc_state))
+        if changed and update_widget and self._active:
+            self._update_row(call, data)
+        return changed
+
+    def _apply_pending_fcc_identities(self) -> None:
+        if not self._active or not self._net_in_progress:
+            return
+        token = self._fcc_session_token()
+        pending = getattr(self, "_fcc_identity_pending", {})
+        broker = getattr(self, "_fcc_identity_broker", None)
+        if broker is None:
+            return
+        for call in tuple(pending):
+            if pending.get(call) != token:
+                self._drop_fcc_pending(call)
+                continue
+            record = broker.identity(call)
+            if record is None:
+                # The worker may still be in flight. Keep the session token
+                # so its eventual result can fill this row.
+                continue
+            self._apply_fcc_identity(call, (record,), token, update_widget=True)
+
+    def _on_fcc_identities_ready(self, rows) -> None:
+        if getattr(self, "_is_shutting_down", False):
+            return
+        grouped: Dict[str, list] = {}
+        for record in tuple(rows or ()):
+            call = str(getattr(record, "callsign", "") or "").strip().upper()
+            if call in getattr(self, "_fcc_identity_pending", {}):
+                grouped.setdefault(call, []).append(record)
+        token = self._fcc_session_token()
+        for call, records in grouped.items():
+            if self._fcc_identity_pending.get(call) != token:
+                self._drop_fcc_pending(call)
+                continue
+            if not self._active:
+                continue
+            broker = getattr(self, "_fcc_identity_broker", None)
+            record = broker.identity(call) if broker is not None else None
+            if record is None:
+                continue
+            self._apply_fcc_identity(call, (record,), token, update_widget=True)
+
     def _rebuild_checkin_table(self) -> None:
         self._checkin_rows = {}
         self._clear_table()
@@ -1684,6 +1820,7 @@ class JS8CallNetControlTab(QWidget):
         if resp != QMessageBox.Yes:
             return
         self._checkins.pop(callsign, None)
+        self._drop_fcc_pending(callsign)
         self._status_mismatch.pop(callsign, None)
         self._checkins_saved.discard(callsign)
         self._rebuild_checkin_table()
@@ -1812,6 +1949,16 @@ class JS8CallNetControlTab(QWidget):
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
                 self.checkin_table.setItem(row, idx, item)
             item.setText(val)
+            if cols[idx] == "NAME" and data.get("fcc_name"):
+                item.setToolTip(
+                    "FCC licensee: " + str(data["fcc_name"])
+                    + " (may differ from the operator identity)."
+                )
+            elif cols[idx] == "ST" and data.get("fcc_state"):
+                item.setToolTip(
+                    "FCC mailing state: " + str(data["fcc_state"])
+                    + " (not a live operating location)."
+                )
             # Status coloring
             if cols[idx] == "STATUS":
                 theme = resolve_theme(self.settings)
@@ -1848,6 +1995,50 @@ class JS8CallNetControlTab(QWidget):
         if grid:
             meta["grid"] = grid
         data = self._checkins.get(base, {})
+        current_name = str(data.get("name") or "").strip()
+        current_state = str(data.get("state") or "").strip().upper()
+        local_name = str(meta.get("name") or "").strip()
+        local_state = str(meta.get("state") or "").strip().upper()
+        if data.get("_fcc_name_fallback"):
+            if current_name and data.get("fcc_name") and current_name != data.get("fcc_name"):
+                data["_fcc_name_fallback"] = False
+            elif local_name and local_name != current_name:
+                current_name = local_name
+                data["_fcc_name_fallback"] = False
+        if data.get("_fcc_state_fallback"):
+            if current_state and data.get("fcc_state") and current_state != data.get("fcc_state"):
+                data["_fcc_state_fallback"] = False
+            elif local_state and local_state != current_state:
+                current_state = local_state
+                data["_fcc_state_fallback"] = False
+        name = current_name or local_name
+        state = current_state or local_state
+        fcc_record = None
+        broker = getattr(self, "_fcc_identity_broker", None)
+        token = self._fcc_session_token()
+        if self._net_in_progress and broker is not None and (not name or not state):
+            try:
+                fcc_record = broker.identity(base)
+            except Exception:
+                fcc_record = None
+            if fcc_record is not None:
+                fcc_name, fcc_state = self._fcc_record_fields(fcc_record)
+                self._store_fcc_metadata(data, fcc_record)
+                if not name and fcc_name:
+                    name = fcc_name
+                    data["_fcc_name_fallback"] = True
+                if not state and fcc_state:
+                    state = fcc_state
+                    data["_fcc_state_fallback"] = True
+                self._drop_fcc_pending(base)
+            else:
+                self._queue_fcc_identity(base, token)
+                try:
+                    broker.request(base, interactive=False)
+                except Exception:
+                    pass
+        elif name and state:
+            self._drop_fcc_pending(base)
         current_status = (data.get("status") or "").upper()
         # Do not downgrade from ACKED/F!xxx to NEW
         if status:
@@ -1859,10 +2050,10 @@ class JS8CallNetControlTab(QWidget):
             status_to_use = data.get("status", "")
         data.update(
             {
-                "name": meta.get("name", ""),
-                "state": meta.get("state", ""),
-                "grid": meta.get("grid", ""),
-                "region": meta.get("region", ""),
+                "name": name,
+                "state": state,
+                "grid": grid or data.get("grid") or meta.get("grid", ""),
+                "region": meta.get("region") or data.get("region", ""),
                 "mode": mode or data.get("mode", ""),
                 "snr": snr if snr is not None else data.get("snr"),
                 "offset": offset if offset is not None else data.get("offset"),
@@ -3092,6 +3283,13 @@ class JS8CallNetControlTab(QWidget):
                 self._js8_rx_registered = False
         except Exception:
             pass
+        try:
+            broker = getattr(self, "_fcc_identity_broker", None)
+            if broker is not None:
+                broker.identities_ready.disconnect(self._on_fcc_identities_ready)
+        except Exception:
+            pass
+        getattr(self, "_fcc_identity_pending", {}).clear()
 
     def _line_has_checkin_form(self, line: str) -> bool:
         """

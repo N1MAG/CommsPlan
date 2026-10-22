@@ -548,6 +548,7 @@ class MainWindow(QMainWindow):
             "Shortwave": self._create_shortwave_tab,
             "HF Operators": self._create_operator_history_tab,
             "Local Operators": self._create_local_operator_tab,
+            "Call Finder": self._create_call_finder_tab,
             "Local Reports": self._create_local_report_history_tab,
             "Peer Schedules": self._create_peer_sched_tab,
             "Help": self._create_help_tab,
@@ -569,6 +570,7 @@ class MainWindow(QMainWindow):
             ("NCS-Local", self._placeholder_widget("NCS-Local")),
             ("HF Operators", self._placeholder_widget("HF Operators")),
             ("Local Operators", self._placeholder_widget("Local Operators")),
+            ("Call Finder", self._placeholder_widget("Call Finder")),
             ("Local Reports", self._placeholder_widget("Local Reports")),
             ("Map", self._placeholder_widget("Map")),
             ("HF Schedule", self._placeholder_widget("HF Schedule")),
@@ -618,6 +620,7 @@ class MainWindow(QMainWindow):
             ("VHF/UHF", "NCS-Local"),
             ("HF Callsigns", "HF Operators"),
             ("Local Callsigns", "Local Operators"),
+            ("Call Finder", "Call Finder"),
             ("Local Reports", "Local Reports"),
             ("Frequencies", "Resources"),
             ("Plan Builder", "FreqPlanner"),
@@ -1163,6 +1166,7 @@ class MainWindow(QMainWindow):
             self.dependency_status_service.snapshot_changed.connect(
                 lambda _snapshot: self._schedule_station_command_bar_refresh("dependency_status", force=False)
             )
+            self.dependency_status_service.snapshot_changed.connect(self._refresh_application_status_scopes)
         except Exception:
             pass
         right_layout.addWidget(self.station_command_bar, 0)
@@ -4932,6 +4936,22 @@ class MainWindow(QMainWindow):
         if idx >= 0:
             self._set_screen(idx)
 
+    def open_fio_spotter_forms(self, *, legacy_form_sources: object | None = None) -> None:
+        """Open CommsPlan Spotter directly on its station-owned Forms page."""
+        self.open_fio_spotter()
+        tab = getattr(self, "fio_spotter_tab", None)
+        if tab is not None and legacy_form_sources is not None and hasattr(tab, "set_legacy_form_sources"):
+            tab.set_legacy_form_sources(legacy_form_sources)
+        if tab is not None and hasattr(tab, "open_forms"):
+            tab.open_forms()
+
+    def open_fio_spotter_imports(self) -> None:
+        """Open CommsPlan Spotter directly on its External Spotter imports page."""
+        self.open_fio_spotter()
+        tab = getattr(self, "fio_spotter_tab", None)
+        if tab is not None and hasattr(tab, "open_imports"):
+            tab.open_imports()
+
     def open_fio_spotter_expect(self, *, entry_id: int = 0, expect_key: str = "") -> None:
         """Open fresh, authoritative Expect administration for one rule."""
         self.open_fio_spotter()
@@ -6165,6 +6185,7 @@ class MainWindow(QMainWindow):
             self.fio_spotter_tab,
             self.log_tab,
             self.operator_history_tab,
+            getattr(self, "call_finder_tab", None),
             self.local_operator_tab,
             self.local_report_history_tab,
             self.local_ncs_tab,
@@ -6502,8 +6523,18 @@ class MainWindow(QMainWindow):
     def _create_station_bbs_tab(self) -> QWidget:
         with perf_span("main_window.create_station_bbs_tab", settings=self.settings, min_ms=5.0):
             tab = StationBbsTab(self, settings=self.settings)
+            tab.catalog_published.connect(self._on_station_bbs_catalog_published)
             self.station_bbs_tab = tab
             return tab
+
+    def _on_station_bbs_catalog_published(self, snapshot) -> None:
+        """Publish to the separate Settings view without a synchronous reload."""
+        tab = getattr(self, 'settings_tab', None)
+        publish = getattr(getattr(tab, 'settings', None), 'publish_station_bbs_catalog', None)
+        if callable(publish):
+            publish(snapshot)
+            tab._last_station_readiness_report = None
+            tab._refresh_section_titles()
 
     def _create_resources_tab(self) -> QWidget:
         from freqinout.gui.resources_tab import ResourcesTab
@@ -6586,6 +6617,26 @@ class MainWindow(QMainWindow):
             )
             self._wire_lazy_local_data_links()
             return tab
+
+    def _create_call_finder_tab(self) -> QWidget:
+        from freqinout.gui.call_finder_tab import CallFinderTab
+        tab = CallFinderTab(self)
+        self.call_finder_tab = tab
+        tab.add_operator_requested.connect(self._review_fcc_operator)
+        return tab
+
+    def _review_fcc_operator(self, record) -> None:
+        destination, accepted = QInputDialog.getItem(
+            self, "Add callsign reference to Operators", "Review in:",
+            ["HF Callsigns", "Local Callsigns"], 0 if record.service == "Amateur" else 1, False,
+        )
+        if not accepted:
+            return
+        screen = "HF Operators" if destination == "HF Callsigns" else "Local Operators"
+        index = self._screen_index_by_label[screen]
+        self._ensure_lazy_tab_loaded(screen, index)
+        tab = self.stack.widget(index)
+        tab.review_fcc_license(record)
 
     def _create_local_report_history_tab(self) -> QWidget:
         with perf_span("main_window.create_local_report_history_tab", settings=self.settings, min_ms=5.0):
@@ -7172,11 +7223,11 @@ class MainWindow(QMainWindow):
         dialog.setIcon(QMessageBox.Information)
         dialog.setText("No existing CommsPlan station was found.")
         dialog.setInformativeText(
-            "Start by setting up the first radio. Nothing is changed until you review and save it."
+            "Choose your operator information, groups, radios, applications, and operating behavior. Scheduling stays off until you review and enable it."
         )
-        setup_button = dialog.addButton("Set Up First Radio…", QMessageBox.AcceptRole)
+        setup_button = dialog.addButton("Set Up Station…", QMessageBox.AcceptRole)
         later_button = dialog.addButton("Set Up Later", QMessageBox.RejectRole)
-        setup_button.setAccessibleName("Set up the first radio")
+        setup_button.setAccessibleName("Set up station")
         later_button.setAccessibleName("Set up the first radio later")
         dialog.setDefaultButton(setup_button)
         theme = resolve_theme(self.settings)
@@ -7206,7 +7257,7 @@ class MainWindow(QMainWindow):
             "set_up_first_radio" if start_setup else "set_up_later",
         )
         if start_setup:
-            QTimer.singleShot(0, self.open_guided_add_radio)
+            QTimer.singleShot(0, lambda: self.open_settings_section("operator_station_setup", settings_nav_context="main"))
 
     def request_message_projection_catchup(self, *, reason: str = "source_change"):
         """Coalesce message projection work onto the application-owned lane."""
@@ -8606,6 +8657,12 @@ class MainWindow(QMainWindow):
             elif hold.get("active"):
                 kind = "manual_hold"
         fallback = self._station_command_compact_state_text(self._station_command_state_text(snapshot))
+        scheduler = getattr(self, 'scheduler', None)
+        if getattr(scheduler, '_require_operator_schedule_approval', False):
+            review = next((lane.get('schedule_review') or {} for lane in scheduler._cached_active_schedule_lane_rows()
+                           if int(lane.get('device_profile_id') or 0) == int(radio_id or 0)), {})
+            if not review.get('enabled'):
+                fallback = str(review.get('label') or 'Scheduling off — review required')
         return authority_text(kind, hold.get("remaining_sec"), fallback)
 
     def _station_command_is_held(self, snapshot: object) -> bool:
@@ -9404,6 +9461,7 @@ class MainWindow(QMainWindow):
         if not callable(getter):
             return
         cache: dict[int, tuple[tuple[str, bool], ...]] = {}
+        scopes = {}
         for profile in profiles:
             if not isinstance(profile, Mapping):
                 continue
@@ -9438,9 +9496,49 @@ class MainWindow(QMainWindow):
                         )
                     )
             cache[radio_profile_id] = tuple(monitored)
+            identities = {}
+            for item in raw_items:
+                if not isinstance(item, Mapping):
+                    continue
+                readiness = item.get('readiness_policy') or {}
+                if not isinstance(readiness, Mapping):
+                    continue
+                name = str(item.get('name') or item.get('app_name') or '')
+                if not name or (name not in LAUNCH_APP_ORDER and not (item.get('launch_path_override') or item.get('launch_command_override') or readiness.get('executable'))):
+                    continue
+                environment = readiness.get('environment')
+                environment = environment if isinstance(environment, Mapping) else {}
+                identities[name] = dict(target=str(item.get('launch_path_override') or item.get('launch_command_override') or readiness.get('executable') or ''),
+                    arguments=tuple(item.get('launch_arguments') or readiness.get('launch_arguments') or ()),
+                    process_executable=str(readiness.get('process_executable') or ''),
+                    process_ini=str(readiness.get('process_ini') or readiness.get('profile_selector') or ''),
+                    wine_prefix=str(readiness.get('wine_prefix') or environment.get('WINEPREFIX') or ''),
+                    local_expected=str(readiness.get('local_expected','true')).lower() not in {'0','false'})
+            scopes[radio_profile_id] = dict(host_override=profile.get('js8_host'),port_override=profile.get('js8_port'),
+                flrig_host_override=profile.get('flrig_host'),flrig_port_override=profile.get('flrig_port'),
+                fldigi_host_override=profile.get('fldigi_host'),fldigi_port_override=profile.get('fldigi_port'),
+                instance_identities=identities)
         self._station_command_launch_monitor_cache = cache
+        self._application_status_scope_cache = scopes
+        self._refresh_application_status_scopes()
+
+    def _refresh_application_status_scopes(self, snapshot=None) -> None:
+        """Queue bounded probes from lifecycle/process publications, never paint."""
+        if snapshot is not None and str(getattr(snapshot, 'scope', '')) != 'legacy_primary':
+            return
+        service = getattr(self, 'dependency_status_service', None)
+        if service is None:
+            return
+        for radio_id, values in tuple(getattr(self, '_application_status_scope_cache', {}).items()):
+            service.status_snapshot(radio_id=radio_id, **dict(values))
 
     def _station_command_health_status_snapshot(self, profile: object | None) -> Mapping[str, object]:
+        service = getattr(self, 'dependency_status_service', None)
+        radio_id = self._station_command_snapshot_id(profile) if profile is not None else 0
+        if service is not None and radio_id:
+            published = service.software_status_snapshot(radio_id=radio_id)
+            if any(info.get('checked_at') for info in published.values()):
+                return published
         # An explicit (even empty) radio-scoped cache is authoritative.  Do
         # not substitute the station/global process cache, which can describe
         # a different radio endpoint and produce cross-radio false warnings.
@@ -12564,6 +12662,15 @@ class MainWindow(QMainWindow):
             return
         menu = QMenu(self)
         menu.addSection(f"Schedule sources · {profile.get('name') or radio_id}")
+        review_action = menu.addAction('Review & enable scheduling…')
+        def open_review():
+            self.open_settings_section('operator_station_setup', radio_id=radio_id, settings_nav_context='main')
+            self.settings_tab._operator_station_setup.set_step('review')
+        review_action.triggered.connect(open_review)
+        disable_action = menu.addAction('Disable scheduling')
+        disable_action.triggered.connect(lambda: self.settings_tab._operator_station_disable_requested(radio_id))
+        menu.addSeparator()
+
         current = self.scheduler.radio_operator_choices(radio_id)
         for key, label in (("routine_schedule_enabled", "Daily / Net schedule"), ("sop_tuning_enabled", "SOP tuning")):
             action = menu.addAction(label)
@@ -15012,7 +15119,7 @@ class MainWindow(QMainWindow):
             return "Plan Builder"
         if screen == "Messages":
             return "Messages"
-        if screen in {"HF Operators", "Local Operators", "Local Reports"}:
+        if screen in {"HF Operators", "Local Operators", "Local Reports", "Call Finder"}:
             return "Operators"
         if screen in {"Resources", "Shortwave"}:
             return "Resources"

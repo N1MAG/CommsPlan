@@ -798,18 +798,8 @@ class VarACStatusClient:
         # A relative name cannot prove a radio's process identity.
         if not target.is_absolute():
             return {"running": None, "checked_monotonic": 0.0}
-        arguments = ()
-        default_ini = ""
-        ini = str(self.settings.get("varac_ini_path", "") or "").strip()
-        from freqinout.core.varac_launch_recipe import _wine_identity
-        default_path = str(target.parent / "VarAC.ini")
-        wine_default = _wine_identity(default_path)
-        default_ini = wine_default[1] if wine_default else default_path
-        if ini and Path(ini).resolve() != (target.parent / "VarAC.ini").resolve():
-            wine_identity = _wine_identity(ini)
-            arguments = (wine_identity[1] if wine_identity else ini,)
-            default_ini = ""
-        return self._software_status.cached_instance_process_state("VarAC", str(target), arguments, default_ini=default_ini)
+        return self._software_status.cached_varac_process_state(
+            str(target), str(self.settings.get("varac_ini_path", "") or ""))
 
     def get_status(self, *, include_db_transfer: bool = True) -> Dict[str, object]:
         log_paths = self._resolve_log_paths()

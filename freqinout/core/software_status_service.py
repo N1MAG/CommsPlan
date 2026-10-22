@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import posixpath
 import re
 import shlex
 import socket
@@ -64,6 +65,11 @@ PROCESS_WRAPPER_TOKENS = {
     "python3.exe",
     "wine",
     "wine64",
+    "wine-preloader",
+    "wine64-preloader",
+    "wine-preloader.exe",
+    "wine64-preloader.exe",
+    "proton",
     "mono",
     "bash",
     "sh",
@@ -112,6 +118,7 @@ class SoftwareStatusService:
     """
 
     # Shared caches across all service instances to avoid duplicated polling work.
+    _shared_instance_evidence = {}
     _shared_proc_snapshot: List[str] = []
     _shared_proc_records: List[Dict[str, object]] = []
     _shared_proc_snapshot_ts: float = 0.0
@@ -333,6 +340,7 @@ class SoftwareStatusService:
                         bool(inspect_all)
                         or direct_match
                         or name in PROCESS_WRAPPER_TOKENS
+                        or name.startswith(("wine-", "wine64-", "proton-"))
                         or not name
                     )
                     process_status = ""
@@ -351,6 +359,12 @@ class SoftwareStatusService:
                             cmdline = proc.cmdline() or ()
                         except Exception:
                             cmdline = ()
+                    cwd = ""
+                    if direct_match or any(self._basename_token(arg) in {"varac", "varac.exe"} for arg in cmdline):
+                        try:
+                            cwd = str(proc.cwd() or "")
+                        except Exception:
+                            pass
                     cmd_paths: List[str] = []
                     cmd_tokens: List[str] = []
                     normalized_cmdline = tuple(str(arg or "").strip() for arg in cmdline[:16])
@@ -383,6 +397,7 @@ class SoftwareStatusService:
                             "cmd_tokens": tuple(cmd_tokens),
                             "cmd_paths": tuple(cmd_paths),
                             "cmdline": normalized_cmdline,
+                            "cwd": cwd,
                         }
                     )
                 except Exception:
@@ -653,10 +668,106 @@ class SoftwareStatusService:
             return True
         return False
 
+    @classmethod
+    def cached_endpoint_identity_conflict(cls, host, port):
+        with cls._shared_proc_lock:
+            observed = cls._shared_instance_evidence.get((str(host).lower(),int(port)))
+            return bool(observed and 0 <= time.monotonic()-observed[0] <= 15 and observed[1].get('identity_conflict'))
+
+    def cached_varac_process_state(
+        self, configured_target: str, ini_path: str = "", wine_prefix: str = "",
+        process_records=None, checked_monotonic=None, max_age_s: float = 30.0,
+    ) -> Dict[str, object]:
+        """Attribute one VarAC instance without probing processes or files.
+
+        Only a concrete drive_<letter> host path establishes a Wine mapping.
+        A native Windows path in Wine without observable prefix evidence stays
+        unknown; neither a wrapper PID nor a basename establishes ownership.
+        """
+        from freqinout.core.varac_launch_recipe import _wine_identity
+        cls = type(self)
+        with cls._shared_proc_lock:
+            records = tuple(cls._shared_proc_records if process_records is None else process_records)
+            stamp = float(cls._shared_proc_snapshot_ts if checked_monotonic is None else checked_monotonic)
+        out = dict(running=None, checked_monotonic=stamp, reason="Could not verify", pids=())
+        if not stamp or not 0 <= time.monotonic() - stamp <= max_age_s:
+            out['reason'] = 'Process observation is stale or unavailable'
+            return out
+        def norm(value):
+            return posixpath.normpath(str(value or '').strip().strip('"').replace('\\', '/')).casefold()
+        target = str(configured_target or '').strip()
+        if not target:
+            return out
+        if self._basename_token(target) not in {'varac', 'varac.exe'}:
+            if posixpath.splitext(target)[1]:
+                out['reason'] = 'Choose the VarAC executable for process attribution; launcher identity is unverified'
+                return out
+            target = target.rstrip('/\\') + '/VarAC.exe'
+        target_mapping = _wine_identity(target) if target.startswith('/') else None
+        prefix = wine_prefix or (target_mapping[0] if target_mapping else '')
+        native_target = target_mapping[1] if target_mapping else target
+        if os.name != 'nt' and re.match(r'^[a-zA-Z]:[\\/]', target) and not prefix:
+            out['reason'] = 'Could not verify Wine prefix for the configured Windows path'
+            return out
+        ini = ini_path or target.replace('\\', '/').rsplit('/', 1)[0] + '/VarAC.ini'
+        ini_mapping = _wine_identity(ini) if ini.startswith('/') else None
+        native_ini = ini_mapping[1] if ini_mapping else ini
+        default_ini = self._basename_token(ini) == 'varac.ini'
+        unknown = False
+        matched = []
+        for record in records:
+            if not self._process_record_is_active(record):
+                continue
+            tokens = (record.get('name',''), record.get('exe',''), *record.get('cmd_tokens', ()))
+            args = tuple(record.get('cmdline', ()))
+            paths = (record.get('exe_path',''), *record.get('cmd_paths', ()), *args)
+            if not any(self._basename_token(token) in {'varac','varac.exe'} for token in (*tokens,*paths)):
+                continue
+            host_paths = [str(path) for path in paths if str(path).startswith('/')]
+            mapped_prefixes = {norm(mapping[0]) for path in (*host_paths, str(record.get('cwd') or ''))
+                               if path and (mapping := _wine_identity(path))}
+            if record.get('wine_prefix'):
+                mapped_prefixes.add(norm(record['wine_prefix']))
+            exact_host = any(norm(path) == norm(target) for path in host_paths)
+            if prefix and mapped_prefixes and norm(prefix) not in mapped_prefixes:
+                continue
+            native_matches = any(norm(path) == norm(native_target) for path in paths if path)
+            if not exact_host and native_matches and prefix and norm(prefix) not in mapped_prefixes:
+                unknown = True
+                continue
+            if not exact_host and not native_matches:
+                if not host_paths or not args:
+                    unknown = True
+                continue
+            if not args:
+                unknown = True
+                continue
+            selectors = [str(arg) for arg in args if self._basename_token(arg).endswith('.ini')]
+            if selectors:
+                expected = {norm(ini), norm(native_ini)}
+                if not any(norm(arg) in expected for arg in selectors):
+                    continue
+            elif not default_ini:
+                continue
+            pid = int(record.get('pid') or 0)
+            if pid <= 0:
+                unknown = True
+            else:
+                matched.append(pid)
+        pids = tuple(sorted(set(matched)))
+        out['pids'] = pids
+        if len(pids) == 1 and not unknown:
+            out.update(running=True, reason='Configured VarAC instance is running')
+        elif len(pids) > 1 or unknown:
+            out['reason'] = 'VarAC running — setup unverified'
+        else:
+            out.update(running=False, reason='Configured VarAC instance is not running')
+        return out
+
     def cached_instance_process_state(
         self, program_name: str, configured_target: str,
         expected_arguments: Sequence[object] = (), *, max_age_s: float = 30.0,
-        default_ini: str = "",
+        default_ini: str = "", excluded_options: Sequence[object] = (),
     ) -> Dict[str, object]:
         """Bounded attribution from the existing inventory; never walk processes.
 
@@ -686,8 +797,10 @@ class SoftwareStatusService:
             paths = (record.get("exe_path", ""), *record.get("cmd_paths", ()))
             if (self._process_record_is_active(record)
                     and any(self._matches_target_process_name(str(token), family) for token in tokens)
-                    and any(self._normalized_process_argument(path) == target for path in paths if path)
-                    and self._process_arguments_match(record.get("cmdline", ()), expected_arguments)):
+                    and any(self._normalized_process_argument(path) == target or
+                            (target.endswith('.app') and self._normalized_process_argument(path).startswith(target + '/')) for path in paths if path)
+                    and self._process_arguments_match(record.get("cmdline", ()), expected_arguments)
+                    and self._process_arguments_exclude_options(record.get('cmdline', ()), excluded_options)):
                 matches.append(record)
         pids = {record.get("pid") for record in matches}
         if len(pids) == 1 and None not in pids and 0 not in pids:
@@ -1472,6 +1585,7 @@ class SoftwareStatusService:
         control_probe_only: bool = False,
     ) -> Dict[str, Dict[str, object]]:
         identities = instance_identities if isinstance(instance_identities, Mapping) else {}
+        process_observations = {}
         active_control_via = (
             str(control_backend or "").strip().upper()
             or self._settings_text("control_via", "FLRig").strip().upper()
@@ -1486,6 +1600,9 @@ class SoftwareStatusService:
                 if not isinstance(arguments, (list, tuple)):
                     arguments = ()
                 if target or arguments:
+                    process_observations[program_name] = self.cached_instance_process_state(
+                        program_name,target,arguments,
+                        excluded_options=('-r','--rig-name') if program_name == 'JS8Call' and not arguments else ())
                     excluded_options: tuple[str, ...] = ()
                     if program_name == "JS8Call" and not arguments:
                         # The native default JS8Call namespace is selected by
@@ -1601,6 +1718,31 @@ class SoftwareStatusService:
             health=js8_health,
         )
 
+        js8_identity = identities.get('JS8Call') or {}
+        local_expected = js8_identity.get('local_expected', self._is_loopback_host(js8_host))
+        if isinstance(local_expected, str):
+            local_expected = local_expected.lower() not in {'false','0'}
+        process_state = process_observations.get('JS8Call', {}).get('running')
+        if not js8_identity:
+            # Family discovery cannot establish this endpoint's native profile.
+            process_state = None
+        conflict = bool(js8_api_ok and process_state is False and local_expected)
+        evidence = out['JS8Call_API']
+        evidence.update(process_running=process_state, local_expected=bool(local_expected),
+                        identity_conflict=conflict, value='needs_review' if conflict else 'connected' if js8_api_ok else 'running' if process_state is True else 'unknown')
+        if conflict:
+            evidence.update(state='warn',tooltip='Status needs review: configured API is connected but the expected local profile was not observed.')
+        elif js8_api_ok:
+            evidence['tooltip'] = ('Started elsewhere · Connected' if not local_expected else 'Connected · local process/profile unverified' if process_state is None else 'Running · Connected') + f' · {self._format_endpoint(js8_host,js8_port)}'
+        elif process_state is None and not running_js8:
+            evidence.update(state='unknown',tooltip='Could not verify the configured process/profile; API is not connected.')
+        with type(self)._shared_proc_lock:
+            key = (str(js8_host).lower(),int(js8_port))
+            type(self)._shared_instance_evidence[key] = (time.monotonic(),dict(evidence))
+            if len(type(self)._shared_instance_evidence) > 64:
+                oldest = min(type(self)._shared_instance_evidence,key=lambda entry:type(self)._shared_instance_evidence[entry][0])
+                type(self)._shared_instance_evidence.pop(oldest,None)
+
         for key in STATUS_KEYS:
             if key == "JS8Call_API":
                 continue
@@ -1641,6 +1783,19 @@ class SoftwareStatusService:
                     process_running=running_fldigi,
                     health=self._health_snapshot_for(fldigi_key),
                 )
+                continue
+            if key == 'VarAC' and identities.get('VarAC'):
+                identity = identities['VarAC']
+                target = identity.get('process_executable') or identity.get('target') or ''
+                arguments = identity.get('arguments') or ()
+                if self._basename_token(target) != 'varac.exe':
+                    target = next((str(arg) for arg in arguments if self._basename_token(arg) == 'varac.exe'), target)
+                observed = self.cached_varac_process_state(str(target),
+                    str(identity.get('process_ini') or ''), str(identity.get('wine_prefix') or ''))
+                running = observed['running']
+                out[key] = {**observed, 'state':'ok' if running is True else 'unknown' if running is None else 'idle',
+                            'tooltip': observed['reason'], 'process_running':running,
+                            'value':'running' if running is True else 'unknown' if running is None else 'not_running'}
                 continue
             running = _running(key)
             tooltip = "Running" if running else "Not running"

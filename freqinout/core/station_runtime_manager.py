@@ -796,16 +796,20 @@ class DeviceRuntime:
             varac_ini_path = str(self.profile.get("varac_ini_path", "") or "").strip()
             varac_launch_cmd = str(self.profile.get("launch_cmd", "") or "").strip()
             varac_configured = any((varac_install_path, varac_db_path, varac_ini_path, varac_launch_cmd))
-            running_varac = False
+            running_varac = None
+            varac_process_reason = "Could not verify the configured VarAC instance"
             if self.status_service is not None and varac_configured:
                 try:
-                    running_varac = bool(
-                        self.status_service.cached_program_is_running("VarAC")
-                        if cache_only and hasattr(self.status_service, "cached_program_is_running")
-                        else self.status_service.program_is_running("VarAC")
-                    )
+                    target = varac_install_path
+                    status_probe = getattr(self.status_service, 'cached_varac_process_state', None)
+                    if status_probe is None:
+                        from freqinout.core.software_status_service import SoftwareStatusService
+                        status_probe = SoftwareStatusService(getattr(self, "settings", {})).cached_varac_process_state
+                    observed = status_probe(target, varac_ini_path)
+                    running_varac = observed['running']
+                    varac_process_reason = observed['reason']
                 except Exception:
-                    running_varac = False
+                    pass
             raw_varac_status = (
                 self.varac_status_client.get_status()
                 if self.varac_status_client is not None and varac_configured and not cache_only
@@ -853,8 +857,9 @@ class DeviceRuntime:
                 else:
                     varac_info = {
                         "state": "idle",
-                        "tooltip": "VarAC configured for this device, but not running.",
-                        "running": False,
+                        "tooltip": varac_process_reason,
+                        "running": running_varac,
+                        "process_running": running_varac,
                         "busy": False,
                         "waiting_for_frequency": False,
                     }

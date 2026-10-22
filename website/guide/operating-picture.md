@@ -1,6 +1,6 @@
 ---
 title: Operating Picture
-description: Understand CommsPlan's Message Intelligence, FIO Spotter, CommStat, plans, schedules, Messages, Map, and Local Mesh workflows.
+description: Understand CommsPlan's Message Intelligence, Spotter forms, Call Finder, plans, schedules, Messages, Map, and Local Mesh workflows.
 ---
 
 # The CommsPlan operating picture
@@ -16,21 +16,26 @@ architecture is the base application, while a one-radio station remains a
 normal supported setup. The station control context stays visible while the
 active workspace explains what is happening and why.
 
+The Station Setup and scheduling review details on this page describe the
+CommsPlan 2.0.6 workflow. Check the [GitHub Releases page](https://github.com/N1MAG/CommsPlan/releases/latest)
+for currently available installation packages and release-specific
+instructions. The screenshots below come from an earlier release and illustrate
+operating concepts; the interface shown may differ from 2.0.6.
+
 ![CommsPlan Ops Center showing radio profiles, schedules, traffic, and operational awareness](/ops-center.png)
 
 *Demonstration station: identities are scrambled and exercise messages are
 fictional. Radio readbacks and the green Mesh connection status are simulated
 for illustration; no live radio or Mesh connection was used.*
 
-## Main, Radios, and station services
+## Station setup and radio services
 
-**Main** holds station identity, operating groups, defaults, and station-wide
-policies. **Radios** gives each radio its own application identity, profile,
+**Station Setup** holds the saved station checklist and review route. Its
+radio-scoped editors give each radio its own application identity, profile,
 ports, paths, message locations, Frequency Plan assignment, and launch policy.
-Guided Add Radio and Software Administration use the same saved identities, so
-the review shown before saving matches the runtime state afterward.
+Review the saved setup after changes; suggestions do not replace operator review.
 
-Launch Control keeps three decisions separate:
+The radio's launch settings keep three decisions separate:
 
 - whether CommsPlan monitors an application;
 - whether it starts that application automatically; and
@@ -44,14 +49,14 @@ software, schedule, or hold state from being mistaken for another's.
 
 <a id="message-intelligence"></a>
 
-Message Intelligence is the shared interpretation layer for Inbox, FIO Spotter,
+Message Intelligence is the shared interpretation layer for Inbox, CommsPlan Spotter,
 Ops Center, and Map. Supported source records are projected into one canonical
 station message library with stable source identity and external references.
 The projection can add bounded summaries, topics, location cues, status,
 actionability, and routing signals while retaining the original message and
 its source, radio, endpoint, receive path, or import provenance.
 
-The source label remains meaningful. JS8Call, FIO Spotter, CommStat, FLMsg,
+The source label remains meaningful. JS8Call, CommsPlan Spotter, CommStat, FLMsg,
 FLAmp, VarAC, BBS, MeshCore, and Meshtastic records can share the station
 library without pretending that their transports have the same capabilities.
 Historical or imported data remains identifiable as imported, and a derived
@@ -62,14 +67,15 @@ summary does not replace the underlying evidence.
 *Demonstration inbox: the displayed traffic is fictional exercise data with
 scrambled identities and no private operator messages.*
 
-## FIO Spotter and CommStat
+## CommsPlan Spotter and CommStat
 
-<a id="fiospotter-and-commstat"></a>
+<a id="commsplan-spotter-and-commstat"></a>
 
-The built-in **FIO Spotter** service is branded **CommsPlan Spotter** in the
-CommsPlan interface. It owns station-wide watches, JS8 Expect responses, access
-policies, forms, and reviewed imports. Messages remains the complete traffic
-triage surface; FIO Spotter provides focused administration and automation.
+The built-in **CommsPlan Spotter** service owns station-wide watches, JS8 Expect
+responses, access policies, forms, and reviewed imports. Its Forms Library is
+shared with Compose and Net Control. Review MCF files before adding them to the
+station library; bundled forms remain available and a custom folder is optional.
+Messages remains the complete traffic triage surface.
 
 The optional external **JS8Spotter** application is a separate companion with
 its own installation, profile, and launch identity. CommsPlan can be configured
@@ -126,15 +132,24 @@ payload, and final action remain visible before a guarded send. Native source
 records, read state, archive state, and source references remain separate from
 station-level watches and publication services.
 
-## Offline Map
+## Map and Call Finder
 
 <a id="offline-map"></a>
 
 Map uses bundled geography and local station data, so it remains useful without
 an online tile account, API key, or tile service. Layers can show stations,
 paths, traffic, regional intelligence, RF planning, schedule context, saved
-pins, peer schedules, and MeshCore/Meshtastic nodes or positions. Select an item
-to inspect its source, age, status, and related inbox evidence.
+pins, peer schedules, and MeshCore/Meshtastic nodes or positions. The **All
+countries** scope supports worldwide evidence. Map controls are organized into
+Layers, Filters, Display, Paths, and Planning categories. Select an item to
+inspect its source, age, status, and related inbox evidence.
+
+Call Finder can search locally loaded FCC US amateur and GMRS licenses and
+Canadian ISED amateur callsigns. It also supports postal reference data for
+approximate grids. License references can be reviewed on the map using the
+available location estimate; a postal-derived point is not proof of a current
+operating location. See [What's new in 2.0.6](/guide/whats-new) for dataset
+updates and source details.
 
 Map is decision support. A path, peer schedule, message, or mesh position is
 evidence with a source and age; it is not a guarantee of current propagation,

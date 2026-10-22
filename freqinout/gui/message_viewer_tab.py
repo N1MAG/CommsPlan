@@ -387,14 +387,14 @@ from freqinout.core.js8_spotter_forms import (
     SPOTTER_COMMENTS_KEY,
     SPOTTER_COMMENTS_MAX_LENGTH,
     SpotterFormField,
-    discover_spotter_forms,
+    choose_effective_spotter_forms_catalog,
+    discover_effective_spotter_forms,
     factory_mapping_for_form,
     form_codes_enabled_for,
     form_id_enabled,
     normalize_form_code,
     parse_spotter_form_fields,
     parse_spotter_form_guidance,
-    resolve_spotter_forms_dir,
     spotter_operator_autofill_kind,
 )
 from freqinout.core.js8_spotter_decode import (
@@ -1162,10 +1162,12 @@ class _ComposeCatalogDiscoveryWorker(QObject):
                             problems.append(f"{template.path.name}: {exc}")
             else:
                 forms = []
-                for candidate in self._spotter_candidates:
-                    forms = discover_spotter_forms(candidate)
-                    if forms:
-                        break
+                if self._spotter_candidates:
+                    # The caller has already applied global > legacy-radio >
+                    # bundled precedence. Discovery is the worker boundary;
+                    # it never probes alternate sources after an explicit
+                    # choice is missing or empty.
+                    forms = discover_effective_spotter_forms(self._spotter_candidates[0])
                 entries.append(
                     {
                         "kind": "spotter",
@@ -8852,17 +8854,14 @@ class MessageViewerTab(QWidget):
 
     def _compose_spotter_forms_path(self, target: Optional[ComposeRadioTarget] = None) -> str:
         radio = target or self._selected_compose_radio_target()
+        legacy = ""
         if radio is not None:
-            configured = self._spotter_forms_dir_usable(
+            legacy = (
                 self._compose_profile_text(radio.profile, "js8_forms_path")
                 or self._compose_profile_text(radio.profile, "forms_path")
             )
-            if configured:
-                return configured
-        configured = self._spotter_forms_dir_usable(
-            self.settings.get("js8_forms_path", self.forms_path)
-        )
-        return str(resolve_spotter_forms_dir(configured))
+        global_path = str(self.settings.get("js8_forms_path", self.forms_path) or "").strip()
+        return choose_effective_spotter_forms_catalog(global_path, legacy).path
 
     def _clear_spotter_form_caches(self) -> None:
         self._form_cache.clear()
@@ -10344,11 +10343,14 @@ class MessageViewerTab(QWidget):
 
         radio = self._selected_compose_radio_target()
         profile = radio.profile if radio is not None else {}
-        spotter_candidates = [
-            self._compose_profile_text(profile, "js8_forms_path"),
-            self._compose_profile_text(profile, "forms_path"),
-            str(self.settings.get("js8_forms_path", self.forms_path) or "").strip(),
-        ]
+        legacy_path = (
+            self._compose_profile_text(profile, "js8_forms_path")
+            or self._compose_profile_text(profile, "forms_path")
+        )
+        global_path = str(self.settings.get("js8_forms_path", self.forms_path) or "").strip()
+        # Pass one already chosen source to the worker.  It must not fall back
+        # to another radio or bundled catalog after an explicit global choice.
+        spotter_candidates = [choose_effective_spotter_forms_catalog(global_path, legacy_path).path]
         settings_snapshot = {
             "nbems_custom_forms_path": self.settings.get("nbems_custom_forms_path", ""),
             "message_paths": self.settings.get("message_paths", {}) or {},

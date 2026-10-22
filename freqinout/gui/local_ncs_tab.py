@@ -216,6 +216,18 @@ class LocalNCSTab(QWidget):
         self.lookup_edit = QLineEdit()
         self.lookup_edit.setPlaceholderText("CALL / Name / State (or callsign only)")
         lookup_row.addWidget(self.lookup_edit, stretch=1)
+        from freqinout.gui.fcc_identity_lookup import NcsIdentityPrefetch
+        self._fcc_identity = NcsIdentityPrefetch(
+            self, self.lookup_edit, self._parse_lookup_line, known=lambda: self._lookup_by_callsign,
+        )
+        from freqinout.gui.call_finder_dialog import open_ncs_draft_picker
+        self.fcc_lookup_btn = QPushButton("FCC lookup…")
+        self.fcc_lookup_btn.setToolTip("Review offline FCC licensee details for this draft; does not add a check-in.")
+        self.fcc_lookup_btn.clicked.connect(lambda: open_ncs_draft_picker(
+            self, self.lookup_edit, self._parse_lookup_line, self._format_entry,
+            lambda: self._lookup_by_callsign,
+        ))
+        lookup_row.addWidget(self.fcc_lookup_btn)
         self.add_checkin_btn = QPushButton("Add Check-in")
         self.add_checkin_btn.setFocusPolicy(Qt.StrongFocus)
         lookup_row.addWidget(self.add_checkin_btn)
@@ -800,6 +812,7 @@ class LocalNCSTab(QWidget):
         known_first = str(known.get("first_name", "")).strip()
         known_last = str(known.get("last_name", "")).strip()
         known_name = str(known.get("name", "")).strip()
+        name, state = self._fcc_identity.fill(cs, name, state, known)
         name_out = name.strip() or known_name or " ".join([p for p in (known_first, known_last) if p]).strip()
         first_name_out = known_first
         last_name_out = known_last

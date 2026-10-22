@@ -10,6 +10,7 @@ include build_executable.py
 include installer.iss
 include install_freqinout.py
 include install-commsplan.sh
+include install-commsplan.py
 include install_FreqInOut_linux.sh
 include uninstall_FreqInOut_linux.sh
 include start-freqinout.sh

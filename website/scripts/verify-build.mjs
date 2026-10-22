@@ -10,6 +10,7 @@ const expectedHtmlPages = [
   "install/index.html",
   "guide/first-radio.html",
   "guide/operating-picture.html",
+  "guide/whats-new.html",
   "integrations/mesh.html",
   "support.html",
 ];
@@ -19,6 +20,7 @@ const forbiddenText = [
   "private-testing",
   "production-release",
 ];
+const legacyProductName = /freq(?:in)?out/i;
 const htmlFiles = [];
 const allFiles = [];
 const failures = [];
@@ -89,6 +91,9 @@ for (const actual of actualHtmlPages) {
 for (const file of allFiles) {
   if (!/\.(?:html|js|css|json|txt|xml)$/i.test(file)) continue;
   const source = fs.readFileSync(file, "utf8");
+  if (legacyProductName.test(source)) {
+    failures.push(`${path.relative(siteRoot, file)} contains a retired product name`);
+  }
   for (const forbidden of forbiddenText) {
     if (source.includes(forbidden)) {
       failures.push(

@@ -1086,6 +1086,7 @@ class SoftwareInstanceAssistant(QWidget):
         radio_role: str = "tx_rx",
         initial_draft: Mapping[str, Any] | SoftwareInstanceDraft | None = None,
         editing_existing: bool = False,
+        replacement_requested: bool = False,
         launch_recipe_resolution: GuidedLaunchRecipeResolution | Mapping[str, Any] | None = None,
         varac_native_presentation: VarACNativePresentation | Mapping[str, Any] | None = None,
         managed_root: str = "",
@@ -1109,6 +1110,12 @@ class SoftwareInstanceAssistant(QWidget):
         self._varac_clusters = tuple(dict(row) for row in varac_clusters if isinstance(row, Mapping))
         self._selected_radio_id = _int(selected_radio_id)
         self._editing_existing = bool(editing_existing)
+        # The named Replace action is already explicit operator intent, scoped
+        # to the original radio/assignment. It cannot authorize another target.
+        self._replacement_requested = bool(replacement_requested or editing_existing)
+        self._replacement_radio_id = self._selected_radio_id
+        self._replacement_family_key = requested_family
+        self._replacement_target_instance_id: int | None = None
         self._unsaved_owner_key = _text(unsaved_owner_key)
         self._assistant_draft_owner_key = self._unsaved_owner_key or f"assistant-{uuid.uuid4().hex}"
         self._unsaved_radio_label = _text(unsaved_radio_label) or "Unsaved radio draft"
@@ -2439,7 +2446,8 @@ class SoftwareInstanceAssistant(QWidget):
                 self.family_combo.blockSignals(blocked)
         title, detail = _FAMILY_DETAILS[normalized]
         if hasattr(self, "title_label"):
-            self.title_label.setText(f"Add {title}")
+            action = "Replace" if self._replacement_requested else "Add"
+            self.title_label.setText(f"{action} {title}")
             self.guidance_label.setText(
                 f"Set up one distinct {title.lower()} for the selected radio. "
                 + detail
@@ -2674,14 +2682,28 @@ class SoftwareInstanceAssistant(QWidget):
             self.replacement_checkbox.setEnabled(False)
             self.replacement_banner.setText("Choose a radio before entering instance data.")
         elif replacement is not None:
+            replacement_id = _int(replacement.get("id") or replacement.get("instance_id"))
+            requested_target = (self._replacement_requested and radio_id == self._replacement_radio_id
+                                and self._family_key == self._replacement_family_key)
+            if requested_target and self._replacement_target_instance_id is None:
+                self._replacement_target_instance_id = replacement_id
+            explicit_intent = bool(requested_target and replacement_id is not None
+                                   and replacement_id == self._replacement_target_instance_id)
+            if explicit_intent:
+                self._replacement_confirmed = True
+                blocked = self.replacement_checkbox.blockSignals(True)
+                self.replacement_checkbox.setChecked(True)
+                self.replacement_checkbox.blockSignals(blocked)
             name = _text(replacement.get("name") or replacement.get("instance_name")) or "existing instance"
             self.radio_guidance_label.setText(
                 "This radio is already assigned to this software family. "
-                "Choose replacement mode before entering instance data; the existing record is retained."
+                + ("Replacement selected; the existing record is retained until Save."
+                   if explicit_intent else
+                   "Choose replacement mode before entering instance data; the existing record is retained.")
             )
             self.replacement_checkbox.setText(f"Replace the existing instance assigned to {self.radio_combo.currentText().split(' — ', 1)[0]}")
-            self.replacement_checkbox.setVisible(True)
-            self.replacement_checkbox.setEnabled(True)
+            self.replacement_checkbox.setVisible(not explicit_intent)
+            self.replacement_checkbox.setEnabled(not explicit_intent)
             mode = "active" if self._replacement_confirmed else "required"
             self.replacement_banner.setText(
                 f"Replacement mode {mode}: {name} is currently assigned. "

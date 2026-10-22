@@ -552,6 +552,23 @@ def upsert_operator(
     return get_operator(cs)
 
 
+def insert_reference_operator(row: Dict[str, Any]) -> bool:
+    """Explicit reviewed reference import; never overwrite or fabricate activity."""
+    ensure_tables()
+    with sqlite3.connect(_db_path()) as conn:
+        cursor = conn.execute(
+            """INSERT OR IGNORE INTO local_operator_checkins
+               (callsign,first_name,last_name,name,city,state,category,notes,
+                sitrep_status,first_seen_utc,last_seen_utc,checkin_count)
+               VALUES (?,?,?,?,?,?,?,?,?,'','',0)""",
+            (_norm_callsign(row["callsign"]), row.get("first_name", ""), row.get("last_name", ""),
+             _compose_name(row.get("first_name", ""), row.get("last_name", "")), row.get("city", ""),
+             str(row.get("state", "")).upper(), row.get("category", ""), row.get("notes", ""),
+             _norm_status(row.get("sitrep_status", "GREEN"))),
+        )
+        return cursor.rowcount == 1
+
+
 def delete_operators(callsigns: List[str]) -> int:
     keys = sorted({_norm_callsign(cs) for cs in callsigns if _norm_callsign(cs)})
     if not keys:

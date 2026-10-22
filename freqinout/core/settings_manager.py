@@ -225,6 +225,8 @@ class SettingsManager:
         if isinstance(groups, list) and all(isinstance(row, dict) for row in groups):
             loaded["operating_groups"] = ensure_operating_group_frequency_keys(groups)
         self._data = loaded
+        from freqinout.core.station_bbs_state import load_station_bbs_catalog
+        self._station_bbs_catalog = load_station_bbs_catalog(self._conn)
 
     # ---------- public persistence API ---------- #
 
@@ -284,6 +286,10 @@ class SettingsManager:
 
     def get(self, key: str, default: Any = None) -> Any:
         self._assert_thread_affinity()
+        from freqinout.core.station_bbs_state import BBS_CATALOG_SETTINGS_KEYS, project_station_bbs_settings
+        catalog = getattr(self, '_station_bbs_catalog', None)
+        if catalog is not None and key in BBS_CATALOG_SETTINGS_KEYS:
+            return project_station_bbs_settings({}, catalog).get(key, default)
         if key == "timezone" and not self._runtime_worker:
             self._sync_system_timezone()
         return self._data.get(key, default)
@@ -295,25 +301,17 @@ class SettingsManager:
         self._assert_thread_affinity()
         if key == "operating_groups" and isinstance(value, list) and all(isinstance(row, dict) for row in value):
             value = ensure_operating_group_frequency_keys(value)
-        self._data[key] = value
+        candidate = {**self._data, key: value}
         try:
             with self._conn:
                 self._conn.execute(
                     "INSERT OR REPLACE INTO kv(key,value) VALUES(?,?)",
                     (key, json.dumps(value)),
                 )
-                try:
-                    mirror_legacy_settings_into_runtime_active_device(
-                        self._conn,
-                        self._data,
-                        keys_changed={key},
-                    )
-                except Exception as mirror_exc:
-                    log.error(
-                        "SettingsManager: failed to mirror key %s into multi-radio store: %s",
-                        key,
-                        mirror_exc,
-                    )
+                mirror_legacy_settings_into_runtime_active_device(
+                    self._conn, candidate, keys_changed={key},
+                )
+            self._data[key] = value
         except Exception as e:
             log.error("SettingsManager: failed to write key %s: %s", key, e)
             raise
@@ -327,35 +325,35 @@ class SettingsManager:
         groups = values.get("operating_groups")
         if isinstance(groups, list) and all(isinstance(row, dict) for row in groups):
             values["operating_groups"] = ensure_operating_group_frequency_keys(groups)
-        self._data.update(values)
+        candidate = {**self._data, **values}
         try:
             payload = [(k, json.dumps(v)) for k, v in values.items()]
             with self._conn:
                 self._conn.executemany(
                     "INSERT OR REPLACE INTO kv(key,value) VALUES(?,?)", payload
                 )
-                try:
-                    mirror_legacy_settings_into_runtime_active_device(
-                        self._conn,
-                        self._data,
-                        keys_changed=set(values.keys()),
-                    )
-                except Exception as mirror_exc:
-                    log.error(
-                        "SettingsManager: failed to mirror batch settings into multi-radio store: %s",
-                        mirror_exc,
-                    )
+                mirror_legacy_settings_into_runtime_active_device(
+                    self._conn, candidate, keys_changed=set(values),
+                )
+            self._data.update(values)
         except Exception as e:
             log.error("SettingsManager: failed to batch write: %s", e)
             raise
 
     def all(self) -> Dict[str, Any]:
         """
-        Return the in-memory dict. Callers that mutate this directly should not
-        rely on it persisting unless they call set/set_many.
+        Return the cached effective settings view. Use set/set_many to update
+        persisted operator values; canonical BBS metadata is a read projection.
         """
         self._assert_thread_affinity()
-        return self._data
+        from freqinout.core.station_bbs_state import project_station_bbs_settings
+        return project_station_bbs_settings(self._data, getattr(self, '_station_bbs_catalog', None))
+
+    def publish_station_bbs_catalog(self, snapshot) -> None:
+        """Accept detached worker-published metadata without UI-thread I/O."""
+        from copy import deepcopy
+        self._assert_thread_affinity()
+        self._station_bbs_catalog = deepcopy(snapshot)
 
     def close(self) -> None:
         conn = self._conn

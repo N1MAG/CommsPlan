@@ -22,6 +22,8 @@ from freqinout.core.sqlite_utils import connect_sqlite_readonly
 
 # Values only: no settings manager, Qt object, connection, executor or host.
 INPUT_FIELDS = (
+    "_map_geographic_country",
+    "_map_user_camera_owned",
     "_app_active",
     "_initial_data_loaded",
     "_last_map_auto_fit_sig",
@@ -468,7 +470,8 @@ class MapReadEngine:
                 budget.raise_if_failed()
                 if ctx.payload is None:
                     raise RuntimeError('Map builder returned no projection')
-                projection = StationsMapTab._serialize_map_projection_snapshot(request.generation, ctx.payload)
+                scoped_payload = dict(ctx.payload, _geographic_country=request.state.get('_map_geographic_country', ''))
+                projection = StationsMapTab._serialize_map_projection_snapshot(request.generation, scoped_payload)
                 budget.raise_if_failed()
                 if projection.error:
                     raise RuntimeError(projection.error)

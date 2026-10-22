@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.0.6]
+- Release status: Approved for public publication. Download availability and package checks are reported on the CommsPlan Releases page; physical-radio and platform qualification limits remain noted below.
+- Added: Offline Call Finder searches US Amateur, GMRS, and Canadian amateur callsign references, with source details, mailing-postal grid estimates, reviewed Add to Operators, and draft-only NCS lookup. Update all downloads and imports the five source datasets one at a time, stopping on failure or cancellation.
+- Changed: Configuration now uses a saved-setup checklist and scoped radio/application editors, with explicit launch responsibility, retained drafts, atomic save/readback checks, and consistent configuration status explanations. BBS setup reads the station catalog rather than creating competing library state.
+- Changed: Automatic scheduling requires per-radio Review & enable approval of the saved setup. Disable immediately fences further automatic commands; changed command-affecting inputs require review again. Radio, application identity, endpoint and RF safety checks remain enforced.
+- Added: The station CP Forms Library supports reviewed imports, duplicate protection, bounded validation and shared catalog selection across Spotter, Compose and Net Control.
+- Changed: The offline map now includes worldwide country geography, category-based tools, geographic Country filtering, saved starting areas, a selection inspector and optional license-reference searches with explicit local index preparation and mailing-location caveats.
+- Fixed: Mainland geometry remains visible in the bundled map, recovered JS8 endpoints clear obsolete health warnings, and saved Radio/Software status uses consistent scoped checks and correction routes.
+- Fixed: Map Paths exposes Off, My Station, and All in the main filter strip. All includes links between other stations within current filters, and layer off/on retains the chosen scope.
+- Changed: The Help guide, README and website cover these workflows under the CommsPlan name. A branded cross-platform source-installer entry point delegates to the existing verified installer.
+- Known qualification gaps: A recorded macOS/PySide Compose comments crash remains unresolved. Native packages undergo automated build, startup, install/upgrade and rollback checks; these checks do not establish physical-radio or every operating-system/display configuration. An earlier combined-run world-grid test failed despite passing separately; the fresh combined release check now passes all 192 tests, including that grid test, although the earlier cause is unconfirmed.
+
 ## [2.0.5]
 - Release note: This entry covers the CommsPlan 2.0.5 scope. Native package upgrade, uninstall, recovery, and hardware behavior remain subject to their platform procedures and operator checks; the complete Plan Builder input catalog remains deferred beyond 2.0.5.
 - Changed: The CommsPlan brand retains FreqInOut profile roots, `freqinout.db` and `freqinout_nets.db`, compatibility commands, the Windows `AppId=FreqInOut`, the Linux package identity, and the historical macOS bundle identifier. Migration, profile-copy/recovery, and Linux source-checkout relocation workflows preserve explicit paths and rollback artifacts.

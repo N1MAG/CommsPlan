@@ -705,7 +705,7 @@ class StationsMapTab(QWidget):
         self.stations: List[StationPoint] = []
         self.show_callsigns = False
         self.show_cities = False
-        self.show_states = False
+        self.show_states = True
         self.show_station_markers = True
         self.show_link_paths = False
         self.show_grids = False
@@ -926,6 +926,13 @@ class StationsMapTab(QWidget):
         self._map_geometry_timer.setInterval(0)
         self._map_geometry_timer.timeout.connect(self._flush_map_geometry_reflow)
 
+        self._map_geographic_country = ""
+        self._map_country_catalog = ()
+        from freqinout.gui.map_camera_preferences import validated_view
+        saved_start = validated_view(self.settings.get("map_starting_view", None)) if self.settings else None
+        self._map_user_camera_owned = bool(saved_start)
+        if saved_start:
+            self._last_map_view = saved_start
         self._build_ui()
         self._refresh_group_filter_options()
         self._refresh_region_filter_options()
@@ -965,7 +972,7 @@ class StationsMapTab(QWidget):
 
         apply_chk(self.show_calls_chk, "show_callsigns", "map_show_callsigns", False)
         apply_chk(self.show_regions_chk, "show_regions", "map_show_regions", False)
-        apply_chk(self.show_states_chk, "show_states", "map_show_states", False)
+        apply_chk(self.show_states_chk, "show_states", "map_show_states", True)
         apply_chk(self.show_cities_chk, "show_cities", "map_show_cities", False)
         apply_chk(self.show_grid_labels_chk, "show_grids", "map_show_grids", False)
         apply_chk(self.map_stations_chk, "show_station_markers", "map_show_station_markers", True)
@@ -1656,6 +1663,12 @@ class StationsMapTab(QWidget):
         if self._map_visible == is_visible:
             return
         self._map_visible = is_visible
+        references = getattr(self,"_license_reference_presenter",None)
+        if references is not None:
+            references.set_active(self._map_visible and self._app_active)
+        geography_lane = getattr(self,"_world_geography_lane",None)
+        if not is_visible and geography_lane is not None:
+            geography_lane.invalidate()
         if not self._map_visible:
             if self._js8_timer is not None:
                 self._js8_timer.stop()
@@ -1685,6 +1698,9 @@ class StationsMapTab(QWidget):
 
     def set_app_active(self, active: bool) -> None:
         self._app_active = bool(active)
+        references = getattr(self,"_license_reference_presenter",None)
+        if references is not None:
+            references.set_active(self._map_visible and self._app_active)
         renderer = getattr(self, "_native_map_renderer", None)
         if renderer is not None:
             renderer.set_map_visible(self._map_visible)
@@ -1989,7 +2005,8 @@ class StationsMapTab(QWidget):
             except Exception:
                 label = ""
         self._map_recency_label = label or "Any"
-        button.setText(self._map_recency_display_label(label or "Any"))
+        activity_label = label or "Any"
+        button.setText(activity_label)
         button.setToolTip("Selected activity age. Observed paths use at most the last 24h; other layers retain this age.")
 
     def _build_map_since_menu(self) -> None:
@@ -2153,6 +2170,12 @@ class StationsMapTab(QWidget):
 
     def shutdown(self) -> None:
         self._is_shutting_down = True
+        references = getattr(self,"_license_reference_presenter",None)
+        if references is not None:
+            references.dispose()
+        geography_lane = getattr(self,"_world_geography_lane",None)
+        if geography_lane is not None:
+            geography_lane.shutdown()
         for lane in (self._map_read_lane, self._map_inspector_lane):
             if lane is not None:
                 lane.shutdown()
@@ -2237,6 +2260,9 @@ class StationsMapTab(QWidget):
         else:
             self._active_theme_override = resolve_theme(self.settings)
         theme = self._theme_snapshot()
+        reference_panel = getattr(self,"_license_reference_panel",None)
+        if reference_panel is not None:
+            reference_panel.apply_theme(theme)
         renderer = getattr(self, "_native_map_renderer", None)
         if renderer is not None:
             renderer.apply_theme(theme)
@@ -2261,6 +2287,7 @@ class StationsMapTab(QWidget):
         self._sync_map_control_button_widths()
         self._update_splitter_indicator_state(theme=theme)
         self._reflow_map_filter_bar()
+        StationsMapTab._coordinate_map_panels(self)
         try:
             if self.prop_overlay_enabled:
                 target_label, best_band, best_score = getattr(
@@ -2344,7 +2371,7 @@ class StationsMapTab(QWidget):
         top_row.addWidget(self._show_fio_button, alignment=Qt.AlignLeft)
         self._controls_button = QPushButton("Advanced Map Tools")
         self._controls_button.setToolTip("Refine evidence, inspect paths, adjust basemap detail, and manage planning pins.")
-        self._controls_button.setVisible(True)
+        self._controls_button.setVisible(False)
         self._controls_button.clicked.connect(self._toggle_controls_drawer)
         top_row.addWidget(self._controls_button, alignment=Qt.AlignLeft)
         self._help_button = QPushButton("Help")
@@ -2398,7 +2425,12 @@ class StationsMapTab(QWidget):
         self._main_splitter = splitter
         layout.addWidget(splitter, stretch=1)
 
-        controls_scroll = QScrollArea(self)
+        controls_host = QWidget(self)
+        self._controls_host = controls_host
+        controls_host_layout = QHBoxLayout(controls_host)
+        controls_host_layout.setContentsMargins(0, 0, 0, 0)
+        controls_host_layout.setSpacing(6)
+        controls_scroll = QScrollArea(controls_host)
         self._controls_scroll = controls_scroll
         controls_scroll.setWidgetResizable(True)
         controls_scroll.setFrameShape(QFrame.NoFrame)
@@ -2413,8 +2445,66 @@ class StationsMapTab(QWidget):
         self._controls_top_spacer = QWidget(self._controls_panel)
         self._controls_top_spacer.setFixedHeight(0)
         controls_layout.addWidget(self._controls_top_spacer)
+        # The rail is deliberately presentation-only: the existing widgets
+        # below remain the single callback/data owners.
+        rail = QFrame(controls_host)
+        self._map_control_rail = rail
+        rail_layout = QVBoxLayout(rail)
+        rail_layout.setContentsMargins(0, 0, 0, 0)
+        rail_layout.setSpacing(4)
+        from freqinout.gui.active_page_stack import ActivePageStack
+        category_stack = ActivePageStack(self._controls_panel)
+        # The active category owns its natural width; a hidden Planning or
+        # Paths page must not inflate the rail pane at compact widths.
+        category_stack.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        try:
+            from PySide6.QtWidgets import QLayout
+            category_stack.layout().setSizeConstraint(QLayout.SetNoConstraint)
+        except Exception:
+            pass
+        category_stack.setVisible(False)
+        self._map_control_category_stack = category_stack
+        self._map_control_requested_category = ""
+        self._map_control_rail_buttons = {}
+        category_layouts = {}
+        for index, category in enumerate(("Layers", "Filters", "Display", "Paths", "Planning")):
+            button = QToolButton(rail)
+            button.setText(category)
+            button.setCheckable(True)
+            button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+            button.setAccessibleName(f"Map tools: {category}")
+            button.setStyleSheet(button_style("muted", self._theme_snapshot()))
+            rail_layout.addWidget(button)
+            page = QWidget(category_stack)
+            page_layout = QVBoxLayout(page)
+            page_layout.setContentsMargins(0, 4, 0, 0)
+            page_layout.setSpacing(8)
+            category_stack.addWidget(page)
+            self._map_control_rail_buttons[category] = button
+            category_layouts[category] = page_layout
+            def select_category(checked=False, *, name=category, page_index=index):
+                self._open_map_tool_category(name,toggle=True)
+            button.clicked.connect(select_category)
+        self._select_map_control_category = lambda name="Layers": next(
+            (button.click() for category, button in self._map_control_rail_buttons.items() if category == name), None
+        )
+        rail_layout.addStretch(1)
+        self._map_controls_close_button = QPushButton("Close tools", self._controls_panel)
+        self._map_controls_close_button.clicked.connect(lambda: self._set_controls_drawer_open(False))
+        controls_layout.addWidget(self._map_controls_close_button)
+        controls_layout.addWidget(category_stack, 1)
+        controls_host_layout.addWidget(rail, 0)
+        controls_host_layout.addWidget(controls_scroll, 1)
+        try:
+            from PySide6.QtGui import QKeySequence, QShortcut
+            escape_shortcut = QShortcut(QKeySequence(Qt.Key_Escape), self)
+            escape_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+            escape_shortcut.activated.connect(self._close_active_map_pane)
+            self._map_controls_escape_shortcut = escape_shortcut
+        except Exception:
+            pass
         controls_scroll.setWidget(self._controls_panel)
-        splitter.addWidget(controls_scroll)
+        splitter.addWidget(controls_host)
 
         self.link_mode_combo = QComboBox()
         self.link_mode_combo.addItem("Off", ("off", ""))
@@ -2424,10 +2514,10 @@ class StationsMapTab(QWidget):
         self._map_path_scope_combo = QComboBox()
         self._map_path_scope_combo.addItem("Off", ("off", ""))
         self._map_path_scope_combo.addItem("My Station", ("my_station", ""))
-        self._map_path_scope_combo.addItem("Network", ("all", ""))
+        self._map_path_scope_combo.addItem("All", ("all", ""))
         self._map_path_scope_combo.setCurrentIndex(0)
         self._map_path_scope_combo.setToolTip(
-            "Choose which path links are shown: links involving my station, the visible network, or none."
+            "Choose My Station for local links, All for the full network topology within current filters, or Off."
         )
 
         self.group_filter_combo = QComboBox()
@@ -2465,8 +2555,7 @@ class StationsMapTab(QWidget):
         self._map_since_button = QToolButton()
         self._map_since_button.setPopupMode(QToolButton.DelayedPopup)
         self._map_since_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
-        self._map_since_button.setMinimumWidth(118)
-        self._map_since_button.setMaximumWidth(145)
+        self._map_since_button.setMinimumWidth(self._map_since_button.fontMetrics().horizontalAdvance("90d") + 32)
         self._map_since_button.setToolTip("Choose how far back mapped stations, traffic, and paths should be considered.")
         self._build_map_since_menu()
         self._update_map_since_button_text(MAP_DEFAULT_RECENCY_LABEL)
@@ -2491,7 +2580,7 @@ class StationsMapTab(QWidget):
             relay_completer.setFilterMode(Qt.MatchContains)
             relay_completer.setCaseSensitivity(Qt.CaseInsensitive)
 
-        layers_layout = self._add_collapsible_group(controls_layout, "Map Detail", expanded=False)
+        layers_layout = self._add_collapsible_group(category_layouts["Display"], "Display", expanded=True)
         self.show_calls_chk = QCheckBox("Callsigns")
         self.show_regions_chk = QCheckBox("Regions")
         self.show_states_chk = QCheckBox("States")
@@ -2532,7 +2621,7 @@ class StationsMapTab(QWidget):
         pop_grid.addWidget(self.city_pop_combo, 0, 1)
         layers_layout.addLayout(pop_grid)
 
-        prop_layout = self._add_collapsible_group(controls_layout, "Propagation Forecast", expanded=False)
+        prop_layout = self._add_collapsible_group(category_layouts["Planning"], "Propagation Forecast", expanded=False)
         self.prop_overlay_chk = QCheckBox("Enable Propagation Overlay")
         prop_layout.addWidget(self.prop_overlay_chk)
 
@@ -2626,7 +2715,7 @@ class StationsMapTab(QWidget):
         )
         self._map_regional_intel_button.clicked.connect(self.focus_regional_intelligence)
         self._map_paths_button = QPushButton("Paths")
-        self._map_paths_button.setToolTip("Open the topology-first path view. Use Paths to add My Station or Network links as an overlay.")
+        self._map_paths_button.setToolTip("Open the topology-first path view. Use Paths to choose My Station or All network links.")
         self._map_paths_button.clicked.connect(self.focus_paths)
         self._map_propagation_button = QPushButton("RF Planning")
         self._map_propagation_button.setToolTip(
@@ -2651,6 +2740,17 @@ class StationsMapTab(QWidget):
         self._map_mode_combo.setToolTip("Choose the main map view.")
         self._map_mode_combo.setMinimumWidth(180)
         self._map_mode_combo.setMaximumWidth(240)
+        self._map_country_combo = QComboBox()
+        self._map_country_combo.addItem("All countries", "")
+        self._map_country_combo.setToolTip(
+            "Scope plotted locations by country. This is geographic evidence, not callsign nationality or licensing origin.")
+        self._map_country_combo.setMinimumWidth(150)
+        self._map_country_combo.setMaximumWidth(230)
+        self._map_focus_country_button = QPushButton("Focus map")
+        self._map_focus_country_button.setToolTip("Fit the map to the selected country when geographic map data is available.")
+        self._map_focus_country_button.setEnabled(False)
+        self._map_focus_country_button.setToolTip("Focus the selected country's largest landmass. Filters retain the current camera until this action.")
+        self._map_focus_country_button.setProperty("mapUiHook", "focus_country")
         self._map_traffic_subtype_combo = QComboBox()
         for label, data in (
             ("All", "all"),
@@ -2724,10 +2824,11 @@ class StationsMapTab(QWidget):
         self._map_scope_filter_combo.setToolTip("Choose whether advanced filters show stations, traffic, or both.")
         self._map_state_filter_combo = QComboBox()
         self._map_state_filter_combo.setEditable(True)
-        self._map_state_filter_combo.addItem("All States", "")
-        for code in sorted(set(US_STATE_NAMES) | set(CANADA_PROVINCE_NAMES)):
-            self._map_state_filter_combo.addItem(code, code)
-        self._map_state_filter_combo.setToolTip("Filter stations and reports by state or province abbreviation.")
+        self._map_state_filter_combo.addItem("All", "")
+        for prefix, regions in (("US", US_STATE_NAMES), ("CA", CANADA_PROVINCE_NAMES)):
+            for code in sorted(regions):
+                self._map_state_filter_combo.addItem(f"{prefix} · {code}", code)
+        self._map_state_filter_combo.setToolTip("Region supplied with station/report records. Country uses plotted coordinates.")
         self._map_source_filter_combo = QComboBox()
         for label, data in (
             ("All Sources", ""),
@@ -2829,11 +2930,11 @@ class StationsMapTab(QWidget):
             mode_actions_layout.addWidget(button, idx // 4, idx % 4)
         for col in range(4):
             mode_actions_layout.setColumnStretch(col, 1)
-        views_layout = self._add_collapsible_group(controls_layout, "Operator Views", expanded=False)
+        views_layout = self._add_collapsible_group(category_layouts["Layers"], "View shortcuts", expanded=False)
         views_layout.addWidget(mode_actions_row)
         # Layer choices have one visible owner: the compact checkbox strip.
         views_layout.parentWidget().parentWidget().hide()
-        path_tools_layout = self._add_collapsible_group(controls_layout, "Path Tools", expanded=False)
+        path_tools_layout = self._add_collapsible_group(category_layouts["Paths"], "Path tools", expanded=True)
         path_tools_grid = QGridLayout()
         path_tools_grid.setContentsMargins(0, 0, 0, 0)
         path_tools_grid.setHorizontalSpacing(8)
@@ -2849,7 +2950,7 @@ class StationsMapTab(QWidget):
         path_tools_layout.addWidget(self._refresh_links_button)
         path_tools_layout.addWidget(self._paths_help_button)
 
-        intelligence_layout = self._add_collapsible_group(controls_layout, "Intelligence Layers", expanded=False)
+        intelligence_layout = self._add_collapsible_group(category_layouts["Layers"], "Layers", expanded=True)
         self._map_intelligence_layers_section = intelligence_layout.parentWidget().parentWidget()
         intelligence_layout.addWidget(self.map_stations_chk)
         intelligence_layout.addWidget(self.map_links_chk)
@@ -2858,13 +2959,14 @@ class StationsMapTab(QWidget):
         intelligence_layout.addWidget(self.map_infrastructure_chk)
         self._map_intelligence_layers_section.hide()
 
-        advanced_layout = self._add_collapsible_group(controls_layout, "Advanced Filters", expanded=False)
+        advanced_layout = self._add_collapsible_group(category_layouts["Filters"], "Filters", expanded=True)
         advanced_grid = QGridLayout()
         advanced_grid.setContentsMargins(0, 0, 0, 0)
         advanced_grid.setHorizontalSpacing(8)
         advanced_grid.setVerticalSpacing(6)
         self._map_scope_filter_combo.hide()  # Stations/Traffic checkboxes own this choice.
-        advanced_grid.addWidget(QLabel("State"), 1, 0)
+        self._map_region_filter_label = QLabel("Region")
+        advanced_grid.addWidget(self._map_region_filter_label, 1, 0)
         advanced_grid.addWidget(self._map_state_filter_combo, 1, 1)
         advanced_grid.addWidget(QLabel("Source"), 2, 0)
         advanced_grid.addWidget(self._map_source_filter_combo, 2, 1)
@@ -2874,42 +2976,65 @@ class StationsMapTab(QWidget):
         advanced_grid.addWidget(self._map_trust_filter_combo, 4, 1)
         advanced_layout.addLayout(advanced_grid)
 
-        pins_tools_layout = self._add_collapsible_group(controls_layout, "Planning Pins", expanded=False)
+        pins_tools_layout = self._add_collapsible_group(category_layouts["Planning"], "Planning pins", expanded=True)
         pins_tools_layout.addWidget(self._map_add_rf_pin_button)
         pins_tools_layout.addWidget(self._map_manage_rf_pins_button)
-        controls_layout.addStretch()
+        display_actions = self._add_collapsible_group(category_layouts["Display"], "Map navigation", expanded=True)
+        self._map_save_starting_view_button = QPushButton("Use current view as starting area")
+        self._map_save_starting_view_button.setToolTip("Save this center and zoom for the next session. This does not change geographic filters.")
+        self._map_save_starting_view_button.setProperty("mapUiHook", "save_starting_view")
+        display_actions.addWidget(self._map_save_starting_view_button)
+        self._map_category_layouts = category_layouts
+        for page_layout in category_layouts.values():
+            page_layout.addStretch(1)
 
         self._map_intel_sensitivity_field = filter_field("Sensitivity", self._map_intel_sensitivity_combo, 155, 190)
         self._map_traffic_subtype_field = filter_field("Type", self._map_traffic_subtype_combo, 130, 180)
         self._map_path_scope_field = filter_field("Paths", self._map_path_scope_combo, 150, 220)
+        self._map_view_field = filter_field("View", self._map_mode_combo, 180, 250)
+        self._map_country_field = filter_field("Country", self._map_country_combo, 165, 250)
         filter_grid = QGridLayout(filter_bar)
         self._map_filter_grid = filter_grid
         filter_grid.setContentsMargins(0, 0, 0, 0)
         filter_grid.setHorizontalSpacing(10)
         filter_grid.setVerticalSpacing(6)
-        # Keep the four principal questions in reading order. Mode-specific
-        # controls follow them and are omitted entirely by the responsive
-        # reflow while hidden, so they cannot reserve invisible grid cells.
+        # Keep direct operational questions in reading order. The category
+        # panes own less-common type, topic, and sensitivity choices.
         self._map_filter_fields = (
-            filter_field("Topic", self._map_topic_filter_combo, 185, 260),
+            self._map_view_field,
             filter_field("Group", self.group_filter_combo, 170, 230),
-            filter_field("Age", self._map_since_button, 118, 150),
-            self._map_traffic_subtype_field,
-            self._map_intel_sensitivity_field,
+            filter_field("Activity window", self._map_since_button, 165, 210),
+            self._map_country_field,
             self._map_path_scope_field,
         )
         self._map_search_field = filter_field("Search", self._map_search_edit)
+        filters_layout = self._add_collapsible_group(category_layouts["Filters"], "Message and evidence", expanded=True)
+        filters_layout.addWidget(filter_field("Topic", self._map_topic_filter_combo, 185, 260))
+        filters_layout.addWidget(self._map_traffic_subtype_field)
+        filters_layout.addWidget(self._map_intel_sensitivity_field)
+        display_actions.addWidget(self._map_focus_country_button)
+        self._map_restore_starting_view_button = QPushButton("Restore starting area")
+        display_actions.addWidget(self._map_restore_starting_view_button)
+        self._map_starting_view_status = QLabel("Save a starting area without excluding other countries.")
+        self._map_starting_view_status.setWordWrap(True)
+        display_actions.addWidget(self._map_starting_view_status)
+        self._map_country_combo.currentIndexChanged.connect(self._on_map_country_changed)
+        self._map_focus_country_button.clicked.connect(self._focus_map_country)
+        self._map_save_starting_view_button.clicked.connect(self._save_map_starting_view)
+        self._map_restore_starting_view_button.clicked.connect(self._restore_map_starting_view)
         self._reflow_map_filter_bar()
-        self._map_mode_combo.setVisible(False)
         self._map_layer_controls = MapLayerControls(map_container)
+        self._map_layer_controls.set_visible_layers(("stations", "paths", "traffic"))
         self._map_layer_controls.layer_toggled.connect(self._on_map_layer_toggled)
-        map_layout.addWidget(self._map_layer_controls)
+        category_layouts["Layers"].insertWidget(0, self._map_layer_controls)
         self._mesh_recent_chk = QCheckBox("Recent (24h)", map_container)
         self._mesh_recent_chk.setToolTip("Unchecked: all known contacts. Checked: contacts heard in the last 24 hours. Advertised positions may be old.")
         self._mesh_recent_chk.setVisible(False)
         self._mesh_recent_chk.toggled.connect(self._on_mesh_recent_changed)
         map_layout.addWidget(self._mesh_recent_chk)
-        map_layout.addWidget(filter_bar)
+        # Common selections span the workspace and keep their width when a
+        # tool pane opens; disclosure must not squeeze the operational toolbar.
+        layout.insertWidget(layout.indexOf(splitter), filter_bar)
 
         self._map_canvas_splitter = QSplitter(Qt.Horizontal, map_container)
         style_splitter_handles(self._map_canvas_splitter, self._theme_snapshot(), width=12)
@@ -2983,12 +3108,17 @@ class StationsMapTab(QWidget):
         self.prop_target_type_combo.currentIndexChanged.connect(self._on_prop_target_type_changed)
         self.prop_target_value_combo.currentTextChanged.connect(self._on_prop_target_value_changed)
 
+        from freqinout.gui.map_license_reference_panel import MapLicenseReferencePanel
+        from freqinout.gui.map_license_reference_presenter import MapLicenseReferencePresenter
+        self._license_reference_panel = MapLicenseReferencePanel(self)
+        category_layouts["Layers"].insertWidget(1, self._license_reference_panel)
+        self._license_reference_presenter = MapLicenseReferencePresenter(self, self._license_reference_panel)
         self._sync_city_pop_enabled()
         try:
             self._on_link_mode_changed(self.link_mode_combo.currentIndex())
         except Exception:
             pass
-        self._install_splitter_indicator()
+        # The persistent category rail owns control disclosure.
         self._sync_controls_top_alignment()
         QTimer.singleShot(0, self._update_drawer_mode)
 
@@ -3020,7 +3150,8 @@ class StationsMapTab(QWidget):
 
         tabs = QTabWidget(panel)
         tabs.setDocumentMode(True)
-        tabs.setMinimumHeight(210)
+        tabs.setMinimumHeight(tabs.fontMetrics().lineSpacing() * 5)
+        tabs.hide()
         overview_body = QTextBrowser(tabs)
         status_body = QTextBrowser(tabs)
         paths_body = QTextBrowser(tabs)
@@ -3032,7 +3163,6 @@ class StationsMapTab(QWidget):
         tabs.addTab(status_body, "Status")
         tabs.addTab(paths_body, "Paths")
         tabs.addTab(messages_body, "Inbox")
-        layout.addWidget(tabs, 1)
 
         action_grid = QGridLayout()
         action_grid.setContentsMargins(0, 0, 0, 0)
@@ -3068,9 +3198,37 @@ class StationsMapTab(QWidget):
         messages_btn.clicked.connect(self._open_map_selected_messages)
         spotter_btn.clicked.connect(self._compose_message_for_selected_station)
         sop_btn.clicked.connect(self._open_map_selected_sop)
-        for idx, btn in enumerate((center_btn, paths_btn, group_btn, topic_btn, messages_btn, spotter_btn, sop_btn)):
+        from PySide6.QtWidgets import QMenu
+        more_btn = QPushButton("More…", panel)
+        more_menu = QMenu(more_btn)
+        self._map_selected_more_actions = []
+        action_owner = QWidget(panel)
+        action_owner.hide()
+        for btn in (group_btn, topic_btn, messages_btn, spotter_btn, sop_btn):
+            btn.setParent(action_owner)
+            btn.hide()
+            action = more_menu.addAction(btn.text(), btn.click)
+            self._map_selected_more_actions.append((action, btn))
+        def sync_more_actions():
+            for action, btn in self._map_selected_more_actions:
+                action.setText(btn.text())
+                action.setEnabled(btn.isEnabled())
+                action.setVisible(not btn.isHidden())
+        more_menu.aboutToShow.connect(sync_more_actions)
+        more_btn.setMenu(more_menu)
+        details_btn = QPushButton("Details", panel)
+        details_btn.setCheckable(True)
+        def disclose_details(visible):
+            tabs.setVisible(visible)
+            self._map_canvas_layout_signature = None
+            self._sync_map_canvas_splitter()
+        details_btn.toggled.connect(disclose_details)
+        for idx, btn in enumerate((center_btn, paths_btn, more_btn, details_btn)):
             action_grid.addWidget(btn, idx // 2, idx % 2)
         layout.addLayout(action_grid)
+        layout.addWidget(tabs, 1)
+        layout.addStretch(0)
+        self._map_selected_details_button = details_btn
 
         self._map_selected_panel = panel
         self._map_selected_title = title
@@ -3107,21 +3265,7 @@ class StationsMapTab(QWidget):
         return min(430, max(360, total // 4))
 
     def _sync_map_canvas_splitter(self) -> None:
-        splitter = getattr(self, "_map_canvas_splitter", None)
-        if splitter is None:
-            return
-        panel = getattr(self, "_map_selected_panel", None)
-        try:
-            total = max(1, int(splitter.width() or sum(splitter.sizes()) or 1))
-            visible = bool(panel is not None and panel.isVisible())
-            side = self._map_selected_panel_target_width(total) if visible else 0
-            signature = (visible, total, side)
-            if signature == getattr(self, "_map_canvas_layout_signature", None):
-                return
-            self._map_canvas_layout_signature = signature
-            splitter.setSizes([max(1, total - side), max(0, side)])
-        except Exception:
-            pass
+        StationsMapTab._coordinate_map_panels(self)
 
     def _show_map_selected_detail(self, payload: Dict[str, object]) -> None:
         panel = getattr(self, "_map_selected_panel", None)
@@ -3141,8 +3285,15 @@ class StationsMapTab(QWidget):
         if self._map_selected_title is not None:
             self._map_selected_title.setText(display_title)
         if self._map_selected_subtitle is not None:
-            self._map_selected_subtitle.setText(route)
-            self._map_selected_subtitle.setVisible(bool(route))
+            from freqinout.gui.map_marker_presentation import plain_tooltip_text
+            brief = " · ".join(str(payload.get(key) or rows.get(key) or "").strip()
+                               for key in ("name", "state", "grid")
+                               if str(payload.get(key) or rows.get(key) or "").strip())
+            if not brief:
+                lines = plain_tooltip_text(payload.get("title") or "").splitlines()
+                brief = " · ".join(lines[1:4])
+            self._map_selected_subtitle.setText(route or brief)
+            self._map_selected_subtitle.setVisible(bool(route or brief))
         if not same_selection:
             self._map_inspector_has_content = False
             for body in (self._map_selected_body, self._map_selected_status_body,
@@ -3896,9 +4047,19 @@ class StationsMapTab(QWidget):
             if labels:
                 return f"Mesh Node: {labels[0]}"
             return title or "Mesh Node"
+        station_callsign = self._map_detail_clean_text(payload.get("callsign"))
+        kind = str(payload.get("type") or payload.get("_map_item_kind") or "").strip().lower()
+        has_station_fields = bool(station_callsign) and any(
+            key in payload for key in ("is_own_station", "name", "state", "grid")
+        )
+        # Older station projections omit ``type``.  Do not let their familiar
+        # structured fields relabel an explicit report or event selection.
+        is_station = kind == "station" or (not kind and has_station_fields)
+        if is_station and station_callsign:
+            return station_callsign
         if title and not title.lower().startswith("message reports"):
             return title
-        kind = str(payload.get("type") or "").strip().lower()
+        kind = str(payload.get("type") or payload.get("_map_item_kind") or "").strip().lower()
         raw_callsigns = payload.get("callsigns")
         callsign_text = ""
         if isinstance(raw_callsigns, (list, tuple, set)):
@@ -5065,7 +5226,7 @@ class StationsMapTab(QWidget):
             label = f"{mode.title()}: {value}"
             target_data = (mode, value)
         elif mode == "all":
-            label = "Network"
+            label = "All"
             target_data = ("all", "")
         elif mode == "my_station":
             label = "My Station"
@@ -5594,6 +5755,7 @@ class StationsMapTab(QWidget):
     def _add_collapsible_group(self, parent_layout: QVBoxLayout, title: str, expanded: bool) -> QVBoxLayout:
         section = QFrame(self)
         section.setFrameShape(QFrame.StyledPanel)
+        section.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         section_layout = QVBoxLayout(section)
         section_layout.setContentsMargins(6, 6, 6, 6)
         section_layout.setSpacing(6)
@@ -5621,7 +5783,15 @@ class StationsMapTab(QWidget):
         return body_layout
 
     def _toggle_controls_drawer(self) -> None:
-        self._set_controls_drawer_open(not self._controls_drawer_open)
+        if self._controls_drawer_open:
+            self._set_controls_drawer_open(False)
+            return
+        requested = str(getattr(self, "_map_control_requested_category", "") or "Layers")
+        selector = getattr(self, "_select_map_control_category", None)
+        if callable(selector):
+            selector(requested)
+        else:
+            self._set_controls_drawer_open(True)
 
     def _install_splitter_indicator(self) -> None:
         splitter = self._main_splitter
@@ -5806,41 +5976,140 @@ class StationsMapTab(QWidget):
             info_row = action_row + 1
         grid.addWidget(reachable, info_row, 0, 1, columns, alignment=Qt.AlignLeft)
 
-    def _set_controls_drawer_open(self, open_drawer: bool) -> None:
-        if self._main_splitter is None:
+    def _open_map_tool_category(self, name, *, toggle=False) -> None:
+        names=tuple(self._map_control_rail_buttons)
+        if name not in names:
             return
-        self._controls_drawer_open = bool(open_drawer)
-        total = max(1, self.width())
-        panel_width = min(300, max(220, int(total * 0.27)))
-        state_changed = self._applied_controls_drawer_open is not self._controls_drawer_open
-        self._applied_controls_drawer_open = self._controls_drawer_open
-        if self._controls_drawer_open and state_changed:
-            controls_scroll = getattr(self, "_controls_scroll", None)
-            if controls_scroll is not None:
-                controls_scroll.setMinimumWidth(300)
-                controls_scroll.setMaximumWidth(520)
-                controls_scroll.setVisible(True)
-            self._main_splitter.setSizes([panel_width, max(1, total - panel_width)])
-        elif not self._controls_drawer_open and state_changed:
-            controls_scroll = getattr(self, "_controls_scroll", None)
-            if controls_scroll is not None:
-                controls_scroll.setMinimumWidth(0)
-                controls_scroll.setMaximumWidth(0)
-            self._main_splitter.setSizes([0, total])
-        if self._controls_button is not None:
-            self._controls_button.setText("Hide Advanced Tools" if self._controls_drawer_open else "Advanced Map Tools")
-            self._controls_button.setVisible(True)
-        self._update_splitter_indicator_state()
-        self._position_splitter_indicator()
+        active=getattr(self,"_map_control_requested_category","")
+        scroll=self._controls_scroll.verticalScrollBar()
+        positions=getattr(self,"_map_tool_scroll_positions",{})
+        if active and self._controls_drawer_open:
+            positions[active]=scroll.value()
+        self._map_tool_scroll_positions=positions
+        if (toggle and active==name and getattr(self,"_controls_requested_open",False)
+                and not getattr(self,"_map_controls_suspended_for_inspector",False)):
+            self._set_controls_drawer_open(False)
+            return
+        if getattr(self,"_map_controls_suspended_for_inspector",False):
+            self._map_selected_panel.hide()
+        self._map_control_focus_widget=self._map_control_rail_buttons[name]
+        self._map_control_requested_category=name
+        self._map_control_category_stack.setCurrentIndex(names.index(name))
+        self._set_controls_drawer_open(True)
+        def restore():
+            if (not getattr(self,"_is_shutting_down",False) and self.isVisible()
+                    and self._controls_drawer_open and self._map_control_requested_category==name):
+                scroll.setValue(positions.get(name,0))
+        QTimer.singleShot(0,restore)
+
+    def _close_active_map_pane(self) -> None:
+        panel = getattr(self,"_map_selected_panel",None)
+        if panel is not None and not panel.isHidden():
+            self._clear_map_selected_detail()
+        else:
+            self._set_controls_drawer_open(False)
+
+    def _set_controls_drawer_open(self, open_drawer: bool) -> None:
+        self._controls_requested_open = bool(open_drawer)
+        if open_drawer and not getattr(self, "_map_control_requested_category", ""):
+            self._map_control_requested_category = "Layers"
+        StationsMapTab._coordinate_map_panels(self)
+        if not open_drawer:
+            focus = getattr(self, "_map_control_focus_widget", None)
+            if focus is not None:
+                try:
+                    focus.setFocus()
+                except RuntimeError:
+                    pass
+
+    def _coordinate_map_panels(self) -> None:
+        """One cache-only owner for intent, effective visibility and inspector fit."""
+        main = getattr(self, "_main_splitter", None)
+        if main is None:
+            return
+        rail = getattr(self, "_map_control_rail", None)
+        rail_width = max(76, rail.sizeHint().width() if rail is not None else 76)
+        total = max(1, main.contentsRect().width())
+        fm = self.fontMetrics() if hasattr(self, "fontMetrics") else None
+        unit = fm.horizontalAdvance("M") if fm else 10
+        panel_width = max(300, min(400, unit * 28))
+        inspector = getattr(self, "_map_selected_panel", None)
+        inspector_visible = bool(inspector is not None and not inspector.isHidden())
+        # Inspector fit is independent of the three-pane tools breakpoint.
+        # Hide tools before moving the selection below an otherwise useful map.
+        inspector_min = max(280, inspector.minimumSizeHint().width() if inspector is not None else 280)
+        inspector_width = max(inspector_min, min(460, unit * 24))
+        map_min = max(280, unit * 24)
+        suspended = bool(inspector_visible and
+                         total < rail_width + panel_width + inspector_width + map_min + 36)
+        requested = bool(getattr(self, "_controls_requested_open", getattr(self, "_controls_drawer_open", False)))
+        effective = requested and not suspended
+        previous_effective = bool(getattr(self,"_controls_drawer_open",False))
+        scroll_owner = getattr(self,"_controls_scroll",None)
+        positions = getattr(self,"_map_tool_scroll_positions",{})
+        remembered_category = str(getattr(self,"_map_control_requested_category","") or "")
+        if previous_effective and not effective and hasattr(scroll_owner,"verticalScrollBar"):
+            positions[remembered_category] = scroll_owner.verticalScrollBar().value()
+            self._map_tool_scroll_positions = positions
+        self._map_controls_suspended_for_inspector = suspended
+        self._controls_drawer_open = effective
+        category = str(getattr(self, "_map_control_requested_category", "Layers") or "Layers")
+        for name, button in getattr(self, "_map_control_rail_buttons", {}).items():
+            selected = effective and name == category
+            button.blockSignals(True)
+            button.setChecked(selected)
+            button.blockSignals(False)
+            button.setAccessibleDescription("Expanded" if selected else ("Temporarily closed while selection is open" if suspended and name == category else "Collapsed"))
+            button.setStyleSheet(button_style("eligible_info" if selected else "muted", self._theme_snapshot()))
+        stack = getattr(self, "_map_control_category_stack", None)
+        if stack is not None:
+            stack.setVisible(effective)
+        scroll = getattr(self, "_controls_scroll", None)
+        if scroll is not None:
+            scroll.setMinimumWidth(panel_width if effective else 0)
+            scroll.setMaximumWidth(max(panel_width, 520) if effective else 0)
+            scroll.setVisible(effective)
+        signature = (effective, panel_width, rail_width, total)
+        if signature != getattr(self, "_map_pane_layout_signature", None):
+            self._map_pane_layout_signature = signature
+            tools = rail_width + (panel_width + 6 if effective else 0)
+            main.setSizes([tools, max(1,total-tools)])
+        if effective and not previous_effective and hasattr(scroll_owner,"verticalScrollBar"):
+            def restore_scroll():
+                if (not getattr(self,"_is_shutting_down",False)
+                        and getattr(self,"_controls_drawer_open",False)
+                        and getattr(self,"_map_control_requested_category","")==remembered_category):
+                    scroll_owner.verticalScrollBar().setValue(positions.get(remembered_category,0))
+            QTimer.singleShot(0,restore_scroll)
+        button = getattr(self, "_controls_button", None)
+        if button is not None:
+            button.setVisible(False)
+        canvas = getattr(self, "_map_canvas_splitter", None)
+        if canvas is not None and inspector is not None:
+            compact = canvas.contentsRect().width() < inspector_width + map_min + canvas.handleWidth()
+            orientation = Qt.Vertical if compact else Qt.Horizontal
+            canvas.setOrientation(orientation)
+            inspector.setMinimumWidth(0 if compact else inspector_min)
+            inspector.setMaximumWidth(16777215 if compact else inspector_width)
+            dimension = canvas.height() if compact else canvas.width()
+            details = getattr(self, "_map_selected_details_button", None)
+            expanded = bool(details and details.isChecked())
+            side = (max(inspector.minimumSizeHint().height(), int(dimension * 0.55)) if expanded
+                    else inspector.minimumSizeHint().height()) if compact else inspector_width
+            if not inspector_visible:
+                side = 0
+            sig = (inspector_visible,compact,dimension,side,expanded)
+            if sig != getattr(self,"_map_canvas_layout_signature",None):
+                self._map_canvas_layout_signature = sig
+                canvas.setSizes([max(1,dimension-side),side])
+        update = getattr(self,"_update_splitter_indicator_state",None)
+        if callable(update):
+            update()
 
     def _update_drawer_mode(self) -> None:
-        narrow = self.width() < self._controls_drawer_threshold
-        if narrow != self._drawer_mode:
-            self._drawer_mode = narrow
-            if self._controls_button is not None:
-                self._controls_button.setVisible(True)
+        self._drawer_mode = self.width() < self._controls_drawer_threshold
         self._sync_controls_top_alignment()
-        self._set_controls_drawer_open(self._controls_drawer_open)
+        StationsMapTab._coordinate_map_panels(self)
 
     def _schedule_map_geometry_reflow(self) -> None:
         if self._is_shutting_down:
@@ -6849,10 +7118,13 @@ class StationsMapTab(QWidget):
             recent.setVisible(key == "mesh_nodes")
         filter_bar = getattr(self, "_map_filter_bar", None)
         if filter_bar is not None:
-            filter_bar.setVisible(key != "mesh_nodes")
-        for field in tuple(getattr(self, "_map_filter_fields", ()) or ())[:3] + (getattr(self, "_map_search_field", None),):
+            filter_bar.setVisible(True)
+        for field in tuple(getattr(self, "_map_filter_fields", ()) or ()):
             if field is not None:
-                field.setEnabled(key != "mesh_nodes")
+                operational = str(field.property("mapFilterRole") or "") in {"Group", "Activity window"}
+                field.setEnabled(not operational or key != "mesh_nodes")
+                if operational:
+                    field.setToolTip("Operational evidence filter; Mesh known contacts use Recent (24h)." if key == "mesh_nodes" else "Filters operational evidence; license references have separate scope.")
         sensitivity_field = getattr(self, "_map_intel_sensitivity_field", None)
         if sensitivity_field is not None:
             sensitivity_field.setVisible(key == "regional")
@@ -6965,7 +7237,7 @@ class StationsMapTab(QWidget):
             target = value or str(getattr(self, "relay_target", "") or "").strip().upper()
             return f"Paths To {target}" if target else "Paths To Station"
         if mode == "all":
-            return "Network"
+            return "All"
         if mode == "my_station":
             return "My Station"
         if mode == "group":
@@ -10568,6 +10840,9 @@ class StationsMapTab(QWidget):
         )[:150]
 
     def _selected_map_search_text(self) -> str:
+        references = getattr(self,"_license_reference_presenter",None)
+        if references is not None and references.scope.currentData() == "references":
+            return references._operational_search
         edit = getattr(self, "_map_search_edit", None)
         if edit is None:
             return ""
@@ -11123,7 +11398,7 @@ class StationsMapTab(QWidget):
     def _map_filters_active(self) -> bool:
         if getattr(self, "_current_map_mode_key", lambda: "all")() == "mesh_nodes":
             recent = getattr(self, "_mesh_recent_chk", None)
-            return bool(recent and recent.isChecked())
+            return bool((recent and recent.isChecked()) or getattr(self,"_map_geographic_country",""))
         group = self._selected_map_group_filter()
         region = self._selected_map_region_filter()
         band_data = self.band_combo.currentData() if hasattr(self, "band_combo") else {"type": "all"}
@@ -11135,6 +11410,7 @@ class StationsMapTab(QWidget):
         return bool(
             group
             or region
+            or getattr(self,"_map_geographic_country","")
             or band_active
             or int(self.recency_seconds or 0) != MAP_DEFAULT_RECENCY_SECONDS
             or str(topic or "").strip()
@@ -11233,6 +11509,11 @@ class StationsMapTab(QWidget):
             )
 
     def _on_map_search_text_changed(self, _text: str) -> None:
+        references = getattr(self,"_license_reference_presenter",None)
+        if references is not None:
+            if references.scope.currentData() == "references":
+                return
+            references._operational_search = str(_text or "").strip()
         # Fence a previous search before the debounce interval elapses.
         self._map_payload_generation = getattr(self, "_map_payload_generation", 0) + 1
         self._map_inspector_generation = getattr(self, "_map_inspector_generation", 0) + 1
@@ -11278,6 +11559,7 @@ class StationsMapTab(QWidget):
             recent.blockSignals(False)
         for combo_attr, value in (
             ("group_filter_combo", ""),
+            ("_map_country_combo", ""),
             ("region_filter_combo", ""),
             ("recency_combo", MAP_DEFAULT_RECENCY_LABEL),
             ("_map_traffic_subtype_combo", "all"),
@@ -11292,6 +11574,7 @@ class StationsMapTab(QWidget):
             self._set_combo_to_first_matching_data_or_text(getattr(self, combo_attr, None), value)
         if hasattr(self, "band_combo"):
             self._set_combo_to_first_matching_data_or_text(self.band_combo, "All")
+        self._map_geographic_country = ""
         self.recency_seconds = MAP_DEFAULT_RECENCY_SECONDS
         self._map_recency_label = MAP_DEFAULT_RECENCY_LABEL
         self._update_map_since_button_text(MAP_DEFAULT_RECENCY_LABEL)
@@ -11309,6 +11592,9 @@ class StationsMapTab(QWidget):
 
     def clear_map_layers(self, *, reason: str = "clear_map_layers") -> None:
         """Clear visual overlays while preserving report/data filters."""
+        references = getattr(self,"_license_reference_panel",None)
+        if references is not None:
+            references.overlay_checkbox.setChecked(False)
         self._remember_map_path_scope()
         current_focus_mode = str(getattr(self, "_observation_focus_mode", "") or "").strip().lower()
         preserve_report_focus = self._map_report_refinement_active()
@@ -13660,6 +13946,9 @@ class StationsMapTab(QWidget):
             action_signal = getattr(renderer, "action_requested", None)
             if action_signal is not None:
                 action_signal.connect(self._on_native_map_action)
+            viewport_signal = getattr(renderer,"viewport_changed",None)
+            if viewport_signal is not None:
+                viewport_signal.connect(lambda value: self._on_reference_viewport_changed(value))
             view_signal = getattr(renderer, "view_state_changed", None)
             if view_signal is not None:
                 view_signal.connect(self._on_native_map_view_state_changed)
@@ -13712,10 +14001,105 @@ class StationsMapTab(QWidget):
                 exc=RuntimeError(str(detail or "Qt Location renderer unavailable")),
             )
 
+    def _on_reference_viewport_changed(self, value) -> None:
+        presenter = getattr(self,"_license_reference_presenter",None)
+        if presenter is not None:
+            presenter.viewport_changed(value)
+
+    def _publish_map_country_catalog(self, catalog) -> None:
+        combo = getattr(self, "_map_country_combo", None)
+        if combo is None or tuple(catalog) == tuple(getattr(self,"_map_country_catalog",())):
+            return
+        self._map_country_catalog = tuple(catalog)
+        selected = combo.currentData() or ""
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("All countries", "")
+        combo.addItem("Unknown location", "unknown")
+        for item in catalog:
+            combo.addItem(str(item['name']),str(item['code']))
+        combo.setCurrentIndex(max(0,combo.findData(selected)))
+        combo.blockSignals(False)
+
+    def _on_map_country_changed(self, *_args) -> None:
+        self._map_geographic_country = self._map_country_combo.currentData() or ""
+        references = getattr(self,"_license_reference_presenter",None)
+        if references is not None:
+            references.scope_changed()
+        selected_region = self._map_state_filter_combo.currentData() or ""
+        country = self._map_geographic_country
+        self._map_region_filter_label.setText("State" if country == "USA" else "Province / territory" if country == "CAN" else "Region")
+        combo = self._map_state_filter_combo
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("All", "")
+        scopes = (("US",US_STATE_NAMES),) if country == "USA" else (("CA",CANADA_PROVINCE_NAMES),) if country == "CAN" else (("US",US_STATE_NAMES),("CA",CANADA_PROVINCE_NAMES)) if not country else ()
+        for prefix, regions in scopes:
+            for code in sorted(regions):
+                combo.addItem(code if country else f"{prefix} · {code}",code)
+        combo.setCurrentIndex(max(0,combo.findData(selected_region)))
+        combo.setEnabled(bool(scopes))
+        combo.blockSignals(False)
+        self._map_focus_country_button.setEnabled(bool(self._map_geographic_country not in ("", "unknown")))
+        self._request_map_refresh(level="light", reason="geographic_country")
+
+    def _focus_map_country(self) -> None:
+        from freqinout.gui.map_camera_preferences import country_focus_view
+        renderer = getattr(self,"_native_map_renderer",None)
+        country = getattr(self,"_map_geographic_country","")
+        item = next((item for item in getattr(self,"_map_country_catalog",()) if item['code'] == country), None)
+        if item and renderer:
+            view = country_focus_view(item['bounds'],renderer.width(),renderer.height())
+            if view:
+                renderer.set_view_center(view['lat'],view['lon'],view['zoom'])
+                self._on_native_map_view_state_changed(view)
+
+    def _save_map_starting_view(self) -> None:
+        from freqinout.gui.map_camera_preferences import validated_view
+        renderer = getattr(self,"_native_map_renderer",None)
+        view = validated_view(renderer.view_state()) if renderer else None
+        if view and self.settings:
+            self.settings.set("map_starting_view", view)
+            renderer.set_home_view(view)
+            self._map_starting_view_status.setText("Starting area saved for the next session.")
+            self._map_save_starting_view_button.setToolTip("Starting area saved. Country filters are unchanged.")
+
+    def _restore_map_starting_view(self) -> None:
+        from freqinout.gui.map_camera_preferences import validated_view
+        view = validated_view(self.settings.get("map_starting_view",None)) if self.settings else None
+        renderer = getattr(self,"_native_map_renderer",None)
+        if view and renderer:
+            renderer.set_view_center(view['lat'],view['lon'],view['zoom'])
+            self._on_native_map_view_state_changed(view)
+
     def _on_native_map_view_state_changed(self, view: object) -> None:
         if isinstance(view, Mapping):
             parsed = StationsMapTab._parse_view_state(self, dict(view))
             self._last_map_view = parsed
+            self._map_user_camera_owned = True
+            StationsMapTab._request_world_geography(self,parsed)
+
+    def _request_world_geography(self, view):
+        config = getattr(self,"_world_geography_config",None)
+        if not config or not getattr(self,"_map_visible",False) or not getattr(self,"_app_active",True) or getattr(self,"_is_shutting_down",False):
+            return
+        renderer = getattr(self,"_native_map_renderer",None)
+        if renderer is None:
+            return
+        lane = getattr(self,"_world_geography_lane",None)
+        if lane is None:
+            from freqinout.gui.world_geography import GeographyLane
+            lane = GeographyLane(self)
+            lane.ready.connect(self._apply_world_geography)
+            self._world_geography_lane = lane
+        lane.request(view,renderer.width(),renderer.height(),**config)
+
+    def _apply_world_geography(self, payload):
+        if getattr(self,"_is_shutting_down",False) or not getattr(self,"_map_visible",False) or not getattr(self,"_app_active",True):
+            return
+        renderer = getattr(self,"_native_map_renderer",None)
+        if renderer is not None:
+            renderer.apply_geography(payload)
 
     def _on_native_map_action(self, action_payload: object) -> None:
         if not isinstance(action_payload, Mapping):
@@ -13734,8 +14118,17 @@ class StationsMapTab(QWidget):
                 handler(dict(action_payload))
             return
         if isinstance(payload, Mapping):
+            if str(payload.get("type") or "") == "license_reference":
+                references = getattr(self,"_license_reference_presenter",None)
+                if references is not None:
+                    references.select(payload)
+                return
             show_detail = getattr(self, "_show_map_selected_detail", None)
             if callable(show_detail):
+                payload = dict(payload)
+                rendered = action_payload.get("marker") if action == "select_marker" else None
+                if isinstance(rendered, Mapping) and rendered.get("kind"):
+                    payload["_map_item_kind"] = str(rendered["kind"])
                 show_detail(dict(payload))
 
     def _apply_native_map_projection(self, payload: Mapping[str, object] | None) -> bool:
@@ -13752,12 +14145,20 @@ class StationsMapTab(QWidget):
         if renderer is None or (callable(available) and not available()):
             self._pending_map_payload = projection
             return False
-        if bool(getattr(self, "_map_initialized", False)):
+        if bool(getattr(self, "_map_initialized", False) or getattr(self,"_map_user_camera_owned",False)):
             projection.pop("auto_fit", None)
             current_view = getattr(renderer, "view_state", None)
             if callable(current_view):
                 projection["view"] = current_view()
+        StationsMapTab._publish_map_country_catalog(self, projection.get("_country_catalog", ()))
         renderer.apply_projection(projection)
+        references = getattr(self,"_license_reference_presenter",None)
+        if references is not None:
+            references.publish()
+        if projection.get("_world_geography"):
+            self._world_geography_config = {"show_cities":bool(projection.get("show_cities")),
+                                             "min_population":float(projection.get("city_min_pop") or 0)}
+            StationsMapTab._request_world_geography(self,renderer.view_state())
         self._pending_map_payload = None
         self._map_initialized = True
         self._map_load_ok = True
@@ -14915,7 +15316,7 @@ class StationsMapTab(QWidget):
         infrastructure_events: Optional[List[Dict[str, object]]] = None,
     ) -> bool:
         """Fit an initial focused view; retain navigation after first publication."""
-        if bool(getattr(self, "_map_initialized", False)):
+        if bool(getattr(self, "_map_initialized", False) or getattr(self,"_map_user_camera_owned",False)):
             return False
         mode = str(map_mode or "").strip().lower() or "all"
         point_count = (
@@ -15006,6 +15407,9 @@ class StationsMapTab(QWidget):
         """Serialize one newest-wins projection away from the GUI thread."""
         if getattr(self, "_is_shutting_down", False):
             return
+        renderer = getattr(self,"_native_map_renderer",None)
+        if renderer is not None:
+            pending_payload = {**pending_payload,"geography_viewport":{"width":renderer.width(),"height":renderer.height()}}
         if not getattr(self, "_map_visible", False) or not getattr(self, "_app_active", True):
             self._pending_map_payload = dict(pending_payload)
             return

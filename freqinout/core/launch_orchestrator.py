@@ -589,6 +589,8 @@ class LaunchOrchestrator(QObject):
                 if "executable" in recipe_component or record.family_key == "varac":
                     readiness["executable"] = argv[0]
 
+                if 'operator_recipe_v1' in readiness:
+                    readiness['operator_recipe_v1'] = self.is_truthy(readiness['operator_recipe_v1'])
                 dependencies = [str(value) for value in component.dependencies if str(value)]
                 cross_items = cross_family.get(component.component_id, ())
                 if isinstance(cross_items, (tuple, list)):
@@ -3268,6 +3270,20 @@ class LaunchOrchestrator(QObject):
         """Return exact process state, or ``None`` when it cannot be proven."""
 
         name = self._queue_item_name(item)
+        if name == 'VarAC' and isinstance(item, Mapping):
+            readiness = item.get('readiness_policy') or {}
+            if isinstance(readiness, Mapping):
+                target = str(readiness.get('process_executable') or '')
+                args = item.get('launch_arguments') or readiness.get('launch_arguments') or ()
+                if not target.lower().endswith('varac.exe'):
+                    target = next((str(arg) for arg in args if str(arg).replace('\\','/').lower().endswith('/varac.exe')), target)
+                if target and hasattr(getattr(self, 'status', None), 'cached_varac_process_state'):
+                    records = self._launch_process_records()
+                    kwargs = {} if records is None else dict(process_records=records, checked_monotonic=time.monotonic())
+                    return self.status.cached_varac_process_state(target,
+                        str(readiness.get('process_ini') or readiness.get('profile_selector') or ''),
+                        str(readiness.get('wine_prefix') or (readiness.get('environment') or {}).get('WINEPREFIX') or ''),
+                        **kwargs)['running']
         daemon = self._custom_rigctld_identity(item)
         if daemon is not None:
             records = self._launch_process_records()
@@ -3416,6 +3432,8 @@ class LaunchOrchestrator(QObject):
 
         if exact_process_running is True:
             return ""
+        if self._queue_item_name(item) == 'VarAC' and exact_process_running is None:
+            return 'Could not verify the configured VarAC instance; duplicate launch skipped. Review setup or check again.'
         # FLRig, FLDigi, and JS8Call own persisted per-radio endpoints.  Once
         # this launch sequence has freshly proved the requested endpoint clear,
         # another same-family process belongs to a different endpoint and must
@@ -3534,9 +3552,18 @@ class LaunchOrchestrator(QObject):
             cmd = self._command_from_config_path(name, override_path)
             if cmd:
                 return self._finalize_launch_command(name, cmd, launch_arguments), "radio configured path"
+            readiness = item.get('readiness_policy', {})
+            operator_recipe = isinstance(readiness, Mapping) and self.is_truthy(readiness.get('operator_recipe_v1'))
+            if operator_recipe and (os.path.isabs(override_path) or ' ' in override_path):
+                return None, 'reviewed application target is unavailable'
             cmd = self._command_from_freeform(override_path)
             if cmd:
                 return self._finalize_launch_command(name, cmd, launch_arguments), "radio configured command"
+        readiness = item.get('readiness_policy', {})
+        if isinstance(readiness, Mapping) and self.is_truthy(readiness.get('operator_recipe_v1')):
+            # A saved explicit choice is never permission to launch a legacy
+            # global path or another program found as a fallback.
+            return None, 'reviewed application target is unavailable'
         custom_cmd = self._custom_tool_command(name)
         if custom_cmd:
             cmd = self._command_from_freeform(custom_cmd)

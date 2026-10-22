@@ -112,6 +112,7 @@ class _BbsCatalogSnapshot:
     limit_access_enabled: bool
     sweeper_rules: tuple[dict[str, object], ...]
     managed_root: str = ""
+    station_catalog: object = None
 
 
 class _BbsCatalogWorker(QObject):
@@ -135,6 +136,8 @@ class _BbsCatalogWorker(QObject):
                 profiles = tuple()
             with connect_sqlite(self.db_path) as conn:
                 locations = tuple(list_bbs_locations(conn, include_disabled=True))
+                from freqinout.core.station_bbs_state import load_station_bbs_catalog
+                station_catalog = load_station_bbs_catalog(conn)
                 default_row = conn.execute(
                     "SELECT value FROM bbs_library_meta WHERE key='station_default_location_id' LIMIT 1"
                 ).fetchone()
@@ -174,6 +177,7 @@ class _BbsCatalogWorker(QObject):
             self.finished.emit(
                 self.generation,
                 _BbsCatalogSnapshot(
+                    station_catalog=station_catalog,
                     profiles=profiles,
                     locations=locations,
                     artifact_rows=artifact_rows,
@@ -314,6 +318,8 @@ def _expires_text(row: BbsArtifactAdminRow, *, now_utc: dt.datetime | None = Non
 
 class StationBbsTab(QWidget):
     """A bounded, database-backed catalog view for station Managed BBS work."""
+
+    catalog_published = Signal(object)
 
     def __init__(self, parent: Optional[QWidget] = None, *, settings: object | None = None) -> None:
         super().__init__(parent)
@@ -465,12 +471,11 @@ class StationBbsTab(QWidget):
         radio_editor_layout.addWidget(self.radio_native_paths_label, 3, 0, 1, 3)
         self.radio_service_save_btn = QPushButton("Save Radio Service")
         self.radio_service_save_btn.clicked.connect(self._save_selected_radio_service)
-        self.radio_initialize_btn = QPushButton("Initialize BBS…")
+        self.radio_initialize_btn = QPushButton("Set up BBS files…")
         self.radio_initialize_btn.setToolTip(
-            "Create the station Managed BBS library beside this radio's live BBS folder "
-            "and optionally import its current files."
+            "Choose the existing VarAC live BBS folder, then choose whether to reuse its current files."
         )
-        self.radio_initialize_btn.setAccessibleName("Initialize station Managed BBS library")
+        self.radio_initialize_btn.setAccessibleName("Set up station BBS files")
         self.radio_initialize_btn.clicked.connect(self._initialize_selected_radio_bbs)
         self.radio_settings_btn = QPushButton("Open Radio Settings")
         self.radio_settings_btn.clicked.connect(self._open_radio_settings)
@@ -1365,7 +1370,7 @@ class StationBbsTab(QWidget):
                 f"{radio_name}: {serving}; {publication}; {health}."
             )
             self._set_radio_service_editor_enabled(use_varac)
-            self.radio_initialize_btn.setText("Serve station BBS" if getattr(self, "_station_managed_root", "") else "Initialize BBS…")
+            self.radio_initialize_btn.setText("Serve station BBS" if getattr(self, "_station_managed_root", "") else "Set up BBS files…")
             self.radio_settings_btn.setEnabled(True)
             self.radio_service_status.setText(
                 "Configure the live BBS service here."
@@ -1455,10 +1460,12 @@ class StationBbsTab(QWidget):
             return
         answer = QMessageBox.question(
             self,
-            "Initialize Managed BBS",
-            "Create or reuse the station Managed BBS library beside this live BBS folder?\n\n"
+            "Set up station BBS files",
+            "Use this existing VarAC live BBS folder for the station's BBS files?\n\n"
             f"Live BBS: {live_dir}\n\n"
-            "The live folder will not be replaced or deleted. Catalog publication will be enabled for this radio.",
+            "The live folder remains in place. The next choice controls whether its current files are reused in the managed Default location. "
+            "If setup completes, this radio's BBS service and CommsPlan catalog publication will be enabled. "
+            "Cancel leaves files and settings unchanged.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -1467,9 +1474,10 @@ class StationBbsTab(QWidget):
             return
         import_answer = QMessageBox.question(
             self,
-            "Import Existing BBS Files",
+            "Reuse current live BBS files?",
             "Copy the files currently in this live BBS folder into the managed Default location?\n\n"
-            "Choose No to initialize an empty managed location. Existing live files remain untouched either way.",
+            "Yes reuses the current files as the starting catalog. No starts an empty managed location. "
+            "Existing live files remain untouched either way. Cancel leaves files and settings unchanged.",
             QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
             QMessageBox.Yes,
         )
@@ -1530,9 +1538,11 @@ class StationBbsTab(QWidget):
         self._refresh_radio_services(self._radio_profiles_by_id.values())
         self._pending_radio_status = (
             f"Station BBS reused; this radio now serves the existing locations and access rules. "
+            "BBS files and this radio's service settings were saved. "
             if result.reused else
             f"Managed BBS initialized. {result.imported_files} existing file(s) copied; "
-            f"{result.cataloged_files} file(s) cataloged in {result.default_location_dir}."
+            f"{result.cataloged_files} file(s) cataloged in {result.default_location_dir}. "
+            "BBS files and this radio's service settings were saved."
         )
         self.radio_service_status.setText(self._pending_radio_status)
         self.refresh_catalog()
@@ -2135,6 +2145,10 @@ class StationBbsTab(QWidget):
             self._on_catalog_failure(generation, "Catalog loader returned an invalid snapshot.")
             return
         self._catalog_rows = snapshot.artifact_rows
+        publish = getattr(self.settings, 'publish_station_bbs_catalog', None)
+        if callable(publish):
+            publish(snapshot.station_catalog)
+        self.catalog_published.emit(snapshot.station_catalog)
         self._station_managed_root = snapshot.managed_root
         self._station_default_location_id = snapshot.default_location_id or DEFAULT_LOCATION_ID
         self._locations_by_id = {location.location_id: location for location in snapshot.locations}

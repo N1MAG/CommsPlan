@@ -6,11 +6,11 @@ owned by the integrating window/controller.
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 from typing import Mapping, Sequence
 
 from PySide6.QtCore import QEvent, Qt, Signal
 from PySide6.QtWidgets import (
-    QCheckBox,
     QComboBox,
     QFormLayout,
     QGridLayout,
@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSplitter,
     QVBoxLayout,
@@ -28,6 +29,18 @@ from PySide6.QtWidgets import (
 )
 
 from freqinout.core.mesh import MeshChannel, MeshChannelCapabilities, MeshChannelPolicy
+from freqinout.gui.theme import ThemedCheckBox
+
+
+class _RetentionComboBox(QComboBox):
+    """Readable retention labels while accepting legacy value text in callers."""
+
+    def setCurrentText(self, text: str) -> None:  # noqa: N802 - Qt API
+        index = self.findText(text)
+        if index < 0:
+            index = self.findData(text)
+        if index >= 0:
+            self.setCurrentIndex(index)
 
 
 class MeshChannelAdminWidget(QGroupBox):
@@ -80,11 +93,16 @@ class MeshChannelAdminWidget(QGroupBox):
 
         details = QWidget()
         detail_layout = QVBoxLayout(details)
+        detail_layout.setContentsMargins(8, 8, 8, 8)
         self.detail_title = QLabel("Select a channel")
         self.detail_title.setStyleSheet("font-weight: 700;")
         detail_layout.addWidget(self.detail_title)
         self.state_group = QGroupBox("Device state")
         state_form = QFormLayout(self.state_group)
+        state_form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        state_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        state_form.setLabelAlignment(Qt.AlignLeft | Qt.AlignTop)
+        state_form.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.index_label = QLabel("—")
         self.privacy_label = QLabel("—")
         self.membership_label = QLabel("—")
@@ -100,34 +118,54 @@ class MeshChannelAdminWidget(QGroupBox):
 
         self.policy_group = QGroupBox("CommsPlan policy")
         policy_form = QFormLayout(self.policy_group)
+        policy_form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        policy_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        policy_form.setLabelAlignment(Qt.AlignLeft | Qt.AlignTop)
+        policy_form.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.review_label = QLabel("—")
         self.category_combo = QComboBox()
-        self.category_combo.addItems(["auto", "social", "ignore"])
-        self.retention_combo = QComboBox()
-        self.retention_combo.addItems(["24h", "7d", "30d", "keep pinned", "none"])
+        # Keep the persisted policy values stable while presenting operator
+        # language in the editor.  ``auto`` is an implementation value, not
+        # a useful label for someone reviewing a channel.
+        self.category_combo.addItem("Automatic", "auto")
+        self.category_combo.addItem("Social", "social")
+        self.category_combo.addItem("Ignore", "ignore")
+        self.retention_combo = _RetentionComboBox()
+        for label, value in (
+            ("24 hours", "24h"),
+            ("7 days", "7d"),
+            ("30 days", "30d"),
+            ("Keep pinned", "keep pinned"),
+            ("Do not retain", "none"),
+        ):
+            self.retention_combo.addItem(label, value)
         self.updated_label = QLabel("—")
         self.groups_edit = QLineEdit()
         self.groups_edit.setPlaceholderText("Optional operating groups, comma separated")
         surfaces = QWidget()
         surfaces_layout = QHBoxLayout(surfaces)
         surfaces_layout.setContentsMargins(0, 0, 0, 0)
-        self.inbox_check = QCheckBox("Inbox")
-        self.ops_check = QCheckBox("Ops")
-        self.map_check = QCheckBox("Map")
-        self.topics_check = QCheckBox("Topics")
+        self.inbox_check = ThemedCheckBox("Inbox")
+        self.ops_check = ThemedCheckBox("Ops")
+        self.map_check = ThemedCheckBox("Map")
+        self.topics_check = ThemedCheckBox("Topics")
         for check in (self.inbox_check, self.ops_check, self.map_check, self.topics_check):
             surfaces_layout.addWidget(check)
         surfaces_layout.addStretch(1)
         policy_form.addRow("Review", self.review_label)
         policy_form.addRow("Category", self.category_combo)
-        policy_form.addRow("Retention", self.retention_combo)
+        policy_form.addRow("Keep messages for", self.retention_combo)
         policy_form.addRow("Groups", self.groups_edit)
-        policy_form.addRow("Use in", surfaces)
+        policy_form.addRow("Show in", surfaces)
         policy_form.addRow("Updated", self.updated_label)
         detail_layout.addWidget(self.policy_group)
 
         edit_group = QGroupBox("Device configuration")
         edit_form = QFormLayout(edit_group)
+        edit_form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        edit_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        edit_form.setLabelAlignment(Qt.AlignLeft | Qt.AlignTop)
+        edit_form.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.name_edit = QLineEdit()
         self.name_edit.setMaxLength(120)
         self.role_combo = QComboBox()
@@ -142,13 +180,15 @@ class MeshChannelAdminWidget(QGroupBox):
         actions = QGridLayout()
         actions.setContentsMargins(0, 0, 0, 0)
         self._actions_layout = actions
-        self.accept_button = QPushButton("Accept")
-        self.accept_button.setToolTip("Accept this channel for CommsPlan handling; the device is not changed.")
+        self.accept_button = QPushButton("Use channel in CommsPlan")
+        self.accept_button.setToolTip(
+            "Use this channel in CommsPlan according to the policy above; the device is not changed."
+        )
         self.accept_button.clicked.connect(lambda: self._set_review("accepted"))
-        self.ignore_button = QPushButton("Ignore")
+        self.ignore_button = QPushButton("Ignore in CommsPlan")
         self.ignore_button.setToolTip("Ignore this channel in CommsPlan; the device is not changed.")
         self.ignore_button.clicked.connect(lambda: self._set_review("ignored"))
-        self.configure_button = QPushButton("Configure device")
+        self.configure_button = QPushButton("Configure device…")
         self.configure_button.setToolTip("Change supported channel fields on the connected device after review.")
         self.configure_button.clicked.connect(self._configure)
         self.remove_device_button = QPushButton("Remove from device")
@@ -168,7 +208,15 @@ class MeshChannelAdminWidget(QGroupBox):
             actions.addWidget(button, index // 2, index % 2)
         detail_layout.addLayout(actions)
         detail_layout.addStretch(1)
-        splitter.addWidget(details)
+        # The channel inspector is the sole scroll owner for the details pane.
+        # This keeps all actions reachable when the Settings workspace is
+        # compact without creating nested scrolling form traps.
+        self.inspector_scroll = QScrollArea()
+        self.inspector_scroll.setObjectName("meshChannelInspectorScroll")
+        self.inspector_scroll.setWidgetResizable(True)
+        self.inspector_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.inspector_scroll.setWidget(details)
+        splitter.addWidget(self.inspector_scroll)
         splitter.setSizes([220, 500])
         root.addWidget(splitter)
         self._update_actions()
@@ -301,14 +349,35 @@ class MeshChannelAdminWidget(QGroupBox):
         self.membership_label.setText(membership)
         self.last_seen_label.setText("Device snapshot")
         self.review_label.setText(policy.review_state if policy else "pending")
-        self.category_combo.setCurrentText(policy.default_category if policy else "auto")
-        self.retention_combo.setCurrentText(policy.retention_window if policy else "7d")
+        category = policy.default_category if policy else "auto"
+        category_index = self.category_combo.findData(category)
+        self.category_combo.setCurrentIndex(category_index if category_index >= 0 else 0)
+        retention = policy.retention_window if policy else "7d"
+        retention_index = self.retention_combo.findData(retention)
+        self.retention_combo.setCurrentIndex(
+            retention_index if retention_index >= 0 else self.retention_combo.findData("7d")
+        )
         self.groups_edit.setText(", ".join(policy.mapped_groups) if policy else "")
         self.inbox_check.setChecked(policy.inbox_enabled if policy else True)
         self.ops_check.setChecked(policy.ops_enabled if policy else True)
         self.map_check.setChecked(policy.map_enabled if policy else True)
         self.topics_check.setChecked(policy.topic_scan_enabled if policy else True)
-        self.updated_label.setText(policy.updated_utc if policy and policy.updated_utc else "Not recorded")
+        updated = str(policy.updated_utc or "").strip() if policy else ""
+        if updated:
+            # Keep the table readable while retaining the exact value for
+            # auditing and copy/paste in the read-only tooltip.
+            try:
+                parsed = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                display = parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            except (TypeError, ValueError, OverflowError):
+                display = updated
+            self.updated_label.setText(display)
+            self.updated_label.setToolTip(f"Exact timestamp: {updated}")
+        else:
+            self.updated_label.setText("Not recorded")
+            self.updated_label.setToolTip("")
         self.name_edit.setText(channel.name)
         self.role_combo.setCurrentText(channel.role or "unknown")
         self._update_actions()
@@ -377,8 +446,8 @@ class MeshChannelAdminWidget(QGroupBox):
                 channel.channel_id or str(channel.index),
                 {
                     "review_state": state,
-                    "default_category": self.category_combo.currentText(),
-                    "retention_window": self.retention_combo.currentText(),
+                    "default_category": self.category_combo.currentData() or "auto",
+                    "retention_window": self.retention_combo.currentData() or "7d",
                     "mapped_groups": groups,
                     "inbox_enabled": self.inbox_check.isChecked(),
                     "ops_enabled": self.ops_check.isChecked(),

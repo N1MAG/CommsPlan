@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import re
+import os
+import shutil
+import tempfile
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Sequence
@@ -61,6 +65,58 @@ class SpotterFormField:
     description: str = ""
 
 
+@dataclass(frozen=True)
+class SpotterFormsCatalogChoice:
+    """Pure selection of the catalog an operator-facing consumer should use.
+
+    Selecting a source is intentionally separate from checking that its folder
+    exists or reading its files.  Render paths can therefore use this model
+    without filesystem I/O, while an explicit refresh/worker owns discovery.
+    """
+
+    path: str
+    source: str
+    ownership: str
+
+
+@dataclass(frozen=True)
+class SpotterFormsImportItem:
+    source: str
+    name: str
+    form_code: str
+    size: int
+    valid: bool
+    duplicate: bool = False
+    reason: str = ""
+    source_digest: str = ""
+
+
+@dataclass(frozen=True)
+class SpotterFormsImportPreview:
+    items: tuple[SpotterFormsImportItem, ...]
+    existing: tuple[str, ...]
+    source_count: int
+    valid_count: int
+    duplicate_count: int
+    rejected_count: int
+    bounded: bool = False
+    existing_bounded: bool = False
+
+
+@dataclass(frozen=True)
+class SpotterFormsImportResult:
+    target_dir: str
+    copied: tuple[str, ...]
+    skipped: tuple[str, ...]
+    errors: tuple[str, ...]
+    committed: bool
+
+
+MAX_SPOTTER_IMPORT_FILES = 200
+MAX_SPOTTER_FORM_BYTES = 1024 * 1024
+CP_FORMS_LIBRARY_NAME = "spotter_forms"
+
+
 SPOTTER_COMMENTS_KEY = "COMMENTS"
 SPOTTER_COMMENTS_MAX_LENGTH = 50
 
@@ -83,7 +139,316 @@ _OPERATOR_AUTOFILL_FIELDS: Mapping[str, Mapping[str, str]] = {
 def bundled_spotter_forms_dir() -> Path:
     """Return FIO's packaged station-level Spotter form catalog."""
 
-    return Path(__file__).resolve().parent.parent / "resources" / "spotter_forms"
+    # Keep source selection pure: resolving this packaged path must not stat
+    # or create anything. Discovery performs filesystem checks explicitly.
+    return Path(__file__).parent.parent / "resources" / "spotter_forms"
+
+
+def choose_effective_spotter_forms_path(
+    global_path: object = "",
+    legacy_radio_path: object = "",
+    bundled_path: object = None,
+) -> str:
+    """Choose the active catalog path without touching the filesystem.
+
+    The station-global CP Forms Library (`js8_forms_path`) wins whenever it is
+    explicitly set.  A per-radio forms path is retained only as a clearly
+    legacy fallback for stations that have not selected a global catalog.
+    """
+
+    global_text = str(global_path or "").strip()
+    if global_text:
+        return global_text
+    legacy_text = str(legacy_radio_path or "").strip()
+    if legacy_text:
+        return legacy_text
+    return str(bundled_path if bundled_path is not None else bundled_spotter_forms_dir())
+
+
+def choose_effective_spotter_forms_catalog(
+    global_path: object = "",
+    legacy_radio_path: object = "",
+    bundled_path: object = None,
+) -> SpotterFormsCatalogChoice:
+    """Return source and ownership metadata for the pure path choice."""
+
+    global_text = str(global_path or "").strip()
+    if global_text:
+        return SpotterFormsCatalogChoice(global_text, "global", "CommsPlan Forms Library")
+    legacy_text = str(legacy_radio_path or "").strip()
+    if legacy_text:
+        return SpotterFormsCatalogChoice(legacy_text, "legacy-radio", "Legacy per-radio catalog")
+    bundled = str(bundled_path if bundled_path is not None else bundled_spotter_forms_dir())
+    return SpotterFormsCatalogChoice(bundled, "bundled", "Bundled CommsPlan catalog")
+
+
+# Descriptive aliases keep callers readable while allowing tests/integrations
+# to use either the path or metadata form of the helper.
+effective_spotter_forms_path = choose_effective_spotter_forms_path
+effective_spotter_forms_catalog = choose_effective_spotter_forms_catalog
+
+
+def cp_spotter_forms_library_dir(config_root: object = None) -> Path:
+    """Return the station-owned CP library location without creating it."""
+
+    root = Path(config_root).expanduser() if config_root else None
+    if root is None:
+        from freqinout.core.config_paths import get_config_dir
+
+        root = get_config_dir() / "config"
+    return root / CP_FORMS_LIBRARY_NAME
+
+
+def _import_source_paths(sources: Iterable[object]) -> tuple[list[Path], bool]:
+    paths: list[Path] = []
+    bounded = False
+    for raw in sources or ():
+        try:
+            path = Path(raw).expanduser()
+        except (OSError, TypeError, ValueError):
+            continue
+        if path.is_dir():
+            children, exceeded = _bounded_catalog_files(path)
+            bounded = bounded or exceeded
+            paths.extend(children)
+        elif path.is_file() and path.suffix.lower() == ".txt" and FORM_FILE_RE.fullmatch(path.stem):
+            paths.append(path)
+        if len(paths) > MAX_SPOTTER_IMPORT_FILES:
+            bounded = True
+            paths = paths[:MAX_SPOTTER_IMPORT_FILES]
+            break
+    # A file selected twice or supplied by a folder and file selection is one
+    # candidate, preserving source order while avoiding duplicate reads.
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        key = os.path.normcase(os.path.normpath(str(path)))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique, bounded
+
+
+def _bounded_catalog_files(root: Path, limit: int = MAX_SPOTTER_IMPORT_FILES) -> tuple[list[Path], bool]:
+    """Read at most ``limit + 1`` MCF entries so overlarge catalogs fail closed."""
+
+    files: list[Path] = []
+    try:
+        for entry in root.iterdir():
+            if entry.is_file() and entry.suffix.lower() == ".txt" and FORM_FILE_RE.fullmatch(entry.stem):
+                files.append(entry)
+                if len(files) > limit:
+                    return files[:limit], True
+    except OSError:
+        return files, False
+    return sorted(files, key=lambda item: item.name.upper()), False
+
+
+def preview_spotter_forms_import(
+    sources: Iterable[object],
+    *,
+    existing_dir: object = None,
+    existing_dirs: Iterable[object] = (),
+    max_files: int = MAX_SPOTTER_IMPORT_FILES,
+    max_bytes: int = MAX_SPOTTER_FORM_BYTES,
+) -> SpotterFormsImportPreview:
+    """Validate a bounded list of existing MCF files without changing state."""
+
+    paths, bounded = _import_source_paths(sources)
+    if max_files > 0 and len(paths) > max_files:
+        paths = paths[:max_files]
+        bounded = True
+    existing_names: set[str] = set()
+    existing_bounded = False
+    directories = [existing_dir, *(existing_dirs or ())]
+    for directory in directories:
+        if not directory:
+            continue
+        try:
+            root = Path(directory).expanduser()
+            if root.is_dir():
+                files, exceeded = _bounded_catalog_files(root)
+                existing_bounded = existing_bounded or exceeded
+                existing_names.update(p.name.casefold() for p in files)
+        except (OSError, TypeError, ValueError):
+            continue
+    items: list[SpotterFormsImportItem] = []
+    seen_names: set[str] = set(existing_names)
+    for path in paths:
+        name = path.name
+        form_code = normalize_form_code(path.stem)
+        valid = True
+        reason = ""
+        raw = b""
+        try:
+            size = int(path.stat().st_size)
+        except OSError as exc:
+            size = 0
+            valid = False
+            reason = f"Cannot read file: {exc}"
+        if valid and size > max_bytes:
+            valid = False
+            reason = f"File exceeds {max_bytes} byte limit"
+        if valid:
+            try:
+                with path.open("rb") as stream:
+                    raw = stream.read(max_bytes + 1)
+            except OSError as exc:
+                valid = False
+                reason = f"Cannot read file: {exc}"
+            else:
+                if len(raw) != size:
+                    valid = False
+                    reason = "File changed while it was being reviewed"
+        if valid and not form_code:
+            valid = False
+            reason = "Filename is not a supported MCF form"
+        digest = hashlib.sha256(raw).hexdigest() if valid else ""
+        if valid:
+            try:
+                text = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                valid = False
+                reason = "Form is not valid UTF-8"
+            else:
+                if not text.strip():
+                    valid = False
+                    reason = "Form is empty"
+                elif form_code not in extract_form_codes(text):
+                    valid = False
+                    reason = "Form header does not match its MCF filename"
+                elif not parse_spotter_form_fields(text):
+                    valid = False
+                    reason = "Form contains no supported fields"
+        duplicate = name.casefold() in seen_names
+        if duplicate and valid:
+            reason = "Already present in CP Forms Library"
+        if valid:
+            seen_names.add(name.casefold())
+        items.append(SpotterFormsImportItem(str(path), name, form_code, size, valid, duplicate, reason, digest))
+    valid_count = sum(1 for item in items if item.valid and not item.duplicate)
+    return SpotterFormsImportPreview(
+        tuple(items), tuple(sorted(existing_names)), len(items), valid_count,
+        sum(1 for item in items if item.duplicate), sum(1 for item in items if not item.valid), bounded,
+        existing_bounded,
+    )
+
+
+def import_spotter_forms_to_library(
+    preview: SpotterFormsImportPreview,
+    *,
+    target_dir: object,
+    preserve_dir: object = None,
+) -> SpotterFormsImportResult:
+    """Copy reviewed forms into a CP-owned catalog with rollback on failure.
+
+    ``preserve_dir`` is an existing valid catalog selected by the operator. Its
+    files are copied into the staged CP library before imported files. Source
+    folders are never modified and existing target names are never overwritten.
+    """
+
+    target = Path(target_dir).expanduser()
+    copied: list[str] = []
+    skipped: list[str] = []
+    errors: list[str] = []
+    if preview.bounded:
+        errors.append("Import exceeds the bounded file limit")
+    if preview.existing_bounded:
+        errors.append("An existing catalog exceeds the bounded file limit")
+    if len(preview.existing) + preview.valid_count > MAX_SPOTTER_IMPORT_FILES:
+        errors.append("Combined catalog exceeds the bounded file limit")
+    if preview.rejected_count:
+        errors.extend(
+            f"{item.name}: {item.reason or 'invalid form'}"
+            for item in preview.items
+            if not item.valid
+        )
+    if errors:
+        return SpotterFormsImportResult(str(target), (), (), tuple(errors), False)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(prefix=f".{target.name}.", dir=str(target.parent)))
+    except OSError as exc:
+        return SpotterFormsImportResult(str(target), (), (), (f"Cannot prepare CP Forms Library: {exc}",), False)
+    created: list[Path] = []
+    try:
+        # Preserve an already valid catalog in the staging tree.  Existing
+        # target files are copied as-is into staging and never replaced.
+        preserve = Path(preserve_dir).expanduser() if preserve_dir else None
+        preserve_files: list[Path] = []
+        if preserve and preserve.is_dir():
+            preserve_files, preserve_bounded = _bounded_catalog_files(preserve)
+            if preserve_bounded:
+                return SpotterFormsImportResult(str(target), (), (), ("Existing catalog exceeds the bounded file limit",), False)
+        existing_files, target_bounded = _bounded_catalog_files(target) if target.is_dir() else ([], False)
+        if target_bounded:
+            return SpotterFormsImportResult(str(target), (), (), ("CP Forms Library exceeds the bounded file limit",), False)
+        staged_names = set()
+        for source in [*existing_files, *preserve_files]:
+            destination = staging / source.name
+            if source.name.casefold() in staged_names:
+                continue
+            with source.open("rb") as stream:
+                preserved = stream.read(MAX_SPOTTER_FORM_BYTES + 1)
+            if len(preserved) > MAX_SPOTTER_FORM_BYTES:
+                raise RuntimeError(f"{source.name}: existing form exceeds the bounded size limit")
+            destination.write_bytes(preserved)
+            staged_names.add(source.name.casefold())
+        for item in preview.items:
+            destination = staging / item.name
+            if item.name.casefold() in staged_names or item.duplicate:
+                skipped.append(item.name)
+                continue
+            source_path = Path(item.source)
+            try:
+                with source_path.open("rb") as stream:
+                    current = stream.read(MAX_SPOTTER_FORM_BYTES + 1)
+            except OSError as exc:
+                raise RuntimeError(f"{item.name}: source could not be reread ({exc})") from exc
+            if len(current) != item.size or hashlib.sha256(current).hexdigest() != item.source_digest:
+                raise RuntimeError(f"{item.name}: source changed after review; preview it again")
+            destination.write_bytes(current)
+            staged_names.add(item.name.casefold())
+        # Publish each new file atomically, checking again to preserve the
+        # no-overwrite contract if another process changed the directory.
+        target.mkdir(parents=True, exist_ok=True)
+        for staged in _bounded_catalog_files(staging, MAX_SPOTTER_IMPORT_FILES * 3)[0]:
+            destination = target / staged.name
+            if destination.exists():
+                continue
+            try:
+                # Linking a complete staged file publishes it atomically and
+                # refuses to replace a concurrent/pre-existing destination.
+                os.link(str(staged), str(destination))
+                created.append(destination)
+            except FileExistsError:
+                continue
+            except OSError:
+                # Filesystems without hard-link support still get an
+                # exclusive destination and immediate rollback registration.
+                try:
+                    fd = os.open(str(destination), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    created.append(destination)
+                    with os.fdopen(fd, "wb") as out, staged.open("rb") as source:
+                        shutil.copyfileobj(source, out)
+                        out.flush()
+                        os.fsync(out.fileno())
+                except FileExistsError:
+                    if destination in created:
+                        created.remove(destination)
+                    continue
+            copied.append(staged.name)
+        return SpotterFormsImportResult(str(target), tuple(copied), tuple(skipped), (), True)
+    except Exception as exc:
+        for path in reversed(created):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        return SpotterFormsImportResult(str(target), (), tuple(skipped), tuple(errors + [str(exc)]), False)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 def resolve_spotter_forms_dir(configured_dir: object = None) -> Path:
@@ -103,6 +468,40 @@ def resolve_spotter_forms_dir(configured_dir: object = None) -> Path:
         except (OSError, TypeError, ValueError):
             pass
     return bundled_spotter_forms_dir()
+
+
+def resolve_effective_spotter_forms_dir(
+    global_path: object = "",
+    legacy_radio_path: object = "",
+    bundled_path: object = None,
+) -> Path:
+    """Resolve the chosen catalog at an explicit read/worker boundary.
+
+    An explicitly selected global or legacy path remains authoritative even
+    when it is currently missing; callers can then show an honest empty/error
+    state instead of silently switching catalog ownership.
+    """
+
+    return Path(choose_effective_spotter_forms_path(global_path, legacy_radio_path, bundled_path)).expanduser()
+
+
+def discover_effective_spotter_forms(
+    global_path: object = "",
+    legacy_radio_path: object = "",
+    bundled_path: object = None,
+) -> List[SpotterFormDefinition]:
+    """Discover forms from one resolved effective source, without fallback."""
+
+    root = resolve_effective_spotter_forms_dir(global_path, legacy_radio_path, bundled_path)
+    if not root.exists() or not root.is_dir():
+        return []
+    out: List[SpotterFormDefinition] = []
+    for path in _bounded_catalog_files(root)[0]:
+        match = FORM_FILE_RE.fullmatch(path.stem)
+        if not match:
+            continue
+        out.append(SpotterFormDefinition(f"F!{match.group(1).upper()}", _read_form_title(path), str(path)))
+    return out
 
 
 def normalize_form_code(value: object) -> str:
@@ -150,7 +549,7 @@ def discover_spotter_forms(forms_dir: object) -> List[SpotterFormDefinition]:
         return []
     out: List[SpotterFormDefinition] = []
     for path in sorted(root.glob("MCF*.txt"), key=lambda item: item.name.upper()):
-        match = FORM_FILE_RE.match(path.stem)
+        match = FORM_FILE_RE.fullmatch(path.stem)
         if not match:
             continue
         form_code = f"F!{match.group(1).upper()}"
@@ -406,7 +805,16 @@ def effective_mapping_rows(settings, forms_dir: object = None) -> List[Dict[str,
 
     out: List[Dict[str, object]] = []
     seen: set[str] = set()
-    for definition in discover_spotter_forms(forms_dir):
+    # Empty means the bundled catalog. Once an operator has explicitly chosen
+    # a station path, that path remains authoritative and a missing folder is
+    # represented as empty rather than silently replacing it with bundled
+    # forms.
+    definitions = (
+        discover_effective_spotter_forms(forms_dir)
+        if str(forms_dir or "").strip()
+        else discover_spotter_forms("")
+    )
+    for definition in definitions:
         base = factory_mapping_for_form(definition.form_code, definition.title)
         row = dict(configured.get(definition.form_code, base))
         row["form_code"] = definition.form_code

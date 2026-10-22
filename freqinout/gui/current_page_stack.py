@@ -43,10 +43,14 @@ class CurrentPageStack(QStackedWidget):
 
     def hasHeightForWidth(self) -> bool:  # noqa: N802 - Qt override
         page = self.currentWidget()
-        return bool(page is not None and page.hasHeightForWidth())
+        # An editor with its own content scroll fits the outer viewport. Its
+        # wrapped content must not request a second outer scrolling height.
+        return bool(page is not None and not page.property("fioOwnsContentScroll") and page.hasHeightForWidth())
 
     def heightForWidth(self, width: int) -> int:  # noqa: N802 - Qt override
         page = self.currentWidget()
+        if page is not None and page.property("fioOwnsContentScroll"):
+            return -1
         if page is None or not page.hasHeightForWidth():
             return super().heightForWidth(width)
         return page.heightForWidth(width)

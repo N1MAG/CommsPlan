@@ -15,7 +15,7 @@ Local Mesh connects station-level MeshCore or Meshtastic services to CommsPlan. 
 
 ## Add a saved device
 
-1. Open **Configuration → Mesh**.
+1. Open **Configuration → Main → Local Mesh**.
 2. Select **Add Device**.
 3. Choose **MeshCore** or **Meshtastic**.
 4. Choose the supported connection type for that protocol.
@@ -41,7 +41,7 @@ If Bluetooth is powered off, the pairing is cancelled, or the device stops adver
 
 Receiving data does not automatically authorize transmission.
 
-1. Open **Configuration → Mesh**.
+1. Open **Configuration → Main → Local Mesh**.
 2. Select the saved device.
 3. Turn on **Allow Send** in **Saved Devices**.
 4. Confirm that the device is connected.

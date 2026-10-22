@@ -409,6 +409,16 @@ def _merge_equivalent_endpoint_items(items: List[Dict[str, object]]) -> List[Dic
         if existing is None:
             merged[key] = item
             continue
+        if key.startswith("js8call:"):
+            # TCP/fallback and capability probes publish separate records for
+            # one endpoint. A recovered endpoint must not retain an older
+            # failure simply because warnings sort ahead of healthy results.
+            checked = _float_value(item.get("last_check_ts"))
+            existing_checked = _float_value(existing.get("last_check_ts"))
+            if checked != existing_checked:
+                if checked > existing_checked:
+                    merged[key] = item
+                continue
         item_rank = severity_rank.get(str(item.get("severity", "ok")), 3)
         existing_rank = severity_rank.get(str(existing.get("severity", "ok")), 3)
         if item_rank < existing_rank:
@@ -1004,16 +1014,18 @@ def summarize_station_health(
         if not isinstance(raw_snapshot, Mapping):
             continue
         item = _item_from_snapshot(str(key or ""), raw_snapshot, scope_resolver=scope_resolver, now=now)
-        if include_ok or item["is_issue"]:
-            items.append(item)
+        items.append(item)
     for raw_item in extra_items or ():
         if not isinstance(raw_item, Mapping):
             continue
         item = dict(raw_item)
-        if include_ok or item.get("is_issue"):
-            items.append(item)
+        items.append(item)
     items = _collapse_background_ingest_ok_items(items)
     items = _merge_equivalent_endpoint_items(items)
+    # Recovery evidence must participate in endpoint merging even when the
+    # caller only wants current issues (including the shell issue counter).
+    if not include_ok:
+        items = [item for item in items if item.get("is_issue")]
     items.sort(
         key=lambda item: (
             {"danger": 0, "warning": 1, "info": 2, "ok": 3}.get(str(item.get("severity")), 4),

@@ -22,10 +22,10 @@ _MAX_RINGS_PER_FEATURE = 6
 _MAX_LABELS = 400
 _MAX_STATE_LABELS = 64
 _MAX_LEGEND_ITEMS = 12
-_GRID_LAT_MIN = 10
-_GRID_LAT_MAX = 80
-_GRID_LON_MIN = -170
-_GRID_LON_MAX = -50
+_GRID_LAT_MIN = -85
+_GRID_LAT_MAX = 85
+_GRID_LON_MIN = -180
+_GRID_LON_MAX = 180
 
 _US_STATE_CODES = {
     "Alabama": "AL", "Alaska": "AK", "Arizona": "AZ", "Arkansas": "AR",
@@ -143,6 +143,24 @@ def _simplify_ring(ring: Sequence[Sequence[object]]) -> list[dict[str, float]]:
     return simplified[: _MAX_POINTS_PER_RING + 1]
 
 
+def _ring_area(ring: Sequence[Sequence[object]]) -> float:
+    """Rank bundled exterior pieces by area, independent of vertex density."""
+    points: list[tuple[float, float]] = []
+    for raw in ring:
+        if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes, bytearray)) or len(raw) < 2:
+            continue
+        lon, lat = _number(raw[0], 999.0), _number(raw[1], 999.0)
+        if -180.0 <= lon <= 180.0 and -90.0 <= lat <= 90.0:
+            points.append((lon, lat))
+    if len(points) < 3:
+        return 0.0
+    return abs(sum(
+        point[0] * points[(index + 1) % len(points)][1]
+        - points[(index + 1) % len(points)][0] * point[1]
+        for index, point in enumerate(points)
+    )) / 2.0
+
+
 @lru_cache(maxsize=4)
 def _geometry_features(filename: str) -> tuple[dict[str, object], ...]:
     path = _ASSET_DIR / filename
@@ -163,9 +181,17 @@ def _geometry_features(filename: str) -> tuple[dict[str, object], ...]:
         region = str(props.get("fema_region") or "").strip().upper()
         if region and not region.startswith("R"):
             region = f"R{region.zfill(2)}"
-        for ring_index, ring in enumerate(_outer_rings(feature.get("geometry"))):
-            if ring_index >= _MAX_RINGS_PER_FEATURE:
-                break
+        # Source order often starts with tiny islands, with the mainland last.
+        # Rank original geometry before decimation; retain source IDs for hits.
+        ranked_rings = sorted(
+            ((index, ring, _ring_area(ring)) for index, ring in
+             enumerate(_outer_rings(feature.get("geometry")))),
+            key=lambda item: -item[2],
+        )
+        retained = 0
+        for ring_index, ring, area in ranked_rings:
+            if area <= 0.0:
+                continue
             points = _simplify_ring(ring)
             if len(points) < 3:
                 continue
@@ -180,6 +206,9 @@ def _geometry_features(filename: str) -> tuple[dict[str, object], ...]:
             )
             if len(output) >= _MAX_POLYGONS:
                 return tuple(output)
+            retained += 1
+            if retained >= _MAX_RINGS_PER_FEATURE:
+                break
     return tuple(output)
 
 
@@ -231,7 +260,7 @@ def _state_and_region_labels() -> tuple[tuple[dict[str, object], ...], tuple[dic
         if not code or not isinstance(points, Sequence):
             continue
         current = by_state.get(code)
-        if current is None or len(points) > len(current.get("points") or ()):
+        if current is None:
             by_state[code] = dict(feature)
     state_labels: list[dict[str, object]] = []
     region_points: dict[str, list[dict[str, float]]] = {}
@@ -424,7 +453,7 @@ def _dynamic_legend(payload: Mapping[str, object]) -> list[dict[str, object]]:
         add("FEMA Regions", "info")
     # The provider-free basemap always draws geographic boundaries. Keep that
     # visible context honest even when the optional state-label overlay is off.
-    add("State boundaries", "muted")
+    add("Borders", "muted")
     if bool(payload.get("show_grids")):
         add("Maidenhead grid", "muted")
     if bool(payload.get("show_cities")) and bool(payload.get("show_city_labels", True)):
@@ -545,12 +574,13 @@ def _base_polygons() -> tuple[dict[str, object], ...]:
 def _grid_projection() -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     lines: list[dict[str, object]] = []
     labels: list[dict[str, object]] = []
-    for lon in range(_GRID_LON_MIN, _GRID_LON_MAX + 1, 2):
+    for lon in range(_GRID_LON_MIN, _GRID_LON_MAX + 1, 20):
         lines.append({"id": f"grid-lon-{lon}", "kind": "grid", "color_role": "muted", "points": [{"lat": _GRID_LAT_MIN, "lon": lon}, {"lat": _GRID_LAT_MAX, "lon": lon}]})
-    for lat in range(_GRID_LAT_MIN, _GRID_LAT_MAX + 1):
-        lines.append({"id": f"grid-lat-{lat}", "kind": "grid", "color_role": "muted", "points": [{"lat": lat, "lon": _GRID_LON_MIN}, {"lat": lat, "lon": _GRID_LON_MAX}]})
+    for lat in range(-80, 81, 10):
+        for west,east in ((-180,-60),(-60,60),(60,180)):
+            lines.append({"id": f"grid-lat-{lat}:{west}", "kind": "grid", "color_role": "muted", "points": [{"lat": lat, "lon": west}, {"lat": lat, "lon": east}]})
     for lon in range(_GRID_LON_MIN, _GRID_LON_MAX, 20):
-        for lat in range(_GRID_LAT_MIN, _GRID_LAT_MAX, 10):
+        for lat in range(-90, 90, 10):
             field_lon = int((lon + 180) // 20)
             field_lat = int((lat + 90) // 10)
             if 0 <= field_lon < 18 and 0 <= field_lat < 18:
@@ -577,6 +607,8 @@ def _regional_summary(payload: Mapping[str, object]) -> dict[str, object]:
 
 def build_native_overlay_projection(payload: Mapping[str, object]) -> dict[str, object]:
     """Return a bounded copy enriched with static native overlay collections."""
+    from freqinout.core.geographic_scope import filter_geographic_payload
+    payload = filter_geographic_payload(payload, str(payload.get('_geographic_country') or ''))
     projected = dict(payload)
     projected["_native_projection_enriched"] = True
     marker_source = payload.get("markers")
@@ -609,7 +641,16 @@ def build_native_overlay_projection(payload: Mapping[str, object]) -> dict[str, 
                 event["color"], event["color_role"] = _SITREP_STATUS_STYLE[status]
             events.append(event)
         projected[collection] = events
-    projected["base_polygons"] = [dict(item) for item in _base_polygons()]
+    try:
+        from freqinout.gui.world_geography import prepare_geography
+        viewport = payload.get("geography_viewport") or {}
+        geography = prepare_geography(payload.get("view"), viewport.get("width",1000), viewport.get("height",700),
+                                      show_cities=bool(payload.get("show_cities")),
+                                      min_population=float(payload.get("city_min_pop") or 0))
+        projected.update(geography)
+    except (OSError,ValueError,KeyError,TypeError):
+        projected.pop("_world_geography",None)
+        projected["base_polygons"] = [dict(item) for item in _base_polygons()]
     projected["polygons"] = _state_polygons(payload)
     state_labels, region_labels = _state_and_region_labels()
     projected["state_labels"] = [dict(item) for item in state_labels] if bool(payload.get("show_states")) else []
@@ -652,6 +693,8 @@ def build_native_overlay_projection(payload: Mapping[str, object]) -> dict[str, 
         projected["city_labels"] = cities[:_MAX_LABELS]
     else:
         projected["city_labels"] = []
+    if projected.get("_world_geography"):
+        projected["city_labels"] = geography["city_labels"]
     projected["regional_summary"] = _regional_summary(payload)
     sitrep_summary = _sitrep_summary(payload)
     if sitrep_summary:

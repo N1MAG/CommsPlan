@@ -6,27 +6,31 @@ description: Choose the right CommsPlan setup path for a new station, an upgrade
 # Start here
 
 <div class="doc-badge-row">
-  <span class="doc-badge">CommsPlan 2.0.5</span>
+  <span class="doc-badge">CommsPlan 2.0.6</span>
   <span class="doc-badge">Windows · Linux · macOS</span>
   <span class="doc-badge">Choose the right path</span>
 </div>
 
-CommsPlan is a coordinated operations console for HF digital stations. It does not replace FLRig, FLDigi, FLMsg, FLAmp, JS8Call, VarAC, VARA, MeshCore, or Meshtastic. It coordinates those applications as one station while preserving their own profiles and technical controls. CommsPlan is the current product name; FreqInOut remains the compatibility name in established profiles, launchers, package identity, and source paths.
+CommsPlan is a coordinated operations console for HF digital stations. It does not replace FLRig, FLDigi, FLMsg, FLAmp, JS8Call, VarAC, VARA, MeshCore, or Meshtastic. It coordinates those applications as one station while preserving their own profiles and technical controls. The [GitHub Releases page](https://github.com/N1MAG/CommsPlan/releases/latest) lists published packages, checksums, and release notes.
+
+The Station Setup checklist and workflow described below are part of CommsPlan
+2.0.6. Use the installation and upgrade guide to select a currently published
+package or source installation.
 
 ## Which path fits your station?
 
 <div class="decision-grid">
   <div class="decision-card">
     <strong>New to CommsPlan</strong>
-    <p>Install the current package, enter the station identity, and use Guided Add Radio for the first radio.</p>
+    <p>Install a package from the latest published release, enter the station identity, and use Station Setup to review the first radio.</p>
   </div>
   <div class="decision-card">
     <strong>Upgrading a single-radio station</strong>
-    <p>Close CommsPlan and companion applications, install the update, then review Upgrade Existing Station.</p>
+    <p>Close CommsPlan and companion applications, install the update, then review the saved station setup and radio configuration.</p>
   </div>
   <div class="decision-card">
-    <strong>Already using FreqInOut 2.0</strong>
-    <p>Install CommsPlan over the established application and keep using the established station profile.</p>
+    <strong>Already using CommsPlan</strong>
+    <p>Follow the upgrade steps for your installation type and keep the verified station backup available.</p>
   </div>
 </div>
 
@@ -41,23 +45,22 @@ CommsPlan is a coordinated operations console for HF digital stations. It does n
 - Treat a verified station backup as mandatory for an upgrade.
 
 ::: tip One radio is enough
-You do not need to add another radio to use CommsPlan 2.0.5. The multi-radio architecture keeps one-radio operation fully supported.
+You do not need to add another radio to use CommsPlan. One-radio operation remains fully supported.
 :::
 
 ## First successful session
 
 The recommended order is:
 
-1. Enter the station identity and location under **Configuration**.
-2. Define the operating groups used by scheduling, filtering, access policies, and publication rules.
-3. Add or review the first radio and select only the software it actually uses.
-4. Review Software Administration and Launch Control for that radio.
-5. Create or assign a frequency plan and schedule.
-6. Open Ops Center, Messages, and Map to confirm the resulting station context.
+1. Open **Configuration → Main → Station setup** and review the saved checklist.
+2. Complete operator and operating-group details.
+3. Choose a radio and use its scoped editors to review software, connections, behavior, and schedule.
+4. Review the saved setup summary. Scheduling stays off until you explicitly review and enable it.
+5. Open Ops Center, Messages, and Map to confirm the resulting station context.
 
 <div class="expectation">
   <strong>Expected result</strong>
-  CommsPlan reopens with the same station profile, the configured radio appears under Configuration, and its selected application identities appear in Software Administration.
+  The saved checklist reflects the configured station. The reviewed radio and its application identities are available in the scoped setup editors.
 </div>
 
 ## Understand the operating model
@@ -68,7 +71,7 @@ CommsPlan keeps three questions connected:
 - **When do I need to be there?** Schedules, events, and the next meaningful transition.
 - **What do I do when I am there?** The task, message, SOP action, or station service appropriate to that context.
 
-The Station Control Bar keeps radio and schedule context visible. The active workspace focuses on the task and why an action is ready, blocked, or unnecessary. Message Intelligence carries source-aware summaries into Messages, FIO Spotter, Ops Center, and Map; Plan Builder connects schedules to the radio that owns them.
+The Station Control Bar keeps radio and schedule context visible. The active workspace focuses on the task and why an action is ready, blocked, or unnecessary. Message Intelligence carries source-aware summaries into Messages, Ops Center, and Map; Plan Builder connects schedules to the radio that owns them.
 
 ## Continue
 

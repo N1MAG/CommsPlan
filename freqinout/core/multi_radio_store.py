@@ -7,6 +7,7 @@ import sqlite3
 import threading
 import uuid
 from dataclasses import dataclass, replace
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
@@ -262,6 +263,7 @@ SETTINGS_TABLE_SPECS: Dict[str, Dict[str, object]] = {
             use_flamp INTEGER NOT NULL DEFAULT 0,
             use_js8call INTEGER NOT NULL DEFAULT 0,
             use_js8spotter INTEGER NOT NULL DEFAULT 0,
+            use_external_js8spotter INTEGER,
             use_commstat INTEGER NOT NULL DEFAULT 0,
             use_varac INTEGER NOT NULL DEFAULT 0,
             rig_host TEXT,
@@ -373,6 +375,7 @@ SETTINGS_TABLE_SPECS: Dict[str, Dict[str, object]] = {
             "use_flamp": "INTEGER NOT NULL DEFAULT 0",
             "use_js8call": "INTEGER NOT NULL DEFAULT 0",
             "use_js8spotter": "INTEGER NOT NULL DEFAULT 0",
+            "use_external_js8spotter": "INTEGER",
             "use_commstat": "INTEGER NOT NULL DEFAULT 0",
             "use_varac": "INTEGER NOT NULL DEFAULT 0",
             "rig_host": "TEXT",
@@ -3245,6 +3248,10 @@ def ensure_multi_radio_settings_schema(conn: sqlite3.Connection) -> None:
         """,
         (RADIO_HARDWARE_SCHEMA_VERSION_KEY, json.dumps(HARDWARE_BINDING_SCHEMA_VERSION)),
     )
+    from freqinout.core.operator_schedule_authorization import ensure_schedule_authorization_schema
+    ensure_schedule_authorization_schema(conn)
+    from freqinout.core.schedule_approval_sources import install_source_revisions
+    install_source_revisions(conn)
     conn.commit()
 
 
@@ -3508,6 +3515,7 @@ def _validate_software_application_claims_conn(
     values: Mapping[str, Any],
     *,
     allowed_varac_shared_db_path: str = "",
+    reviewed_existing_id: Optional[int] = None,
 ) -> None:
     """Reject collisions in legacy application rows that predate manifests."""
 
@@ -3516,15 +3524,31 @@ def _validate_software_application_claims_conn(
     family = str(family_key or "").strip().lower()
     if family == "js8call":
         host = _coerce_text(payload.get("host", "127.0.0.1"), "127.0.0.1").casefold()
+        host_key = '127.0.0.1' if host == 'localhost' else host
         port = _coerce_int(payload.get("port", 2442), 2442)
+        prior = _record_by_id(conn, 'js8_instances', int(reviewed_existing_id)) if reviewed_existing_id else None
+        same_claim = bool(prior and record_id == reviewed_existing_id
+                          and host_key == ('127.0.0.1' if str(prior.get('host') or '127.0.0.1').strip().lower() == 'localhost' else str(prior.get('host') or '127.0.0.1').strip().lower())
+                          and port == int(prior.get('port') or 2442))
         row = conn.execute(
             """
             SELECT name FROM js8_instances
-             WHERE LOWER(COALESCE(host, '127.0.0.1'))=? AND port=?
+             WHERE (CASE WHEN LOWER(TRIM(COALESCE(host, '127.0.0.1')))='localhost'
+                         THEN '127.0.0.1' ELSE LOWER(TRIM(COALESCE(host, '127.0.0.1'))) END)=? AND port=?
+               AND (enabled<>0 OR EXISTS (SELECT 1 FROM device_profiles d WHERE d.js8_instance_id=js8_instances.id))
                AND (? IS NULL OR id<>?) LIMIT 1
             """,
-            (host, port, record_id, record_id),
+            (host_key, port, record_id, record_id),
         ).fetchone()
+        if same_claim:
+            # Retained unassigned rows cannot veto review of an unchanged
+            # endpoint already owned by this radio. Another radio still can.
+            row = conn.execute('''SELECT j.name FROM js8_instances j
+                JOIN device_profiles d ON d.js8_instance_id=j.id
+                WHERE j.id<>? AND
+                (CASE WHEN LOWER(TRIM(COALESCE(j.host,'127.0.0.1')))='localhost' THEN '127.0.0.1'
+                 ELSE LOWER(TRIM(COALESCE(j.host,'127.0.0.1'))) END)=? AND j.port=? LIMIT 1''',
+                (record_id, host_key, port)).fetchone()
         if row is not None:
             raise ValueError(f"JS8Call TCP endpoint {host}:{port} is already used by {row[0]}.")
         return
@@ -3548,17 +3572,33 @@ def _validate_software_application_claims_conn(
                 "fldigi_port",
             ),
         )
-        if claims[0][1:3] == claims[1][1:3]:
+        normalized_endpoints = [('127.0.0.1' if host == 'localhost' else host, port)
+                                for _, host, port, _, _ in claims]
+        if normalized_endpoints[0] == normalized_endpoints[1]:
             raise ValueError("FLRig and FLDigi must use different local TCP endpoints.")
         for label, host, port, host_column, port_column in claims:
+            host_key = '127.0.0.1' if host == 'localhost' else host
+            prior = _record_by_id(conn, 'fast_light_configs', int(reviewed_existing_id)) if reviewed_existing_id else None
+            same_claim = bool(prior and record_id == reviewed_existing_id
+                              and host_key == ('127.0.0.1' if str(prior.get(host_column) or '127.0.0.1').strip().lower() == 'localhost' else str(prior.get(host_column) or '127.0.0.1').strip().lower())
+                              and port == int(prior.get(port_column) or (12345 if host_column == 'flrig_host' else 7362)))
             row = conn.execute(
                 f"""
                 SELECT name FROM fast_light_configs
-                 WHERE LOWER(COALESCE({host_column}, '127.0.0.1'))=? AND {port_column}=?
+                 WHERE (CASE WHEN LOWER(TRIM(COALESCE({host_column}, '127.0.0.1')))='localhost'
+                             THEN '127.0.0.1' ELSE LOWER(TRIM(COALESCE({host_column}, '127.0.0.1'))) END)=? AND {port_column}=?
+                   AND (enabled<>0 OR EXISTS (SELECT 1 FROM device_profiles d WHERE d.fast_light_config_id=fast_light_configs.id))
                    AND (? IS NULL OR id<>?) LIMIT 1
                 """,
-                (host, port, record_id, record_id),
+                (host_key, port, record_id, record_id),
             ).fetchone()
+            if same_claim:
+                row = conn.execute(f'''SELECT a.name FROM fast_light_configs a
+                    JOIN device_profiles d ON d.fast_light_config_id=a.id
+                    WHERE a.id<>? AND
+                    (CASE WHEN LOWER(TRIM(COALESCE(a.{host_column},'127.0.0.1')))='localhost' THEN '127.0.0.1'
+                     ELSE LOWER(TRIM(COALESCE(a.{host_column},'127.0.0.1'))) END)=? AND a.{port_column}=? LIMIT 1''',
+                    (record_id, host_key, port)).fetchone()
             if row is not None:
                 raise ValueError(f"{label} endpoint {host}:{port} is already used by {row[0]}.")
         return
@@ -3582,7 +3622,8 @@ def _validate_software_application_claims_conn(
                     # must not reject the reviewed cluster contract.
                     continue
             row = conn.execute(
-                f"SELECT name FROM varac_nodes WHERE {column}=? AND (? IS NULL OR id<>?) LIMIT 1",
+                f"SELECT name FROM varac_nodes WHERE {column}=? AND (? IS NULL OR id<>?) "
+                "AND (enabled<>0 OR EXISTS (SELECT 1 FROM device_profiles d WHERE d.varac_node_id=varac_nodes.id)) LIMIT 1",
                 (path, record_id, record_id),
             ).fetchone()
             if row is not None:
@@ -3743,17 +3784,25 @@ def _save_software_instance_manifest_conn(
             "fast_light": "fast_light_configs",
             "varac": "varac_nodes",
         }[candidate.family_key]
-        if _record_by_system_key(
+        candidate_owner = _record_by_system_key(
             conn,
             candidate_table,
             candidate.application_system_key,
-        ) is None:
+        )
+        if candidate_owner is None:
             # Interrupted saves from older builds can leave FIO-only manifest
             # evidence after their application row was rolled back or removed.
             # Retain that evidence for diagnostics, but it has no live owner
             # and therefore cannot reserve ports or paths against a reviewed
             # recovery transaction.
             continue
+        if not int(candidate_owner.get('enabled', 1) or 0):
+            link_column = _SOFTWARE_INSTANCE_ASSIGNMENTS[candidate.family_key][0]
+            if conn.execute(f'SELECT 1 FROM device_profiles WHERE {link_column}=? LIMIT 1',
+                            (candidate_owner['id'],)).fetchone() is None:
+                # Retired unassigned evidence remains available but cannot
+                # reserve an endpoint against an explicit reviewed assignment.
+                continue
         existing.append(candidate)
     conflicts = find_manifest_conflicts(manifest, existing)
     if conflicts:
@@ -4797,6 +4846,9 @@ def _resolve_device_profile_links_conn(conn: sqlite3.Connection, profile: Mappin
             if data.get("scheduler_enabled") is None:
                 data["scheduler_enabled"] = data["operating_scheduler_enabled"]
             data["use_launch_control"] = _coerce_bool_int(operating.get("use_launch_control", 0), False)
+    if data.get('use_external_js8spotter') is None:
+        data['use_external_js8spotter'] = int(bool(str(data.get('spotter_launch_path') or '').strip()))
+
     return data
 
 
@@ -4994,7 +5046,8 @@ def _legacy_settings_projection_from_device(
     else:
         updates["path_js8call"] = ""
     spotter_launch = _coerce_text(device_profile.get("spotter_launch_path", ""), "")
-    if use_js8spotter and spotter_launch:
+    external_spotter_selected = device_profile.get("use_external_js8spotter")
+    if (bool(external_spotter_selected) if external_spotter_selected is not None else use_js8spotter) and spotter_launch:
         updates["path_js8spotter"] = spotter_launch
     else:
         updates["path_js8spotter"] = ""
@@ -5994,10 +6047,24 @@ def mirror_legacy_settings_into_runtime_active_device(
     *,
     keys_changed: Optional[Iterable[str]] = None,
 ) -> Optional[Dict[str, Any]]:
-    if keys_changed is not None and MIRRORED_LEGACY_KEYS.isdisjoint({str(key) for key in keys_changed}):
+    # The caller may hold a stale whole-station snapshot. Only the explicitly
+    # changed keys have write authority; runtime observations never have it.
+    changed = {str(key) for key in (settings_values if keys_changed is None else keys_changed)}
+    changed &= MIRRORED_LEGACY_KEYS & settings_values.keys()
+    changed -= {"varac_bbs_vault_runtime_state_v1", "varac_bbs_vault_last_summary"}
+    if not changed:
         return None
-    ensure_multi_radio_settings_schema(conn)
-    if not is_multi_rig_migration_current(conn):
+    settings_values = {key: settings_values[key] for key in changed}
+    # Schema/migration belongs to startup, not an ordinary settings write. Those
+    # helpers commit internally and would split the caller's atomic transaction.
+    version_row = conn.execute("SELECT value FROM kv WHERE key=?", (MULTI_RIG_MIGRATION_VERSION_KEY,)).fetchone()
+    if not version_row:
+        return None
+    try:
+        version = json.loads(version_row[0])
+    except (ValueError, TypeError):
+        version = version_row[0]
+    if _coerce_int(version, 0) < CURRENT_MULTI_RIG_MIGRATION_VERSION:
         return None
     active_count = _runtime_active_device_count(conn)
     if active_count > 1:
@@ -6007,22 +6074,34 @@ def mirror_legacy_settings_into_runtime_active_device(
             active_count,
         )
         return None
-    active_id = _normalize_runtime_primary_device(conn)
+    # Compatibility writes must not normalize selection/primary ownership.
+    active_row = conn.execute(
+        "SELECT id FROM device_profiles WHERE enabled=1 AND runtime_active=1 "
+        "AND device_class<>'observer' ORDER BY runtime_primary DESC, display_order, id LIMIT 1"
+    ).fetchone()
+    active_id = int(active_row[0]) if active_row else None
     if active_id is None:
         return None
     existing = _record_by_id(conn, "device_profiles", int(active_id))
     if not existing:
         return None
 
-    control_backend = _normalize_control_backend(settings_values)
-    flrig_host = _settings_text(settings_values, "flrig_host", "127.0.0.1") or "127.0.0.1"
-    fldigi_host = _settings_text(settings_values, "fldigi_host", "") or flrig_host or "127.0.0.1"
-    js8_host = _settings_text(settings_values, "js8_host", "127.0.0.1") or "127.0.0.1"
+    control_backend = (
+        _normalize_control_backend(settings_values) if "control_via" in changed
+        else _coerce_text(existing.get("control_backend"), "manual")
+    )
+    flrig_host = _settings_text(settings_values, "flrig_host", "")
+    fldigi_host = _settings_text(settings_values, "fldigi_host", "")
+    js8_host = _settings_text(settings_values, "js8_host", "")
+    linked = _resolve_device_profile_links_conn(conn, dict(existing))
     launch_path = _coerce_text(existing.get("launch_path", ""), "")
     if control_backend == "flrig":
-        launch_path = _settings_text(settings_values, "path_flrig", "")
+        launch_path = _settings_text(settings_values, "path_flrig", linked.get("flrig_path", ""))
     elif control_backend == "js8call":
-        launch_path = _settings_text(settings_values, "path_js8call", "")
+        launch_path = _settings_text(settings_values, "path_js8call", linked.get("js8_install_path", ""))
+    message_paths = settings_values.get("message_paths", {}) or {}
+    if not isinstance(message_paths, Mapping):
+        message_paths = {}
     updates = {
         "control_backend": control_backend,
         "rig_host": _settings_text(settings_values, "rig_host", ""),
@@ -6034,9 +6113,9 @@ def mirror_legacy_settings_into_runtime_active_device(
         "fldigi_log_path": _settings_text(settings_values, "fldigi_log_path", ""),
         "fldigi_checkin_dir": _settings_text(settings_values, "fldigi_checkin_dir", ""),
         "flmsg_path": _settings_text(settings_values, "path_flmsg", ""),
-        "flmsg_message_path": _coerce_text((settings_values.get("message_paths", {}) or {}).get("flmsg", ""), ""),
+        "flmsg_message_path": _coerce_text(message_paths.get("flmsg", ""), ""),
         "flamp_path": _settings_text(settings_values, "path_flamp", ""),
-        "flamp_message_path": _coerce_text((settings_values.get("message_paths", {}) or {}).get("flamp", ""), ""),
+        "flamp_message_path": _coerce_text(message_paths.get("flamp", ""), ""),
         "js8_host": js8_host,
         "js8_port": _settings_int(settings_values, "js8_port", 2442),
         "js8_profile_path": _settings_text(settings_values, "js8_profile_path", ""),
@@ -6164,96 +6243,99 @@ def mirror_legacy_settings_into_runtime_active_device(
         "launch_cmd": _settings_text(settings_values, "varac_launch_cmd", ""),
         "updated_utc": _utc_now_iso(),
     }
-    assignments = ", ".join(f"{name}=?" for name in updates)
-    conn.execute(
-        f"UPDATE device_profiles SET {assignments} WHERE id=?",
-        [updates[name] for name in updates] + [int(active_id)],
-    )
+    # Source -> destination mappings are deliberately field-scoped. A batch may
+    # edit several domains, but cannot refill their unchanged fields from cache.
+    aliases = {
+        "control_backend": "control_via", "scheduler_enabled": "use_scheduler",
+        "launch_enabled": "launch_control_enabled", "launch_cmd": "varac_launch_cmd",
+        "varac_install_path": "varac_path", "flmsg_path": "path_flmsg",
+        "flamp_path": "path_flamp", "flmsg_message_path": "message_paths",
+        "flamp_message_path": "message_paths",
+    }
+    updates = {column: value for column, value in updates.items()
+               if aliases.get(column, column) in changed}
+    path_key = {"flrig": "path_flrig", "js8call": "path_js8call"}.get(control_backend)
+    if "control_via" in changed or (path_key and path_key in changed):
+        updates["launch_path"] = launch_path
 
-    js8_instance_id = _coerce_optional_int(existing.get("js8_instance_id"))
-    if js8_instance_id is not None:
-        js8_existing = _record_by_id(conn, "js8_instances", int(js8_instance_id)) or {}
-        _save_js8_instance_conn(
-            conn,
-            {
-                "id": int(js8_instance_id),
-                "system_key": js8_existing.get("system_key"),
-                "name": js8_existing.get("name", DEFAULT_JS8_INSTANCE_NAME),
-                "enabled": js8_existing.get("enabled", 1),
-                "host": js8_host,
-                "port": _settings_int(settings_values, "js8_port", 2442),
-                "offset_hz": coerce_js8_offset_hz(_settings_int(settings_values, "js8_offset_hz", 0)),
-                "profile_path": _settings_text(settings_values, "js8_profile_path", ""),
-                "directed_path": _settings_text(settings_values, "js8_directed_path", ""),
-                "forms_path": _settings_text(settings_values, "js8_forms_path", ""),
-                "install_path": _settings_text(settings_values, "path_js8call", ""),
-                "spotter_launch_path": _settings_text(settings_values, "path_js8spotter", ""),
-                "commstat_launch_path": _settings_text(settings_values, "path_commstat", ""),
-            },
-        )
+    js8_fields = {
+        "js8_host": "host", "js8_port": "port", "js8_offset_hz": "offset_hz",
+        "js8_profile_path": "profile_path", "js8_directed_path": "directed_path",
+        "js8_forms_path": "forms_path", "path_js8call": "install_path",
+        "path_js8spotter": "spotter_launch_path", "path_commstat": "commstat_launch_path",
+    }
+    fast_fields = {
+        "path_flrig": "flrig_path", "flrig_host": "flrig_host", "flrig_port": "flrig_port",
+        "path_fldigi": "fldigi_path", "fldigi_host": "fldigi_host", "fldigi_port": "fldigi_port",
+        "fldigi_log_path": "fldigi_log_path", "fldigi_checkin_dir": "fldigi_checkin_dir",
+    }
+    varac_fields = {
+        "varac_path": "install_path", "varac_db_path": "db_path",
+        "varac_ini_path": "ini_path", "varac_launch_cmd": "launch_cmd",
+    }
+    js8_updates = {column: _settings_text(settings_values, key, "") for key, column in js8_fields.items() if key in changed}
+    if "js8_host" in changed:
+        js8_updates["host"] = js8_host
+    if "js8_port" in changed:
+        js8_updates["port"] = _settings_int(settings_values, "js8_port", 2442)
+    if "js8_offset_hz" in changed:
+        js8_updates["offset_hz"] = coerce_js8_offset_hz(_settings_int(settings_values, "js8_offset_hz", 0))
+    fast_updates = {column: _settings_text(settings_values, key, "") for key, column in fast_fields.items() if key in changed}
+    for key in ("flrig_host", "flrig_port", "fldigi_host", "fldigi_port", "fldigi_log_path", "fldigi_checkin_dir"):
+        if key in changed:
+            fast_updates[key] = updates[key]
+    varac_updates = {column: _settings_text(settings_values, key, "") for key, column in varac_fields.items() if key in changed}
+    if "varac_incoming_path" in changed:
+        varac_updates["incoming_path"] = _settings_text(settings_values, "varac_incoming_path", "")
+    elif "message_paths" in changed:
+        varac_updates["incoming_path"] = _coerce_text(message_paths.get("varac", ""), "")
 
-    fast_light_config_id = _coerce_optional_int(existing.get("fast_light_config_id"))
-    if fast_light_config_id is not None:
-        fast_existing = _record_by_id(conn, "fast_light_configs", int(fast_light_config_id)) or {}
-        _save_fast_light_config_conn(
-            conn,
-            {
-                "id": int(fast_light_config_id),
-                "system_key": fast_existing.get("system_key"),
-                "name": fast_existing.get("name", DEFAULT_FAST_LIGHT_NAME),
-                "enabled": fast_existing.get("enabled", 1),
-                "flrig_path": _settings_text(settings_values, "path_flrig", ""),
-                "flrig_host": flrig_host,
-                "flrig_port": _settings_int(settings_values, "flrig_port", 12345),
-                "fldigi_path": _settings_text(settings_values, "path_fldigi", ""),
-                "fldigi_host": fldigi_host,
-                "fldigi_port": _settings_int(settings_values, "fldigi_port", 7362),
-                "fldigi_log_path": _settings_text(settings_values, "fldigi_log_path", ""),
-                "fldigi_checkin_dir": _settings_text(settings_values, "fldigi_checkin_dir", ""),
-            },
-        )
+    assignment = _effective_assignment_for_device(conn, active_id)
+    operating_updates = {}
+    if "use_scheduler" in changed:
+        operating_updates["scheduler_enabled"] = updates["scheduler_enabled"]
+    if "launch_control_enabled" in changed:
+        operating_updates["use_launch_control"] = updates["launch_enabled"]
 
-    varac_node_id = _coerce_optional_int(existing.get("varac_node_id"))
-    if varac_node_id is not None:
-        varac_existing = _record_by_id(conn, "varac_nodes", int(varac_node_id)) or {}
-        message_paths = settings_values.get("message_paths", {}) or {}
-        _save_varac_node_conn(
-            conn,
-            {
-                "id": int(varac_node_id),
-                "system_key": varac_existing.get("system_key"),
-                "name": varac_existing.get("name", DEFAULT_VARAC_NODE_NAME),
-                "enabled": varac_existing.get("enabled", 1),
-                "install_path": _settings_text(settings_values, "varac_path", ""),
-                "db_path": _settings_text(settings_values, "varac_db_path", ""),
-                "ini_path": _settings_text(settings_values, "varac_ini_path", ""),
-                "launch_cmd": _settings_text(settings_values, "varac_launch_cmd", ""),
-                "incoming_path": _settings_varac_incoming_path(settings_values),
-            },
-        )
-
-    assignment = _effective_assignment_for_device(conn, int(active_id))
-    if assignment:
-        operating = _record_by_id(conn, "operating_profiles", int(assignment["operating_profile_id"])) or {}
-        _save_operating_profile_conn(
-            conn,
-            {
-                "id": int(assignment["operating_profile_id"]),
-                "system_key": operating.get("system_key"),
-                "name": operating.get("name", DEFAULT_OPERATING_NAME),
-                "enabled": operating.get("enabled", 1),
-                "description": operating.get("description", ""),
-                "scheduler_enabled": _settings_bool(settings_values, "use_scheduler", True),
-                "scheduler_mode": operating.get("scheduler_mode", "full"),
-                "use_messages": operating.get("use_messages", 1),
-                "use_map": operating.get("use_map", 1),
-                "use_background_ingest": operating.get("use_background_ingest", 1),
-                "use_launch_control": _settings_bool(settings_values, "launch_control_enabled", False),
-                "use_net_control_tabs": operating.get("use_net_control_tabs", 1),
-            },
-        )
-    conn.commit()
-    return _resolve_device_profile_links_conn(conn, _record_by_id(conn, "device_profiles", int(active_id)) or existing)
+    targets = [("device_profiles", active_id, updates)]
+    for table, link, patch in (
+        ("js8_instances", "js8_instance_id", js8_updates),
+        ("fast_light_configs", "fast_light_config_id", fast_updates),
+        ("varac_nodes", "varac_node_id", varac_updates),
+    ):
+        record_id = _coerce_optional_int(existing.get(link))
+        if record_id is None or not patch:
+            continue
+        # Even an inactive sibling owns its saved configuration. Legacy global
+        # editing cannot choose which consumer of a shared identity to change.
+        if conn.execute(f"SELECT 1 FROM device_profiles WHERE {link}=? AND id<>? LIMIT 1",
+                        (record_id, active_id)).fetchone():
+            log.warning("MultiRadioStore: skipped legacy mirror of shared %s; use scoped configuration", table)
+            return None
+        targets.append((table, record_id, patch))
+    if assignment and operating_updates:
+        operating_id = int(assignment["operating_profile_id"])
+        if conn.execute(
+            "SELECT 1 FROM operating_profile_assignments WHERE operating_profile_id=? "
+            "AND device_profile_id<>? AND assignment_state IN (?, ?) LIMIT 1",
+            (operating_id, active_id, *tuple(EFFECTIVE_ASSIGNMENT_STATES)),
+        ).fetchone():
+            log.warning("MultiRadioStore: skipped legacy mirror of shared Operating Model; use scoped configuration")
+            return None
+        targets.append(("operating_profiles", operating_id, operating_updates))
+    for table, record_id, patch in targets:
+        current = _record_by_id(conn, table, record_id)
+        if current is None:
+            continue
+        actual = {key: value for key, value in patch.items() if current.get(key) != value}
+        if not actual:
+            continue
+        actual["updated_utc"] = _utc_now_iso()
+        assignments = ", ".join(f"{column}=?" for column in actual)
+        conn.execute(f"UPDATE {table} SET {assignments} WHERE id=?",
+                     [*actual.values(), record_id])
+    # The SettingsManager caller owns commit/rollback, including its kv write.
+    return _resolve_device_profile_links_conn(conn, _record_by_id(conn, "device_profiles", active_id) or existing)
 
 
 class _GuidedTransactionConnection:
@@ -6338,6 +6420,27 @@ class GuidedSaveTransaction:
         return False
 
 
+class _ConfigurationSavepoint:
+    """Join an existing CP save without an independent commit or partial failure."""
+    def __init__(self, connection):
+        self.connection = connection
+        self.name = 'configuration_' + uuid.uuid4().hex
+        self.done = False
+
+    def __enter__(self):
+        self.connection.execute('SAVEPOINT ' + self.name)
+        return self
+
+    def complete(self):
+        self.done = True
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is not None or not self.done:
+            self.connection.execute('ROLLBACK TO SAVEPOINT ' + self.name)
+        self.connection.execute('RELEASE SAVEPOINT ' + self.name)
+        return False
+
+
 class MultiRadioStore:
     def __init__(self, db_path: Optional[Path] = None) -> None:
         self.db_path = Path(db_path) if db_path else settings_db_path()
@@ -6395,6 +6498,26 @@ class MultiRadioStore:
         """
 
         return self._connect_readonly()
+
+    @contextmanager
+    def configuration_read_transaction(self):
+        """Reuse a caller snapshot, otherwise bind store reads to a read-only transaction."""
+        if getattr(self._transaction_local, 'connection', None) is not None:
+            yield
+            return
+        connection = self._connect_readonly()
+        try:
+            connection.execute('BEGIN')
+            self._transaction_local.connection = connection
+            yield
+        finally:
+            self._transaction_local.connection = None
+            connection.close()
+
+    def configuration_save_transaction(self):
+        """Compose operator app/radio saves under one existing atomic owner."""
+        active = getattr(self._transaction_local, 'connection', None)
+        return _ConfigurationSavepoint(active) if active is not None else self.guided_save_transaction()
 
     def guided_save_transaction(self) -> GuidedSaveTransaction:
         """Return the atomic boundary for one reviewed guided radio save.
@@ -6773,6 +6896,10 @@ class MultiRadioStore:
             "use_flamp": _coerce_bool_int(payload.get("use_flamp", default_use_flamp), False),
             "use_js8call": _coerce_bool_int(payload.get("use_js8call", default_use_js8call), control_backend == "js8call"),
             "use_js8spotter": _coerce_bool_int(payload.get("use_js8spotter", default_use_js8spotter), False),
+            "use_external_js8spotter": (
+                None if payload.get('use_external_js8spotter', (existing or {}).get('use_external_js8spotter')) is None
+                else _coerce_bool_int(payload.get('use_external_js8spotter', (existing or {}).get('use_external_js8spotter')),False)
+            ),
             "use_commstat": _coerce_bool_int(payload.get("use_commstat", default_use_commstat), False),
             "use_varac": _coerce_bool_int(payload.get("use_varac", default_use_varac), False),
             "rig_host": _coerce_text(payload.get("rig_host", (existing or {}).get("rig_host", "")), ""),
@@ -8002,7 +8129,7 @@ class MultiRadioStore:
             "varac": bool(int(profile.get("use_varac", 0) or 0)),
             "fio_spotter": bool(int(profile.get("use_js8spotter", 0) or 0)),
             "commstat": bool(int(profile.get("use_commstat", 0) or 0)),
-            "external_js8spotter": bool(str(profile.get("spotter_launch_path", "") or "").strip()),
+            "external_js8spotter": bool(profile.get("use_external_js8spotter")) if profile.get("use_external_js8spotter") is not None else bool(str(profile.get("spotter_launch_path", "") or "").strip()),
             "sdrpp": str(profile.get("device_class", "") or "").strip().lower() == "observer",
         }
         if identity_set_row is not None and int(identity_set_row[0] or 0) > 0:
@@ -8091,6 +8218,18 @@ class MultiRadioStore:
                 expected_app_executable = str(
                     component_executable_fields.get(component.component_id) or ""
                 ).strip()
+                if record.family_key == 'js8call' and manifest is not None:
+                    saved_evidence = _json(manifest.get('evidence_json'), {})
+                    if isinstance(saved_evidence, Mapping) and saved_evidence.get('settings_identity_mode') == 'custom_launcher':
+                        recipe = saved_evidence.get('launch_recipe') or {}
+                        parts = recipe.get('components', ()) if isinstance(recipe, Mapping) else ()
+                        reviewed = next((part for part in parts if isinstance(part, Mapping)
+                                         and part.get('component_key') == component.component_id), None)
+                        if reviewed is not None:
+                            # An explicitly reviewed launcher can differ from
+                            # the installed JS8 application. Native paths above
+                            # and the launch projection below remain checked.
+                            expected_app_executable = str(reviewed.get('executable') or '').strip()
                 canonical_executable = str(component.argv[0] if component.argv else "").strip()
                 if expected_app_executable != canonical_executable:
                     family_issues.append(
@@ -8220,6 +8359,14 @@ class MultiRadioStore:
                         and str(row.get("instance_key") or "").startswith("receiver:")
                     )
                 ]
+                exact_key = f"{record.bundle_id}:{component.component_id}".casefold()
+                exact = [row for row in candidates
+                         if str(row.get("instance_key") or "").casefold() == exact_key]
+                if exact:
+                    # Disabled historical rows are retained evidence, not a
+                    # second launch identity. Enabled peers remain a conflict.
+                    candidates = exact + [row for row in candidates if row not in exact
+                                          and bool(row.get("enabled"))]
                 if len(candidates) != 1:
                     family_issues.append(
                         f"launch component {component.component_id} is missing or duplicated"
@@ -8291,7 +8438,7 @@ class MultiRadioStore:
                 # They may legitimately change after Add Radio and must not be
                 # reported as canonical application/recipe drift.
                 for key, expected_value in component.readiness.items():
-                    if key not in readiness or str(readiness.get(key)) != str(expected_value):
+                    if key not in readiness or str(readiness.get(key) or "").strip() != str(expected_value or "").strip():
                         family_issues.append(
                             f"launch component {component.component_id} readiness differs"
                         )
@@ -8600,15 +8747,23 @@ class MultiRadioStore:
         components = {item.component_id.casefold(): item for item in record.components}
         flmsg = components.get("flmsg")
         flamp = components.get("flamp")
-        if selected_flmsg and (flmsg is None or "--auto-dir" in flmsg.argv):
+        if selected_flmsg and (flmsg is None or (
+            not flmsg.launch.get("operator_starts", False) and "--auto-dir" in flmsg.argv
+        )):
             return True
         if selected_flamp and (
             flamp is None
-            or "--config-dir" not in flamp.argv
-            or "--arq-server-port" not in flamp.argv
-            or not flamp.cwd
+            or (not flamp.launch.get("operator_starts", False) and (
+                "--config-dir" not in flamp.argv
+                or "--arq-server-port" not in flamp.argv
+                or not flamp.cwd
+            ))
         ):
             return True
+        if flamp is not None and flamp.launch.get("operator_starts", False):
+            # An explicitly operator/remote-managed application uses its own
+            # native settings. Do not demand a CP-generated profile or argv.
+            return False
         return any(
             str(item.get("app_name") or "").strip().casefold() == "flamp"
             and "station-shared" in str(item.get("instance_key") or "").casefold()
@@ -8714,6 +8869,13 @@ class MultiRadioStore:
             next_fldigi = dict(after_components.get("fldigi") or {})
             prior_fldigi.pop("argv", None)
             next_fldigi.pop("argv", None)
+            # Argument-derived readiness mirrors the repaired argv. Everything
+            # else remains part of the retained FLDigi identity.
+            for component in (prior_fldigi, next_fldigi):
+                component["readiness"] = {
+                    key: value for key, value in (component.get("readiness") or {}).items()
+                    if key not in {"launch_arguments", "effective_command", "effective_command_text"}
+                }
             if not bootstrap_legacy and next_fldigi != prior_fldigi:
                 raise ValueError(
                     "Component repair changed FLDigi outside its required FLMsg/FLAmp pairing arguments; nothing was saved."
@@ -8895,8 +9057,14 @@ class MultiRadioStore:
                 allowed_varac_shared_db_path = ""
                 if (
                     family == "varac"
-                    and str(app_values.get("native_management_state") or "operator").strip().lower()
-                    == "managed"
+                    and (str(app_values.get("native_management_state") or "operator").strip().lower()
+                         == "managed"
+                         or (cluster_db_id_value is not None
+                             and _coerce_optional_int(app_values.get("id")) == actual_current
+                             and actual_current is not None
+                             and conn.execute('''SELECT 1 FROM varac_cluster_members
+                                 WHERE cluster_id=? AND device_profile_id=? AND enabled=1''',
+                                 (cluster_db_id_value, radio_id)).fetchone() is not None))
                 ):
                     if create_cluster_values:
                         allowed_varac_shared_db_path = _coerce_text(
@@ -8907,11 +9075,31 @@ class MultiRadioStore:
                         allowed_varac_shared_db_path = _coerce_text(
                             selected_cluster.get("shared_db_path", ""), ""
                         )
+                        # An existing cluster is proof for
+                        # its own members only, never an unrelated node.
+                        for other_node in conn.execute(
+                            "SELECT id, name, db_path FROM varac_nodes WHERE id<>? AND "
+                            "(enabled<>0 OR EXISTS (SELECT 1 FROM device_profiles d WHERE d.varac_node_id=varac_nodes.id))",
+                            (_coerce_optional_int(app_values.get('id')) or -1,),
+                        ).fetchall():
+                            if (allowed_varac_shared_db_path
+                                    and _coerce_text(other_node['db_path'], '')
+                                    and normalize_varac_path(other_node['db_path'], 'VarAC database')
+                                    == normalize_varac_path(allowed_varac_shared_db_path, 'VarAC shared database')):
+                                member = conn.execute('''SELECT 1 FROM device_profiles d
+                                    JOIN varac_cluster_members m ON m.device_profile_id=d.id
+                                    WHERE d.varac_node_id=? AND m.cluster_id=? AND m.enabled=1''',
+                                    (other_node['id'], cluster_db_id_value)).fetchone()
+                                if member is None:
+                                    raise ValueError(
+                                        f"VarAC database is already assigned to {other_node['name']} outside this cluster."
+                                    )
                 _validate_software_application_claims_conn(
                     conn,
                     family,
                     app_values,
                     allowed_varac_shared_db_path=allowed_varac_shared_db_path,
+                    reviewed_existing_id=(actual_current if _coerce_optional_int(app_values.get('id')) == actual_current else None),
                 )
                 if family == "js8call":
                     saved_app = _save_js8_instance_conn(conn, app_values)
@@ -9919,6 +10107,19 @@ class MultiRadioStore:
                     )
                 )
             rows = tuple(recipe_rows)
+        elif qualified_components and family_key == 'js8call':
+            if len(qualified_components) != 1 or qualified_components[0].get('component_key') != 'js8call':
+                raise ValueError('JS8Call needs one exact reviewed launch component.')
+            component = qualified_components[0]
+            readiness = dict(component.get('readiness') or {})
+            readiness.update(host=str(saved_app.get('host') or ''),port=int(saved_app.get('port') or 0),
+                             require_api=True,launch_arguments=list(component.get('arguments') or ()),
+                             working_directory=str(component.get('working_directory') or ''),
+                             environment=dict(component.get('environment') or {}),
+                             profile_selector=str(component.get('profile_selector') or ''),
+                             operator_starts=bool(component.get('operator_starts')),
+                             component_launch_at_startup=bool(component.get('launch_at_startup')))
+            rows=((f'{manifest_key}:js8call','JS8Call',50,'',str(component.get('executable') or ''),[],readiness),)
         elif family_key == "js8call":
             js8_readiness = {
                 "host": str(saved_app.get("host", "127.0.0.1") or "127.0.0.1"),

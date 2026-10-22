@@ -80,7 +80,7 @@ HELP_CONTEXTS: Dict[str, HelpContext] = {
         key="tab.map",
         anchor="map",
         title="Map Help",
-        summary="Map plan context cue, layers, report icons, filters, traffic overlays, and station-visibility controls.",
+        summary="Category-based map tools, worldwide offline geography, saved starting area, operational evidence, and optional license-reference searches.",
     ),
     "tab.station-health": HelpContext(
         key="tab.station-health",
@@ -98,7 +98,7 @@ HELP_CONTEXTS: Dict[str, HelpContext] = {
         key="map.controls",
         anchor="map-top-controls",
         title="Map Controls Help",
-        summary="Top-level map filters, station/link/report layers, and control drawer behavior.",
+        summary="Layers, Filters, Display, Paths, and Planning categories; Country, Activity window, search scope, and selection inspector behavior.",
     ),
     "map.paths": HelpContext(
         key="map.paths",
@@ -158,7 +158,13 @@ HELP_CONTEXTS: Dict[str, HelpContext] = {
         key="settings.operator",
         anchor="settings-operator-info",
         title="Operator Information Help",
-        summary="Callsign, name, state, and grid used across message naming, maps, and reporting.",
+        summary="Compact two-row station identity: callsign/name, state or region, and grid used across message naming, maps, and reporting.",
+    ),
+    "settings.station_setup": HelpContext(
+        key="settings.station_setup",
+        anchor="settings-station-setup",
+        title="Station Setup Help",
+        summary="Saved-setup checklist, editor-owned Save actions, per-radio scheduling review and enable, and immediate scheduling disable.",
     ),
     "settings.freqinout": HelpContext(
         key="settings.freqinout",
@@ -182,13 +188,13 @@ HELP_CONTEXTS: Dict[str, HelpContext] = {
         key="settings.js8call",
         anchor="settings-js8call-details",
         title="JS8Call Settings Help",
-        summary="Radio-scoped JS8Call application, API, message storage, ingest, launch, health, and advanced tasks. CommStat and Spotter are separate software families.",
+        summary="Radio-scoped JS8Call application/profile, API, native message storage, ingest, launch, health, and advanced tasks. Launch profile selection stays separate from existing ALL.TXT, DIRECTED.TXT, and inbox.db3 paths; CommStat and Spotter are separate families.",
     ),
     "settings.fast-light": HelpContext(
         key="settings.fast-light",
         anchor="settings-fast-light-details",
         title="Fast Light Settings Help",
-        summary="FLRig, FLDigi, FLMsg, and FLAmp paths, connection fields, message folders, and auto-fill help.",
+        summary="Component-scoped FLRig, FLDigi, FLMsg, and FLAmp settings with matching Configure/Details routes, connection fields, message folders, signing, and auto-fill help.",
     ),
     "settings.hf-groups": HelpContext(
         key="settings.hf-groups",
@@ -206,7 +212,7 @@ HELP_CONTEXTS: Dict[str, HelpContext] = {
         key="settings.local-mesh",
         anchor="settings-local-mesh",
         title="Local Mesh Help",
-        summary="Configure saved MeshCore or Meshtastic connections, supported transports, Inbox/Map ingest, and channel policy safely.",
+        summary="Choose a saved MeshCore or Meshtastic device, review one connection state, use Add device… or Check connection, then manage Inbox/Map ingest and channel policy safely.",
     ),
     "settings.varac": HelpContext(
         key="settings.varac",
