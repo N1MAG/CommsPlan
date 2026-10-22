@@ -7,18 +7,19 @@
 See the CommsPlan 2.0.6 release page for available platform packages, source
 archives, checksums, and release notes.
 
-### A coordinated operations console for HF digital stations
+### CommsPlan makes your comms plan work.
 
-CommsPlan brings radio configuration, companion applications, schedules,
-message intelligence, traffic review, operational awareness, and station
-services into one desktop workspace. Version 2.0 makes multi-radio operation
-the standard architecture while keeping a one-radio station simple and fully
-supported.
+**Where to be. When to be there. What to do when you’re there.**
 
-CommsPlan does not replace FLRig, FLDigi, FLMsg, FLAmp, JS8Call, VarAC, VARA,
-MeshCore, or Meshtastic. It coordinates those independently useful applications
-as one coherent station while preserving their own profiles, records, and
-protocol-specific controls.
+Bring your frequency plans, operating schedules, radio tools, and message
+intelligence together in one workspace. Plan your operating windows, see what
+comes next, and find useful information in the traffic—with the original
+messages close at hand. One radio is enough; add more when you need them.
+
+Comms Unity means bringing the pieces together: your plans, radios, applications,
+and traffic working toward a common purpose. CommsPlan works with FLRig, FLDigi,
+FLMsg, FLAmp, JS8Call, VarAC, VARA, MeshCore, and Meshtastic while keeping their
+own controls available to you.
 
 <p align="center">
   <img src="docs/images/readme-2.0/ops-center.png" alt="CommsPlan Ops Center showing multi-radio activity, schedules, traffic, and operational awareness">

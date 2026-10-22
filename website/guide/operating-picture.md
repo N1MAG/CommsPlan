@@ -11,56 +11,52 @@ description: Understand CommsPlan's Message Intelligence, Spotter forms, Call Fi
   <span class="doc-badge">Messages and Map</span>
 </div>
 
-CommsPlan connects station setup to live operating decisions. The multi-radio
-architecture is the base application, while a one-radio station remains a
-normal supported setup. The station control context stays visible while the
-active workspace explains what is happening and why.
+**Where to be. When to be there. What to do when you’re there.** CommsPlan
+keeps those three questions connected. Your radio and schedule stay in view
+while you review traffic, prepare a message, or explore the map. One radio is
+enough, and each additional radio can have its own tools and schedule.
 
-The Station Setup and scheduling review details on this page describe the
-CommsPlan 2.0.6 workflow. Check the [GitHub Releases page](https://github.com/N1MAG/CommsPlan/releases/latest)
-for currently available installation packages and release-specific
-instructions. The screenshots below come from an earlier release and illustrate
-operating concepts; the interface shown may differ from 2.0.6.
+The examples below show CommsPlan 2.0.6. Find available downloads on the
+[GitHub Releases page](https://github.com/N1MAG/CommsPlan/releases/latest).
 
-![CommsPlan Ops Center showing radio profiles, schedules, traffic, and operational awareness](/ops-center.png)
+![CommsPlan Ops Center demonstration showing two radios and their operating windows](/ops-center.png)
 
-*Demonstration station: identities are scrambled and exercise messages are
-fictional. Radio readbacks and the green Mesh connection status are simulated
-for illustration; no live radio or Mesh connection was used.*
+*Demonstration screenshots use scrambled identities and fictional exercise
+messages. Radio readbacks and Mesh connection indicators are simulated; no
+live radio or Mesh connection was used. Detail images show individual workspaces.*
+
+## Where, when, and what
+
+- **Where:** Your frequency plan brings frequencies, modes, groups, and radios together.
+- **When:** Daily schedules and nets tell you what’s current and what comes next.
+- **What:** Messages, forms, and operating procedures help you put the plan into action.
+
+This is Comms Unity in practice: moving between your plan, your tools, and
+incoming information in one workspace.
 
 ## Station setup and radio services
 
-**Station Setup** holds the saved station checklist and review route. Its
-radio-scoped editors give each radio its own application identity, profile,
-ports, paths, message locations, Frequency Plan assignment, and launch policy.
-Review the saved setup after changes; suggestions do not replace operator review.
+Start with **Station Setup**, your checklist for station details, radio tools,
+connections, and schedules. Each radio keeps its own settings, so adding a
+second radio does not mix up the first radio’s tools or plan.
 
-The radio's launch settings keep three decisions separate:
-
-- whether CommsPlan monitors an application;
-- whether it starts that application automatically; and
-- whether the operator starts it manually now.
-
-CommsPlan checks process and endpoint readiness in the context of the selected
-radio before treating an application as running. This prevents one radio's
-software, schedule, or hold state from being mistaken for another's.
+**Launch Control** lets you choose which applications to monitor, which to start
+automatically, and which to start yourself. CommsPlan checks each radio’s tools
+separately to help you see what is ready.
 
 ## Message Intelligence
 
 <a id="message-intelligence"></a>
 
-Message Intelligence is the shared interpretation layer for Inbox, CommsPlan Spotter,
-Ops Center, and Map. Supported source records are projected into one canonical
-station message library with stable source identity and external references.
-The projection can add bounded summaries, topics, location cues, status,
-actionability, and routing signals while retaining the original message and
-its source, radio, endpoint, receive path, or import provenance.
+Message Intelligence helps you see what the traffic is telling you. It brings
+supported messages into one inbox and adds summaries, topics, locations, status,
+and cues that help you find what needs attention. Open the original message to
+check the details and where it came from before deciding what to do next.
 
-The source label remains meaningful. JS8Call, CommsPlan Spotter, CommStat, FLMsg,
-FLAmp, VarAC, BBS, MeshCore, and Meshtastic records can share the station
-library without pretending that their transports have the same capabilities.
-Historical or imported data remains identifiable as imported, and a derived
-summary does not replace the underlying evidence.
+Messages can come from JS8Call, CommsPlan Spotter, CommStat, FLMsg, FLAmp,
+VarAC, BBS, MeshCore, and Meshtastic. Source labels help you distinguish received
+traffic from imported or Internet-assisted information. A summary keeps the
+original message available; an imported report does not mean your radio heard it.
 
 ![CommsPlan Message Inbox showing source filters, intelligence topics, and mixed station traffic](/message-inbox.png)
 
@@ -71,44 +67,36 @@ scrambled identities and no private operator messages.*
 
 <a id="commsplan-spotter-and-commstat"></a>
 
-The built-in **CommsPlan Spotter** service owns station-wide watches, JS8 Expect
-responses, access policies, forms, and reviewed imports. Its Forms Library is
-shared with Compose and Net Control. Review MCF files before adding them to the
-station library; bundled forms remain available and a custom folder is optional.
-Messages remains the complete traffic triage surface.
+Use the built-in **CommsPlan Spotter** to watch for information of interest,
+manage forms, and set up permitted responses to JS8 traffic. Its Forms Library
+is shared with Compose and Net Control. Preview a form before importing it;
+you can start with the bundled forms and add your own later.
 
-The optional external **JS8Spotter** application is a separate companion with
-its own installation, profile, and launch identity. CommsPlan can be configured
-to launch it or import selected data explicitly. It does not rename the
-external companion to CommsPlan Spotter, and external imports retain their
-provenance.
+The optional **JS8Spotter** companion is a separate application. You can launch
+it from CommsPlan or import selected data. Imported information stays labeled
+so you know where it came from.
 
-CommStat is also a separate companion integration. CommStat artifacts and
-JS8-delivered CommStat reports can enter the shared message projection with
-status, brevity, source, and transport context when available. A CommStat
-record that is Internet-assisted or imported is not presented as proof that a
-selected radio heard it locally. Compose stages supported CommStat RF traffic
-through the existing guarded path; native CommStat actions remain owned by
-CommStat where that is the source application's capability.
+**CommStat** is also a separate companion. Supported reports can appear in the
+same inbox with their status and source information. An Internet-assisted or
+imported report is not evidence that your radio heard it. Use Compose for
+supported CommStat radio messages; other CommStat actions stay in CommStat.
 
 ## Plans and scheduling
 
 <a id="plans-and-scheduling"></a>
 
-Plan Builder combines saved **HF Daily**, **HF Nets**, and **SOP** condition
-layers into a named Frequency Plan. Assign a plan to a radio only after
-reviewing its effective windows and RF Guard implications. The plan context
-shows which radio and schedule own each window.
+Plan Builder brings your **HF Daily** schedule, **HF Nets**, and **SOP**
+(standard operating procedure) layers into a named frequency plan. Assign a
+plan to a radio and review its operating windows before enabling scheduling.
 
-HF Daily provides the ordinary schedule. HF Nets contributes named net
-windows and their operating expectations. SOP layers describe condition-driven
-operating postures. Ops Center then shows the live effective context and the
-next meaningful transition. Scheduler actions remain subject to readiness,
-busy deferral, holds, manual control, and shared-resource safety boundaries.
+Use HF Daily for your regular schedule and HF Nets for net times. SOP layers
+let you plan for changing operating conditions. Ops Center shows the current
+window and what comes next. Holds, busy checks, and manual controls help you
+manage changes while you operate.
 
 ![CommsPlan Plan Builder combining Daily, Net, and SOP layers](/plan-builder.png)
 
-*Demonstration plan: frequency, net, and SOP names are sample station data for
+*Demonstration plan: frequency, net, and procedure names are sample station data for
 illustration.*
 
 ![CommsPlan HF Daily schedule with source rows and conflict review](/daily-schedule.png)
@@ -120,40 +108,34 @@ a live station schedule.*
 
 <a id="messages-and-compose"></a>
 
-Messages is the station's multi-source inbox and outbound staging area. Use
-source, age, group, topic, and search filters to narrow the bounded projection;
-open a row to review its original evidence and derived intelligence. Compose
-stages only the fields and actions supported by the selected application or
-transport, including FLMsg/FLAmp, JS8Call, Spotter forms, CommStat RF, VarAC
-files, and qualified Local Mesh sends.
+Use **Messages** to review incoming traffic and **Compose** to prepare an
+outgoing message. Filter by source, age, group, or topic, or search for a word
+or callsign. Open a message to see its original content and useful context.
 
-Opening Compose does not send a message. The selected radio, target, policy,
-payload, and final action remain visible before a guarded send. Native source
-records, read state, archive state, and source references remain separate from
-station-level watches and publication services.
+Compose offers the actions supported by your selected radio application or
+connection. These include supported forms, JS8Call messages, CommStat radio
+messages, VarAC files, and Local Mesh messages after setup.
+
+Opening Compose does not send anything. Review the radio, recipient, and
+message before choosing the final send action.
 
 ## Map and Call Finder
 
 <a id="offline-map"></a>
 
-Map uses bundled geography and local station data, so it remains useful without
-an online tile account, API key, or tile service. Layers can show stations,
-paths, traffic, regional intelligence, RF planning, schedule context, saved
-pins, peer schedules, and MeshCore/Meshtastic nodes or positions. The **All
-countries** scope supports worldwide evidence. Map controls are organized into
-Layers, Filters, Display, Paths, and Planning categories. Select an item to
-inspect its source, age, status, and related inbox evidence.
+The map works with bundled geography and local station data, so you can use
+it without an online map account. Show stations, paths, schedules, message
+locations, and available mesh-node positions. Choose layers and filters to
+focus on the information you need, then select an item to check its source
+and age.
 
-Call Finder can search locally loaded FCC US amateur and GMRS licenses and
-Canadian ISED amateur callsigns. It also supports postal reference data for
-approximate grids. License references can be reviewed on the map using the
-available location estimate; a postal-derived point is not proof of a current
-operating location. See [What's new in 2.0.6](/guide/whats-new) for dataset
-updates and source details.
+**Call Finder** searches locally loaded US amateur and GMRS license records,
+plus Canadian amateur records. Optional postal data can help estimate a
+location. These estimates do not show where an operator is right now.
+See [What’s new in 2.0.6](/guide/whats-new) for data updates and details.
 
-Map is decision support. A path, peer schedule, message, or mesh position is
-evidence with a source and age; it is not a guarantee of current propagation,
-reachability, or delivery.
+Use the map to support your decisions. A marker or path does not guarantee
+that a station is reachable or that a message will be delivered.
 
 ![CommsPlan offline operational map with stations, status, and regional context](/operational-map.png)
 
@@ -162,17 +144,16 @@ they do not disclose a live operator location or guarantee current reachability.
 
 ## Local Mesh
 
-Local Mesh connects supported MeshCore and Meshtastic devices at the station
-level. Received text can enter Messages and available node positions can
-contribute to Map without turning a mesh device into an HF radio profile.
+Connect a supported **MeshCore** or **Meshtastic** device to bring local mesh
+text into Messages and available node positions onto the map. Mesh devices
+work alongside your HF radios, with their own connection settings.
 
-Outbound use is off by default. After a saved connection is qualified and
-connected, enable **Allow Send**, accept the required channel policy or select
-a known direct node, and use **Messages → Compose → Local Mesh**. The final
-confirmation and adapter serialization protect against overlapping sends.
+Sending is off by default. After setting up and connecting a device, enable
+**Allow Send**, review the channel policy or choose a known direct node, and
+open **Messages → Compose → Local Mesh**. Review the message and destination
+before confirming the send.
 
-See [Connect Local Mesh](/integrations/mesh) for pairing, connection, and
-offline recovery steps.
+See [Connect Local Mesh](/integrations/mesh) for pairing and connection help.
 
 ## Continue
 

@@ -5,7 +5,7 @@ export default defineConfig({
   title: "CommsPlan",
   titleTemplate: ":title · CommsPlan",
   description:
-    "Install, configure, and operate CommsPlan — a coordinated operations console for HF digital stations.",
+    "CommsPlan makes your comms plan work. Where to be, when to be there, and what to do when you’re there.",
   base: "/CommsPlan/",
   cleanUrls: true,
   lastUpdated: true,
@@ -15,12 +15,12 @@ export default defineConfig({
     ["link", { rel: "icon", type: "image/png", href: "/CommsPlan/commsplan-mark.png" }],
     ["meta", { name: "theme-color", content: "#12324a" }],
     ["meta", { property: "og:type", content: "website" }],
-    ["meta", { property: "og:title", content: "CommsPlan Documentation" }],
+    ["meta", { property: "og:title", content: "CommsPlan makes your comms plan work." }],
     [
       "meta",
       {
         property: "og:description",
-        content: "Clear setup, operating, and troubleshooting guidance for CommsPlan.",
+        content: "Where to be. When to be there. What to do when you’re there. Bring plans, radio tools, and message intelligence together.",
       },
     ],
   ],

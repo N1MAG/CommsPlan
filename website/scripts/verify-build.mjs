@@ -115,7 +115,7 @@ for (const file of htmlFiles) {
     }
 
     const { candidates, fragment } = htmlCandidates(file, value);
-    const existing = candidates.find((candidate) => fs.existsSync(candidate));
+    const existing = candidates.find((candidate) => fs.existsSync(candidate) && fs.statSync(candidate).isFile());
     if (!existing) {
       failures.push(`${path.relative(siteRoot, file)} has unresolved target: ${value}`);
       continue;
