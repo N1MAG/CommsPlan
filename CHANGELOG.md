@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.0.6.1]
+- Fixed: Fresh radio setup saves FLRig-only configurations without false application-path readback errors or a database error from the unused FLDigi port.
+- Fixed: FLRig, FLDigi, FLMsg and FLAmp can each be configured independently. Hidden endpoint fields preserve existing ports, and edited FLMsg/FLAmp executable paths save correctly.
+- Fixed: Application setup keeps Save and Cancel reachable in compact Software Administration views. Suggestions, validation messages and recovery controls scroll with the fields across JS8Call, Fast Light and VarAC editors.
+- Changed: Release metadata validation accepts the four-part hotfix version 2.0.6.1.
+- Qualification: Automated configuration and compact-layout checks pass. Native builds perform their platform checks; physical-radio behavior and every Windows display/scaling combination require operator verification. Existing 2.0.6 known limitations remain applicable.
+
 ## [2.0.6]
 - Release status: Approved for public publication. Download availability and package checks are reported on the CommsPlan Releases page; physical-radio and platform qualification limits remain noted below.
 - Added: Offline Call Finder searches US Amateur, GMRS, and Canadian amateur callsign references, with source details, mailing-postal grid estimates, reviewed Add to Operators, and draft-only NCS lookup. Update all downloads and imports the five source datasets one at a time, stopping on failure or cancellation.

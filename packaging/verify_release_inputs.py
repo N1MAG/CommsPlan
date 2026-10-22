@@ -64,7 +64,7 @@ def validated_version(root: Path = ROOT, *, expected_tag: str = "") -> str:
         ),
         "guide": _match(
             root / "docs/guide.html",
-            r"(?:Current version|Latest public release)</strong>:\s*(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z][0-9A-Za-z.-]*)?)",
+            r"(?:Current version|Latest public release)</strong>:\s*(\d+\.\d+\.\d+(?:\.\d+)?(?:[-+][0-9A-Za-z][0-9A-Za-z.-]*)?)(?!\d|\.\d)",
             "guide version",
         ),
     }

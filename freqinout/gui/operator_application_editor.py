@@ -174,6 +174,10 @@ class ApplicationSetupEditor(QWidget):
         self._sync_controls_to_data()
         return deepcopy(self._data)
 
+    def add_form_context(self, widget: QWidget) -> None:
+        """Keep optional context in the field scroll, above the fixed footer."""
+        self._content_layout.insertWidget(0, widget)
+
     def set_values(
         self,
         values: Mapping[str, Any] | None,

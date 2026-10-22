@@ -335,11 +335,9 @@ def _validate_identity_record(record: SoftwareIdentityRecord) -> None:
             raise ValueError(
                 "Fast Light identity has unknown component id(s): " + ", ".join(unknown)
             )
-        # FLMsg/FLAmp may be omitted when not selected.  If either is selected,
-        # its application-owned Fast Light dependency is explicit rather than
-        # silently reconstructed by another screen.
-        if ({"flmsg", "flamp"} & component_kinds) and "fldigi" not in component_kinds:
-            raise ValueError("Fast Light FLMsg/FLAmp components require explicit FLDigi")
+        # Each Fast Light application may be configured independently. Any
+        # explicitly chosen launch dependencies use the ordinary graph checks;
+        # selecting FLMsg or FLAmp does not require another installed component.
 
 
 def identity_record_to_mapping(value: SoftwareIdentityRecord) -> Mapping[str, Any]:

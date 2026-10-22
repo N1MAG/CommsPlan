@@ -211,6 +211,10 @@ class OperatorInstanceAssistant(QWidget):
             parent=self,
         )
         self.application_editor = self.editor
+        # Suggestions, validation messages and recovery controls share the
+        # existing field-scroll body. Variable-height context above the editor
+        # can consume a short Settings viewport and clip its fixed Save footer.
+        self.editor.add_form_context(self._context_widget)
         self.editor.full_family_review_requested.connect(self._full_family_review_requested)
         if self.task_scope:
             self.editor.set_task_scope(self.task_scope)
@@ -228,7 +232,7 @@ class OperatorInstanceAssistant(QWidget):
         self.operation_status_label.setAccessibleName("Application setup operation status")
         self.operation_status_label.setWordWrap(True)
         self.status_label = self.operation_status_label
-        self._root_layout.insertWidget(1, self.operation_status_label)
+        self._context_layout.insertWidget(0, self.operation_status_label)
         self._editor_host_layout.addWidget(self.editor, 1)
         heading = self.editor.findChild(QLabel, 'operatorApplicationHeading')
         if heading is not None:
@@ -452,6 +456,11 @@ class OperatorInstanceAssistant(QWidget):
         heading.setStyleSheet(label_style("text", active_app_theme(), weight=700))
         self._root_layout.addWidget(heading)
 
+        self._context_widget = QWidget()
+        self._context_layout = QVBoxLayout(self._context_widget)
+        self._context_layout.setContentsMargins(0, 0, 0, 0)
+        self._context_layout.setSpacing(6)
+
         self.discovery_group = QGroupBox("Suggestions")
         self.discovery_group.setObjectName("operatorInstanceDiscoveryGroup")
         discovery_layout = QVBoxLayout(self.discovery_group)
@@ -475,7 +484,7 @@ class OperatorInstanceAssistant(QWidget):
         controls.addWidget(self.use_discovery_button)
         controls.addStretch(1)
         discovery_layout.addLayout(controls)
-        self._root_layout.addWidget(self.discovery_group)
+        self._context_layout.addWidget(self.discovery_group)
         self.discovery_group.setVisible(False)
 
         self.create_radio_button = QPushButton("Create a radio…")
@@ -484,7 +493,7 @@ class OperatorInstanceAssistant(QWidget):
         self.create_radio_button.setVisible(
             self.selected_radio_id in (None, "") and not self._nested_unsaved
         )
-        self._root_layout.addWidget(self.create_radio_button, 0, Qt.AlignmentFlag.AlignLeft)
+        self._context_layout.addWidget(self.create_radio_button, 0, Qt.AlignmentFlag.AlignLeft)
 
         recovery_actions = QHBoxLayout()
         self.recover_button = QPushButton("Recover unfinished")
@@ -500,7 +509,7 @@ class OperatorInstanceAssistant(QWidget):
         recovery_actions.addWidget(self.recover_button)
         recovery_actions.addWidget(self.discard_unfinished_button)
         recovery_actions.addStretch(1)
-        self._root_layout.addLayout(recovery_actions)
+        self._context_layout.addLayout(recovery_actions)
 
         self._editor_host = QWidget()
         self._editor_host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)

@@ -138,6 +138,8 @@ def application_issues(family: str, values: Mapping[str, Any]) -> tuple[str, ...
     if family == 'fast_light':
         if not any(values.get(f'{name}_enabled') for name in ('flrig','fldigi','flmsg','flamp')):
             issues.append('Choose at least one Fast Light component.')
+        if values.get('fldigi_enabled') and values.get('secondary_port') in ('', None):
+            issues.append('Enter an FLDigi API port from 1 to 65535.')
         for name in ('flrig','fldigi','flmsg','flamp'):
             if values.get(f'{name}_enabled') and values.get(f'{name}_launch_at_startup') and not values.get(f'{name}_application_path'):
                 issues.append(f'Choose the {name.upper()} executable before enabling startup.')
@@ -377,6 +379,32 @@ def save_operator_application(store, payload: Mapping[str, Any]):
     # This does not move profiles or change native application settings.
     proposed['operator_projection_version'] = 1
     if family == 'fast_light':
+        # Component-scoped forms retain blank defaults for hidden endpoints.
+        # They do not clear another component's required typed port. Omit a
+        # fresh blank so the store can supply its schema-compatible default;
+        # retain an existing baseline without replaying it as an edit.
+        for field, component in (('port', 'flrig'), ('secondary_port', 'fldigi')):
+            if not proposed.get(f'{component}_enabled') and proposed.get(field) in ('', None):
+                if base.get(field) not in ('', None):
+                    proposed[field] = base[field]
+                else:
+                    proposed.pop(field, None)
+                    base.pop(field, None)
+        # The short form edits component paths. Legacy aliases project the
+        # same typed columns and must agree before computing changed fields;
+        # otherwise a fresh hidden blank alias rejects a valid typed readback.
+        for values in (proposed, base):
+            for component, alias in (('flrig', 'application_path'),
+                                     ('fldigi', 'secondary_application_path')):
+                field = f'{component}_application_path'
+                if field in values:
+                    # A blank default must still accept an older alias-only
+                    # seed. A reviewed clear of an existing component wins.
+                    cleared = field in base and values[field] != base[field]
+                    path = values[field] if values[field] or cleared else values.get(alias, values[field])
+                    values[field] = values[alias] = path
+                elif alias in values:
+                    values[field] = values[alias]
         # The short form exposes per-component policy, not the derived family
         # flag. Normalize its baseline too so an unchanged review is not a
         # synthetic concurrent edit of that hidden aggregate.
@@ -526,6 +554,15 @@ def save_operator_application(store, payload: Mapping[str, Any]):
                     'application_system_key':app['system_key'], 'management_mode':'fio_managed' if values.get('mode') == 'managed' else 'remote' if values.get('mode') == 'remote' else 'operator',
                     'verification_state':'configured','verification_summary':'Saved in CommsPlan; connection not checked.',
                     'evidence':evidence}
+        if family == 'fast_light':
+            # These executables project to radio-owned columns via resource
+            # claims. Replace prior path claims on explicit review, otherwise
+            # adoption's legacy fallback can replay an old executable.
+            manifest['resource_claims'] = [
+                claim for claim in manifest.get('resource_claims', ()) or ()
+                if claim.get('kind') not in {'flmsg_application', 'flamp_application'}
+            ] + [dict(kind=f'{name}_application', value=values[f'{name}_application_path'], exclusive=False)
+                 for name in ('flmsg', 'flamp') if values.get(f'{name}_application_path')]
         cluster_context = {}
         if family == 'varac' and expected_id and source_id in (None, expected_id):
             # Editing this member does not select a new VarAC arrangement.
