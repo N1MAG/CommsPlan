@@ -151,5 +151,5 @@ Guard.
 ## Continue
 
 - [Understand the operating picture](/guide/operating-picture)
-- [See what's new in CommsPlan 2.0.6](/guide/whats-new)
+- [See what's new in CommsPlan 2.0.7](/guide/whats-new)
 - [Install or upgrade](/install/)
