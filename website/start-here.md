@@ -6,7 +6,7 @@ description: Choose the right CommsPlan setup path for a new station, an upgrade
 # Start here
 
 <div class="doc-badge-row">
-  <span class="doc-badge">CommsPlan 2.0.6</span>
+  <span class="doc-badge">CommsPlan 2.0.7</span>
   <span class="doc-badge">Windows · Linux · macOS</span>
   <span class="doc-badge">Choose the right path</span>
 </div>
@@ -30,8 +30,13 @@ Message Intelligence helps you find useful information in the traffic, with the
 original messages available when you need the details.
 
 The Station Setup checklist and workflow described below are part of CommsPlan
-2.0.6. Use the installation and upgrade guide to select a currently published
-package or source installation.
+2.0.7. Use the [CommsPlan 2.0.7 release page](https://github.com/N1MAG/CommsPlan/releases/tag/v2.0.7)
+and the installation and upgrade guide to select a package or source
+installation.
+
+The latest release adds Station Traffic Summaries, reviewable message
+enrichment, per-net FLDigi tuning, and clearer radio setup recovery. [Read the
+2.0.7 feature notes →](/guide/whats-new)
 
 ## Which path fits your station?
 

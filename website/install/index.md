@@ -6,15 +6,25 @@ description: Install CommsPlan from the latest published release or update an es
 # Install or upgrade CommsPlan
 
 <div class="doc-badge-row">
-  <span class="doc-badge">CommsPlan 2.0.6</span>
+  <span class="doc-badge">CommsPlan 2.0.7</span>
   <span class="doc-badge">Windows · Linux · macOS</span>
   <span class="doc-badge">Back up before upgrade</span>
 </div>
 
-CommsPlan 2.0.6 is the documented release version. The
-[latest public release page](https://github.com/N1MAG/CommsPlan/releases/latest)
+CommsPlan 2.0.7 is the documented release version. The
+[CommsPlan 2.0.7 release page](https://github.com/N1MAG/CommsPlan/releases/tag/v2.0.7)
 is the authority for currently available packages, checksums, and release
 notes. Download a native package only when it is listed there.
+
+The four 2.0.7 package filenames are:
+
+- Windows 10/11 x86-64: `CommsPlan-2.0.7-windows-x86_64-setup-unsigned.exe`
+- Debian/Ubuntu-family Linux amd64: `CommsPlan-2.0.7-linux-amd64.deb`
+- Apple Silicon macOS: `CommsPlan-2.0.7-macos-arm64-unsigned.dmg`
+- Intel macOS: `CommsPlan-2.0.7-macos-x86_64-unsigned.dmg`
+
+Verify the downloaded package against [`SHA256SUMS.txt`](https://github.com/N1MAG/CommsPlan/releases/download/v2.0.7/SHA256SUMS.txt)
+before opening it.
 
 ## Choose an installation method
 
@@ -23,12 +33,12 @@ the release notes and verify the downloaded file against the published checksum
 before opening it. Windows or macOS may show an operating-system security
 prompt for an unsigned package; follow the release-specific instructions.
 
-The source commands below use the CommsPlan 2.0.6 installer entry points. Use
-the 2.0.6 source tree for these instructions. When using a source checkout,
+The source commands below use the current CommsPlan installer entry points.
+When using a source checkout,
 install Git and Python 3.11 (3.10–3.13 are accepted; 3.11 is recommended).
 Close CommsPlan and companion applications before installing or updating.
 
-### Windows source installation — CommsPlan 2.0.6
+### Windows source installation — CommsPlan 2.0.7
 
 ```powershell
 git clone https://github.com/N1MAG/CommsPlan.git "$HOME\CommsPlan"
@@ -37,7 +47,7 @@ py -3.11 install-commsplan.py
 .\start-commsplan.cmd
 ```
 
-### macOS source installation — CommsPlan 2.0.6
+### macOS source installation — CommsPlan 2.0.7
 
 ```bash
 git clone https://github.com/N1MAG/CommsPlan.git "$HOME/CommsPlan"
@@ -51,7 +61,7 @@ python3.11 install-commsplan.py
 Install the Debian package offered by the release page, then launch CommsPlan
 from your applications menu or with the `commsplan` command when available.
 
-### Linux source installation and maintenance — CommsPlan 2.0.6
+### Linux source installation and maintenance — CommsPlan 2.0.7
 
 The guided installer supports setup, update, repair, and desktop launcher
 refresh. With no action supplied, it runs setup.
