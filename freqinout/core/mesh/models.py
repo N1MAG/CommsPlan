@@ -135,6 +135,8 @@ class MeshMessage:
     topics: tuple[str, ...] = ()
     severity: str = "info"
     raw: Mapping[str, object] = field(default_factory=dict)
+    public_key_or_hash: str = ""
+    contact_node_id: str = ""
 
     def as_traffic_context(self) -> dict[str, object]:
         received = self.rx_time or utc_now()

@@ -45,6 +45,7 @@ from freqinout.core.mesh.meshcore_codec import (
     normalize_meshcore_channels,
     normalize_meshcore_nodes,
     normalize_meshcore_waiting_messages,
+    receive_time_contact_identity,
 )
 from freqinout.core.mesh.meshtastic_adapter import MeshConnectionError
 from freqinout.core.mesh.models import (
@@ -1526,8 +1527,13 @@ class MeshCorePythonCompanionClient:
     def _on_contact_message(self, event: object) -> None:
         payload = getattr(event, "payload", None)
         if isinstance(payload, Mapping):
+            retained = dict(payload)
+            retained.pop("_cp_receive_contact", None)
+            contact = receive_time_contact_identity(payload, getattr(self._client, "contacts", {}))
+            if contact:
+                retained["_cp_receive_contact"] = contact
             with self._message_lock:
-                self._messages.append({"contactMessage": dict(payload)})
+                self._messages.append({"contactMessage": retained})
 
     def _on_node_event(self, event: object, event_name: str) -> None:
         payload = getattr(event, "payload", None)

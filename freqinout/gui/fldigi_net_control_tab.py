@@ -58,6 +58,7 @@ from freqinout.core.fldigi_role_workspace import (
 )
 from freqinout.gui.fldigi_macro_mapping_dialog import FldigiMacroMappingDialog
 from freqinout.gui.fldigi_workspace_cards import WorkspaceBucketCard
+from freqinout.gui.net_tuning_actions import show_net_tuning_dialog
 from freqinout.gui.help_registry import resolve_help_host
 from freqinout.utils.timezones import get_timezone
 from freqinout.gui.qsy_helper import (
@@ -359,8 +360,65 @@ class FldigiNetControlTab(QWidget):
             summary = f"{summary} | Active"
         self.ncs_session_summary_label.setText(summary)
         self.ncs_session_summary_label.setToolTip(summary)
+        self._refresh_net_tuning_action_state()
         if hasattr(self, "_responsive_geometry_timer"):
             self._responsive_geometry_timer.start(0)
+
+    def _selected_net_tuning_radio_id(self) -> int:
+        """Return the already-published/session-scoped radio identity."""
+        try:
+            active = int(getattr(self, "_ncs_session_radio_id", 0) or 0)
+            if active > 0:
+                return active
+        except (TypeError, ValueError):
+            pass
+        try:
+            window = self.window()
+            selected = int(getattr(window, "_station_command_selected_profile_id", 0) or 0)
+            if selected > 0:
+                return selected
+        except (TypeError, ValueError, AttributeError):
+            pass
+        return 0
+
+    def _refresh_net_tuning_action_state(self) -> None:
+        button = getattr(self, "net_tuning_btn", None)
+        if button is None:
+            return
+        radio_id = self._selected_net_tuning_radio_id()
+        button.setEnabled(radio_id > 0)
+        button.setToolTip(
+            "Apply the configured FLDigi Center + Narrow tuning to this radio."
+            if radio_id > 0
+            else "Select a configured radio before applying NET FLDigi tuning."
+        )
+
+    def _open_net_tuning_dialog(self) -> None:
+        radio_id = self._selected_net_tuning_radio_id()
+        if radio_id <= 0:
+            return
+        window = self.window()
+        scheduler = getattr(window, "scheduler", None)
+        if scheduler is None:
+            return
+        radio_name = ""
+        cache = getattr(window, "_station_command_profile_cache", ())
+        for profile in cache if isinstance(cache, (list, tuple)) else ():
+            try:
+                if int(profile.get("id", 0) or 0) == radio_id:
+                    radio_name = str(profile.get("name") or profile.get("label") or "").strip()
+                    break
+            except (AttributeError, TypeError, ValueError):
+                continue
+        if not radio_name:
+            radio_name = f"Radio {radio_id}"
+        show_net_tuning_dialog(
+            self,
+            scheduler,
+            radio_id,
+            radio_name=radio_name,
+            net_name=self.net_name_combo.currentText().strip() if hasattr(self, "net_name_combo") else "",
+        )
 
     def _build_session_bar(self, layout: QVBoxLayout) -> None:
         session_frame = QFrame()
@@ -455,6 +513,11 @@ class FldigiNetControlTab(QWidget):
         self.log_assisted_enable_chk.toggled.connect(self._on_log_assisted_toggled)
         self.session_tools_layout = QHBoxLayout()
         self.session_tools_layout.setSpacing(6)
+        self.net_tuning_btn = QPushButton("Center + Narrow…")
+        self.net_tuning_btn.setObjectName("fldigiNetTuningAction")
+        self.net_tuning_btn.setAccessibleName("Apply FLDigi Center and Narrow tuning")
+        self.net_tuning_btn.clicked.connect(self._open_net_tuning_dialog)
+        self.session_tools_layout.addWidget(self.net_tuning_btn)
         self.help_btn = QPushButton("Help")
         self.help_btn.setToolTip("Open FLDigi / SSB Net Control help.")
         self.help_btn.clicked.connect(lambda: self._open_context_help("tab.ncs-fldigi"))

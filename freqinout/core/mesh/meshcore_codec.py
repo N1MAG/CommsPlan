@@ -441,6 +441,9 @@ def _normalize_contact_message(
         value.get("pubKeyPrefix", value.get("pub_key_prefix", value.get("pubkey_prefix")))
     )
     hop_count = meshcore_companion_path_len_to_hops(value.get("pathLen", value.get("path_len")))
+    contact = value.get("_cp_receive_contact")
+    if not isinstance(contact, Mapping):
+        contact = {}
     return MeshMessage(
         adapter_id=adapter_id,
         transport=transport,
@@ -456,7 +459,40 @@ def _normalize_contact_message(
         snr=_coerce_float(_first_non_none(value.get("snr"), value.get("snr_db"))),
         rssi=_coerce_float(_first_non_none(value.get("rssi"), value.get("rssi_dbm"))),
         raw=raw,
+        public_key_or_hash=str(contact.get("public_key") or ""),
+        contact_node_id=str(contact.get("node_id") or ""),
     )
+
+
+def receive_time_contact_identity(payload: Mapping[str, object], contacts: object) -> dict[str, str]:
+    """Resolve one native six-byte prefix against a bounded cached contact list.
+
+    This is attribution from the contact list at receipt time, not authentication.
+    Missing/ambiguous matches stay unknown and are never reconstructed later.
+    """
+    if not isinstance(contacts, Mapping) or len(contacts) > 2000:
+        return {}
+    prefix = _hex_bytes(payload.get("pubKeyPrefix", payload.get("pub_key_prefix", payload.get("pubkey_prefix")))).lower()
+    if not re.fullmatch(r"[0-9a-f]{12}", prefix):
+        return {}
+    matches = []
+    try:
+        values = tuple(contacts.values())
+    except RuntimeError:
+        return {}
+    for value in values:
+        if not isinstance(value, Mapping):
+            continue
+        key = _hex_bytes(value.get("publicKey", value.get("public_key"))).lower()
+        if re.fullmatch(r"[0-9a-f]{64}", key) and key.startswith(prefix):
+            node = normalize_meshcore_node(value, adapter_id="receive-context")
+            if node is not None:
+                matches.append((node.node_id, key))
+    distinct = set(matches)
+    if len(distinct) != 1:
+        return {}
+    node_id, key = next(iter(distinct))
+    return {"node_id": node_id, "public_key": key, "evidence": "receive_time_contact_list"}
 
 
 def _meshcore_message_id(kind: str, peer: object, sender_time: int | None, text: str) -> str:

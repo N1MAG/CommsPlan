@@ -39,6 +39,7 @@ class OperatorConfigurationJob(QThread):
                     response['review'] = set_schedule_authorization(store,self.payload['radio_id'],
                         enable=self.action == 'schedule_enable',expected_fingerprint=self.payload.get('fingerprint',''))
                 response['setup'] = review_station_setup(store)
+                response['new_radio_draft'] = load_unfinished_configuration(store, 'radio:new')
                 self.result_ready.emit(response)
                 return
             radio_action = self.action.startswith('radio_')
@@ -50,15 +51,22 @@ class OperatorConfigurationJob(QThread):
                 scope = f"application:{int(self.payload['radio_id'])}:{self.payload['family_key']}"
             if self.action == 'radio_load':
                 response.update(load_operator_radio_context(store,radio_id))
+                # Catalog/cache and bounded rigctl discovery run off the GUI and
+                # outside the radio read transaction. Failure cannot block manual setup.
+                try:
+                    from freqinout.core.radio_catalog import load_radio_catalog
+                    response['radio_catalog'] = load_radio_catalog()
+                except Exception:
+                    response['radio_catalog'] = {'source': 'unavailable', 'entries': []}
                 self.result_ready.emit(response)
                 return
             if self.action == 'radio_discard':
-                discard_unfinished_configuration(store,scope,expected_revision=self.payload['draft_revision'])
+                response['draft_revision'] = discard_unfinished_configuration(store,scope,expected_revision=self.payload['draft_revision'])
                 response['discarded'] = True
                 self.result_ready.emit(response)
                 return
-            if self.action == 'radio_save':
-                response.update(save_operator_radio(store,self.payload))
+            if self.action in {'radio_save', 'radio_keep_draft'}:
+                response.update(save_operator_radio(store, {**self.payload, 'keep_draft_only': self.action == 'radio_keep_draft'}))
                 response['unfinished'] = load_unfinished_configuration(store,scope)
                 self.result_ready.emit(response)
                 return

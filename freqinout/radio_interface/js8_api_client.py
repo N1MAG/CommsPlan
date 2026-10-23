@@ -224,6 +224,7 @@ class JS8ApiClient:
         self._reader_thread: Optional[threading.Thread] = None
         self._pending: Dict[str, "queue.Queue[JS8ApiMessage]"] = {}
         self._pending_expected: Dict[str, frozenset[str]] = {}
+        self._pending_require_id: set[str] = set()
         self._listeners: List[Callable[[JS8ApiMessage], None]] = []
         # Push traffic can be continuous on busy JS8 networks.  Keep the
         # optional polling backlog bounded; registered listeners still see
@@ -328,7 +329,13 @@ class JS8ApiClient:
         value: object = "",
         expect_types: Optional[Iterable[str]] = None,
         timeout_s: Optional[float] = None,
+        require_id: bool = False,
     ) -> JS8ApiMessage:
+        """Request a reply, optionally requiring an echoed request identifier.
+
+        Legacy type-only response fallback remains the default. Mutations whose
+        verification cannot accept unsolicited state use ``require_id=True``.
+        """
         command_text = _safe_text(command, limit=_FIELD_LIMIT).strip().upper()
         if not command_text:
             raise ValueError("JS8 API command is required")
@@ -346,6 +353,8 @@ class JS8ApiClient:
         with self._state_lock:
             self._pending[str(msg_id)] = waiter
             self._pending_expected[str(msg_id)] = expected
+            if require_id:
+                self._pending_require_id.add(str(msg_id))
         try:
             self._send({"type": command_text, "value": _safe_text(value), "params": request_params})
             timeout = float(timeout_s if timeout_s is not None else self.timeout_s)
@@ -356,6 +365,7 @@ class JS8ApiClient:
             with self._state_lock:
                 self._pending.pop(str(msg_id), None)
                 self._pending_expected.pop(str(msg_id), None)
+                self._pending_require_id.discard(str(msg_id))
         if response.type == "API.ERROR":
             self._record_error(response.value or "JS8Call API returned API.ERROR")
             if _safe_text(response.params.get("ERROR_CLASS"), limit=64) == "connection":
@@ -553,7 +563,8 @@ class JS8ApiClient:
                     (
                         self._pending[key]
                         for key in self._pending
-                        if response_type in self._pending_expected.get(key, frozenset())
+                        if key not in self._pending_require_id
+                        and response_type in self._pending_expected.get(key, frozenset())
                     ),
                     None,
                 )
@@ -591,6 +602,7 @@ class JS8ApiClient:
             pending = list(self._pending.values())
             self._pending.clear()
             self._pending_expected.clear()
+            self._pending_require_id.clear()
         for waiter in pending:
             try:
                 waiter.put_nowait(

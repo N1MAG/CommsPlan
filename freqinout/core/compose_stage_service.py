@@ -184,6 +184,12 @@ def _publish_to_managed_bbs(
     with connect_sqlite(Path(request.bbs_db_path)) as conn:
         ensure_bbs_library_schema(conn)
         with conn:
+            if not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")
+            for location_id in request.bbs_location_ids:
+                row = conn.execute("SELECT enabled FROM bbs_locations WHERE location_id=?", (location_id,)).fetchone()
+                if row is None or not row[0]:
+                    raise ValueError("A selected Managed BBS location is missing or disabled. Review destinations and retry.")
             artifact_id = upsert_bbs_artifact_path(
                 conn,
                 source_path=source_path,

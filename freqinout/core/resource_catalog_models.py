@@ -180,6 +180,7 @@ class NetDirectorySession:
     replacement_net_session_key: str | None = None
     created_utc: str | None = None
     updated_utc: str | None = None
+    fldigi_tuning_json: str = "{}"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "net_session_key", _text(self.net_session_key, "net_session_key", required=True))

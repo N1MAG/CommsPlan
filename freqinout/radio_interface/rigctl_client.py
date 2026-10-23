@@ -227,6 +227,38 @@ class FLRigClient:
             self._fldigi_proxy = None
             return False
 
+    def get_net_tuning_state(self) -> dict:
+        """Worker-only observed FLRig/FLDigi state for an explicit net action."""
+        frequency = self.get_vfo_frequency()
+        offset = self.get_fldigi_offset()
+        vfo = self.get_active_vfo()
+        mode = str(self._with_proxy(lambda p: p.rig.get_mode(), label="get_mode") or "").strip().upper()
+        sideband = {"USB": "USB", "DATA-U": "USB", "DIGU": "USB", "PKTUSB": "USB",
+                    "LSB": "LSB", "DATA-L": "LSB", "DIGL": "LSB", "PKTLSB": "LSB"}.get(mode, "")
+        width = None
+        try:
+            raw = str(self._with_proxy(lambda p: p.rig.get_bw(), label="get_bw")).strip()
+            if re.fullmatch(r"[0-9]+", raw):
+                width = int(raw)
+        except Exception:
+            # Width is optional; never invent a previous width for Restore.
+            pass
+        return dict(frequency_hz=frequency, audio_offset_hz=offset, vfo=vfo,
+                    sideband=sideband, filter_width_hz=width)
+
+    def set_filter_width(self, width_hz: int) -> bool:
+        """Request radio filter width through documented FLRig XML-RPC.
+
+        The caller must read back rig.get_bw; a successful RPC is not proof
+        that the radio supports or selected the requested width.
+        """
+        try:
+            self._with_proxy(lambda p: p.rig.set_bandwidth(int(width_hz)), label="set_bandwidth")
+            return True
+        except Exception as exc:
+            log.warning("Failed to request FLRig filter width: %s", exc)
+            return False
+
     def get_fldigi_offset(self) -> Optional[int]:
         proxy = self._connect_fldigi()
         if proxy is None:

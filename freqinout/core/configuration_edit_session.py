@@ -248,3 +248,24 @@ def discard_unfinished_configuration(store, scope: str, *, expected_revision: in
                              (_encode(dict(version=DRAFT_VERSION, revision=revision, payload=None)), key))
             transaction.complete()
     return revision
+
+
+def retain_configuration_edit(store, scope: str, request: Mapping[str, Any]) -> ConfigurationSaveResult:
+    """Explicit draft-only commit. Never writes typed radio/application rows."""
+    request = deepcopy(dict(request))
+    if request.get('version') != DRAFT_VERSION:
+        raise ValueError('Unsupported edit request version.')
+    _encode(request)
+    with store.configuration_save_transaction() as transaction:
+        with store.connect() as conn:
+            envelope = _read_envelope(conn, _key(scope))
+            if envelope['revision'] != request['draft_revision']:
+                raise ConfigurationConflict('The previous draft changed. Review it before replacing it.')
+            previous = envelope.get('payload')
+            if previous and previous.get('session_id') not in (request['session_id'], request.get('recovered_from')):
+                raise ConfigurationConflict('Confirm replacing the previous draft with the current setup.')
+            revision = envelope['revision'] + 1
+            conn.execute('INSERT OR REPLACE INTO kv(key,value) VALUES (?,?)',
+                         (_key(scope), _encode(dict(version=DRAFT_VERSION, revision=revision, payload=request))))
+            transaction.complete()
+    return ConfigurationSaveResult(request['session_id'], 'draft_saved', revision, request['values'])

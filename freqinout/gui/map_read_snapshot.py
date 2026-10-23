@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import time
 import datetime
+import html
 import weakref
 
 from PySide6.QtCore import QObject, Signal
@@ -19,6 +20,29 @@ from PySide6.QtCore import QObject, Signal
 from freqinout.core.config_paths import get_config_dir
 from freqinout.core.map_read_budget import map_read_budget
 from freqinout.core.sqlite_utils import connect_sqlite_readonly
+from freqinout.core.geographic_guidance import geographic_guidance
+
+
+def _home_guidance_html(ctx, payload):
+    """Read only the detached worker context; never call a GUI/settings manager."""
+    origin = ctx._get_user_latlon()
+    target = ctx._map_selected_latlon(payload)
+    # The existing map domain uses (0, 0) as its missing-location sentinel.
+    # The pure calculation still supports genuine zero coordinates.
+    if target == (0.0, 0.0):
+        target = None
+    guidance = geographic_guidance(origin, target)
+    if guidance is None:
+        text = "Unavailable: configured home grid or selected location is unknown."
+    else:
+        bearing = (f"{guidance.initial_true_bearing:.0f}° true initial bearing"
+                   if guidance.initial_true_bearing is not None else "initial bearing undefined")
+        text = (f"{guidance.distance_km:,.0f} km / {guidance.distance_miles:,.0f} mi · {bearing}. "
+                "From configured home grid center to the selected mapped location; "
+                "grid/state placements are estimates. Geographic guidance only.")
+    return ("<div class='fio-detail-card'><div class='fio-detail-section'>"
+            "<div class='fio-detail-heading'>From home</div>"
+            f"<div class='fio-detail-row'>{html.escape(text)}</div></div></div>")
 
 # Values only: no settings manager, Qt object, connection, executor or host.
 INPUT_FIELDS = (
@@ -459,7 +483,7 @@ class MapReadEngine:
                 if request.kind == 'inspector':
                     payload = ctx._map_selected_payload
                     summary = ctx._map_detail_clean_text(payload.get('summary') or '', multiline=True)
-                    inspector = (ctx._map_selected_detail_html(payload, summary=summary),
+                    inspector = (ctx._map_selected_detail_html(payload, summary=summary) + _home_guidance_html(ctx, payload),
                                  ctx._map_selected_status_html(payload, summary=summary),
                                  ctx._map_selected_paths_html(payload), ctx._map_selected_messages_html(payload))
                     budget.raise_if_failed()

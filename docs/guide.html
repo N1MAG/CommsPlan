@@ -31,7 +31,7 @@
   </div>
 
   <h1 id="guide-home">CommsPlan User Guide</h1>
-  <p><strong>Current version</strong>: 2.0.6.1. This is the CommsPlan 2.0.6.1 release guide. See the release notes for available packages, known issues, and platform upgrade qualification.</p>
+  <p><strong>Current version</strong>: 2.0.7. This release guide covers 2.0.7 features and accumulated setup fixes. See the release notes for available packages, known issues, and platform upgrade qualification.</p>
   <div class="callout">
     <p><strong>Dedication</strong></p>
     <p>Dedicated to my Dad (SK), a U.S. Navy Radioman who learned HF Digital Tri-Mode at age 86.</p>
@@ -105,6 +105,17 @@
   <div class="callout">
     Recommended first-run mindset: finish the Configuration sequence first, then the schedule sequence, then the operating tabs. If you jump straight into Messages, Map, or an NCS tab before identity, software, and schedule are coherent, CommsPlan may still be functioning correctly but the experience will feel harder to interpret.
   </div>
+
+  <h2 id="upcoming-2-0-7">CommsPlan 2.0.7 and Setup Fixes</h2>
+  <p>CommsPlan 2.0.7 includes the features and setup fixes below. Consult the release notes for available platform packages and remaining qualification limits.</p>
+  <ul class="section-list">
+    <li><a href="#messages-traffic-summary">Station Traffic Summary</a>: review stored traffic as paired RF Brief and Detailed Report drafts, then export or review in Compose.</li>
+    <li><a href="#messages-review-tools">Review tools</a>: verified JS8Call selection clearing, Mesh contact favorites/history and received structured evidence.</li>
+    <li><a href="#received-pin-review">Map and peer evidence</a>: locally review received pins, inspect peer evidence and use distance/true-bearing guidance.</li>
+    <li><a href="#station-support-report">Support report</a>: preview and copy bounded, redacted cached diagnostics.</li>
+    <li><a href="#hf-nets-schedule">FLDigi tuning</a>: optional per-net Center + Narrow presets and explicit restoration.</li>
+    <li><a href="#settings-station-setup">Radio setup fixes</a>: independent applications, guided model/band choices, clear save/draft recovery, visible conflict feedback and responsive controls.</li>
+  </ul>
 
   <h2 id="main-menu">Main Menu and Left Rail</h2>
   <p>The left rail is grouped and collapsible. You can keep multiple groups open or collapse groups to save space.</p>
@@ -502,7 +513,7 @@
   <p><strong>Mesh traffic</strong>: enabled MeshCore or Meshtastic connections can place received text in this same Inbox and provide node-position context to Map. The source label identifies the mesh connection so the traffic is not confused with a radio-owned JS8Call, FLDigi, CommStat, or VarAC instance. Configure connection, outbound permission, and channel policy under <a href="#settings-local-mesh">Configuration &gt; Main &gt; Local Mesh</a>. Explicit operator sends are available from the <code>Local Mesh</code> Compose mode for qualified transports.</p>
 
   <h3 id="messages-header-actions">Header Actions</h3>
-  <p><strong>Overview</strong>: the Messages header keeps the primary inbox view, refresh timing, and common session actions visible. Less common actions are grouped under <code>More...</code>. BBS details appear as a single status button instead of a long technical status line.</p>
+  <p><strong>Overview</strong>: the Messages header keeps the primary inbox view, refresh timing, and common session actions visible. Less common actions are grouped under <code>More Actions</code>. BBS details appear as a single status button instead of a long technical status line.</p>
   <table>
     <thead>
       <tr><th>Control</th><th>What It Does</th></tr>
@@ -514,7 +525,7 @@
       <tr><td><code>Next check</code></td><td>Appears under the time display and counts down in calm five-second steps. It is a reassurance indicator, not a second-by-second task timer.</td></tr>
       <tr><td><code>Refresh Now</code></td><td>Forces a full refresh of file, JS8, JS8Spotter, CommStat, and VarAC message sources.</td></tr>
       <tr><td><code>Mark All as Read</code></td><td>Marks currently filtered messages as read.</td></tr>
-      <tr><td><code>More...</code></td><td>Opens less common inbox actions such as export, delete selected, copy summary, and inbox help.</td></tr>
+      <tr><td><code>More Actions</code></td><td>Opens <code>Create Traffic Summary…</code>, export, maintenance and other inbox actions.</td></tr>
       <tr><td><code>BBS Status</code></td><td>Shows a simple BBS health indicator such as <code>BBS OK</code>, <code>BBS Issue</code>, or <code>BBS Off</code>. Click it to see the detailed VarAC BBS and Managed BBS Library status.</td></tr>
       <tr><td><code>BBS Manage</code></td><td>Opens BBS-focused actions, including VarAC BBS settings and BBS help.</td></tr>
       <tr><td><code>Hide Types</code></td><td>Opens a multi-select menu for message types that should stay hidden in the default view until you explicitly choose that type in <code>MSG Type...</code>.</td></tr>
@@ -523,10 +534,28 @@
   </table>
   <p><strong>BBS status definitions</strong>: <code>BBS OK</code> means the configured live BBS path is usable by CommsPlan. <code>BBS Issue</code> usually means the BBS is enabled but its folder is missing or not configured. <code>BBS Off</code> means the BBS workflow is not enabled. For complete BBS setup details, see <a href="#settings-varac-details">VarAC Settings Details</a>.</p>
 
+  <h3 id="messages-traffic-summary">Station Traffic Summary</h3>
+  <p>Open <code>Messages &gt; Inbox &gt; More Actions &gt; Create Traffic Summary…</code>. The separate review window builds reports from stored station traffic; it does not transmit a report.</p>
+  <ol>
+    <li>Choose a <code>Period</code>, such as Last 24 hours, Last 7 days, Custom UTC window or Latest stored data. Review the UTC start/end and station identity.</li>
+    <li>Choose <code>Groups</code> and <code>Source families</code>. Each supports multiple choices or All. Choose <code>Generate reports</code>.</li>
+    <li>Open <code>Review source reports</code> to inspect provenance, reported locations and source text. Clearing a report's <code>Include</code> choice excludes it from both outputs and regenerates the drafts; review any edits again.</li>
+    <li>Switch between <code>RF Brief</code> and <code>Detailed Report</code>. Edit their narratives independently and label added interpretation as an Operator note. Computed counts and source references remain tied to the reviewed evidence. Changing scope or RF length requires generation again before staging.</li>
+    <li>Use <code>Save drafts</code> to retain both outputs and their review context; <code>Load saved draft…</code> reopens a saved pair. <code>Copy / export</code> operates on the selected report. RF length and delivery estimates are planning guidance, not a transmission guarantee.</li>
+    <li>Choose <code>Review in Compose…</code> to place the selected report into a Compose draft. Review its destination and staging choices there. This handoff does not send it; replacing an existing Compose message requires confirmation.</li>
+  </ol>
+  <p>Stored timestamps can represent authored/event time or file modification time rather than actual receipt. A sender's origin can differ from the event location. Review the underlying reports before distributing either output; a summary does not establish that an unreported area is clear.</p>
+
+  <h3 id="messages-review-tools">JS8Call Selection and Mesh Contact Review</h3>
+  <p>In JS8Call Compose, the selected-target row distinguishes live JS8Call selection from the current message draft. <code>Refresh Target</code> checks that radio's selection; <code>Use Target</code> copies it into the draft. <code>Clear selection</code> verifies the observed target and clears it in that JS8Call instance while keeping the draft. It does not send the draft, but JS8Call's normal deselection behavior can resume heartbeats paused by a selection. A changed or unconfirmed selection requires another review.</p>
+  <p>In <code>Messages &gt; Compose &gt; Local Mesh</code>, select a qualified MeshCore contact to use <code>Inspect contact history</code> and <code>Add favorite</code> / <code>Remove favorite</code>. Favorites belong to that exact adapter/node/full-key identity. History is bounded received evidence; older records with only a key prefix may be omitted. A favorite or contact match does not authenticate the sender, prove reachability or send a message.</p>
+  <h3 id="messages-mesh-intelligence">Mesh Receive Intelligence</h3>
+  <p>Policy-approved structured and wrapped Mesh reports can contribute received evidence to Inbox and Map. Source provenance and privacy rules still apply. Reported event locations and node positions are separate evidence; parsing received text does not authorize an automatic response or cross-transport relay. Unknown, malformed, oversized or unapproved payloads remain unstructured.</p>
+
   <h3 id="messages-maintenance">Message Maintenance</h3>
   <p><strong>Normal operation is automatic</strong>: CommsPlan discovers and indexes new or changed traffic in small background batches after the main window is usable. Opening Messages, changing a filter, or pressing Refresh does not rebuild retained history.</p>
   <ul class="section-list">
-    <li><strong>Message Index</strong>: choose <code>More... &gt; Message Maintenance...</code>, then open this tab only when troubleshooting a stale or missing indexed view.</li>
+    <li><strong>Message Index</strong>: choose <code>More Actions &gt; Message Maintenance...</code>, then open this tab only when troubleshooting a stale or missing indexed view.</li>
     <li><strong>Preview Message Index Rebuild</strong>: counts the available source evidence and shows an estimate before anything changes. Preview is read-only.</li>
     <li><strong>Rebuild safety</strong>: confirmation resets only derived indexing watermarks. It does not delete or rewrite native messages, received files, operator read state, BBS mappings, or source evidence.</li>
     <li><strong>Legacy duplicate repair</strong>: after replaying current sources, the rebuild also combines proven duplicate presentation rows left by older index versions. Separate JS8, VarAC, FLMsg, FLAmp, and BBS receipts remain attached to the surviving station message. Files that merely look alike but have different content hashes stay separate.</li>
@@ -756,6 +785,10 @@
     <li><strong>SitRep summary</strong>: in sitrep-focused views, a bottom-left state summary panel can show per-state counts and receipt mix without requiring raw table scans on every refresh.</li>
   </ul>
 
+  <h3 id="received-pin-review">Received Pins and Geographic Guidance</h3>
+  <p>On Map, open <code>Manage Pins</code> to inspect a pending received pin and its retained raw claim. Choose <code>Accept</code> or <code>Dismiss</code> after review. Received claims remain read-only; these decisions and <code>Delete Local</code> affect local records and do not retract a remote pin or broadcast a new PIN. Map display still follows acceptance and layer/filter rules.</p>
+  <p><a href="#hf-peers-evidence">Peer evidence inspection</a> provides bounded history and passive HEARING/receiving paths. Review the source and time: a reported path is not proof of a present connection. Station/roster geographic context provides computed distance and initial true bearing only when coordinates are available. Postal-derived or approximate positions remain estimates and do not establish current station location or RF reachability.</p>
+
   <h2 id="station-overview">Station Control Center</h2>
   <p><strong>Purpose</strong>: show the current operating state of every active radio or SDR without merging one device's process, endpoint, schedule, or hold state into another's.</p>
   <p><strong>Operational use</strong>: the Control Center provides one comparison view of each active device's current activity, control source, next action, and attention state before device-specific details are opened.</p>
@@ -798,6 +831,9 @@
     </tbody>
   </table>
   <p><strong>Operator note</strong>: Station Health shows both current conditions and recent scheduler decisions. The current-condition rows explain what CommsPlan is waiting on right now. The recent scheduler decisions explain what CommsPlan recently did or why it did not act, including schedule holds, manual control, disabled automation, control backoff, bad schedule data, multi-rig coordination review, and successful schedule changes.</p>
+
+  <h3 id="station-support-report">Support Report</h3>
+  <p>Open <code>Station &gt; Health Details &gt; Support report…</code> to preview bounded, redacted diagnostics from cached station observations. Review the text, then choose <code>Copy</code> if you want to share it through your normal support channel. Opening or copying the report does not contact another person, upload a bundle or start new radio checks.</p>
 
   <h2 id="ncs-fldigi-ssb">NCS: FLDigi / SSB</h2>
   <p><strong>Purpose</strong>: this is the live net-control desk for an FLDigi-supported or voice-supported directed net. It helps NCS and ANCS build one clean roster, keep track of who is handling each station, copy the right lines at the right time, and feed FLDigi macros from files that CommsPlan keeps current.</p>
@@ -1142,6 +1178,8 @@
   </table>
   <p><strong>Net Schedule columns</strong>: <code>Select</code>, <code>Day</code>, <code>Recurrence</code>, <code>Weeks of Month</code>, <code>Group Name</code>, <code>Mode</code>, <code>Band</code>, <code>Freq (MHz)</code>, <code>Start</code>, <code>End</code>, <code>Early (min)</code>, <code>FLDigi Mode</code>, <code>FLDigi Offset</code>, <code>Net Name</code>, <code>Auto-Tune</code>.</p>
   <p><strong>Recurrence values</strong>: <code>Weekly</code>, <code>Daily</code>, <code>Periodic</code>. Periodic rows use <code>Weeks of Month</code>.</p>
+  <p><strong>Optional FLDigi tuning</strong>: use a row's <code>FLDigi Tuning…</code> button, enable the preset, and save the schedule. The default <code>Center + Narrow</code> action moves FLDigi audio to 1500 Hz and requests a 500 Hz radio receiver filter. Customize its label, audio offset, optional filter width, signal-preservation behavior, and optional application at net start. A blank width leaves the radio filter unchanged. Preserving the signal compensates the actual dial frequency for the audio change in confirmed USB/LSB; the starting schedule frequency and offset retain their usual meaning.</p>
+  <p>During the scheduled net, open the radio card's Net menu or <code>Center + Narrow…</code> in the FLDigi NCS session tools. Review the named radio/net and requested settings, then apply once. Results show observed before/after tuning; success requires readback. <code>Restore previous tuning</code> restores the preceding observation for the same net, radio authority, and VFO. Unknown previous filter width is left unchanged. These actions require the radio's FLRig/FLDigi connections and honor transmit, protected-traffic and RF Guard checks. No transmission is started. Operators remain free to adjust tuning afterward; a failed automatic preset requires an explicit manual retry.</p>
   <p><strong>During a scheduled net</strong>: after the initial setup succeeds, the unchanged net occurrence leaves frequency, modem, and offset changes to the operator. The radio card identifies the net source even when its RF frequency matches the ordinary HF schedule. Use its Net control for <code>Resume current schedule</code> or <code>Remain paused</code>; end an active NCS session in the NCS workspace.</p>
 
   <h3 id="hf-nets-resources">Net Row Library Section</h3>
@@ -1269,6 +1307,10 @@
   </table>
   <p><strong>Peer table columns</strong>: <code>CALLSIGN</code>, <code>NAME</code>, <code>STATE</code>, <code>GROUPS</code>, <code>DAY</code>, <code>START</code>, <code>END</code>, <code>BAND</code>, <code>MODE</code>, <code>FREQ</code>, <code>OVERLAP</code>.</p>
   <p><strong>Concept note</strong>: peer schedules are intent data, not evidence data. They tell CommsPlan when another operator expects to be on a band or frequency. That is valuable for planning and relay thinking, but it should always be weighed against actual recent traffic shown in Messages, Map links, and Ops Center activity.</p>
+
+  <h3 id="hf-peers-evidence">Peer Evidence Inspector</h3>
+  <p>In <code>HF Peer Scheds</code>, enter <code>Evidence callsign</code> or select a schedule row, then choose <code>Inspect Evidence</code>. Open <code>Evidence details</code> for retained source, radio, time, coverage and passive hearing/receiving evidence. Missing or incomplete coverage is shown explicitly.</p>
+  <p>Recurrence confidence describes retained observations, not RF delivery probability. Relay candidates are unverified evidence, not a send route. Inspection does not issue a query or transmit; review the time and provenance before using this history to plan.</p>
 
   <h2 id="call-finder">Operators: Call Finder</h2>
   <p><strong>Purpose</strong>: search downloaded US FCC Amateur/GMRS and Canadian ISED amateur callsign references offline. Open <code>Operators &gt; Call Finder</code>. These sources are separate from the operator rosters; opening the screen or searching does not download data or add an operator.</p>
@@ -1626,10 +1668,35 @@
     <li><strong>Application choices</strong>: use <code>Default profile</code>, <code>Named profile</code>, or <code>Custom launcher</code> as shown by the selected family. The CommsPlan display name is not silently reused as a native rig name.</li>
     <li><strong>Changing JS8Call versions or profiles</strong>: select the radio, JS8Call, and Application &amp; Profile. Choose the executable independently of the native Default or Named launch profile. Keeping the same native profile allows the selected version to use that profile; check compatibility before opening an older database with another version. The historical <code>settings_root</code> value is retained as metadata but is hidden from ordinary editing and is not an ordinary redirect setting. Review <code>Read JS8Call messages from</code> and the effective <code>ALL.TXT</code>, <code>DIRECTED.TXT</code>, and <code>inbox.db3</code> paths. When a native profile changes, CommsPlan preserves previous message sources unless you edit them and explicitly acknowledge the resulting paths. The launch profile, save/transfer folder, and native message sources are separate choices. CommsPlan does not copy, move, or delete native profiles or messages.</li>
     <li><strong>Reachable settings</strong>: the application form scrolls within its section while Save and Cancel remain available. Suggestions appear after Find installed is requested; an empty suggestions panel does not take space from the form.</li>
-    <li><strong>Browse and Find</strong>: browse buttons choose a path and Find may offer cache-backed discovery suggestions. A suggestion is applied only when you explicitly choose it; manual path edits stay intact and no native preparation runs automatically.</li>
+    <li><strong>Browse and Find</strong>: browse buttons choose a path and Find offers suggestions for the application being configured. Its informational, detected, and selected treatments include text as well as color; selected means the path was chosen, not that a radio connection was verified. Selecting a suggestion fills the application path in the editable form. <code>Use selected values</code> also copies other suggested settings. Review the fields and click <code>Save</code> to keep changes. Receiving new discovery results does not replace manual edits or run native preparation.</li>
     <li><strong>Offline setup</strong>: an unavailable executable, endpoint, or native application is a structural warning or incomplete field. Save keeps the operator's raw choices for correction; it does not require a live connection.</li>
-    <li><strong>Cancel and return</strong>: Cancel leaves unsaved edits alone. Navigation between steps does not commit changes, and returning to Main does not enable scheduling.</li>
+    <li><strong>Cancel and return</strong>: navigation between steps does not commit changes. In Radio setup, Close setup explains how to save, keep editing, or discard current changes; see <a href="#settings-radio-cancel-recovery">Cancel, Discard, and Recover a Radio Draft</a>. Returning to Main does not enable scheduling.</li>
     <li><strong>After save</strong>: reopen the same radio and application family to correct a saved field. The editor preserves unknown saved fields so later versions do not silently discard configuration.</li>
+  </ul>
+
+  <h4 id="settings-first-radio">Add a Radio and Choose Its Applications</h4>
+  <ol class="section-list">
+    <li>Open <code>Configuration &gt; Radios</code> and choose <code>Add Radio</code>. On a fresh installation, <code>Set up station</code> also leads to the station checklist; open <code>Radios &amp; applications</code> from there.</li>
+    <li>On <code>Radio</code>, search <code>Radio model</code> by manufacturer or model and select a result, or enter <code>Manufacturer</code> and <code>Model</code> manually. An untouched new radio name is suggested; edit <code>Radio name</code> to use your own station label. Existing names remain yours. The cached Hamlib catalog falls back to built-in models; manual entry is always available. Select the antenna's supported bands using the checkboxes in <code>More radio settings</code>; leave all unchecked when no band limit is specified. Model selection does not choose bands or control software. Choose the <code>Control backend</code> that actually controls this radio: <code>FLRig</code>, <code>rigctld</code>, <code>JS8Call</code>, or <code>Manual</code>. FLRig and JS8Call control select their corresponding application. For FLRig, review the host and control port (normally <code>127.0.0.1:12345</code>); for rigctld, enter its Hamlib host and port (normally <code>127.0.0.1:4532</code>). Use the actual remote host when the service runs elsewhere.</li>
+    <li>On <code>Applications</code>, check <code>Use</code> only for software this radio uses. FLRig, FLDigi, FLMsg, and FLAmp are independent selections within the Fast Light family. FLRig control does not require FLDigi, and rigctld does not require FLRig. FLDigi alone, JS8Call alone, VarAC alone, any pair of FLDigi/JS8Call/VarAC, or all three can be selected. These choices assign software in CommsPlan; they do not install external programs.</li>
+    <li>Choose <code>Configure…</code> beside each selected application to review its own fields in the same Radio setup window. <code>Back to radio setup</code> returns to the radio choices; if this form has edits, choose whether to apply them, discard only the application edits, or keep editing. Confirm the endpoint, native profile or INI, message paths, and launch responsibility as applicable. FLDigi's XML-RPC port is normally <code>7362</code>; JS8Call uses the TCP API port configured in JS8Call. Leave unused applications unchecked. An application you start yourself or run remotely does not require a local CommsPlan executable/launcher.</li>
+    <li>Choose <code>Apply to radio setup</code> in the application form to return its settings to the radio draft. This does not yet commit the new radio. Review <code>Operating behavior</code>, <code>Schedule</code>, and <code>Review</code>, then choose <code>Save radio</code> in <code>Radio setup</code> to commit the radio and its reviewed application settings together.</li>
+    <li>After a successful save, select the same radio to review or edit it. Use <code>Software &gt; Change software used…</code> to change its selected applications. Saving a new radio does not activate runtime participation or scheduling: choose <code>Radio actions &gt; Use Radio</code> when ready, and separately review and enable scheduling.</li>
+  </ol>
+  <p><strong>Auxiliary JS8 applications:</strong> CommsPlan Spotter, External JS8Spotter, and CommStat use their <code>Software settings…</code> actions. For a new or changed radio, choose <code>Save &amp; Open</code> to save the radio before opening that application's owning Software page. <code>Cancel</code> in that handoff keeps you editing the radio.</p>
+
+  <h4 id="settings-radio-cancel-recovery">Cancel, Discard, and Recover a Radio Draft</h4>
+  <ul class="section-list">
+    <li><strong>Save radio:</strong> saves the entries currently shown and the reviewed application choices together. It remains available when an older draft exists. Confirm <code>Save current setup</code> if you want these entries to replace that draft. If fields need correction, the current entries are kept and setup remains open.</li>
+    <li><strong>Required fields:</strong> application forms mark required fields and explain missing or invalid values beside the settings. New JS8Call and FLDigi forms propose common API ports <code>2442</code> and <code>7362</code>; confirm they match the applications. If Save radio needs a correction, setup opens the responsible application and focuses the first field. Apply the correction, then choose Save radio again. No radio is added until Save radio succeeds.</li>
+    <li><strong>Save draft and close:</strong> keeps unfinished entries so you can continue later, without creating a radio or changing a saved radio's settings. It can keep incomplete fields. For a new radio, Configured Radios shows the unfinished setup name and <strong>Resume setup</strong>. Resume, correct any required fields, and choose <strong>Save radio</strong> to add the radio. Existing radios offer their retained draft when reopened.</li>
+    <li><strong>Load previous draft…:</strong> loads the saved copy instead of current entries. If current entries were edited, a comparison shows both radio names, application choices, and bands. Confirm only if you want to replace what is on screen; <code>Keep editing</code> leaves it intact. You do not need to load a draft before saving the current setup.</li>
+    <li><strong>Close setup:</strong> with unsaved entries, choose <code>Save radio and close</code>, <code>Save draft and close</code>, <code>Discard current changes and close</code>, or <code>Keep editing</code>. Discarding current changes leaves saved radios and any previously retained draft unchanged.</li>
+    <li><strong>Delete previous draft:</strong> removes only that recovery copy while keeping current form entries and saved radios. Save radio and Save draft and close can also replace an older copy after confirmation.</li>
+    <li><strong>Save-failure warning:</strong> an application endpoint conflict shows that the radio was not added or its changes were not saved, names the problem, and offers <code>Keep editing</code>. Correct the settings, then Save radio again. A failed save does not activate a radio. If saving a draft itself could not be confirmed, keep the open entries until that problem is resolved.</li>
+    <li><strong>Compact displays:</strong> actions and band choices wrap to the available width. Full validation and previous-draft guidance scroll with the selected section; scroll within it to reach the fields. The save/close actions remain outside the field scroll. Help has a left-side contents tree, <code>Filter topics</code> and <code>Find in guide</code> search for locating instructions.</li>
+    <li><strong>Supported bands:</strong> choose the antenna bands using checkboxes on the Radio step. Older meter-band entries such as <code>20, 40, 80</code> are recognized as <code>20M, 40M, 80M</code>. An unrecognized saved value remains visible for review; an error returns you to that control. Leave all unchecked if no band limit is specified.</li>
+    <li><strong>Endpoint conflict:</strong> if another radio genuinely owns the selected application's endpoint, review the named owner and configure the intended distinct instance/port. Do not change ports merely to bypass a message naming the same radio. If FLRig-only setup asks you to add another Fast Light component or reports its own endpoint as another owner, keep the draft and report the installed CommsPlan version and error; adding an unused application is not part of setup.</li>
   </ul>
 
   <h4 id="settings-schedule-approval">Scheduling Approval and Disable</h4>
@@ -1643,11 +1710,14 @@
     <li><strong>Saved application families</strong>: a saved radio appears under every application family selected in its profile. Open one family at a time to review its paths, endpoint, launch choice, and warnings; unrelated family choices remain unchanged.</li>
     <li><strong>Radio selector</strong>: <code>All</code> is a summary. Choose one named radio before editing. <code>Available</code> means that radio has no instance in the selected family; <code>Assigned: &lt;instance&gt;</code> names the one it uses. One independently controlled runtime instance cannot be assigned to two radios.</li>
     <li><strong>Left task navigation</strong>: tasks keep the form focused on the work at hand, such as API &amp; Radio, Message Storage, FLRig Control, Inbox &amp; Outbox, Launch, or Health. Task selection is navigation only; it does not change configuration.</li>
+    <li><strong>JS8Call message files</strong>: open Message Storage or Message ingest to browse for the native application-data folder and <code>DIRECTED.TXT</code>, <code>ALL.TXT</code>, and <code>inbox.db3</code>, or enter their paths manually. These fields stay editable for Default, Named, and existing-launcher profiles. The custom command is editable only when Use existing launcher is selected; it does not lock message paths. Named profile belongs in Application &amp; Profile. Recover/Discard unfinished are temporarily unavailable while a load or save is running.</li>
     <li><strong>Exact-scope save</strong>: the editor button names both the software and radio it saves. It saves only that family for that radio. <code>Manage instances &gt; Save all drafts</code> is a deliberate secondary action for every marked Software draft. The general <code>Save Settings</code> action does not silently save Software drafts.</li>
     <li><strong>Instance maintenance</strong>: <code>Manage instances</code> retains assignment, replacement, disassociation, recovery, and bulk draft saves. Unresolved and unsaved counts remain visible beside the context selectors.</li>
     <li><strong>Status</strong>: configuration completeness is separate from runtime connectivity. Unknown, unverified, stale, and conflicting evidence is shown conservatively; a saved configuration alone does not mean an application is running.</li>
     <li><strong>Discovery and health</strong>: selecting software, radio, or task never scans folders, starts a process, probes an API, or contacts a radio. Use a visible check, import, refresh, or browse action when you want that work done. While a check runs, the last known configuration remains usable.</li>
     <li><strong>Ownership</strong>: CommStat is a standalone tool mapped to the selected radio's JS8 transport. External Spotter is optional and separate from built-in CommsPlan Spotter; its executable, database, source paths, and explicit imports provide activity/import awareness only and do not create CommsPlan watches, Expect rules, or live automation. CommsPlan Spotter owns the station CP Forms Library, rules, Expect queries, watches, forms, and activity in the top-level Spotter workspace. Station BBS locations, access, retention, publication, visitor preview, and helpers are managed in the top-level BBS service; VarAC software settings retain only native runtime paths and inbound protection.</li>
+    <li><strong>Discovery and message files</strong>: Configure for a Fast Light component suggests that component, and selecting an installation fills its path. Duplicate installation paths are collapsed; distinct native profiles remain distinct. A discovered executable is not a verified API connection. Message-file paths can be browsed without enabling CommsPlan startup control for the application.</li>
+    <li><strong>Another radio</strong>: an installed executable may be shared, but independently controlled radios require distinct application instance settings and API endpoints. The rigctld control port is separate from FLDigi XML-RPC and JS8Call TCP API ports. Configure matching native settings folders/profiles and endpoints in those applications. A failed Save radio retains a draft; use Resume setup to correct the reported conflict before activating the radio.</li>
     <li><strong>Same identity as Station Setup</strong>: Software Administration edits the exact saved radio and application identity created by <a href="#settings-station-setup">Station Setup</a>. The display name, native rig name, selected profile, and launch arguments remain distinct and are shown separately.</li>
   </ul>
   <p><strong>Fast Light overview</strong> lists FLRig, FLDigi, FLMsg and FLAmp with their explicit Use choices, saved native identities and cached observations. A recorded application path does not mean the application is selected. Each component's <code>Configure</code> or <code>Details</code> action opens that component's owning settings view; it does not open an unrelated full-family form. <code>Check status</code> explicitly refreshes the selected radio; navigation alone does not probe applications or radios.</p>
@@ -1669,7 +1739,7 @@
     <thead><tr><th>Software</th><th>What makes the instance distinct</th><th>What CommsPlan persists and checks</th></tr></thead>
     <tbody>
       <tr><td>JS8Call 2.2.0, Improved 3.0.3, or Subspace</td><td>Radio assignment, <code>--rig-name</code>, TCP API port, optional UDP port, settings file, and application-data folder.</td><td>CommsPlan stores the launch identity and message-root evidence, passes the rig name at launch, and blocks duplicate ports, rig names, or exclusive storage. Subspace uses the same rig-scoped assumption; confirm it in Health with live file evidence.</td></tr>
-      <tr><td>Fast Light</td><td>A paired FLRig and FLDigi workflow with separate XML-RPC ports and, for independent local launches, separate native profile folders.</td><td>CommsPlan stores both endpoints and applications, launches FLRig before FLDigi, and names new native profile folders from the radio name. Display names may contain spaces; generated folder segments use portable hyphens and never expose an internal CommsPlan identifier. CommsPlan blocks endpoint or profile reuse between independent instances.</td></tr>
+      <tr><td>Fast Light</td><td>Any selected combination of FLRig, FLDigi, FLMsg, and FLAmp. Selected control/modem applications use their own endpoints and, for independent local launches, native profile folders.</td><td>CommsPlan stores the selected components and their launch choices. When both FLRig and FLDigi are selected for CommsPlan launch, FLRig starts first. New native profile folders use the radio name. Display names may contain spaces; generated folder segments use portable hyphens and never expose an internal CommsPlan identifier. CommsPlan blocks endpoint or profile reuse between independent instances.</td></tr>
       <tr><td>Cluster VarAC</td><td>A VarAC node with its own INI, database, incoming folder, outbox, launch command, cluster, and positive cluster instance number.</td><td>CommsPlan saves the node, radio link, cluster membership, and launch identity together. Duplicate node paths or cluster instance numbers are rejected and the prior configuration is retained.</td></tr>
     </tbody>
   </table>
@@ -1687,7 +1757,7 @@
   <h3 id="settings-freqinout-details">CommsPlan Settings Details</h3>
   <ul class="section-list">
     <li><strong>Theme and Text Size</strong>: make the screen easier to read for your operating environment. These choices do not change radio behavior.</li>
-    <li><strong>Frequency Control</strong>: tells CommsPlan which tool should be treated as the main way to read or guide the radio frequency. Choose <code>FLRig</code> when FLRig is your radio-control bridge, <code>JS8Call</code> when JS8Call is the practical source of radio state, or <code>Manual</code> when CommsPlan should advise without assuming it can control the radio.</li>
+    <li><strong>Frequency Control</strong>: tells CommsPlan which tool should be treated as the main way to read or guide the radio frequency. Choose <code>FLRig</code> when FLRig is your radio-control bridge, <code>rigctld</code> for a Hamlib rigctld service, <code>JS8Call</code> when JS8Call is the practical source of radio state, or <code>Manual</code> when CommsPlan should advise without assuming it can control the radio.</li>
     <li><strong>Use CommsPlan Scheduler</strong>: turns schedule help on or off. When enabled, CommsPlan watches the active schedule and helps the station move to the expected frequency, mode, or offset according to your enforcement choices.</li>
     <li><strong>Software Used</strong>: check only the programs this station actually uses. This keeps readiness warnings focused. For example, do not check CommStat or JS8Spotter unless you want CommsPlan to expect their launcher or forms settings.</li>
     <li><strong>Per-radio timers</strong>: open <code>Configuration &gt; Radios</code>, choose the radio, and open <code>Schedule Control</code>. Frequency, FLDigi mode, JS8 offset, prompt interval, scheduler automation, and default hold duration belong to that radio and are not edited on Main.</li>
@@ -1705,7 +1775,7 @@
     </thead>
     <tbody>
       <tr><td><code>Use CommsPlan Scheduler</code></td><td>This is the main on/off switch for schedule ownership.</td><td>When it is on, CommsPlan watches the active plan and can help return the radio to it. When it is off, CommsPlan may still show schedule information, but it should not act like it owns schedule changes.</td></tr>
-      <tr><td><code>Frequency Control</code></td><td>This tells CommsPlan which outside program is the best path for reading or guiding the radio frequency.</td><td><code>FLRig</code> is the usual radio-control bridge. <code>JS8Call</code> is useful when JS8Call is the practical source of radio state. <code>Manual</code> means CommsPlan should advise instead of assuming it can control the radio.</td></tr>
+      <tr><td><code>Frequency Control</code></td><td>This tells CommsPlan which outside program is the best path for reading or guiding the radio frequency.</td><td><code>FLRig</code> uses the configured FLRig endpoint; <code>rigctld</code> uses the configured Hamlib service. <code>JS8Call</code> is useful when JS8Call is the practical source of radio state. <code>Manual</code> means CommsPlan should advise instead of assuming it can control the radio.</td></tr>
       <tr><td><code>On Schedule Change</code></td><td>CommsPlan applies that item when the active schedule row changes.</td><td>This feels automatic. It is best when you want the station to follow the plan without stopping to ask every time.</td></tr>
       <tr><td><code>Prompt</code></td><td>Reviews off-schedule differences at the chosen reminder interval.</td><td>This is not approval before every write. New schedule entries and explicit apply/resume actions retain their own behavior. Use Pause or Net control when you need to retain manual control.</td></tr>
       <tr><td><code>Prompt Interval</code></td><td>This is the reminder pace for prompt-mode mismatches.</td><td>A shorter interval is more insistent during an operation. A longer interval is quieter when you may stay off plan on purpose.</td></tr>
@@ -2008,7 +2078,8 @@
   <h2 id="help">Help</h2>
   <p><strong>Purpose</strong>: in-app documentation viewer for this guide.</p>
   <ul class="section-list">
-    <li><strong>Table of Contents</strong> (left): click headings to navigate.</li>
+    <li><strong>Contents</strong> (left): choose a topic, or use the arrow keys and Enter. Section headings are bold; subtopics are indented. <code>Filter topics</code> narrows the index while retaining the matching section context. Long names have full-text tooltips. The <code>Contents</code> button hides or restores this sidebar for more reading space.</li>
+    <li><strong>Find in guide</strong>: searches the full article text, independently of the topic filter. Press <code>Ctrl+F</code> (<code>Command+F</code> on macOS), enter text, then press Enter or choose <code>Next</code>. Use <code>Previous</code> or <code>Shift+Enter</code> to search backward. Matches are selected in the guide; the result line reports wrapping or no matches.</li>
     <li><strong>Guide viewer</strong> (right): renders <code>docs/guide.html</code>.</li>
     <li><strong>Export to PDF</strong>: exports the displayed guide.</li>
     <li><strong>Usage notes</strong>: when a Help button opens a specific section, the purpose text and nearby workflow notes identify the screen's role and related dependencies beyond the control list.</li>
@@ -2038,7 +2109,7 @@
     <li>If JS8Spotter/CommStat launch too early, keep JS8Call earlier in Launch Control order; CommsPlan now waits for JS8 API readiness before proceeding.</li>
     <li>If BBS auto-archive does not run, turn on <code>Enable Auto-Archive</code>, confirm both BBS paths are valid and different, then open Messages once after startup.</li>
     <li>If signature/hash states are neutral, verify Message Auth settings and trusted key/hash entries.</li>
-    <li>If Messages appears stale after its normal background catch-up, use the read-only preview under <code>More... &gt; Message Maintenance... &gt; Message Index</code> before deciding whether a rebuild is warranted.</li>
+    <li>If Messages appears stale after its normal background catch-up, use the read-only preview under <code>More Actions &gt; Message Maintenance... &gt; Message Index</code> before deciding whether a rebuild is warranted.</li>
     <li>For a recurring CPU or UI-stall report, preserve <code>freqinout.log</code>, the bounded rotated <code>perf_metrics.log</code> files, and any generated <code>ui_hang_dumps</code>. The hang snapshot contains bounded scheduler/projection state and redacts credential fields.</li>
   </ul>
 

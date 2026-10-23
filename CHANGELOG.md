@@ -1,5 +1,18 @@
 # Changelog
 
+## [2.0.7]
+- Added: Offline Station Traffic Summaries with independently editable RF Brief and Detailed reports, evidence review, group/source/path/geographic filters, paired draft persistence, export and Compose staging.
+- Added: SpotterX review enrichments: verified JS8 Clear selection; peer history and passive hearing paths; policy-filtered structured Mesh analysis; reviewed received PINs; roster/map distance and bearing; redacted support reports; MeshCore contact favorites/history.
+- Added: Optional per-net FLDigi Center + Narrow presets with configurable audio offset/filter width, signal-preserving dial compensation, one-time startup application and explicit Restore. Operators retain tuning freedom during a net.
+- Fixed: Fresh radio setup and existing-radio edits preserve independent application choices without unrelated JS8Call replacement errors or false self-conflicts.
+- Changed: Radio setup distinguishes Apply to radio setup, Save radio, and Save draft and close; retained drafts have Resume setup, required-field guidance and explicit save-failure warnings.
+- Fixed: Component discovery fills the selected application's path and collapses duplicate installation suggestions while preserving distinct native profiles. Message-file browsing remains available independently of application startup choices.
+- Fixed: Radio setup actions and supported bands wrap for compact windows and larger fonts; validation and draft guidance scroll with the active section. Keyboard traversal reaches the form and save actions.
+- Changed: Help contents sit beside the guide with search; operator documentation covers 2.0.7 traffic summaries, review tools, tuning and accumulated setup fixes.
+- Known limitation: The previously recorded macOS/PySide Compose comments crash remains unresolved; see the README qualification notes.
+- Qualification: Package install/startup/upgrade checks and platform qualification are recorded with this release. Automated checks do not establish physical-radio/Mesh/filter/transfer behavior or every display/DPI combination. Outbound PIN broadcast, active peer-query automation and cross-transport relay are not implemented by this update.
+
+
 ## [2.0.6.1]
 - Fixed: Fresh radio setup saves FLRig-only configurations without false application-path readback errors or a database error from the unused FLDigi port.
 - Fixed: FLRig, FLDigi, FLMsg and FLAmp can each be configured independently. Hidden endpoint fields preserve existing ports, and edited FLMsg/FLAmp executable paths save correctly.

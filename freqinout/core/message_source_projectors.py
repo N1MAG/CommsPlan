@@ -47,7 +47,7 @@ from freqinout.core.message_projection_writer import ProjectionBundle
 from freqinout.core.sqlite_utils import connect_sqlite, table_exists
 
 PROJECTOR_VERSION = 4
-FILE_PROJECTOR_VERSION = 5
+FILE_PROJECTOR_VERSION = 6
 JS8_COMMSTAT_CLASSIFICATION_VERSION = 2
 SPOTTER_PROVENANCE_VERSION = 1
 DEFAULT_SOURCE_NATIVE_LIMIT = 5000
@@ -231,6 +231,19 @@ def _file_projection_bundle(
         fallback_title=file_path_display(rec.path.name),
         title_limit=240,
     )
+    # File projections often retain only a title, so preserve derived-report
+    # lineage from a bounded prefix while the ingest worker already owns file I/O.
+    # This survives renamed files and FLMsg/FLAmp/BBS mirrors without opening files
+    # from report generation or Qt rendering.
+    lineage = {}
+    try:
+        with rec.path.open("rb") as handle:
+            prefix = handle.read(8192).decode("utf-8", errors="replace")
+        match = re.search(r"COMMSPLAN-TRAFFIC-SUMMARY:v1:([A-Za-z0-9_-]{1,80})(?:\s|$)", prefix)
+        if match:
+            lineage = {"derived_report": True, "report_id": match.group(1), "report_format_version": 1}
+    except OSError:
+        pass
     received_ts = float(rec.mtime or 0.0)
     event_ts = float(getattr(meta, "report_ts", 0.0) or received_ts)
     status = (read_status or _text(getattr(meta, "status", "")) or "NEW").upper()
@@ -303,6 +316,7 @@ def _file_projection_bundle(
         body_preview=title,
         topics=topics,
         entities={
+            **lineage,
             "origin": origin,
             "path": path_text,
             "extension": safe_path.suffix.lower(),
@@ -332,6 +346,7 @@ def _file_projection_bundle(
                 delete_capability="file_delete",
                 read_capability="fio_read_state",
                 metadata={
+                    **lineage,
                     "origin": origin,
                     "source": "file_scan",
                     "receipt_source_kind": f"{origin}_folder",
@@ -351,7 +366,7 @@ def _file_projection_bundle(
                 block_id=_block_id_from_path(safe_path),
                 transfer_id=q_id,
                 transfer_state="seen" if q_id else "",
-                metadata={"mtime": float(rec.mtime or 0.0), "size": int(rec.size or 0)},
+                metadata={**lineage, "mtime": float(rec.mtime or 0.0), "size": int(rec.size or 0)},
             ),
         ),
     )
@@ -1359,6 +1374,30 @@ def _project_mesh_messages(
             )
         )
         attention = bool(_int(row["operator_attention"]))
+        mesh_structured = provenance.get("mesh_structured")
+        if not isinstance(mesh_structured, dict):
+            mesh_structured = {}
+        structured_fingerprint = (
+            json.dumps(mesh_structured, sort_keys=True, separators=(",", ":"))
+            if mesh_structured else ""
+        )
+        content_hash_parts = [
+            native_projector_version("mesh"),
+            source_ref,
+            row["updated_utc"],
+            status,
+            subject,
+            body,
+            topics,
+        ]
+        if structured_fingerprint:
+            content_hash_parts.append(structured_fingerprint)
+        payload_claim = mesh_structured.get("payload_claim") if mesh_structured else {}
+        payload_location_claim = (
+            isinstance(payload_claim, dict)
+            and isinstance(payload_claim.get("location_evidence"), dict)
+            and bool(payload_claim["location_evidence"].get("location_value"))
+        )
         message_id = canonical_station_message_id(
             transport,
             event_ts=event_ts,
@@ -1383,18 +1422,16 @@ def _project_mesh_messages(
             last_seen_utc=received_utc,
             last_ingested_utc=_utc_now(),
         )
+        mesh_intelligence = {
+            "mesh_policy": provenance.get("channel_policy", {}),
+            "routing": provenance.get("routing", {}),
+        }
+        if mesh_structured:
+            mesh_intelligence["mesh_structured"] = mesh_structured
         projection = MessageProjectionRecord(
             message_id=message_id,
             canonical_key=canonical_message_key(transport, message_id),
-            content_hash=content_hash(
-                native_projector_version("mesh"),
-                source_ref,
-                row["updated_utc"],
-                status,
-                subject,
-                body,
-                topics,
-            ),
+            content_hash=content_hash(*content_hash_parts),
             primary_source_id=source_id,
             source_family=transport,
             source_label=source.source_label,
@@ -1410,8 +1447,12 @@ def _project_mesh_messages(
             group_name=groups[0] if groups else _group(row["channel"]),
             state_code=_upper(row["state"]),
             grid=_upper(row["observation_grid"] or row["message_grid"]),
-            lat=row["observation_lat"] if row["observation_lat"] is not None else row["message_lat"],
-            lon=row["observation_lon"] if row["observation_lon"] is not None else row["message_lon"],
+            lat=(None if payload_location_claim else (
+                row["observation_lat"] if row["observation_lat"] is not None else row["message_lat"]
+            )),
+            lon=(None if payload_location_claim else (
+                row["observation_lon"] if row["observation_lon"] is not None else row["message_lon"]
+            )),
             event_ts=event_ts,
             received_ts=received_ts or event_ts,
             event_utc=event_utc,
@@ -1437,7 +1478,7 @@ def _project_mesh_messages(
             operator_attention=attention,
             intelligence_version=1,
             intelligence_utc=_utc_now(),
-            intelligence={"mesh_policy": provenance.get("channel_policy", {}), "routing": provenance.get("routing", {})},
+            intelligence=mesh_intelligence,
             retention_class="normal",
             search_text=_search_text(
                 row["from_call"], row["from_node"], row["to_target"], row["to_node"],

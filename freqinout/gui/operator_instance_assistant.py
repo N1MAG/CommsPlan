@@ -9,6 +9,7 @@ native preparation code.
 from __future__ import annotations
 
 from copy import deepcopy
+from os.path import normcase, normpath
 from types import SimpleNamespace
 from typing import Any, Iterable, Mapping
 from uuid import uuid4
@@ -31,7 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 from freqinout.gui.operator_application_editor import ApplicationSetupEditor
-from freqinout.gui.theme import active_app_theme, button_style, label_style
+from freqinout.gui.theme import active_app_theme, button_style, label_style, control_height_for_font
 
 
 def _text(value: object) -> str:
@@ -158,6 +159,7 @@ class OperatorInstanceAssistant(QWidget):
         self._initial_raw = self._mapping_from_draft(initial_draft)
         self._raw_fields = deepcopy(self._initial_raw)
         self._discovery_results: tuple[dict[str, Any], ...] = ()
+        self._selected_discovery_paths = {}
         self._varac_native_presentation: Any = None
         self._busy = False
         self._status_error = False
@@ -250,6 +252,8 @@ class OperatorInstanceAssistant(QWidget):
         self.discovery_list.itemSelectionChanged.connect(self._discovery_selection_changed)
         self.create_radio_button.clicked.connect(self.create_radio_requested.emit)
         self.set_operation_status("Saved")
+        self.editor.set_discovery_state('ready')
+        self.use_discovery_button.setVisible(not self.visible_components)
 
     # ----- public compatibility surface ----------------------------------
 
@@ -259,6 +263,10 @@ class OperatorInstanceAssistant(QWidget):
     def set_operation_status(self, text: str, *, error: bool = False) -> None:
         self._status_error = bool(error)
         value = _text(text)
+        if value.startswith(('Searching', 'Waiting for the current search')):
+            self.editor.set_discovery_state('searching')
+        elif error or 'could not' in value.lower() or 'failed' in value.lower():
+            self.editor.set_discovery_state('failed')
         self.operation_status_label.setText(value)
         self.operation_status_label.setToolTip(value)
         # The editor footer already communicates the normal saved state. Keep
@@ -280,6 +288,7 @@ class OperatorInstanceAssistant(QWidget):
         if heading is not None:
             heading.setStyleSheet(label_style('text', palette, weight=700))
         self.editor.apply_theme(palette)
+        self._size_discovery_list()
         self.operation_status_label.setStyleSheet(label_style('danger' if self._status_error else 'muted',palette))
         for button in (self.use_discovery_button,self.create_radio_button,self.recover_button,self.discard_unfinished_button):
             button.setStyleSheet(button_style('secondary',palette))
@@ -290,14 +299,36 @@ class OperatorInstanceAssistant(QWidget):
         self.editor.status_label.hide()
         self.use_discovery_button.setEnabled(not self._busy and bool(self.discovery_list.currentItem()))
         self.create_radio_button.setEnabled(not self._busy)
+        self.recover_button.setEnabled(not self._busy)
+        self.discard_unfinished_button.setEnabled(not self._busy)
+
+    def _size_discovery_list(self) -> None:
+        count = self.discovery_list.count()
+        height = control_height_for_font(self.discovery_list, vertical_padding=10, floor=28)
+        target = height * max(1, min(count, 4)) + self.discovery_list.frameWidth() * 2
+        self.discovery_list.setMinimumHeight(target)
+        self.discovery_list.setMaximumHeight(target)
 
     def set_discovery_results(self, results: Iterable[Mapping[str, Any]]) -> None:
-        """Publish candidates without changing the draft until Use is clicked."""
+        """Publish candidates without changing the draft until one is selected."""
 
         rows: list[dict[str, Any]] = []
+        component_paths_seen = set()
         for raw in results:
             if isinstance(raw, Mapping):
                 row = deepcopy(dict(raw))
+                if self.family_key == 'fast_light' and self.visible_components:
+                    paths = self._discovery_application_paths(row)
+                    if not any(paths.get(f'{component}_application_path') for component in self.visible_components):
+                        continue
+                    # This picker copies only component executable paths. Saved
+                    # profiles and detection may describe the same installation.
+                    # Keep profile/source identity rows in the full-family view.
+                    identity = tuple((component, normcase(normpath(_text(paths[f'{component}_application_path']))))
+                                     for component in self.visible_components if paths.get(f'{component}_application_path'))
+                    if identity in component_paths_seen:
+                        continue
+                    component_paths_seen.add(identity)
                 if self._row_has_values(row):
                     rows.append(row)
         self._discovery_results = tuple(rows)
@@ -305,16 +336,30 @@ class OperatorInstanceAssistant(QWidget):
         self.discovery_list.clear()
         for row in rows:
             name = _text(_first(row, "name", "instance_name", "label")) or "Unnamed configuration"
-            detail = _text(_first(row, "application_path", "install_path", "path"))
+            if self.family_key == 'fast_light' and self.visible_components:
+                component = self.visible_components[0]
+                detail = _text(self._discovery_application_paths(row).get(f'{component}_application_path'))
+                name = f"{component.upper()} application"
+            else:
+                detail = _text(_first(row, "application_path", "install_path", "path"))
             item = QListWidgetItem(f"{name} · {detail}" if detail else name)
             item.setData(Qt.ItemDataRole.UserRole, row)
-            item.setToolTip("Choose Use selected values to copy this suggestion into the form.")
+            item.setToolTip("Select to fill this application's path." if self.visible_components else
+                            "Select to fill the application path. Use selected values also copies other suggested settings.")
             self.discovery_list.addItem(item)
         visible = bool(rows)
+        self._size_discovery_list()
+        self.use_discovery_button.setVisible(visible and not self.visible_components)
+        selected = self._selected_discovery_paths
+        still_selected = selected and all(self.values().get(key) == value for key, value in selected.items())
+        self.editor.set_discovery_state('selected' if visible and still_selected else 'detected' if visible else 'empty')
         self.discovery_list.setVisible(visible)
         self._discovery_selection_changed()
         if visible:
-            self.discovery_hint.setText("Select a suggestion, then choose Use selected values. Nothing changes before that action.")
+            self.discovery_hint.setText(
+                "Select the matching application to fill its path. Review the form, then Apply to radio setup."
+                if self.visible_components else
+                "Select a suggestion to fill the path. Use selected values also copies its settings. Review before applying.")
         else:
             self.discovery_hint.setText("No suggestions are available. Enter values directly or use Browse…")
 
@@ -347,6 +392,7 @@ class OperatorInstanceAssistant(QWidget):
     ) -> None:
         """Limit the visible editor task while preserving the atomic draft."""
         self.visible_components = tuple(visible_components) if visible_components is not None else ()
+        self.use_discovery_button.setVisible(not self.visible_components)
         self.visible_fields = tuple(visible_fields) if visible_fields is not None else ()
         self.editor.set_view_scope(
             visible_components=(self.visible_components if visible_components is not None else None),
@@ -412,6 +458,8 @@ class OperatorInstanceAssistant(QWidget):
         visible = self._unfinished_envelope is not None
         self.recover_button.setVisible(visible)
         self.discard_unfinished_button.setVisible(visible)
+        self.recover_button.setEnabled(not self._busy)
+        self.discard_unfinished_button.setEnabled(not self._busy)
 
     def _draft_payload_values(self) -> dict[str, Any]:
         values = self.editor.values()
@@ -456,7 +504,7 @@ class OperatorInstanceAssistant(QWidget):
         heading.setStyleSheet(label_style("text", active_app_theme(), weight=700))
         self._root_layout.addWidget(heading)
 
-        self._context_widget = QWidget()
+        self._context_widget = QWidget(self)
         self._context_layout = QVBoxLayout(self._context_widget)
         self._context_layout.setContentsMargins(0, 0, 0, 0)
         self._context_layout.setSpacing(6)
@@ -487,13 +535,16 @@ class OperatorInstanceAssistant(QWidget):
         self._context_layout.addWidget(self.discovery_group)
         self.discovery_group.setVisible(False)
 
-        self.create_radio_button = QPushButton("Create a radio…")
+        # Parent before any visibility changes. A parentless button would
+        # briefly show as a native top-level window,
+        # disrupting macOS activation/Spaces even after it is reparented.
+        self.create_radio_button = QPushButton("Create a radio…", self._context_widget)
         self.create_radio_button.setObjectName("operatorInstanceCreateRadio")
         self.create_radio_button.setAccessibleName("Create a radio")
+        self._context_layout.addWidget(self.create_radio_button, 0, Qt.AlignmentFlag.AlignLeft)
         self.create_radio_button.setVisible(
             self.selected_radio_id in (None, "") and not self._nested_unsaved
         )
-        self._context_layout.addWidget(self.create_radio_button, 0, Qt.AlignmentFlag.AlignLeft)
 
         recovery_actions = QHBoxLayout()
         self.recover_button = QPushButton("Recover unfinished")
@@ -656,6 +707,7 @@ class OperatorInstanceAssistant(QWidget):
 
     def _request_discovery(self) -> None:
         self._discovery_requested = True
+        self.editor.set_discovery_state('searching')
         self.discovery_group.setVisible(True)
         self.discover_requested.emit(self.family_key)
 
@@ -674,16 +726,58 @@ class OperatorInstanceAssistant(QWidget):
         )
 
     def _discovery_selection_changed(self) -> None:
-        self.use_discovery_button.setEnabled(
-            not self._busy and self.discovery_list.currentItem() is not None
-        )
+        selected = self.discovery_list.selectedItems()
+        self.use_discovery_button.setEnabled(not self._busy and bool(selected))
+        if self._busy or not selected:
+            return
+        row = selected[0].data(Qt.ItemDataRole.UserRole)
+        if not isinstance(row, Mapping):
+            return
+        paths = self._discovery_application_paths(row)
+        if self.family_key == "fast_light" and self.visible_components:
+            paths = {key: value for key, value in paths.items()
+                     if key.removesuffix("_application_path") in self.visible_components}
+        current = self.editor.values()
+        if not paths:
+            return
+        self._selected_discovery_paths = deepcopy(paths)
+        self.editor.set_discovery_state('selected')
+        if all(current.get(key) == value for key, value in paths.items()):
+            return
+        current.update(paths)
+        self.editor.set_values(current, preserve_dirty=False)
+        self.editor.set_dirty(True)
+        self.set_operation_status("Application path filled. Review the remaining fields before applying.")
+
+    def _discovery_application_paths(self, row: Mapping[str, Any]) -> dict[str, Any]:
+        """Map executable paths only; selection never adopts another instance."""
+        if self.family_key != "fast_light":
+            path = _first(row, "application_path", "install_path", "path",
+                          "js8_application_path", "varac_install_path")
+            return {"application_path": path} if path else {}
+        paths = {}
+        component_paths = row.get("component_paths")
+        component_paths = component_paths if isinstance(component_paths, Mapping) else {}
+        for component in ("flrig", "fldigi", "flmsg", "flamp"):
+            aliases = ("application_path", "install_path", "path") if component == "flrig" else (
+                ("secondary_application_path",) if component == "fldigi" else ())
+            path = _first(row, f"{component}_application_path", f"{component}_path", *aliases)
+            path = path or component_paths.get(component)
+            if path:
+                paths[f"{component}_application_path"] = path
+        return paths
 
     def _use_discovery(self) -> None:
+        if self._busy:
+            return
         item = self.discovery_list.currentItem()
         value = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
         if not isinstance(value, Mapping):
             return
         row = deepcopy(dict(value))
+        if self.family_key == 'fast_light' and self.visible_components:
+            self._discovery_selection_changed()
+            return
         self._raw_fields.update(row)
         if row.get('id'):
             self._raw_fields['operator_source_instance_id'] = row['id']
@@ -695,7 +789,9 @@ class OperatorInstanceAssistant(QWidget):
         current.update(self._explicit_form_values(row))
         self.editor.set_values(current, "Suggested values", preserve_dirty=False)
         self.editor.set_dirty(True)
-        self.set_operation_status("Suggested values loaded. Review and Save to publish them.")
+        self.editor.set_discovery_state('selected')
+        self.set_operation_status("Suggested settings loaded. Review, then Apply to radio setup." if getattr(self, '_radio_setup_context', False)
+                                  else "Suggested settings loaded. Review and Save to keep them.")
 
     def _explicit_form_values(self, raw: Mapping[str, Any]) -> dict[str, Any]:
         """Return only fields actually supplied by a suggestion row."""
@@ -747,6 +843,7 @@ class OperatorInstanceAssistant(QWidget):
                 startup_key = f"{component}_launch_at_startup"
                 if startup_key in raw:
                     values[startup_key] = _bool(raw[startup_key])
+        values.update(self._discovery_application_paths(raw))
         return values
 
     def _browse_field(self, key: str) -> None:
@@ -781,11 +878,12 @@ class OperatorInstanceAssistant(QWidget):
 
     def _dirty_close_action(self) -> str:
         box = QMessageBox(self)
-        box.setWindowTitle("Save application changes?")
-        box.setText("There are unsaved application changes.")
-        save = box.addButton("Save", QMessageBox.ButtonRole.AcceptRole)
-        discard = box.addButton("Discard", QMessageBox.ButtonRole.DestructiveRole)
-        stay = box.addButton("Stay", QMessageBox.ButtonRole.RejectRole)
+        nested = getattr(self, '_radio_setup_context', False)
+        box.setWindowTitle("Return to radio setup?" if nested else "Save application changes?")
+        box.setText("There are application changes in this form." if nested else "There are unsaved application changes.")
+        save = box.addButton("Apply to radio setup" if nested else "Save", QMessageBox.ButtonRole.AcceptRole)
+        discard = box.addButton("Discard application changes" if nested else "Discard", QMessageBox.ButtonRole.DestructiveRole)
+        stay = box.addButton("Keep editing" if nested else "Stay", QMessageBox.ButtonRole.RejectRole)
         box.setDefaultButton(stay)
         box.exec()
         if box.clickedButton() is save:
@@ -832,6 +930,8 @@ class OperatorInstanceAssistant(QWidget):
             event.ignore()
 
     def _recover_unfinished(self) -> None:
+        if self._busy:
+            return
         envelope = deepcopy(self._unfinished_envelope or {})
         envelope_payload = envelope.get("payload")
         if not isinstance(envelope_payload, Mapping):
@@ -880,6 +980,8 @@ class OperatorInstanceAssistant(QWidget):
         self.set_operation_status("Unfinished draft recovered. Review and Save to publish.")
 
     def _discard_unfinished(self) -> None:
+        if self._busy:
+            return
         envelope = deepcopy(self._unfinished_envelope or {})
         if not envelope:
             return

@@ -1007,22 +1007,16 @@ class _SoftwareAutofillWorker(QObject):
             candidates: List[Dict[str, Any]] = []
             if self.section == "fast_light":
                 results = dict(payload.get("fast_results") or {})
-                flrig = results.get("path_flrig")
-                fldigi = results.get("path_fldigi")
-                if (flrig and flrig.path) or (fldigi and fldigi.path):
-                    candidates.append(
-                        {
-                            "family_key": "fast_light",
-                            "name": "Detected Fast Light installation",
-                            "application_path": flrig.path if flrig else "",
-                            "secondary_application_path": fldigi.path if fldigi else "",
-                            "host": "127.0.0.1",
-                            "port": 12345,
-                            "secondary_port": 7362,
-                            "storage_path": getattr(results.get("fldigi_log_path"), "path", ""),
-                            "provenance": "detected",
-                        }
-                    )
+                paths = {component: getattr(results.get(f"path_{component}"), "path", "")
+                         for component in ('flrig', 'fldigi', 'flmsg', 'flamp')}
+                if any(paths.values()):
+                    candidates.append({
+                        "family_key": "fast_light", "name": "Detected Fast Light installation",
+                        **{f"{component}_application_path": path for component, path in paths.items() if path},
+                        "application_path": paths['flrig'],
+                        "secondary_application_path": paths['fldigi'],
+                        "provenance": "detected",
+                    })
             elif self.section == "varac":
                 results = dict(payload.get("varac_results") or {})
                 install = results.get("varac_path")
@@ -1754,6 +1748,7 @@ class SettingsTab(QWidget):
         self._operator_station_setup: OperatorStationSetup | None = None
         self._operator_station_setup_group: QGroupBox | None = None
         self._operator_station_job: QThread | None = None
+        self._operator_new_radio_draft_revision = -1
         self._operator_station_generation = 0
         self._operator_station_job_action: str | None = None
         self._operator_station_review_pending = False
@@ -1902,6 +1897,8 @@ class SettingsTab(QWidget):
             self._operator_station_setup.set_operation_status(str(response["error"]), error=True)
             self._operator_station_dispatch_pending()
             return
+        if 'new_radio_draft' in response:
+            self._publish_new_radio_draft(response['new_radio_draft'])
         setup = response.get("setup")
         if isinstance(setup, Mapping):
             self._operator_station_setup.set_snapshot(setup)
@@ -4553,6 +4550,19 @@ class SettingsTab(QWidget):
         configured_title_row = QHBoxLayout()
         self.device_profile_selector_title_label.setVisible(False)
         configured_radios_layout.addLayout(configured_title_row)
+        self.radio_setup_resume_row = QWidget(configured_radios_group)
+        resume_layout = QHBoxLayout(self.radio_setup_resume_row)
+        resume_layout.setContentsMargins(0, 0, 0, 0)
+        self.radio_setup_draft_label = QLabel()
+        self.radio_setup_draft_label.setWordWrap(True)
+        self.radio_setup_draft_label.setTextFormat(Qt.PlainText)
+        self.resume_radio_setup_button = QPushButton('Resume setup', self.radio_setup_resume_row)
+        self.resume_radio_setup_button.setAccessibleName('Resume unfinished radio setup')
+        self.resume_radio_setup_button.clicked.connect(lambda: self._open_device_profile_dialog(resume_draft=True))
+        resume_layout.addWidget(self.radio_setup_draft_label, 1)
+        resume_layout.addWidget(self.resume_radio_setup_button)
+        configured_radios_layout.addWidget(self.radio_setup_resume_row)
+        self.radio_setup_resume_row.hide()
         self.device_profile_selector_widget = QWidget()
         self.device_profile_selector_layout = QHBoxLayout(self.device_profile_selector_widget)
         self.device_profile_selector_layout.setContentsMargins(0, 0, 0, 0)
@@ -16912,7 +16922,7 @@ class SettingsTab(QWidget):
             assistant = self._operator_discovery_assistant(str(request.get('target')))
             if assistant is not None:
                 assistant.set_discovery_results(deduped)
-                assistant.set_operation_status(f'Found {len(deduped)} saved or detected configurations. Choose a suggestion explicitly.')
+                assistant.set_operation_status(f'Found {assistant.discovery_list.count()} matching suggestions. Select one to fill the application path.' if assistant.discovery_list.count() else 'No matching application found. Browse to its application or enter a path.')
             return
         wanted = set(request.get("keys") or ())
         scoped = {
@@ -21136,9 +21146,8 @@ class SettingsTab(QWidget):
         if not isinstance(profile, dict):
             self._refresh_radio_profile_timer_policy_controls(None)
             return
-        payload = dict(profile)
-        payload.update(self._radio_profile_timer_policy_control_values())
-        if not self._persist_device_profile(payload, existing=profile):
+        payload = {"id": profile["id"], **self._radio_profile_timer_policy_control_values()}
+        if not self._persist_device_profile(payload, existing=profile, profile_only=True):
             self._refresh_radio_profile_timer_policy_controls(profile)
             return
         refreshed = self._selected_settings_radio_profile() or payload
@@ -21163,7 +21172,7 @@ class SettingsTab(QWidget):
 
     def _selected_radio_profile_save_payload(self) -> Optional[Dict[str, Any]]:
         profile = self._selected_settings_radio_profile()
-        return dict(profile) if isinstance(profile, dict) else None
+        return {"id": profile["id"]} if isinstance(profile, dict) else None
 
     def _publish_radio_profile_inline_feedback(
         self,
@@ -21223,7 +21232,7 @@ class SettingsTab(QWidget):
                 "enabled": 1 if self.radio_profile_identity_enabled_chk.isChecked() else 0,
             }
         )
-        if not self._persist_device_profile(payload, existing=profile):
+        if not self._persist_device_profile(payload, existing=profile, profile_only=True):
             self._refresh_radio_profile_identity_inline_controls(profile)
             return
         refreshed = self._selected_settings_radio_profile() or payload
@@ -21252,19 +21261,18 @@ class SettingsTab(QWidget):
             {
                 "control_backend": backend,
                 "flrig_host": self.radio_profile_control_flrig_host_edit.text().strip() or "127.0.0.1",
-                "flrig_port": self.radio_profile_control_flrig_port_edit.text().strip() or "12345",
+                "flrig_port": self.radio_profile_control_flrig_port_edit.text().strip(),
                 "rig_host": self.radio_profile_control_rigctld_host_edit.text().strip() or "127.0.0.1",
-                "rig_port": self.radio_profile_control_rigctld_port_edit.text().strip() or "4532",
+                "rig_port": self.radio_profile_control_rigctld_port_edit.text().strip(),
                 "js8_host": self.radio_profile_control_js8_host_edit.text().strip() or "127.0.0.1",
-                "js8_port": self.radio_profile_control_js8_port_edit.text().strip() or "2442",
+                "js8_port": self.radio_profile_control_js8_port_edit.text().strip(),
             }
         )
         if backend == "flrig":
             payload["use_flrig"] = True
         elif backend == "js8call":
             payload["use_js8call"] = True
-        if not self._persist_device_profile(payload, existing=profile):
-            self._refresh_radio_profile_control_inline_controls(profile)
+        if not self._persist_device_profile(payload, existing=profile, inline_scope="control"):
             return
         refreshed = self._selected_settings_radio_profile() or payload
         self._update_device_profile_readiness_detail()
@@ -21312,7 +21320,7 @@ class SettingsTab(QWidget):
                 "notes": self.radio_profile_advanced_notes_edit.toPlainText().strip(),
             }
         )
-        if not self._persist_device_profile(payload, existing=profile):
+        if not self._persist_device_profile(payload, existing=profile, profile_only=True):
             self._refresh_radio_profile_advanced_inline_controls(profile)
             return
         refreshed = self._selected_settings_radio_profile() or payload
@@ -21759,17 +21767,10 @@ class SettingsTab(QWidget):
                 target_label=self._profile_display_name(profile),
             )
             return
-        payload = dict(profile)
-        for software_key, _label in self._radio_profile_software_flag_defs():
-            target_field = self._radio_profile_software_flag_field(software_key)
-            chk = self._radio_profile_software_flag_checks.get(software_key)
-            if target_field and chk is not None:
-                payload[target_field] = bool(chk.isChecked())
-        for locked_key in self._radio_profile_backend_locked_software(profile):
-            locked_field = self._radio_profile_software_flag_field(locked_key)
-            if locked_field:
-                payload[locked_field] = True
-        if self._persist_device_profile(payload, existing=profile) is False:
+        payload = {"id": profile["id"], field: requested_enable}
+        if key in self._radio_profile_backend_locked_software(profile):
+            payload[field] = True
+        if self._persist_device_profile(payload, existing=profile, inline_scope="use") is False:
             self._refresh_radio_profile_software_flag_controls(profile)
             return
         saved_profile = getattr(self, "_last_persisted_device_profile", None)
@@ -24966,6 +24967,8 @@ class SettingsTab(QWidget):
             self.selector_selected_device_profile_label.setAccessibleName(f"Selected radio: {selected_radio_text}")
 
         self.add_device_profile_btn.setStyleSheet(button_style("primary", theme))
+        self.resume_radio_setup_button.setStyleSheet(button_style('eligible_info', theme))
+        self.resume_radio_setup_button.setMinimumHeight(button_height_for_font(self, vertical_padding=10, floor=30))
         if hasattr(self, "copy_readiness_summary_btn"):
             self.copy_readiness_summary_btn.setStyleSheet(button_style("secondary", theme))
         self.edit_device_profile_btn.setEnabled(can_edit)
@@ -27424,7 +27427,7 @@ class SettingsTab(QWidget):
             return "review"
         return ""
 
-    def _open_device_profile_dialog(self, existing=None, *, initial_step='', retry_draft=None):
+    def _open_device_profile_dialog(self, existing=None, *, initial_step='', retry_draft=None, resume_draft=False):
         """All Add/Change/Edit radio routes share one operator-owned draft."""
         from freqinout.gui.operator_radio_editor import OperatorRadioEditor
         if getattr(self, '_operator_radio_dialog', None) is not None:
@@ -27433,9 +27436,11 @@ class SettingsTab(QWidget):
         editor = OperatorRadioEditor(profile={**dict(existing or {}), **dict(retry_draft or {})},
                                      initial_step=initial_step or 'radio',parent=self)
         self._operator_radio_dialog = editor
+        editor._resume_draft_on_load = bool(resume_draft and not existing)
         self._operator_radio_result = None
         self._operator_radio_pending_owner_route = None
         editor.save_requested.connect(self._operator_radio_save_requested)
+        editor.draft_save_requested.connect(lambda payload: self._start_operator_radio_job(payload, action='radio_keep_draft'))
         editor.application_find_requested.connect(self._operator_nested_discovery_requested)
         editor.discard_unfinished_requested.connect(self._operator_radio_discard_requested)
         owner_signal = getattr(editor, "application_owner_requested", None)
@@ -27587,6 +27592,19 @@ class SettingsTab(QWidget):
         if self.sender() is getattr(self, '_operator_radio_job', None):
             self._operator_radio_job = None
 
+    def _publish_new_radio_draft(self, envelope):
+        if not isinstance(envelope, Mapping):
+            return
+        revision = int(envelope.get('revision', 0))
+        if revision < getattr(self, '_operator_new_radio_draft_revision', -1):
+            return
+        self._operator_new_radio_draft_revision = revision
+        payload = envelope.get('payload')
+        values = payload.get('values', {}) if isinstance(payload, Mapping) else {}
+        name = str(values.get('name') or 'Unnamed radio')
+        self.radio_setup_draft_label.setText(f'Unfinished setup: {name}. Not added to Configured Radios yet. Choose Resume setup, correct any reported problems, then Save radio.' if isinstance(payload, Mapping) else '')
+        self.radio_setup_resume_row.setVisible(isinstance(payload, Mapping))
+
     def _operator_radio_saved(self, response):
         job = getattr(self, '_operator_radio_job', None)
         editor = getattr(self, '_operator_radio_dialog', None)
@@ -27594,23 +27612,33 @@ class SettingsTab(QWidget):
             return
         self._operator_radio_job = None
         editor.set_busy(False)
+        if 'unfinished' in response and not editor.base().get('id'):
+            self._publish_new_radio_draft(response['unfinished'])
         if response.get('unfinished',{}).get('payload'):
             editor.set_unfinished(response['unfinished'])
         if response.get('error'):
             editor.set_status(response['error'])
+            if job.action in {'radio_save', 'radio_keep_draft'}:
+                editor.show_save_failure((response['error'],), draft_only=job.action == 'radio_keep_draft')
             return
         if response.get('discarded'):
+            if not editor.base().get('id'):
+                self._publish_new_radio_draft({'revision': response['draft_revision'], 'payload': None})
+            editor._operator_draft_revision = response.get('draft_revision')
             editor.set_unfinished(None)
-            editor.set_status('Saved unfinished work discarded. Active settings remain unchanged.')
+            editor.set_status('Saved draft discarded. Current entries kept. Choose Save radio to keep them.')
             return
         if 'application_seeds' in response:
             editor.set_context(response)
+            if getattr(editor, '_resume_draft_on_load', False):
+                editor._resume_draft_on_load = False
+                editor._recover_unfinished()
             return
         result=response.get('result')
         if result is not None:
             if result.state == 'saved':
                 self._operator_radio_result = response.get('profile')
-            editor.set_result({'state':result.state,'draft_revision':result.draft_revision,'message':'Saved in CommsPlan.' if result.state == 'saved' else 'Saved · incomplete. ' + ' '.join(result.issues)})
+            editor.set_result({'state':result.state,'draft_revision':result.draft_revision,'corrections':response.get('corrections',()),'issues':result.issues,'message':'Saved in CommsPlan.' if result.state == 'saved' else 'Draft kept; radio settings were not changed.'})
 
     def _apply_runtime_projection_widgets(self, data: Dict[str, Any]) -> None:
         ctrl = data.get("control_via", "FLRig") or "FLRig"
@@ -27653,7 +27681,11 @@ class SettingsTab(QWidget):
         *,
         existing: Optional[Dict[str, Any]] = None,
         defer_activation_until_assignment: bool = False,
+        profile_only: bool = False,
+        inline_scope: Optional[str] = None,
     ) -> bool:
+        # Inline radio metadata owns no application settings. Its sparse payload
+        # must preserve current links and never turn resolved defaults into apps.
         self._last_persisted_device_profile = None
         is_active_edit = bool(existing and int(existing.get("runtime_active", 0) or 0) == 1)
         is_primary_edit = bool(existing and int(existing.get("runtime_primary", 0) or 0) == 1)
@@ -27680,10 +27712,27 @@ class SettingsTab(QWidget):
 
         def _profile_int(key: str, default: int) -> int:
             value = payload.get(key, existing_profile.get(key, default))
-            try:
-                return int(str(value if value is not None else default).strip() or default)
-            except Exception:
-                return default
+            from freqinout.core.inline_radio_configuration import strict_port
+            return strict_port(value, key, existing_profile.get(key) or default)
+
+        def _validate_legacy_application_edit(family: str, app_values: Dict[str, Any], application_id: int) -> None:
+            if application_id and existing and self.multi_radio_store.radio_software_identity_generation(int(existing["id"])) > 0:
+                raise ValueError("Use Edit Apps to change this radio's configured application identity or endpoints.")
+            from freqinout.core.multi_radio_store import _validate_software_application_claims_conn
+            evidence = {"operator_values": {f"{name}_enabled": bool(payload.get(f"use_{name}", existing_profile.get(f"use_{name}", False)))
+                                           for name in ("flrig", "fldigi", "flmsg", "flamp")}}
+            if application_id:
+                getter = {"js8call": self.multi_radio_store.get_js8_instance,
+                          "fast_light": self.multi_radio_store.get_fast_light_config,
+                          "varac": self.multi_radio_store.get_varac_node}[family]
+                app_row = getter(application_id) or {}
+                from freqinout.core.operator_application_configuration import application_manifest
+                if application_manifest(self.multi_radio_store, family, app_row):
+                    raise ValueError("Use Edit Apps to change this radio's configured application identity or endpoints.")
+                app_values = {**app_row, **app_values}
+            with self.multi_radio_store.connect() as conn:
+                _validate_software_application_claims_conn(conn, family, app_values,
+                    reviewed_existing_id=application_id or None, fast_light_evidence=evidence if family == "fast_light" else None)
 
         if is_active_edit and target_backend not in SUPPORTED_RUNTIME_CONTROL_BACKENDS:
             QMessageBox.warning(
@@ -27695,164 +27744,147 @@ class SettingsTab(QWidget):
         if is_primary_edit and not self._confirm_runtime_projection_override("Edit Default Radio"):
             return False
         try:
-            existing_js8_id = int((existing or {}).get("js8_instance_id", 0) or 0)
-            js8_needed = any(
-                [
-                    bool(payload.get("use_js8call")),
-                    bool(payload.get("use_js8spotter")),
-                    bool(payload.get("use_commstat")),
-                    str(payload.get("js8_host", "") or "").strip(),
-                    str(payload.get("js8_port", "") or "").strip(),
-                    str(payload.get("js8_install_path", "") or "").strip(),
-                    str(payload.get("js8_profile_path", "") or "").strip(),
-                    str(payload.get("js8_directed_path", "") or "").strip(),
-                    str(payload.get("js8_forms_path", "") or "").strip(),
-                    str(payload.get("spotter_launch_path", "") or "").strip(),
-                    str(payload.get("commstat_launch_path", "") or "").strip(),
-                    existing_js8_id > 0,
-                ]
-            )
-            if js8_needed and "js8call" not in deferred_guided_families:
-                js8_values = {
-                    "id": existing_js8_id or None,
-                    "name": f"{radio_name} JS8",
-                    "host": _profile_text("js8_host", "127.0.0.1") or "127.0.0.1",
-                    "port": _profile_int("js8_port", 2442),
-                    "profile_path": _profile_text("js8_profile_path"),
-                    "directed_path": _profile_text("js8_directed_path"),
-                    "forms_path": _profile_text("js8_forms_path"),
-                    "install_path": _profile_text("js8_install_path"),
-                    "spotter_launch_path": _profile_text("spotter_launch_path"),
-                    "commstat_launch_path": _profile_text("commstat_launch_path"),
-                }
-                js8_saved = self.multi_radio_store.save_js8_instance(js8_values)
-                payload["js8_instance_id"] = int(js8_saved.get("id", 0) or 0)
+            with self.multi_radio_store.configuration_save_transaction() as transaction:
+                if profile_only or inline_scope:
+                    from freqinout.core.inline_radio_configuration import save_inline_radio_profile
+                    if not existing:
+                        raise ValueError("Select an existing radio before saving this section.")
+                    saved = save_inline_radio_profile(self.multi_radio_store, existing, payload,
+                                                      scope="metadata" if profile_only else inline_scope)
+                    first_radio = False
+                    observer_profile = str(saved.get("device_class", "")) == "observer"
+                else:
+                    for port_key in ("flrig_port", "fldigi_port", "js8_port", "rig_port"):
+                        if port_key in payload:
+                            payload[port_key] = _profile_int(port_key, {"flrig_port": 12345, "fldigi_port": 7362,
+                                                                      "js8_port": 2442, "rig_port": 4532}[port_key])
+                    if existing:
+                        from freqinout.core.inline_radio_configuration import _equivalent, _field
+                        current = self.multi_radio_store.get_device_profile(int(existing["id"]))
+                        if current is None:
+                            raise ValueError("This radio no longer exists. Reopen the radio list.")
+                        reviewed = {key: value for key, value in payload.items() if key != "id"
+                                    and not _equivalent(value, _field(existing, key))}
+                        watch = set(reviewed) | {"device_class", "control_backend", "runtime_active", "runtime_primary",
+                                                 "js8_instance_id", "fast_light_config_id", "varac_node_id"}
+                        for key in watch:
+                            if not _equivalent(_field(current, key), _field(existing, key)):
+                                raise ValueError(f"{key.replace('_', ' ')} changed after this editor opened. Reopen the radio to review it.")
+                        payload = {"id": existing["id"], **reviewed}
+                        existing_profile = current
+                    existing_js8_id = int((existing or {}).get("js8_instance_id", 0) or 0)
+                    js8_needed = bool(payload.get("use_js8call")) or existing_js8_id > 0 or target_backend == "js8call"
+                    if existing_js8_id:
+                        js8_needed = any(key in payload and str(payload.get(key) or "") != str(existing_profile.get(key) or "")
+                                          for key in ('js8_host', 'js8_port', 'js8_install_path', 'js8_profile_path', 'js8_directed_path', 'js8_forms_path', 'spotter_launch_path', 'commstat_launch_path'))
+                    if not profile_only and js8_needed and "js8call" not in deferred_guided_families:
+                        js8_values = {
+                            "id": existing_js8_id or None,
+                            "name": (self.multi_radio_store.get_js8_instance(existing_js8_id) or {}).get("name") if existing_js8_id else f"{radio_name} JS8",
+                            "host": _profile_text("js8_host", "127.0.0.1") or "127.0.0.1",
+                            "port": _profile_int("js8_port", 2442),
+                            "profile_path": _profile_text("js8_profile_path"),
+                            "directed_path": _profile_text("js8_directed_path"),
+                            "forms_path": _profile_text("js8_forms_path"),
+                            "install_path": _profile_text("js8_install_path"),
+                            "spotter_launch_path": _profile_text("spotter_launch_path"),
+                            "commstat_launch_path": _profile_text("commstat_launch_path"),
+                        }
+                        if existing_js8_id:
+                            js8_values = {"id": existing_js8_id, **{column: js8_values[column]
+                                for column, field in {'host': 'js8_host', 'port': 'js8_port', 'install_path': 'js8_install_path', 'profile_path': 'js8_profile_path', 'directed_path': 'js8_directed_path', 'forms_path': 'js8_forms_path', 'spotter_launch_path': 'spotter_launch_path', 'commstat_launch_path': 'commstat_launch_path'}.items() if field in payload}}
+                        _validate_legacy_application_edit("js8call", js8_values, existing_js8_id)
+                        js8_saved = self.multi_radio_store.save_js8_instance(js8_values)
+                        payload["js8_instance_id"] = int(js8_saved.get("id", 0) or 0)
 
-            existing_fast_id = int((existing or {}).get("fast_light_config_id", 0) or 0)
-            fast_needed = any(
-                [
-                    bool(payload.get("use_flrig")),
-                    bool(payload.get("use_fldigi")),
-                    str(payload.get("flrig_host", "") or "").strip(),
-                    str(payload.get("flrig_port", "") or "").strip(),
-                    str(payload.get("flrig_path", "") or "").strip(),
-                    str(payload.get("fldigi_host", "") or "").strip(),
-                    str(payload.get("fldigi_port", "") or "").strip(),
-                    str(payload.get("fldigi_path", "") or "").strip(),
-                    existing_fast_id > 0,
-                ]
-            )
-            if fast_needed and "fast_light" not in deferred_guided_families:
-                fast_values = {
-                    "id": existing_fast_id or None,
-                    "name": f"{radio_name} Fast Light",
-                    "flrig_path": _profile_text("flrig_path"),
-                    "flrig_host": _profile_text("flrig_host", "127.0.0.1") or "127.0.0.1",
-                    "flrig_port": _profile_int("flrig_port", 12345),
-                    "fldigi_path": _profile_text("fldigi_path"),
-                    "fldigi_host": _profile_text("fldigi_host")
-                    or _profile_text("flrig_host")
-                    or "127.0.0.1",
-                    "fldigi_port": _profile_int("fldigi_port", 7362),
-                }
-                fast_saved = self.multi_radio_store.save_fast_light_config(fast_values)
-                payload["fast_light_config_id"] = int(fast_saved.get("id", 0) or 0)
+                    existing_fast_id = int((existing or {}).get("fast_light_config_id", 0) or 0)
+                    fast_needed = any(bool(payload.get(key)) for key in ("use_flrig", "use_fldigi", "use_flmsg", "use_flamp")) or target_backend == "flrig" or existing_fast_id > 0
+                    if existing_fast_id:
+                        fast_needed = any(key in payload and str(payload.get(key) or "") != str(existing_profile.get(key) or "")
+                                          for key in ('flrig_host', 'flrig_port', 'flrig_path', 'fldigi_host', 'fldigi_port', 'fldigi_path'))
+                    if not profile_only and fast_needed and "fast_light" not in deferred_guided_families:
+                        fast_values = {
+                            "id": existing_fast_id or None,
+                            "name": (self.multi_radio_store.get_fast_light_config(existing_fast_id) or {}).get("name") if existing_fast_id else f"{radio_name} Fast Light",
+                            "flrig_path": _profile_text("flrig_path"),
+                            "flrig_host": _profile_text("flrig_host", "127.0.0.1") or "127.0.0.1",
+                            "flrig_port": _profile_int("flrig_port", 12345),
+                            "fldigi_path": _profile_text("fldigi_path"),
+                            "fldigi_host": _profile_text("fldigi_host")
+                            or _profile_text("flrig_host")
+                            or "127.0.0.1",
+                            "fldigi_port": _profile_int("fldigi_port", 7362),
+                        }
+                        if existing_fast_id:
+                            fast_values = {"id": existing_fast_id, **{column: fast_values[column]
+                                for column, field in {'flrig_host': 'flrig_host', 'flrig_port': 'flrig_port', 'flrig_path': 'flrig_path', 'fldigi_host': 'fldigi_host', 'fldigi_port': 'fldigi_port', 'fldigi_path': 'fldigi_path'}.items() if field in payload}}
+                        _validate_legacy_application_edit("fast_light", fast_values, existing_fast_id)
+                        fast_saved = self.multi_radio_store.save_fast_light_config(fast_values)
+                        payload["fast_light_config_id"] = int(fast_saved.get("id", 0) or 0)
 
-            existing_varac_id = int((existing or {}).get("varac_node_id", 0) or 0)
-            varac_needed = any(
-                [
-                    bool(payload.get("use_varac")),
-                    str(payload.get("varac_install_path", "") or "").strip(),
-                    str(payload.get("varac_db_path", "") or "").strip(),
-                    str(payload.get("varac_ini_path", "") or "").strip(),
-                    str(payload.get("varac_incoming_path", "") or "").strip(),
-                    str(payload.get("launch_cmd", "") or "").strip(),
-                    existing_varac_id > 0,
-                ]
-            )
-            if varac_needed and "varac" not in deferred_guided_families:
-                varac_values = {
-                    "id": existing_varac_id or None,
-                    "name": f"{radio_name} VarAC",
-                    "install_path": str(payload.get("varac_install_path", "") or "").strip(),
-                    "db_path": str(payload.get("varac_db_path", "") or "").strip(),
-                    "ini_path": str(payload.get("varac_ini_path", "") or "").strip(),
-                    "incoming_path": str(payload.get("varac_incoming_path", "") or "").strip(),
-                    "launch_cmd": str(payload.get("launch_cmd", "") or "").strip(),
-                }
-                varac_saved = self.multi_radio_store.save_varac_node(varac_values)
-                payload["varac_node_id"] = int(varac_saved.get("id", 0) or 0)
+                    existing_varac_id = int((existing or {}).get("varac_node_id", 0) or 0)
+                    varac_needed = bool(payload.get("use_varac")) or existing_varac_id > 0
+                    if existing_varac_id:
+                        varac_needed = any(key in payload and str(payload.get(key) or "") != str(existing_profile.get(key) or "")
+                                          for key in ('varac_install_path', 'varac_db_path', 'varac_ini_path', 'varac_incoming_path', 'launch_cmd'))
+                    if not profile_only and varac_needed and "varac" not in deferred_guided_families:
+                        varac_values = {
+                            "id": existing_varac_id or None,
+                            "name": (self.multi_radio_store.get_varac_node(existing_varac_id) or {}).get("name") if existing_varac_id else f"{radio_name} VarAC",
+                            "install_path": _profile_text("varac_install_path"),
+                            "db_path": _profile_text("varac_db_path"),
+                            "ini_path": _profile_text("varac_ini_path"),
+                            "incoming_path": _profile_text("varac_incoming_path"),
+                            "launch_cmd": _profile_text("launch_cmd"),
+                        }
+                        if existing_varac_id:
+                            varac_values = {"id": existing_varac_id, **{column: varac_values[column]
+                                for column, field in {'install_path': 'varac_install_path', 'db_path': 'varac_db_path', 'ini_path': 'varac_ini_path', 'incoming_path': 'varac_incoming_path', 'launch_cmd': 'launch_cmd'}.items() if field in payload}}
+                        _validate_legacy_application_edit("varac", varac_values, existing_varac_id)
+                        varac_saved = self.multi_radio_store.save_varac_node(varac_values)
+                        payload["varac_node_id"] = int(varac_saved.get("id", 0) or 0)
 
-            first_radio = not bool(self.multi_radio_store.list_device_profiles())
-            observer_profile = str(payload.get("device_class", "") or "").strip().lower() == "observer"
-            if first_radio and not observer_profile and not defer_activation_until_assignment:
-                payload["runtime_active"] = 1
-                payload["runtime_primary"] = 1
-            elif observer_profile or (first_radio and defer_activation_until_assignment):
-                # Guided creation assigns the reviewed Operating Model before
-                # activating a new radio.  Observers can never be the
-                # compatibility primary; a first transceiver becomes primary
-                # only after its selected model has been assigned.
-                payload["runtime_active"] = 0
-                payload["runtime_primary"] = 0
-            saved = self.multi_radio_store.save_device_profile(payload)
+                    first_radio = not bool(self.multi_radio_store.list_device_profiles())
+                    observer_profile = str(payload.get("device_class", "") or "").strip().lower() == "observer"
+                    if first_radio and not observer_profile and not defer_activation_until_assignment:
+                        payload["runtime_active"] = 1
+                        payload["runtime_primary"] = 1
+                    elif observer_profile or (first_radio and defer_activation_until_assignment):
+                        # Guided creation assigns the reviewed Operating Model before
+                        # activating a new radio.  Observers can never be the
+                        # compatibility primary; a first transceiver becomes primary
+                        # only after its selected model has been assigned.
+                        payload["runtime_active"] = 0
+                        payload["runtime_primary"] = 0
+                    saved = self.multi_radio_store.save_device_profile(payload)
+                if receiver_launch_bundle is not None:
+                    self.multi_radio_store.save_radio_launch_bundle(
+                        int(saved["id"]),
+                        items=[dict(item) for item in receiver_launch_bundle.get("items", []) if isinstance(item, dict)],
+                        launch_enabled=bool(receiver_launch_bundle.get("launch_enabled", False)),
+                    )
+                project_runtime = (
+                    (first_radio and not observer_profile and not defer_activation_until_assignment)
+                    or is_primary_edit or int(saved.get("runtime_primary", 0) or 0) == 1
+                )
+                if project_runtime:
+                    self.multi_radio_store.sync_runtime_active_device_to_legacy_settings_if_single_active(int(saved["id"]))
+                transaction.complete()
         except ValueError as exc:
             QMessageBox.warning(self, "Radio Profiles", str(exc))
             return False
         except Exception:
-            log.exception("Failed to save device profile.")
-            QMessageBox.warning(self, "Radio Profiles", "Unable to save the radio profile.")
+            log.exception("Failed to save device profile; configuration transaction rolled back.")
+            QMessageBox.warning(self, "Radio Profiles", "Unable to save the radio profile. No configuration changes were saved.")
             return False
 
-        if receiver_launch_bundle is not None:
-            try:
-                receiver_items = [
-                    dict(item)
-                    for item in receiver_launch_bundle.get("items", [])
-                    if isinstance(item, dict)
-                ]
-                self.multi_radio_store.save_radio_launch_bundle(
-                    int(saved.get("id", 0) or 0),
-                    items=receiver_items,
-                    launch_enabled=bool(receiver_launch_bundle.get("launch_enabled", False)),
-                )
-            except Exception:
-                log.exception("Receive-only launch bundle failed inside guided radio transaction.")
-                self._last_persisted_device_profile = dict(saved)
-                self._refresh_multi_radio_tables()
-                self._emit_device_profiles_changed()
-                QMessageBox.warning(
-                    self,
-                    "Radio setup not saved",
-                    "CommsPlan could not save the complete radio and receive-only launch setup. "
-                    "Nothing from this guided save will be retained. Review the receiver launch choice and try again.",
-                )
-                return False
-
-        if (
-            (first_radio and not observer_profile and not defer_activation_until_assignment)
-            or is_primary_edit
-            or int(saved.get("runtime_primary", 0) or 0) == 1
-        ):
-            try:
-                self.multi_radio_store.sync_runtime_active_device_to_legacy_settings_if_single_active(
-                    int(saved.get("id", 0) or 0)
-                )
-            except ValueError as exc:
-                QMessageBox.warning(self, "Radio Profiles", str(exc))
-                self._refresh_multi_radio_tables()
-                return False
-            except Exception:
-                log.exception("Failed to refresh runtime-primary device projection.")
-                QMessageBox.warning(self, "Radio Profiles", "Unable to refresh the runtime compatibility projection.")
-                self._refresh_multi_radio_tables()
-                return False
-            self._refresh_runtime_projection_ui(refresh_multi_radio=True)
-        else:
-            self._refresh_multi_radio_tables()
         self._last_persisted_device_profile = dict(saved)
-        self._emit_device_profiles_changed()
         if not getattr(self, "_guided_save_ui_deferred", False):
+            if project_runtime:
+                self._refresh_runtime_projection_ui(refresh_multi_radio=True)
+            else:
+                self._refresh_multi_radio_tables()
+            self._emit_device_profiles_changed()
             self._set_save_button_state("info" if self._settings_dirty else "success")
         return True
 

@@ -3,7 +3,7 @@ from copy import deepcopy
 from uuid import uuid4
 import json
 from freqinout.core.configuration_edit_session import (
-    ConfigEditSession, ConfigurationConflict, load_unfinished_configuration, save_configuration_edit,
+    ConfigEditSession, ConfigurationConflict, load_unfinished_configuration, save_configuration_edit, retain_configuration_edit,
 )
 from freqinout.core.multi_radio_store import COMMON_AMATEUR_BANDS, _normalize_band_token, SUPPORTED_DEVICE_CONTROL_BACKENDS, SUPPORTED_DEVICE_CLASSES
 from freqinout.core.software_identity_bundle import build_guided_identity_records
@@ -13,12 +13,17 @@ from freqinout.core.operator_application_configuration import (
     launch_configuration_token,
 )
 
-RADIO_FIELDS = frozenset(('name','device_class','control_backend','flrig_host','flrig_port',
+RADIO_FIELDS = frozenset(('name','radio_catalog_id','radio_manufacturer','radio_model','device_class','control_backend','flrig_host','flrig_port',
     'rig_host','rig_port',
     'antenna_group','antenna_supported_bands','notes','rf_conflict_group','ptt_group','sdr_host','sdr_port',
     'sdr_adapter','sdr_target','sdr_control_enabled',
     'use_flrig','use_fldigi','use_flmsg','use_flamp','use_js8call','use_varac','use_js8spotter',
     'use_external_js8spotter','use_commstat'))
+
+
+def normalize_supported_band(value):
+    token = _normalize_band_token(value)
+    return token + 'M' if token + 'M' in COMMON_AMATEUR_BANDS else token
 
 
 def load_operator_radio_context(store, radio_id=None):
@@ -74,7 +79,7 @@ def save_operator_radio(store,payload):
             else:
                 proposed.pop(field,None)
     band_raw = str(proposed.get('antenna_supported_bands') or '')
-    band_tokens = list(dict.fromkeys(_normalize_band_token(item) for item in band_raw.split(',') if item.strip()))
+    band_tokens = list(dict.fromkeys(normalize_supported_band(item) for item in band_raw.split(',') if item.strip()))
     invalid_bands = [band for band in band_tokens if band not in COMMON_AMATEUR_BANDS] if band_raw != str(base.get('antenna_supported_bands') or '') else []
     if not invalid_bands and 'antenna_supported_bands' in proposed:
         proposed['antenna_supported_bands'] = ', '.join(band_tokens)
@@ -82,6 +87,19 @@ def save_operator_radio(store,payload):
     proposed['_schedule_plan_id'] = int(payload.get('schedule_plan_id',base.get('_schedule_plan_id',0)) or 0)
     proposed['_identity_generation'] = base.get('_identity_generation',0)
     drafts = deepcopy(dict(payload.get('application_drafts') or {}))
+    if (proposed.get('control_backend') == 'flrig' and proposed.get('use_flrig')
+            and not proposed.get('fast_light_config_id') and 'fast_light' not in drafts
+            and (radio_id is None or proposed.get('control_backend') != base.get('control_backend')
+                 or proposed.get('use_flrig') != base.get('use_flrig'))
+            and not any(proposed.get(f'use_{name}') for name in ('fldigi', 'flmsg', 'flamp'))):
+        # The Radio page already reviewed this control endpoint. FLRig may be
+        # operator-started without an executable/launcher or a sibling app.
+        drafts['fast_light'] = {'operator_base_values': {}, 'operator_values': {
+            'flrig_enabled': True, 'fldigi_enabled': False, 'flmsg_enabled': False, 'flamp_enabled': False,
+            'host': str(raw_values.get('flrig_host') or '') if 'flrig_host' in raw_values else str(proposed.get('flrig_host', '127.0.0.1')),
+            'port': str(raw_values.get('flrig_port') or '') if 'flrig_port' in raw_values else str(proposed.get('flrig_port', 12345)),
+            'flrig_launch_control': 'operator', 'flrig_launch_at_startup': False,
+            'settings_identity_mode': 'default'}}
     base['_application_drafts'] = {}
     proposed['_application_drafts'] = drafts
     scope = f'radio:{radio_id or "new"}'
@@ -89,7 +107,18 @@ def save_operator_radio(store,payload):
     session = ConfigEditSession(base,draft_revision=envelope['revision'],watch_fields=('_identity_generation','_launch_snapshot'))
     session.session_id = str(payload.get('operator_session_id') or uuid4().hex)
     session.recovered_from = payload.get('operator_recovered_from')
+    replacement = payload.get('replace_saved_draft')
+    if replacement:
+        previous = envelope.get('payload') or {}
+        if (not isinstance(replacement, dict) or replacement.get('revision') != envelope['revision']
+                or replacement.get('session_id') != previous.get('session_id')):
+            raise ConfigurationConflict('The previous draft changed. Review it before replacing it.')
+        session.recovered_from = previous.get('session_id')
+    if payload.get('operator_draft_revision') is not None and not replacement:
+        session.draft_revision = payload['operator_draft_revision']
     session.values = proposed
+    if payload.get('keep_draft_only'):
+        return {'result': retain_configuration_edit(store, scope, session.snapshot()), 'profile': None}
     published = False
     saved_profile = None
 
@@ -110,10 +139,15 @@ def save_operator_radio(store,payload):
                 '_identity_generation':store.radio_software_identity_generation(radio_id),
                 '_launch_snapshot':launch_configuration_token(store.get_radio_launch_bundle(radio_id))}
 
+    corrections = []
     def validate(values):
         issues=[]
+        corrections.clear()
+        def radio_issue(message, field):
+            issues.append(message)
+            corrections.append({'family':'radio','field':field,'message':message})
         if invalid_bands:
-            issues.append('Choose recognized antenna bands separated by commas: ' + ', '.join(invalid_bands))
+            radio_issue('Review supported antenna bands on the Radio step. Unrecognized saved values: ' + ', '.join(invalid_bands), 'antenna_supported_bands')
         if values.get('control_backend','manual') not in SUPPORTED_DEVICE_CONTROL_BACKENDS:
             issues.append('Choose a supported radio control application.')
         if values.get('device_class','tx_rx') not in SUPPORTED_DEVICE_CLASSES:
@@ -121,19 +155,21 @@ def save_operator_radio(store,payload):
         if values.get('device_class') == 'observer' and (values.get('use_varac') or values.get('use_flrig')):
             issues.append('Observer radios cannot enable VarAC or FLRig transmit control.')
         if not str(values.get('name') or '').strip():
-            issues.append('Enter a radio name.')
+            radio_issue('Enter a radio name.', 'name')
         for field in ('flrig_port','rig_port','sdr_port'):
             if values.get(field) not in ('',None):
                 try:
                     if not 1 <= int(values[field]) <= 65535:
                         raise ValueError
                 except (ValueError,TypeError):
-                    issues.append(f'Enter a valid {field.replace("_"," ")}.')
+                    radio_issue(f'Enter a valid {field.replace("_"," ")}.', field)
         for family,link in LINKS.items():
             selected = bool(values.get('use_js8call' if family == 'js8call' else 'use_varac')) if family != 'fast_light' else any(values.get(f'use_{key}') for key in ('flrig','fldigi','flmsg','flamp'))
             draft = drafts.get(family)
             if draft:
-                issues.extend(application_issues(family,draft['operator_values']))
+                family_corrections = []
+                issues.extend(application_issues(family,draft['operator_values'], corrections=family_corrections))
+                corrections.extend({'family': family, **item} for item in family_corrections)
             elif selected and not values.get(link) and (radio_id is None or not any(base.get(flag) for flag in (('use_flrig','use_fldigi','use_flmsg','use_flamp') if family == 'fast_light' else ('use_js8call',) if family == 'js8call' else ('use_varac',)))):
                 issues.append(f'Choose Edit {family.replace("_"," ")} to enter its application settings.')
         return tuple(issues)
@@ -180,7 +216,7 @@ def save_operator_radio(store,payload):
         # Explicit radio Use selections remain independent of app/startup state.
         flags={key:int(bool(values[key])) for key in RADIO_FIELDS if key.startswith('use_') and key in values}
         if flags:
-            conn.execute('UPDATE device_profiles SET '+', '.join(f'{key}=?' for key in flags)+' WHERE id=?',list(flags.values())+[radio_id])
+            store.save_device_profile({'id':radio_id, **flags})
         # Preserve configured application identities independently of Use flags.
         # The explicit flags below own runtime/launch availability.
         effective=store.get_device_profile(radio_id)
@@ -229,7 +265,7 @@ def save_operator_radio(store,payload):
                 conn.execute('UPDATE radio_launch_bundle_items SET enabled=? WHERE radio_profile_id=? AND app_name=?',(int(bool(effective.get(flag))),radio_id,name))
         # A radio save never opts into scheduling. Material changes revoke its
         # intent; the separate Review & enable transaction owns reenabling.
-        if (set(changes) - {'id','name','notes'}) or drafts or model != old_model or plan != old_plan:
+        if (set(changes) - {'id','name','notes','radio_catalog_id','radio_manufacturer','radio_model'}) or drafts or model != old_model or plan != old_plan:
             conn.execute('UPDATE device_profiles SET scheduler_enabled=0 WHERE id=?',(radio_id,))
         saved_profile=store.get_device_profile(radio_id)
         saved_profile['antenna_supported_bands'] = ', '.join(json.loads(saved_profile.get('antenna_supported_bands_json') or '[]'))
@@ -239,5 +275,17 @@ def save_operator_radio(store,payload):
             raise ValueError('Saved operating model or schedule readback did not match.')
         published=True
 
-    result=save_configuration_edit(store,scope,session.snapshot(),read_current=read,validate=validate,publish=publish)
-    return {'result':result,'profile':saved_profile or (store.get_device_profile(radio_id) if radio_id else None)}
+    original_radio_id = radio_id
+    try:
+        result=save_configuration_edit(store,scope,session.snapshot(),read_current=read,validate=validate,publish=publish)
+    except ConfigurationConflict:
+        raise
+    except ValueError as exc:
+        # The failed atomic publication has rolled back. Retain the reviewed
+        # raw draft in a separate transaction, never a provisional radio ID.
+        radio_id, saved_profile, published = original_radio_id, None, False
+        issues = (str(exc),)
+        result=save_configuration_edit(store,scope,session.snapshot(),read_current=read,
+                                       validate=lambda _values: issues,publish=publish)
+    return {'result':result,'corrections':corrections,'profile':saved_profile if result.state == 'saved'
+            else (store.get_device_profile(original_radio_id) if original_radio_id else None)}

@@ -39,7 +39,7 @@ from freqinout.gui.theme import (
     label_style,
 )
 from freqinout.core.operator_application_configuration import (
-    operator_launch_recipe, js8_profile_path_review_token, js8_profile_paths_need_review,
+    operator_launch_recipe, js8_profile_path_review_token, js8_profile_paths_need_review, application_issues,
     JS8_REVIEW_PATHS,
 )
 
@@ -214,6 +214,16 @@ class ApplicationSetupEditor(QWidget):
         self.status_label.setToolTip(_text(text))
         self.status_label.setVisible(bool(_text(text).strip()) and _text(text).strip().casefold() != 'saved')
 
+    def set_discovery_state(self, state: str) -> None:
+        self._discovery_state = state
+        labels = {'ready': 'Find installed…', 'searching': 'Searching…',
+                  'detected': 'Detected · find again…', 'selected': 'Selected · find again…',
+                  'empty': 'Find again…', 'failed': 'Retry search…'}
+        self.find_button.setText(labels.get(state, 'Find installed…'))
+        role = {'detected': 'eligible_warning', 'selected': 'eligible_success'}.get(state, 'eligible_info')
+        self.find_button.setStyleSheet(button_style(role, getattr(self, '_theme_palette', active_app_theme())))
+        self.find_button.setAccessibleDescription(f'Application discovery: {state}')
+
     def set_busy(self, busy: bool) -> None:
         """Reflect an owner operation while keeping the draft intact."""
 
@@ -284,7 +294,7 @@ class ApplicationSetupEditor(QWidget):
         )
         self._apply_field_scope()
         self._apply_component_scope()
-        self._update_fast_light_scope_ui()
+        self._update_identity_visibility()
 
     def set_task_scope(self, task_key: str | None) -> None:
         """Show the smallest useful editor surface for a named task.
@@ -420,6 +430,12 @@ class ApplicationSetupEditor(QWidget):
         self.configuration_attention_label.setTextFormat(Qt.PlainText)
         self.configuration_attention_label.setAccessibleName("Saved configuration review reason")
         self.configuration_attention_label.hide()
+        self.required_fields_label = QLabel()
+        self.required_fields_label.setWordWrap(True)
+        self.required_fields_label.setTextFormat(Qt.PlainText)
+        self.required_fields_label.setAccessibleName('Required application fields')
+        self.required_fields_label.setObjectName('operatorRequiredApplicationFields')
+        self._content_layout.addWidget(self.required_fields_label)
         self._content_layout.addWidget(self.configuration_attention_label)
 
         self._normal_group = QGroupBox("Application")
@@ -521,7 +537,7 @@ class ApplicationSetupEditor(QWidget):
             # advanced section.  The CP display label remains independent.
             self._add_path(self._normal_form, "rig_name", "Named profile", "Actual JS8 profile name", browse=False)
             self._add_path(self._normal_form, "host", "Host", "127.0.0.1", browse=False)
-            self._add_path(self._normal_form, "port", "API port", "Port", browse=False)
+            self._add_path(self._normal_form, "port", "JS8Call TCP API port", "2442 (common default)", browse=False)
             self.launch_preview_label = QLabel()
             self.launch_preview_label.setWordWrap(True)
             self.launch_preview_label.setObjectName("operatorApplicationLaunchPreview")
@@ -554,8 +570,8 @@ class ApplicationSetupEditor(QWidget):
             self._build_fast_light_components()
             self._add_path(self._normal_form, "host", "FLRig host", "127.0.0.1", browse=False)
             self._add_path(self._normal_form, "fldigi_host", "FLDigi host", "127.0.0.1", browse=False)
-            self._add_path(self._normal_form, "port", "Control port", "Port", browse=False)
-            self._add_path(self._normal_form, "secondary_port", "FLDigi API port", "Port", browse=False)
+            self._add_path(self._normal_form, "port", "FLRig control port", "12345 (common default)", browse=False)
+            self._add_path(self._normal_form, "secondary_port", "FLDigi API port", "7362 (common default)", browse=False)
         elif family == "varac":
             launch_combo = self._add_combo(
                 self._normal_form,
@@ -936,6 +952,7 @@ class ApplicationSetupEditor(QWidget):
         self._sync_component_controls()
         self._update_identity_visibility()
         self._update_launch_preview()
+        self._refresh_required_fields()
 
     def _sync_component_controls(self) -> None:
         components = self._data.get("components") or {}
@@ -1090,7 +1107,8 @@ class ApplicationSetupEditor(QWidget):
         if rig is None or not hasattr(self, "settings_identity_combo"):
             return
         label = self._field_labels.get("rig_name")
-        visible = self.family_key == "js8call" and self.settings_identity_combo.currentData() == "isolated"
+        visible = (self.family_key == "js8call" and self.settings_identity_combo.currentData() == "isolated"
+                   and (self._visible_fields is None or 'rig_name' in self._visible_fields))
         rig.setVisible(visible)
         if label is not None:
             label.setVisible(visible)
@@ -1100,10 +1118,60 @@ class ApplicationSetupEditor(QWidget):
         launcher = self._field_widgets.get('launch_command')
         if self.family_key == 'js8call' and launcher is not None:
             custom = self.settings_identity_combo.currentData() == 'custom_launcher'
-            launcher.parentWidget().setEnabled(custom and not self._busy)
+            launcher.setEnabled(custom and not self._busy)
+            launcher_label = self._field_labels.get('launch_command')
+            if launcher_label is not None:
+                launcher_label.setEnabled(custom and not self._busy)
             launcher.setToolTip('Used only when Launches as is Existing launcher. Default and named profiles use the selected application.')
 
+    def focus_required_field(self, key):
+        widget = self.field_widget(key) if key else None
+        if widget is not None:
+            if self.more_group.isAncestorOf(widget):
+                self.more_button.setChecked(True)
+                self.more_group.show()
+            self.form_scroll.widget().layout().activate()
+            self.form_scroll.ensureWidgetVisible(widget)
+            widget.setFocus()
+
+    def _refresh_required_fields(self):
+        required = set()
+        if self.family_key == 'js8call':
+            required.update(('host', 'port'))
+            if self._data.get('settings_identity_mode') == 'isolated':
+                required.add('rig_name')
+        elif self.family_key == 'fast_light':
+            if self._data.get('flrig_enabled'):
+                required.update(('host', 'port'))
+            if self._data.get('fldigi_enabled'):
+                required.add('secondary_port')
+        elif self.family_key == 'varac':
+            required.add('configuration_path')
+        if self.family_key == 'fast_light':
+            for component in _COMPONENTS:
+                if self._data.get(f'{component}_enabled'):
+                    if self._data.get(f'{component}_launch_at_startup'):
+                        required.add(f'{component}_application_path')
+                    if self._data.get('settings_identity_mode') == 'separatefolder':
+                        required.add(f'{component}_configuration_path')
+        elif self._data.get('launch_control') == 'cp' and not self._data.get('launch_command'):
+            required.add('application_path')
+        if self.family_key == 'js8call' and self._data.get('settings_identity_mode') == 'custom_launcher' and not self._data.get('application_path'):
+            required.add('launch_command')
+        if not hasattr(self, '_required_base_labels'):
+            self._required_base_labels = {key: label.text() for key, label in self._field_labels.items()}
+        for key, label in self._field_labels.items():
+            label.setText(self._required_base_labels[key] + (' (required)' if key in required else ''))
+        corrections = []
+        application_issues(self.family_key, self._data, corrections=corrections)
+        visible = self._visible_fields
+        messages = [item['message'] for item in corrections
+                    if (visible is None or item['field'] is None or item['field'] in visible)]
+        self.required_fields_label.setText(' '.join(messages))
+        self.required_fields_label.setVisible(bool(messages))
+
     def _mark_changed(self, key: str, value: object) -> None:
+        self._refresh_required_fields()
         self._dirty = self._data != self._baseline
         self._update_launch_preview()
         self._refresh_dirty_label()
@@ -1178,6 +1246,7 @@ class ApplicationSetupEditor(QWidget):
         if heading is not None:
             heading.setStyleSheet(label_style('text', palette, weight=700))
         self.status_label.setStyleSheet(label_style("muted", palette))
+        self.required_fields_label.setStyleSheet(label_style('warning', palette))
         self.dirty_label.setStyleSheet(label_style("muted", palette))
         if hasattr(self, "launch_preview_label"):
             self.launch_preview_label.setStyleSheet(label_style("muted", palette))
@@ -1186,7 +1255,10 @@ class ApplicationSetupEditor(QWidget):
             self.fast_light_scope_note.setStyleSheet(label_style("muted", palette))
         if hasattr(self, "review_all_components_button"):
             self.review_all_components_button.setStyleSheet(button_style("secondary", palette))
-        self.find_button.setStyleSheet(button_style("muted", palette))
+        state = getattr(self, '_discovery_state', 'ready')
+        role = {'detected': 'eligible_warning', 'selected': 'eligible_success'}.get(state, 'eligible_info')
+        self._theme_palette = dict(palette)
+        self.find_button.setStyleSheet(button_style(role, palette))
         self.cancel_button.setStyleSheet(button_style("secondary", palette))
         self.save_button.setStyleSheet(button_style("primary", palette))
         for button in self._browse_buttons.values():

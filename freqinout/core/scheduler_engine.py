@@ -39,6 +39,7 @@ from freqinout.core.receiver_control import (
     ReceiverState,
 )
 from freqinout.core.scheduler_manual_control_service import SchedulerManualControlService
+from freqinout.core.scheduler_net_tuning import NetTuningMixin
 from freqinout.core.scheduler_coordination import (
     EndpointKey,
     EndpointResult,
@@ -384,7 +385,7 @@ def compute_next_change_time(
 # ---------------------------------------------------------------------------
 
 
-class SchedulerEngine(QObject):
+class SchedulerEngine(QObject, NetTuningMixin):
     """
     Central frequency scheduler.
 
@@ -409,6 +410,7 @@ class SchedulerEngine(QObject):
     """
 
     # Emitted whenever active entry or next change time updates
+    net_tuning_changed = Signal(int)
     active_entry_changed = Signal(dict, str)  # (entry, source: "HF" / "NET" / "SOP" / "NONE")
     next_change_updated = Signal(object)      # datetime or None
     off_schedule_detected = Signal(dict)
@@ -3843,6 +3845,7 @@ class SchedulerEngine(QObject):
         control_mode: str, freq_hz: int, band: str, ignore_coordination_prompt: bool,
         ignore_js8_busy: bool, ignore_varac_busy: bool, receive_only: bool = False,
         approved_guard_signature: str = "",
+        target_frequency_reader: Optional[Callable[[], int]] = None,
     ) -> Tuple[Callable[[], Optional[str]], Tuple[str, ...]]:
         """Capture detached authority on Qt; worker checks only memory and adapters."""
         gate = self._command_safety_gate()
@@ -3946,7 +3949,7 @@ class SchedulerEngine(QObject):
                     if shared.blocked:
                         return "execution_shared_ptt_hold"
                     conflict = guard.evaluate_rf_conflict_for_device(
-                        radio_id, target_band=band, target_frequency_hz=freq_hz,
+                        radio_id, target_band=band, target_frequency_hz=(target_frequency_reader() if target_frequency_reader else freq_hz),
                         source=source, status_by_device=evidence)
                     if conflict:
                         confirmed = bool(ignore_coordination_prompt and approved_guard_signature
@@ -4308,6 +4311,12 @@ class SchedulerEngine(QObject):
                         verification_data=result.actual_state(),
                         launch_handoff_token=launch_handoff_token,
                     )
+                    if source == "NET":
+                        # Publish the initial readback/launch handoff before a
+                        # second one-shot operation can change this endpoint.
+                        self._queue_scheduler_thread_call(
+                            lambda: self._maybe_start_net_tuning(schedule_entry, device_profile_id)
+                            if gate.current(device_profile_id, completion_stamp) else None)
                 else:
                     lane = registry.lane(endpoint_key)
                     lane_snapshot = lane.snapshot() if lane is not None else None
@@ -5519,6 +5528,7 @@ class SchedulerEngine(QObject):
             (row.get("vfo") or "").strip().upper(),
             (row.get("fldigi_mode") or "").strip().upper(),
             str(row.get("fldigi_offset") or "").strip(),
+            str(row.get("fldigi_tuning_json") or "{}"),
             str(row.get("js8_offset") or row.get("js8call_offset") or "").strip(),
             (row.get("start_utc") or "").strip(),
             (row.get("end_utc") or "").strip(),
@@ -7779,7 +7789,7 @@ class SchedulerEngine(QObject):
                     "net_name",
                     "group_name",
                     "fldigi_mode",
-                    "fldigi_offset",
+                    "fldigi_offset", "fldigi_tuning_json",
                     "target_scope",
                     "target_device_profile_id",
                     "target_operating_profile_id",
@@ -7816,6 +7826,7 @@ class SchedulerEngine(QObject):
                                 "group_name": row_data.get("group_name") or "",
                                 "fldigi_mode": row_data.get("fldigi_mode") or "",
                                 "fldigi_offset": row_data.get("fldigi_offset") or "",
+                                "fldigi_tuning_json": row_data.get("fldigi_tuning_json") or "{}",
                                 "target_scope": row_data.get("target_scope") or "station",
                                 "target_device_profile_id": row_data.get("target_device_profile_id"),
                                 "target_operating_profile_id": row_data.get("target_operating_profile_id"),
@@ -11457,7 +11468,13 @@ class SchedulerEngine(QObject):
                 throttle_sec=120.0,
                 endpoint_key=endpoint_key.canonical,
             )
+            net_tuning_gate = self._command_safety_gate() if source == "NET" else None
+            net_tuning_stamp = net_tuning_gate.stamp(target_radio_id) if net_tuning_gate else None
             self.active_entry_changed.emit(effective_entry, source)
+            if source == "NET":
+                self._queue_scheduler_thread_call(
+                    lambda: self._maybe_start_net_tuning(effective_entry, target_radio_id)
+                    if net_tuning_gate.current(target_radio_id, net_tuning_stamp) else None)
             return "already_applied"
         pending_by_endpoint = getattr(self, "_pending_entry_keys_by_endpoint", {})
         pending_for_endpoint = (

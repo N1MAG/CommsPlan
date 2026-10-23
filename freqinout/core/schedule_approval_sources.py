@@ -9,7 +9,7 @@ import sqlite3
 from freqinout.core.sqlite_utils import connect_sqlite_readonly
 
 TABLE = '_cp_schedule_source_revision'
-IMPLEMENTATION_VERSION = 3
+IMPLEMENTATION_VERSION = 4
 SOURCE_TABLES = ('daily_schedule_tab','net_schedule_tab','net_schedule','sop_schedule_layer',
                  'sop_profiles','sop_net_conflict_policy','net_resources','frequency_plans')
 

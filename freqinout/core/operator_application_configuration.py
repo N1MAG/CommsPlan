@@ -117,34 +117,38 @@ def js8_profile_paths_need_review(base, values):
                 and any(base.get(key) and values.get(key) == base.get(key) for key in JS8_REVIEW_PATHS))
 
 
-def application_issues(family: str, values: Mapping[str, Any]) -> tuple[str, ...]:
+def application_issues(family: str, values: Mapping[str, Any], *, corrections=None) -> tuple[str, ...]:
     issues = []
+    def add(message, field=None):
+        issues.append(message)
+        if corrections is not None:
+            corrections.append({'field': field, 'message': message})
     if family == 'js8call' or (family == 'fast_light' and values.get('flrig_enabled')):
         if not str(values.get('host') or '').strip():
-            issues.append('Enter an endpoint host.')
+            add('Enter a JS8Call API host.' if family == 'js8call' else 'Enter an FLRig control host.', 'host')
         try:
             if not 1 <= int(values.get('port') or '') <= 65535:
                 raise ValueError
         except (TypeError, ValueError):
-            issues.append('Enter an API/control port from 1 to 65535.')
+            add('Enter a JS8Call TCP API port from 1 to 65535.' if family == 'js8call' else 'Enter an FLRig control port from 1 to 65535.', 'port')
     if family == 'js8call' and values.get('settings_identity_mode') == 'isolated' and not str(values.get('rig_name') or '').strip():
-        issues.append('Enter the native JS8Call profile name, or select Default profile.')
+        add('Enter the native JS8Call profile name, or select Default profile.', 'rig_name')
     if family != 'fast_light' and values.get('launch_at_startup') and values.get('launch_control', 'cp') != 'cp':
-        issues.append('Choose CommsPlan launches before enabling application startup.')
+        add('Choose CommsPlan launches before enabling application startup.', 'launch_control')
     if family != 'fast_light' and values.get('launch_control') == 'cp' and not (values.get('application_path') or values.get('launch_command')):
-        issues.append('Choose the application or launcher for CommsPlan to launch.')
+        add('Choose the application or launcher for CommsPlan to launch.', 'application_path')
     if family == 'varac' and not str(values.get('configuration_path') or '').strip():
-        issues.append('Choose the existing VarAC INI file.')
+        add('Choose the existing VarAC INI file.', 'configuration_path')
     if family == 'fast_light':
         if not any(values.get(f'{name}_enabled') for name in ('flrig','fldigi','flmsg','flamp')):
-            issues.append('Choose at least one Fast Light component.')
+            add('Choose at least one Fast Light component.')
         if values.get('fldigi_enabled') and values.get('secondary_port') in ('', None):
-            issues.append('Enter an FLDigi API port from 1 to 65535.')
+            add('Enter an FLDigi API port from 1 to 65535.', 'secondary_port')
         for name in ('flrig','fldigi','flmsg','flamp'):
             if values.get(f'{name}_enabled') and values.get(f'{name}_launch_at_startup') and not values.get(f'{name}_application_path'):
-                issues.append(f'Choose the {name.upper()} executable before enabling startup.')
+                add(f'Choose the {name.upper()} executable before enabling startup.', f'{name}_application_path')
             if values.get(f'{name}_enabled') and values.get('settings_identity_mode') == 'separatefolder' and not values.get(f'{name}_configuration_path'):
-                issues.append(f'Choose the {name.upper()} settings folder.')
+                add(f'Choose the {name.upper()} settings folder.', f'{name}_configuration_path')
     for field in ('secondary_port', 'offset_hz'):
         if values.get(field) not in ('', None):
             try:
@@ -152,15 +156,15 @@ def application_issues(family: str, values: Mapping[str, Any]) -> tuple[str, ...
                 if (field == 'secondary_port' and not 1 <= number <= 65535) or (field == 'offset_hz' and number <= 0):
                     raise ValueError
             except (TypeError, ValueError):
-                issues.append(f'Enter a valid whole number for {field.replace("_", " ")}.')
+                add(f'Enter a valid whole number for {field.replace("_", " ")}.', field)
     if family == 'js8call' and values.get('settings_identity_mode') == 'custom_launcher' and not (values.get('launch_command') or values.get('application_path')):
-        issues.append('Choose or enter the existing launcher command.')
+        add('Choose or enter the existing launcher command.', 'launch_command')
     if family == 'fast_light' and values.get('launch_command'):
-        issues.append('Choose each Fast Light executable separately; a family launcher cannot identify its components.')
+        add('Choose each Fast Light executable separately; a family launcher cannot identify its components.')
     try:
         operator_launch_recipe(family, values)
     except (ValueError, TypeError) as exc:
-        issues.append(str(exc))
+        add(str(exc))
     return tuple(issues)
 
 

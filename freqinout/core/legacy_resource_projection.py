@@ -12,13 +12,14 @@ import sqlite3
 from typing import Any, Iterable, Mapping, Sequence
 
 from freqinout.core.resource_catalog_migration import synchronize_legacy_rows_in_connection
+from freqinout.core.fldigi_tuning import tuning_preset_json
 
 
 LEGACY_COLUMNS = (
     "resource_set", "source_type", "source_ref", "readonly", "day_utc", "recurrence",
     "biweekly_offset_weeks", "month_weeks", "group_name", "band", "mode", "frequency",
     "start_utc", "end_utc", "early_checkin", "primary_js8call_group", "coverage", "comment",
-    "net_name", "fldigi_mode", "fldigi_offset", "updated_utc",
+    "net_name", "fldigi_mode", "fldigi_offset", "fldigi_tuning_json", "updated_utc",
 )
 
 
@@ -38,6 +39,8 @@ def upsert_legacy_resource(
     update_existing: bool = True,
     synchronize: bool = True,
 ) -> int:
+    available = {str(row[1]) for row in conn.execute("PRAGMA table_info(net_resources)")}
+    columns = tuple(name for name in LEGACY_COLUMNS if name in available)
     values = {
         "resource_set": resource_set,
         "source_type": source_type,
@@ -45,13 +48,16 @@ def upsert_legacy_resource(
         "readonly": int(readonly),
         "updated_utc": utc_now_iso(),
     }
-    values.update({name: row.get(name, "") for name in LEGACY_COLUMNS if name not in values})
+    values.update({name: row.get(name, "") for name in columns if name not in values})
     values["biweekly_offset_weeks"] = int(values.get("biweekly_offset_weeks") or 0)
     values["early_checkin"] = int(values.get("early_checkin") or 0)
+    if "fldigi_tuning_json" in columns:
+        values["fldigi_tuning_json"] = tuning_preset_json(row.get("fldigi_tuning_json"))
     rid = int(resource_id or 0)
     if rid <= 0:
+        tuning_clause = " AND COALESCE(NULLIF(TRIM(fldigi_tuning_json),''),'{}')=?" if "fldigi_tuning_json" in columns else ""
         existing = conn.execute(
-            """SELECT id FROM net_resources
+            f"""SELECT id FROM net_resources
             WHERE TRIM(resource_set)=TRIM(?)
               AND TRIM(day_utc)=TRIM(?)
               AND LOWER(TRIM(COALESCE(recurrence,'')))=LOWER(TRIM(?))
@@ -62,10 +68,12 @@ def upsert_legacy_resource(
               AND TRIM(COALESCE(frequency,''))=TRIM(?)
               AND TRIM(start_utc)=TRIM(?) AND TRIM(end_utc)=TRIM(?)
               AND UPPER(TRIM(COALESCE(net_name,'')))=UPPER(TRIM(?))
+              {tuning_clause}
             ORDER BY id LIMIT 1""",
             (resource_set, values["day_utc"], values["recurrence"], values["month_weeks"],
              values["group_name"], values["band"], values["mode"], values["frequency"],
-             values["start_utc"], values["end_utc"], values["net_name"]),
+             values["start_utc"], values["end_utc"], values["net_name"],
+             *([values["fldigi_tuning_json"]] if tuning_clause else [])),
         ).fetchone()
         if existing:
             rid = int(existing[0])
@@ -74,16 +82,16 @@ def upsert_legacy_resource(
                     synchronize_legacy_rows_in_connection(conn)
                 return rid
     if rid > 0 and conn.execute("SELECT 1 FROM net_resources WHERE id=?", (rid,)).fetchone():
-        assignments = ",".join(f"{name}=?" for name in LEGACY_COLUMNS)
+        assignments = ",".join(f"{name}=?" for name in columns)
         conn.execute(
             f"UPDATE net_resources SET {assignments} WHERE id=?",
-            tuple(values[name] for name in LEGACY_COLUMNS) + (rid,),
+            tuple(values[name] for name in columns) + (rid,),
         )
     else:
-        marks = ",".join("?" for _ in LEGACY_COLUMNS)
+        marks = ",".join("?" for _ in columns)
         cursor = conn.execute(
-            f"INSERT INTO net_resources ({','.join(LEGACY_COLUMNS)}) VALUES ({marks})",
-            tuple(values[name] for name in LEGACY_COLUMNS),
+            f"INSERT INTO net_resources ({','.join(columns)}) VALUES ({marks})",
+            tuple(values[name] for name in columns),
         )
         rid = int(cursor.lastrowid or 0)
     if synchronize:
@@ -99,7 +107,8 @@ def update_legacy_resource_fields(
     synchronize: bool = True,
 ) -> bool:
     rid = int(resource_id or 0)
-    allowed = set(LEGACY_COLUMNS) - {"updated_utc"}
+    available = {str(row[1]) for row in conn.execute("PRAGMA table_info(net_resources)")}
+    allowed = (set(LEGACY_COLUMNS) & available) - {"updated_utc"}
     selected = {name: value for name, value in fields.items() if name in allowed}
     if rid <= 0 or not selected:
         return False
@@ -136,9 +145,12 @@ def dedupe_legacy_resources(
     *,
     synchronize: bool = True,
 ) -> int:
+    tuning_column = ",fldigi_tuning_json" if "fldigi_tuning_json" in {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(net_resources)")
+    } else ""
     rows = conn.execute(
-        """SELECT id,resource_set,day_utc,recurrence,month_weeks,group_name,band,mode,
-                  frequency,start_utc,end_utc,net_name,updated_utc
+        f"""SELECT id,resource_set,day_utc,recurrence,month_weeks,group_name,band,mode,
+                  frequency,start_utc,end_utc,net_name{tuning_column},updated_utc
            FROM net_resources ORDER BY COALESCE(updated_utc,'') DESC,id DESC"""
     ).fetchall()
     seen: set[tuple[str, ...]] = set()

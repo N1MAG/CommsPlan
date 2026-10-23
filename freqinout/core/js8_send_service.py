@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
 import threading
 import time
 
@@ -86,6 +86,14 @@ class JS8SelectedTargetState:
     @property
     def has_target(self) -> bool:
         return bool(self.target)
+
+
+@dataclass(frozen=True)
+class JS8SelectedTargetClearResult:
+    state: JS8SelectedTargetState
+    cleared: bool = False
+    status: str = "unavailable"
+    detail: str = ""
 
 
 _EXPECT_TX_LOCKS: dict[tuple[str, int], threading.RLock] = {}
@@ -258,6 +266,15 @@ def normalize_js8_target(value: object) -> str:
     return str(value or "").strip().upper()
 
 
+def _selected_target_value(response: object) -> str:
+    """Read value/legacy parameter spellings without mistaking a target for empty."""
+    params = getattr(response, "params", {}) or {}
+    return normalize_js8_target(
+        getattr(response, "value", "") or params.get("CALLSIGN")
+        or params.get("CALL") or params.get("TARGET") or ""
+    )
+
+
 def query_js8_selected_target(
     client: JS8ApiClient,
     *,
@@ -285,13 +302,7 @@ def query_js8_selected_target(
             expect_types=("RX.CALL_SELECTED",),
             timeout_s=timeout_s,
         )
-        target = normalize_js8_target(
-            response.value
-            or response.params.get("CALLSIGN")
-            or response.params.get("CALL")
-            or response.params.get("TARGET")
-            or ""
-        )
+        target = _selected_target_value(response)
         return JS8SelectedTargetState(endpoint=endpoint, target=target, available=True)
     except Exception as exc:
         return JS8SelectedTargetState(
@@ -299,6 +310,90 @@ def query_js8_selected_target(
             available=False,
             detail=f"JS8Call selected-target state is unavailable: {exc}",
         )
+
+
+def clear_js8_selected_target(
+    client: JS8ApiClient,
+    expected_target: object,
+    *,
+    timeout_s: float = 0.8,
+    cancelled: Callable[[], bool] | None = None,
+) -> JS8SelectedTargetClearResult:
+    """Explicit clear-only transaction; correlated evidence, never a send.
+
+    The endpoint lock serializes CP commands, not external JS8Call UI clicks.
+    Unsupported variants keep the existing manual-deselection fallback.
+    """
+    endpoint = client.endpoint.normalized()
+    state = JS8SelectedTargetState(endpoint)
+    expected = normalize_js8_target(expected_target)
+    timeout = max(0.05, min(2.0, float(timeout_s)))
+    lock = _endpoint_tx_lock(client)
+
+    def result(status: str, detail: str, cleared: bool = False) -> JS8SelectedTargetClearResult:
+        return JS8SelectedTargetClearResult(state, cleared, status, detail)
+
+    def stopped() -> bool:
+        return bool(cancelled and cancelled())
+
+    def read() -> JS8SelectedTargetState:
+        response = client.request(
+            "RX.GET_CALL_SELECTED", expect_types=("RX.CALL_SELECTED",),
+            timeout_s=timeout, require_id=True,
+        )
+        return JS8SelectedTargetState(endpoint, _selected_target_value(response), True)
+
+    deadline = time.monotonic() + timeout
+    acquired = False
+    try:
+        while not stopped() and time.monotonic() < deadline:
+            acquired = lock.acquire(timeout=min(0.05, max(0.001, deadline - time.monotonic())))
+            if acquired:
+                break
+        if stopped():
+            return result("cancelled", "Selection clear cancelled.")
+        if not acquired:
+            return result("unavailable", "JS8Call is busy with another CP action. Try again.")
+        if not client.is_running:
+            client.start()
+        if not client.is_connected:
+            return result("unavailable", "JS8Call is not connected; selection was not cleared.")
+        # Reconnection during this transaction invalidates its identity evidence.
+        connection = getattr(client, "last_connected_ts", None)
+        state = read()
+        if stopped():
+            return result("cancelled", "Selection clear cancelled.")
+        if not state.target:
+            return result("already_empty", "No selection is currently set in JS8Call.", True)
+        if state.target != expected:
+            return result("changed", "JS8Call selection changed. Review it before clearing.")
+        if getattr(client, "last_connected_ts", None) != connection:
+            state = JS8SelectedTargetState(endpoint)
+            return result("unavailable", "JS8Call reconnected; refresh its selection before clearing.")
+        if stopped():
+            return result("cancelled", "Selection clear cancelled.")
+        response = client.request(
+            "RX.SET_CALL_SELECTED", value="", expect_types=("RX.CALL_SELECTED",),
+            timeout_s=timeout, require_id=True,
+        )
+        setter_target = _selected_target_value(response)
+        state = read()
+        if getattr(client, "last_connected_ts", None) != connection:
+            state = JS8SelectedTargetState(endpoint)
+            return result("unavailable", "JS8Call reconnected; could not verify the clear result.")
+        if stopped():
+            return result("cancelled", "Selection clear completed after cancellation; refresh to verify current state.")
+        if setter_target or state.target:
+            return result("failed", "JS8Call selection could not be verified empty. Deselect in JS8Call or refresh.")
+        return result("cleared", "Selection cleared in JS8Call.", True)
+    except Exception:
+        # A setter may have reached the application even if its reply was lost.
+        # Do not publish a previous selection as current or a timeout as empty.
+        state = JS8SelectedTargetState(endpoint)
+        return result("unavailable", "Could not verify selection. Refresh or deselect in JS8Call.")
+    finally:
+        if acquired:
+            lock.release()
 
 
 def set_js8_selected_target(client: JS8ApiClient, target: object = "", *, settle_s: float = 0.12) -> None:

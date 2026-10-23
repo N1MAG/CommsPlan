@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QEvent, QObject, QRect, QSize, Qt, QTimer
-from PySide6.QtWidgets import QHeaderView, QTableWidget
+from PySide6.QtWidgets import QHeaderView, QLayout, QTableWidget
 
 
 class ResponsiveContentTable(QTableWidget):
@@ -190,3 +190,86 @@ def save_full_window_geometry(window, preferences) -> None:
     """Persist only on explicit shutdown, never on resize or status polling."""
     preferences.setValue("full_window_geometry", window.saveGeometry())
     preferences.sync()
+
+
+class WrappingControlLayout(QLayout):
+    """Wrapping controls with a font-derived, single-control width floor.
+
+    Qt height-for-width negotiation owns reflow; no resize callbacks, timers or
+    screen measurements are needed. Buttons keep their complete text/hit size.
+    """
+
+    def __init__(self, parent=None, *, spacing=6, alignment=Qt.AlignRight, max_columns=None):
+        super().__init__(parent)
+        self._alignment = alignment
+        self._max_columns = max_columns
+        self._items = []
+        self.setContentsMargins(0, 0, 0, 0)
+        self.setSpacing(spacing)
+
+    def addItem(self, item):
+        self._items.append(item)
+        self.invalidate()
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, index):
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index):
+        if 0 <= index < len(self._items):
+            item = self._items.pop(index)
+            self.invalidate()
+            return item
+        return None
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._layout_rows(QRect(0, 0, width, 0), measure=True)
+
+    def minimumSize(self):
+        size = QSize(0, 0)
+        for item in self._items:
+            if not item.isEmpty():
+                size = size.expandedTo(item.minimumSize())
+        margins = self.contentsMargins()
+        return size + QSize(margins.left() + margins.right(), margins.top() + margins.bottom())
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._layout_rows(rect, measure=False)
+
+    def _layout_rows(self, rect, *, measure):
+        margins = self.contentsMargins()
+        available = max(0, rect.width() - margins.left() - margins.right())
+        gap = max(0, self.spacing())
+        rows, row, width, height = [], [], 0, 0
+        for item in self._items:
+            if item.isEmpty():
+                continue
+            size = item.sizeHint().expandedTo(item.minimumSize())
+            if row and (width + gap + size.width() > available
+                        or (self._max_columns is not None and len(row) >= self._max_columns)):
+                rows.append((row, width, height))
+                row, width, height = [], 0, 0
+            width += (gap if row else 0) + size.width()
+            height = max(height, size.height())
+            row.append((item, size))
+        if row:
+            rows.append((row, width, height))
+        y = rect.y() + margins.top()
+        for row, width, height in rows:
+            offset = max(0, available - width) if self._alignment & Qt.AlignRight else 0
+            x = rect.x() + margins.left() + offset
+            for item, size in row:
+                if not measure:
+                    item.setGeometry(QRect(x, y, size.width(), height))
+                x += size.width() + gap
+            y += height + gap
+        return y - rect.y() - (gap if rows else 0) + margins.bottom()

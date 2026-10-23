@@ -57,6 +57,7 @@ from PySide6.QtWidgets import (
     QProgressDialog,
     QPushButton,
     QTextEdit,
+    QTextBrowser,
     QPlainTextEdit,
     QFileDialog,
     QGroupBox,
@@ -180,6 +181,8 @@ from freqinout.core.mesh.settings import (
     mesh_outbound_capability,
 )
 from freqinout.core.mesh.store import list_mesh_channel_policies, list_mesh_health, list_mesh_nodes
+from freqinout.core.mesh.contacts import ContactSnapshot, contact_identity, list_contact_favorites
+from freqinout.gui.mesh_contact_lane import MeshContactLane
 from freqinout.core.regional_intelligence import STATE_TO_FEMA_REGION, US_STATE_ABBR_FROM_NAME
 from freqinout.core.sqlite_utils import connect_sqlite, connect_sqlite_readonly, fetch_all, table_exists
 from freqinout.core.sqlite_fingerprint import sqlite_identifier, sqlite_table_fingerprint
@@ -408,6 +411,7 @@ from freqinout.core.js8_spotter_codec import (
 )
 from freqinout.core.js8_spotter_status import classify_spotter_status
 from freqinout.core.js8_send_service import (
+    clear_js8_selected_target,
     js8_endpoint_from_radio_profile,
     js8_profile_allows_transmit,
     query_js8_selected_target,
@@ -1021,13 +1025,18 @@ class _ComposeStageWorker(QObject):
 
     finished = Signal(object)
 
-    def __init__(self, request: ComposeStageRequest):
+    def __init__(self, request: ComposeStageRequest, summary_context=None):
         super().__init__()
         self._request = request
+        self._summary_context = summary_context
 
     def run(self) -> None:
         try:
-            result = stage_compose_request(self._request)
+            if self._summary_context is not None:
+                from freqinout.core.traffic_summary_stage import stage_summary_request
+                result = stage_summary_request(self._request, self._summary_context)
+            else:
+                result = stage_compose_request(self._request)
         except Exception as exc:
             result = ComposeStageResult(
                 generation=self._request.generation,
@@ -1086,7 +1095,7 @@ class _ComposeJs8SendWorker(QObject):
 
 
 class _ComposeJs8SelectedTargetWorker(QObject):
-    """Read one JS8Call UI target selection outside the GUI thread."""
+    """Read or clear one JS8Call UI target selection outside the GUI thread."""
 
     finished = Signal(object)
 
@@ -1094,19 +1103,60 @@ class _ComposeJs8SelectedTargetWorker(QObject):
         super().__init__()
         self._endpoint = endpoint.normalized()
         self._context = dict(context)
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        """Fence a queued clear before the endpoint helper mutates selection."""
+        self._cancel_event.set()
+
+    def _cancelled(self) -> bool:
+        return self._cancel_event.is_set()
 
     def run(self) -> None:
         payload = dict(self._context)
+        if self._cancelled():
+            if str(self._context.get("action", "refresh") or "refresh") == "clear":
+                payload.update(
+                    {
+                        "result": None,
+                        "status": "cancelled",
+                        "cleared": False,
+                        "supported": False,
+                        "target": "",
+                        "error": "Selection clear cancelled before endpoint access.",
+                    }
+                )
+            self.finished.emit(payload)
+            return
         try:
             client = JS8ApiClientRegistry.get(self._endpoint, timeout_s=0.8, auto_reconnect=True)
-            state = query_js8_selected_target(client, timeout_s=0.6)
-            payload.update(
-                {
-                    "supported": bool(state.available),
-                    "target": state.target,
-                    "error": state.detail,
-                }
-            )
+            if str(self._context.get("action", "refresh") or "refresh") == "clear":
+                result = clear_js8_selected_target(
+                    client,
+                    self._context.get("expected_target", ""),
+                    timeout_s=0.8,
+                    cancelled=self._cancelled,
+                )
+                state = result.state
+                payload.update(
+                    {
+                        "result": result,
+                        "status": str(result.status or "failed"),
+                        "cleared": bool(result.cleared),
+                        "supported": bool(state.available),
+                        "target": state.target,
+                        "error": str(result.detail or state.detail or ""),
+                    }
+                )
+            else:
+                state = query_js8_selected_target(client, timeout_s=0.6)
+                payload.update(
+                    {
+                        "supported": bool(state.available),
+                        "target": state.target,
+                        "error": state.detail,
+                    }
+                )
         except Exception as exc:
             payload.update({"supported": False, "target": "", "error": str(exc)})
         self.finished.emit(payload)
@@ -1211,7 +1261,7 @@ class _ComposeMeshDiscoveryWorker(QObject):
         self.generation, self.values, self.db_path = generation, values, db_path
 
     def run(self) -> None:
-        result = {"generation": self.generation, "configs": [], "health": {}, "destinations": {}}
+        result = {"generation": self.generation, "configs": [], "health": {}, "destinations": {}, "favorites": {}}
         try:
             configs = [config for config in load_mesh_connection_configs(self.values)
                        if config.enabled and config.send_enabled
@@ -1224,6 +1274,8 @@ class _ComposeMeshDiscoveryWorker(QObject):
                 if QThread.currentThread().isInterruptionRequested():
                     break
                 try:
+                    favorites = list_contact_favorites(self.db_path, config.adapter_id)
+                    result["favorites"][config.adapter_id] = tuple(favorites)
                     result["destinations"][config.adapter_id] = (
                         list_mesh_channel_policies(self.db_path, adapter_id=config.adapter_id, read_only=True),
                         list_mesh_nodes(self.db_path, adapter_id=config.adapter_id, limit=200, read_only=True),
@@ -3923,6 +3975,8 @@ class MessageViewerTab(QWidget):
         self._messages_mode: str = "Inbox"
         self._compose_templates: List[ComposeFormTemplate] = []
         self._compose_template_kind: str = "custom"
+        self._compose_summary_context = None
+        self._traffic_summary_dialog = None
         self._compose_field_widgets: Dict[str, QWidget] = {}
         self._compose_field_rows: List[ComposeFieldDefinition] = []
         self._compose_spotter_fields: List[SpotterFormField] = []
@@ -3985,6 +4039,7 @@ class MessageViewerTab(QWidget):
         self._compose_js8_selected_target_radio_id: int = 0
         self._compose_js8_selected_target_endpoint_identity: str = ""
         self._compose_js8_selected_target_error: str = ""
+        self._compose_js8_selected_target_action: str = ""
         self._compose_js8_selected_target_thread: QThread | None = None
         self._compose_js8_selected_target_worker: _ComposeJs8SelectedTargetWorker | None = None
         self._compose_js8_selected_target_pending_context: Dict[str, object] = {}
@@ -4001,6 +4056,12 @@ class MessageViewerTab(QWidget):
         self._compose_send_worker: _ComposeJs8SendWorker | None = None
         self._compose_mesh_configs: list[object] = []
         self._compose_mesh_health_by_adapter: dict[str, dict[str, object]] = {}
+        self._compose_mesh_favorites_by_adapter: dict[str, tuple[tuple[str, str, str, str], ...]] = {}
+        self._compose_mesh_contact_generation: int = 0
+        self._compose_mesh_contact_pending: dict[str, object] = {}
+        self._compose_mesh_contact_lane = MeshContactLane(self)
+        self._compose_mesh_contact_lane.ready.connect(self._on_compose_mesh_contact_ready)
+        self._compose_mesh_contact_dialog: QDialog | None = None
         self._compose_mesh_send_inflight = False
         self._compose_mesh_request_id = ""
         self._compose_send_inflight: bool = False
@@ -5765,6 +5826,9 @@ class MessageViewerTab(QWidget):
 
         self.more_actions_btn = QPushButton("More Actions")
         self.more_actions_menu = QMenu(self.more_actions_btn)
+        self.more_traffic_summary_action = self.more_actions_menu.addAction("Create Traffic Summary…")
+        self.more_traffic_summary_action.triggered.connect(self._open_traffic_summary)
+        self.more_actions_menu.addSeparator()
         self.more_export_pdf_action = self.more_actions_menu.addAction("Export to PDF")
         self.more_export_pdf_action.triggered.connect(self._export_pdf)
         self._export_selected_available = callable(getattr(self, "_export_selected_csv", None))
@@ -7038,21 +7102,30 @@ class MessageViewerTab(QWidget):
         self.compose_js8_selected_target_label.setToolTip(
             "This is live state observed in JS8Call. It is not copied into this draft or sent until you choose Use Target."
         )
-        selected_target_row.addWidget(self.compose_js8_selected_target_label, 0, 0, 1, 2)
+        selected_target_row.addWidget(self.compose_js8_selected_target_label, 0, 0, 1, 3)
         self.compose_js8_selected_target_use_btn = QPushButton("Use Target")
         self.compose_js8_selected_target_use_btn.setToolTip(
             "Copy the target already selected in JS8Call into this compose draft. This does not send a message."
         )
         self.compose_js8_selected_target_use_btn.clicked.connect(self._use_compose_js8_selected_target)
         selected_target_row.addWidget(self.compose_js8_selected_target_use_btn, 1, 0)
+        self.compose_js8_selected_target_clear_btn = QPushButton("Clear selection")
+        self.compose_js8_selected_target_clear_btn.setToolTip(
+            "Clear the selection in JS8Call after verifying it is still the observed target. "
+            "Normal JS8Call deselection behavior can resume selection-paused heartbeats. "
+            "This keeps the draft and does not send a message."
+        )
+        self.compose_js8_selected_target_clear_btn.clicked.connect(self._clear_compose_js8_selected_target)
+        selected_target_row.addWidget(self.compose_js8_selected_target_clear_btn, 1, 1)
         self.compose_js8_selected_target_refresh_btn = QPushButton("Refresh Target")
         self.compose_js8_selected_target_refresh_btn.setToolTip(
             "Check the currently selected callsign or group in JS8Call for this radio."
         )
         self.compose_js8_selected_target_refresh_btn.clicked.connect(self.request_compose_js8_selected_target_refresh)
-        selected_target_row.addWidget(self.compose_js8_selected_target_refresh_btn, 1, 1)
+        selected_target_row.addWidget(self.compose_js8_selected_target_refresh_btn, 1, 2)
         selected_target_row.setColumnStretch(0, 0)
         selected_target_row.setColumnStretch(1, 0)
+        selected_target_row.setColumnStretch(2, 0)
         self.compose_js8_selected_target_row_widget.setVisible(False)
         setup_layout.addWidget(self.compose_js8_selected_target_row_widget)
 
@@ -7091,7 +7164,7 @@ class MessageViewerTab(QWidget):
         self.compose_mesh_channel_combo.currentIndexChanged.connect(self._update_compose_preview)
         self.compose_mesh_node_combo = QComboBox()
         self.compose_mesh_node_combo.setMinimumWidth(220)
-        self.compose_mesh_node_combo.currentIndexChanged.connect(self._update_compose_preview)
+        self.compose_mesh_node_combo.currentIndexChanged.connect(self._on_compose_mesh_contact_selection_changed)
         self.compose_mesh_ack_chk = QCheckBox("Request node acknowledgement")
         self.compose_mesh_ack_chk.setChecked(True)
         self.compose_mesh_ack_chk.setToolTip(
@@ -7101,6 +7174,27 @@ class MessageViewerTab(QWidget):
         self.compose_mesh_hint_label = QLabel("")
         self.compose_mesh_hint_label.setWordWrap(True)
         self.compose_mesh_hint_label.setStyleSheet(label_style("muted", resolve_theme(self.settings), weight=600))
+        self.compose_mesh_contact_status_label = QLabel("")
+        self.compose_mesh_contact_status_label.setWordWrap(True)
+        self.compose_mesh_contact_status_label.setStyleSheet(label_style("muted", resolve_theme(self.settings), weight=600))
+        self.compose_mesh_contact_action_row = QWidget()
+        contact_action_layout = QHBoxLayout(self.compose_mesh_contact_action_row)
+        contact_action_layout.setContentsMargins(0, 2, 0, 0)
+        contact_action_layout.setSpacing(8)
+        self.compose_mesh_contact_history_btn = QPushButton("Inspect contact history")
+        self.compose_mesh_contact_history_btn.setToolTip(
+            "Read the bounded retained history for the exact selected MeshCore node and full public key."
+        )
+        self.compose_mesh_contact_history_btn.clicked.connect(self._inspect_compose_mesh_contact)
+        contact_action_layout.addWidget(self.compose_mesh_contact_history_btn)
+        self.compose_mesh_contact_favorite_btn = QPushButton("Add favorite")
+        self.compose_mesh_contact_favorite_btn.setToolTip(
+            "Save this exact MeshCore adapter, node, and full public-key identity as an operator favorite."
+        )
+        self.compose_mesh_contact_favorite_btn.clicked.connect(self._toggle_compose_mesh_favorite)
+        contact_action_layout.addWidget(self.compose_mesh_contact_favorite_btn)
+        contact_action_layout.addStretch(1)
+        self.compose_mesh_contact_action_row.setVisible(False)
         mesh_setup_layout.addWidget(QLabel("Connection"), 0, 0)
         mesh_setup_layout.addWidget(self.compose_mesh_source_combo, 0, 1)
         mesh_setup_layout.addWidget(self.compose_mesh_refresh_btn, 0, 2)
@@ -7110,6 +7204,8 @@ class MessageViewerTab(QWidget):
         mesh_setup_layout.addWidget(self.compose_mesh_node_combo, 3, 1, 1, 2)
         mesh_setup_layout.addWidget(self.compose_mesh_ack_chk, 4, 1, 1, 2)
         mesh_setup_layout.addWidget(self.compose_mesh_hint_label, 5, 0, 1, 3)
+        mesh_setup_layout.addWidget(self.compose_mesh_contact_status_label, 6, 0, 1, 3)
+        mesh_setup_layout.addWidget(self.compose_mesh_contact_action_row, 7, 0, 1, 3)
         mesh_setup_layout.setColumnStretch(1, 1)
         self.compose_mesh_setup_widget.setVisible(False)
         setup_layout.addWidget(self.compose_mesh_setup_widget)
@@ -7802,9 +7898,10 @@ class MessageViewerTab(QWidget):
         # the default-text screenshot's button dimensions.  A scaled font can
         # therefore promote the setup above the form before clipping occurs.
         use_btn = getattr(self, "compose_js8_selected_target_use_btn", None)
+        clear_btn = getattr(self, "compose_js8_selected_target_clear_btn", None)
         refresh_btn = getattr(self, "compose_js8_selected_target_refresh_btn", None)
         action_width = 0
-        for button in (use_btn, refresh_btn):
+        for button in (use_btn, clear_btn, refresh_btn):
             try:
                 action_width += int(button.sizeHint().width())
             except Exception:
@@ -8741,6 +8838,21 @@ class MessageViewerTab(QWidget):
     def _compose_rf_target_text(self, value: object) -> str:
         return str(value or "").strip().upper().lstrip("@")
 
+    @staticmethod
+    def _compose_js8_transport_target(value: object, known_groups: Sequence[str] = ()) -> str:
+        """Return the exact first JS8 transport hop for cue matching.
+
+        Group identity is retained (including ``@``), callsign suffixes stay
+        intact, and native ``RELAY>DEST`` syntax compares on ``RELAY`` rather
+        than silently treating the final recipient as the selected endpoint.
+        """
+        text = str(value or "").strip().upper()
+        if not text:
+            return ""
+        first_hop = text.split(">", 1)[0].strip()
+        groups = {str(group).strip().upper().lstrip("@") for group in known_groups}
+        return f"@{first_hop}" if first_hop in groups else first_hop
+
     def _compose_target_completion_values(self) -> List[str]:
         values: set[str] = set()
         known_groups: set[str] = set()
@@ -8779,6 +8891,7 @@ class MessageViewerTab(QWidget):
                         add_group(value)
                     else:
                         add_call(value)
+        self._compose_target_known_groups = frozenset(known_groups)
         return sorted(values)
 
     def _install_compose_target_completers(self) -> None:
@@ -9297,6 +9410,7 @@ class MessageViewerTab(QWidget):
             "mesh" if idx == 4 else
             "nbems"
         )
+        self._invalidate_compose_mesh_contact()
         self._compose_active_form_key = ""
         self._compose_last_stage_paths = []
         self._compose_radio_targets_loaded = False
@@ -9378,6 +9492,10 @@ class MessageViewerTab(QWidget):
         self._compose_mesh_destinations = payload.get("destinations", {})
         self._compose_mesh_configs = list(configs)
         self._compose_mesh_health_by_adapter = health_by_adapter
+        self._compose_mesh_favorites_by_adapter = {
+            str(adapter_id): tuple(tuple(identity) for identity in identities or () if isinstance(identity, (tuple, list)) and len(identity) == 4)
+            for adapter_id, identities in dict(payload.get("favorites", {}) or {}).items()
+        }
         blocked = combo.blockSignals(True)
         try:
             combo.clear()
@@ -9425,6 +9543,7 @@ class MessageViewerTab(QWidget):
         return combo.currentData() if isinstance(combo, QComboBox) else None
 
     def _on_compose_mesh_source_changed(self, *_args) -> None:
+        self._invalidate_compose_mesh_contact()
         config = self._selected_compose_mesh_config()
         channel_combo = getattr(self, "compose_mesh_channel_combo", None)
         node_combo = getattr(self, "compose_mesh_node_combo", None)
@@ -9460,6 +9579,12 @@ class MessageViewerTab(QWidget):
                     display = str(node.get("callsign") or node.get("short_name") or node.get("long_name") or node_id).strip()
                     suffix = destination_id[:12]
                     node_combo.addItem(f"{display} · {suffix}", destination_id)
+                    if str(config.protocol).lower() == "meshcore":
+                        identity = (str(config.adapter_id or ""), "meshcore", node_id, public_key.lower())
+                        node_index = node_combo.count() - 1
+                        node_combo.setItemData(node_index, identity, Qt.UserRole + 1)
+                        node_combo.setItemData(node_index, display, Qt.UserRole + 2)
+                        node_combo.setItemText(node_index, self._compose_mesh_contact_node_label(node_index))
                 if not node_combo.count():
                     node_combo.addItem("No known node available", None)
         finally:
@@ -9468,6 +9593,7 @@ class MessageViewerTab(QWidget):
         self._on_compose_mesh_destination_changed()
 
     def _on_compose_mesh_destination_changed(self, *_args) -> None:
+        self._invalidate_compose_mesh_contact()
         kind = str(self._compose_combo_data(getattr(self, "compose_mesh_destination_kind_combo", None)) or "channel")
         config = self._selected_compose_mesh_config()
         meshtastic_direct = bool(
@@ -9483,6 +9609,239 @@ class MessageViewerTab(QWidget):
         if isinstance(ack, QCheckBox):
             ack.setVisible(kind == "direct")
         self._update_compose_preview()
+
+    def _on_compose_mesh_contact_selection_changed(self, *_args) -> None:
+        """Fence contact reads before repainting a newly selected node."""
+        self._invalidate_compose_mesh_contact()
+        self._update_compose_preview()
+
+    def _selected_compose_mesh_contact_identity(self) -> tuple[str, str, str, str] | None:
+        """Return only the exact MeshCore identity attached to the selected node item."""
+        config = self._selected_compose_mesh_config()
+        if config is None or str(getattr(config, "protocol", "") or "").lower() != "meshcore":
+            return None
+        kind = str(self._compose_combo_data(getattr(self, "compose_mesh_destination_kind_combo", None)) or "channel")
+        if kind != "direct":
+            return None
+        combo = getattr(self, "compose_mesh_node_combo", None)
+        if not isinstance(combo, QComboBox):
+            return None
+        raw = combo.itemData(combo.currentIndex(), Qt.UserRole + 1)
+        if not isinstance(raw, (tuple, list)) or len(raw) != 4:
+            return None
+        if str(raw[0] or "").strip() != str(getattr(config, "adapter_id", "") or "").strip():
+            return None
+        if str(raw[1] or "").strip().lower() != str(getattr(config, "protocol", "") or "").strip().lower():
+            return None
+        return contact_identity(*raw)
+
+    def _compose_mesh_contact_is_favorite(self, identity: tuple[str, str, str, str] | None) -> bool:
+        if identity is None:
+            return False
+        return identity in tuple(self._compose_mesh_favorites_by_adapter.get(identity[0], ()) or ())
+
+    def _compose_mesh_contact_node_label(self, index: int) -> str:
+        combo = getattr(self, "compose_mesh_node_combo", None)
+        if not isinstance(combo, QComboBox):
+            return ""
+        display = str(combo.itemData(index, Qt.UserRole + 2) or "").strip()
+        destination = str(combo.itemData(index) or "").strip()
+        identity = combo.itemData(index, Qt.UserRole + 1)
+        is_favorite = self._compose_mesh_contact_is_favorite(tuple(identity) if isinstance(identity, (tuple, list)) else None)
+        prefix = "★ " if is_favorite else ""
+        node_id = str(identity[2] or "").strip() if isinstance(identity, (tuple, list)) and len(identity) == 4 else ""
+        suffix = " · ".join(part for part in (node_id, destination[:12]) if part)
+        return f"{prefix}{display} · {suffix}" if display and suffix else display or suffix
+
+    def _refresh_compose_mesh_contact_node_labels(self) -> None:
+        combo = getattr(self, "compose_mesh_node_combo", None)
+        if not isinstance(combo, QComboBox):
+            return
+        blocked = combo.blockSignals(True)
+        try:
+            for index in range(combo.count()):
+                if combo.itemData(index, Qt.UserRole + 1) is not None:
+                    combo.setItemText(index, self._compose_mesh_contact_node_label(index))
+        finally:
+            combo.blockSignals(blocked)
+
+    def _update_compose_mesh_contact_controls(self) -> None:
+        history = getattr(self, "compose_mesh_contact_history_btn", None)
+        favorite = getattr(self, "compose_mesh_contact_favorite_btn", None)
+        row = getattr(self, "compose_mesh_contact_action_row", None)
+        if not all(isinstance(widget, QWidget) for widget in (history, favorite, row)):
+            return
+        identity = self._selected_compose_mesh_contact_identity()
+        eligible = bool(identity is not None and str(getattr(self, "_compose_mode", "") or "") == "mesh")
+        pending = bool(getattr(self, "_compose_mesh_contact_pending", {}))
+        row.setVisible(eligible)
+        history.setEnabled(eligible and not pending)
+        favorite.setEnabled(eligible and not pending)
+        if eligible:
+            is_favorite = self._compose_mesh_contact_is_favorite(identity)
+            favorite.setText("Remove favorite" if is_favorite else "Add favorite")
+            favorite.setToolTip(
+                "Remove this exact MeshCore adapter, node, and full public-key identity from operator favorites."
+                if is_favorite else
+                "Save this exact MeshCore adapter, node, and full public-key identity as an operator favorite."
+            )
+
+    def _invalidate_compose_mesh_contact(self) -> None:
+        self._compose_mesh_contact_generation = int(getattr(self, "_compose_mesh_contact_generation", 0)) + 1
+        self._compose_mesh_contact_pending = {}
+        lane = getattr(self, "_compose_mesh_contact_lane", None)
+        if lane is not None:
+            lane.invalidate()
+        dialog = getattr(self, "_compose_mesh_contact_dialog", None)
+        if isinstance(dialog, QDialog):
+            dialog.close()
+        status = getattr(self, "compose_mesh_contact_status_label", None)
+        if isinstance(status, QLabel):
+            status.setText("")
+        self._update_compose_mesh_contact_controls()
+
+    def _request_compose_mesh_contact(self, *, favorite: bool | None, action: str) -> None:
+        identity = self._selected_compose_mesh_contact_identity()
+        if (
+            identity is None
+            or self._is_shutting_down
+            or not bool(getattr(self, "_has_active_view", False))
+            or str(getattr(self, "_compose_mode", "") or "") != "mesh"
+            or bool(getattr(self, "_compose_mesh_contact_pending", {}))
+        ):
+            return
+        lane = getattr(self, "_compose_mesh_contact_lane", None)
+        if lane is None:
+            return
+        db_path = default_mesh_db_path()
+        generation = lane.request(db_path, identity, favorite=favorite)
+        self._compose_mesh_contact_generation = int(generation)
+        self._compose_mesh_contact_pending = {
+            "generation": int(generation),
+            "identity": identity,
+            "action": str(action),
+        }
+        self.compose_mesh_contact_status_label.setText(
+            "Saving MeshCore favorite…" if favorite is not None else "Reading bounded contact history…"
+        )
+        self._update_compose_mesh_contact_controls()
+
+    def _inspect_compose_mesh_contact(self) -> None:
+        self._request_compose_mesh_contact(favorite=None, action="history")
+
+    def _toggle_compose_mesh_favorite(self) -> None:
+        identity = self._selected_compose_mesh_contact_identity()
+        if identity is None:
+            return
+        self._request_compose_mesh_contact(
+            favorite=not self._compose_mesh_contact_is_favorite(identity),
+            action="favorite",
+        )
+
+    def _show_compose_mesh_contact_snapshot(self, snapshot: ContactSnapshot) -> None:
+        existing = getattr(self, "_compose_mesh_contact_dialog", None)
+        if isinstance(existing, QDialog):
+            existing.close()
+        dialog = QDialog(self)
+        dialog.setWindowTitle("MeshCore contact history")
+        dialog.setModal(False)
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        layout = QVBoxLayout(dialog)
+        identity = snapshot.identity or ("", "", "", "")
+        identity_label = QLabel(f"Adapter {identity[0]} · Node {identity[2]} · Key {identity[3]}")
+        identity_label.setTextFormat(Qt.PlainText)
+        identity_label.setWordWrap(True)
+        layout.addWidget(identity_label)
+        browser = QTextBrowser(dialog)
+        browser.setOpenExternalLinks(False)
+        lines = [
+            "Exact retained contact history (up to 50 rows)",
+            f"Favorite: {'Yes' if snapshot.favorite else 'No'}",
+            "Contact-list matching is evidence of the observed identity, not sender authentication.",
+            "A favorite does not grant trust or send permission.",
+        ]
+        if snapshot.coverage:
+            lines.append(f"Coverage: {snapshot.coverage}")
+        if snapshot.error:
+            lines.append(f"Status: {snapshot.error}")
+        if snapshot.history:
+            lines.append("")
+            for row in snapshot.history[:50]:
+                lines.append(f"{row.received_utc} · {row.summary} · {row.canonical_key}")
+        else:
+            lines.append("No retained exact-identity history is available.")
+        browser.setPlainText("\n".join(lines))
+        layout.addWidget(browser, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close, parent=dialog)
+        buttons.setStyleSheet(button_style("secondary", resolve_theme(self.settings)))
+        buttons.rejected.connect(dialog.close)
+        layout.addWidget(buttons)
+        line_height = max(1, dialog.fontMetrics().lineSpacing())
+        width = max(520, min(900, dialog.fontMetrics().horizontalAdvance("0") * 110))
+        height = max(320, min(700, line_height * 24 + buttons.sizeHint().height() + line_height * 4))
+        dialog.resize(width, height)
+        dialog.finished.connect(lambda *_args, current=dialog: self._clear_compose_mesh_contact_dialog(current))
+        self._compose_mesh_contact_dialog = dialog
+        dialog.show()
+
+    def _clear_compose_mesh_contact_dialog(self, dialog: QDialog) -> None:
+        if getattr(self, "_compose_mesh_contact_dialog", None) is dialog:
+            self._compose_mesh_contact_dialog = None
+
+    def _on_compose_mesh_contact_ready(self, generation: int, result: object) -> None:
+        pending = dict(getattr(self, "_compose_mesh_contact_pending", {}) or {})
+        if self._is_shutting_down or not pending or int(generation) != int(pending.get("generation", 0) or 0):
+            return
+        identity = pending.get("identity")
+        current = self._selected_compose_mesh_contact_identity()
+        if not isinstance(identity, tuple) or current != identity:
+            self._compose_mesh_contact_pending = {}
+            self._update_compose_mesh_contact_controls()
+            return
+        self._compose_mesh_contact_pending = {}
+        if not isinstance(result, ContactSnapshot) or result.identity != identity:
+            self.compose_mesh_contact_status_label.setText("MeshCore contact evidence is unavailable.")
+            self._update_compose_mesh_contact_controls()
+            return
+        favorite_saved = getattr(result, "favorite_saved", None)
+        favorite_commit_confirmed = favorite_saved is True
+        if pending.get("action") == "favorite" and favorite_commit_confirmed:
+            adapter = identity[0]
+            existing = [item for item in self._compose_mesh_favorites_by_adapter.get(adapter, ()) if tuple(item) != identity]
+            if result.favorite:
+                existing.append(identity)
+            self._compose_mesh_favorites_by_adapter[adapter] = tuple(existing)
+            self._refresh_compose_mesh_contact_node_labels()
+            self.compose_mesh_contact_status_label.setText(
+                (
+                    "MeshCore favorite saved; contact history is unavailable for this profile."
+                    if result.error and result.favorite
+                    else "MeshCore favorite saved." if result.favorite
+                    else "MeshCore favorite removed."
+                )
+            )
+        elif pending.get("action") == "history":
+            if favorite_saved is True:
+                adapter = identity[0]
+                existing = [item for item in self._compose_mesh_favorites_by_adapter.get(adapter, ()) if tuple(item) != identity]
+                if result.favorite:
+                    existing.append(identity)
+                self._compose_mesh_favorites_by_adapter[adapter] = tuple(existing)
+                self._refresh_compose_mesh_contact_node_labels()
+            self._show_compose_mesh_contact_snapshot(result)
+            self.compose_mesh_contact_status_label.setText(
+                (
+                    "MeshCore favorite saved; contact history is unavailable for this profile."
+                    if favorite_saved is True and result.error
+                    else "Contact history loaded." if not result.error
+                    else "Contact history is unavailable for this profile."
+                )
+            )
+        elif result.error:
+            self.compose_mesh_contact_status_label.setText(result.error)
+        elif pending.get("action") == "favorite":
+            self.compose_mesh_contact_status_label.setText("Favorite change was not confirmed. Refresh to review retained preferences.")
+        self._update_compose_mesh_contact_controls()
 
     def _compose_mesh_request(self) -> MeshSendRequest | None:
         config = self._selected_compose_mesh_config()
@@ -9906,31 +10265,61 @@ class MessageViewerTab(QWidget):
         )
         return f"radio:{radio_target.radio_id}|endpoint:{endpoint.host}:{endpoint.port}"
 
-    def compose_js8_selected_target_request_context(self) -> Optional[Dict[str, object]]:
+    def _cancel_compose_js8_selected_target_worker(self) -> None:
+        worker = getattr(self, "_compose_js8_selected_target_worker", None)
+        if worker is not None:
+            try:
+                worker.cancel()
+            except Exception:
+                pass
+
+    def compose_js8_selected_target_request_context(
+        self,
+        *,
+        action: str = "refresh",
+        expected_target: object = None,
+    ) -> Optional[Dict[str, object]]:
         """Snapshot a selected-target lookup request for the endpoint worker.
 
         The caller must return this exact generation, radio ID, and endpoint
         identity to :meth:`apply_compose_js8_selected_target_result`; stale
         results are ignored by the UI.
         """
+        action = str(action or "refresh").strip().lower()
+        if action not in {"refresh", "clear"}:
+            return None
+        if action == "clear" and not str(expected_target or "").strip():
+            return None
+        # Cancel first, even when the new mode has no JS8 target surface. This
+        # closes the navigation/shutdown fence before the active-mode checks.
+        self._cancel_compose_js8_selected_target_worker()
         if not self._compose_js8_selected_target_is_active():
             return None
         radio_target = self._selected_compose_radio_target()
         if radio_target is None or "JS8Call" not in tuple(radio_target.capabilities):
             return None
+        # A radio/mode/navigation change fences any queued clear before it can
+        # reach the endpoint helper.  The worker's cancellation callback is
+        # also checked immediately before the setter and during readback.
         self._compose_js8_selected_target_generation += 1
         self._compose_js8_selected_target_radio_id = int(radio_target.radio_id)
         self._compose_js8_selected_target_endpoint_identity = self._compose_js8_selected_target_endpoint_key(radio_target)
-        self._compose_js8_selected_target_state = "refreshing"
-        self._compose_js8_selected_target_value = ""
+        self._compose_js8_selected_target_action = action
+        self._compose_js8_selected_target_state = "clearing" if action == "clear" else "refreshing"
+        if action != "clear":
+            self._compose_js8_selected_target_value = ""
         self._compose_js8_selected_target_error = ""
         self._refresh_compose_js8_selected_target_cue()
-        return {
+        context: Dict[str, object] = {
             "generation": self._compose_js8_selected_target_generation,
             "radio_id": self._compose_js8_selected_target_radio_id,
             "endpoint_identity": self._compose_js8_selected_target_endpoint_identity,
             "radio_label": self._compose_radio_target_short_label(radio_target),
+            "action": action,
         }
+        if action == "clear":
+            context["expected_target"] = str(expected_target or "").strip()
+        return context
 
     def request_compose_js8_selected_target_refresh(self) -> Optional[Dict[str, object]]:
         """Request one explicit selected-target refresh without performing UI-thread I/O."""
@@ -9946,14 +10335,47 @@ class MessageViewerTab(QWidget):
                 pass
         return context
 
+    def _clear_compose_js8_selected_target(self) -> Optional[Dict[str, object]]:
+        """Request a verified clear for the exact observed target and radio."""
+        if self._is_shutting_down:
+            return None
+        if str(getattr(self, "_compose_js8_selected_target_state", "")) != "selected":
+            return None
+        expected = str(getattr(self, "_compose_js8_selected_target_value", "") or "").strip()
+        context = self.compose_js8_selected_target_request_context(
+            action="clear",
+            expected_target=expected,
+        )
+        if context is not None:
+            try:
+                self.composeJs8SelectedTargetRefreshRequested.emit(dict(context))
+            except RuntimeError:
+                pass
+        return context
+
     def _queue_compose_js8_selected_target_refresh(self, context: object) -> None:
         """Serialize target observations so one slow endpoint cannot fan out work."""
         if self._is_shutting_down or not isinstance(context, Mapping):
             return
         request = dict(context)
+        try:
+            generation = int(request.get("generation", -1))
+            requested_radio = int(request.get("radio_id", 0))
+        except (TypeError, ValueError):
+            return
+        selected_radio = self._selected_compose_radio_target()
+        if (
+            generation != self._compose_js8_selected_target_generation
+            or not self._compose_js8_selected_target_is_active()
+            or selected_radio is None
+            or requested_radio != int(selected_radio.radio_id)
+        ):
+            return
         if self._compose_js8_selected_target_thread is not None and self._qt_thread_running(
             self._compose_js8_selected_target_thread
         ):
+            # Keep only the newest radio/action request.  In particular, a
+            # refresh or radio switch replaces a queued clear before mutation.
             self._compose_js8_selected_target_pending_context = request
             return
         try:
@@ -10033,19 +10455,53 @@ class MessageViewerTab(QWidget):
         if self._compose_js8_selected_target_endpoint_key(selected) != endpoint_identity:
             return False
 
+        action = str(result.get("action", self._compose_js8_selected_target_action) or "refresh").strip().lower()
         supported = bool(result.get("supported", True))
         target = str(result.get("target", "") or "").strip().upper()
         error = str(result.get("error", "") or "").strip()
         self._compose_js8_selected_target_error = error
-        if not supported:
-            self._compose_js8_selected_target_state = "unsupported"
-            self._compose_js8_selected_target_value = ""
-        elif target:
-            self._compose_js8_selected_target_state = "selected"
-            self._compose_js8_selected_target_value = target
+        if action == "clear":
+            clear_result = result.get("result")
+            status = str(
+                result.get("status", getattr(clear_result, "status", "failed")) or "failed"
+            ).strip().lower()
+            state_obj = getattr(clear_result, "state", None)
+            state_available = bool(
+                getattr(state_obj, "available", result.get("supported", False))
+            )
+            state_target = str(getattr(state_obj, "target", target) or target).strip().upper()
+            if status in {"cleared", "already_empty"}:
+                self._compose_js8_selected_target_state = "empty"
+                self._compose_js8_selected_target_value = ""
+            elif status == "changed":
+                self._compose_js8_selected_target_state = "changed" if state_target else (
+                    "empty" if state_available else "unknown"
+                )
+                self._compose_js8_selected_target_value = state_target
+            elif status == "unsupported":
+                self._compose_js8_selected_target_state = "unsupported"
+                self._compose_js8_selected_target_value = ""
+            elif status == "unavailable":
+                self._compose_js8_selected_target_state = "unavailable"
+                self._compose_js8_selected_target_value = state_target if state_available else ""
+            elif status == "cancelled":
+                self._compose_js8_selected_target_state = "cancelled"
+                self._compose_js8_selected_target_value = state_target if state_available else ""
+            else:
+                self._compose_js8_selected_target_state = "failed"
+                self._compose_js8_selected_target_value = state_target if state_available else ""
+            self._compose_js8_selected_target_action = ""
         else:
-            self._compose_js8_selected_target_state = "empty"
-            self._compose_js8_selected_target_value = ""
+            self._compose_js8_selected_target_action = ""
+            if not supported:
+                self._compose_js8_selected_target_state = "unsupported"
+                self._compose_js8_selected_target_value = ""
+            elif target:
+                self._compose_js8_selected_target_state = "selected"
+                self._compose_js8_selected_target_value = target
+            else:
+                self._compose_js8_selected_target_state = "empty"
+                self._compose_js8_selected_target_value = ""
         self._refresh_compose_js8_selected_target_cue()
         return True
 
@@ -10053,29 +10509,52 @@ class MessageViewerTab(QWidget):
         row = getattr(self, "compose_js8_selected_target_row_widget", None)
         label = getattr(self, "compose_js8_selected_target_label", None)
         use_btn = getattr(self, "compose_js8_selected_target_use_btn", None)
+        clear_btn = getattr(self, "compose_js8_selected_target_clear_btn", None)
         refresh_btn = getattr(self, "compose_js8_selected_target_refresh_btn", None)
-        if any(widget is None for widget in (row, label, use_btn, refresh_btn)):
+        if any(widget is None for widget in (row, label, use_btn, clear_btn, refresh_btn)):
             return
         active = self._compose_js8_selected_target_is_active()
         radio = self._selected_compose_radio_target()
         radio_label = self._compose_radio_target_short_label(radio) or "the selected radio"
         state = str(getattr(self, "_compose_js8_selected_target_state", "unknown") or "unknown")
         target = str(getattr(self, "_compose_js8_selected_target_value", "") or "")
+        mode = str(getattr(self, "_compose_mode", "nbems") or "nbems")
+        draft_widget = (
+            getattr(self, "compose_commstat_target_edit", None)
+            if mode == "commstat_rf"
+            else getattr(self, "compose_js8_target_edit", None)
+        )
+        intended_target = str(getattr(draft_widget, "text", lambda: "")() or "").strip().upper()
+        known_groups = tuple(getattr(self, "_compose_target_known_groups", ()))
         draft_uses_target = bool(
             target
-            and self._compose_rf_target_text(target) == self._compose_intent_target()
+            and intended_target
+            and self._compose_js8_transport_target(target, known_groups)
+            == self._compose_js8_transport_target(intended_target, known_groups)
         )
         if state == "selected" and target:
             if draft_uses_target:
                 text = f"Already selected in JS8Call on {radio_label}: {target} · This draft uses it."
+            elif intended_target:
+                text = f"Already selected in JS8Call on {radio_label}: {target} · Draft target: {intended_target}. Use Target to adopt it."
             else:
                 text = f"Already selected in JS8Call on {radio_label}: {target} · Use Target to adopt it."
         elif state == "refreshing":
             text = f"Checking the target currently selected in JS8Call on {radio_label}…"
+        elif state == "clearing":
+            text = f"Verifying and clearing JS8Call selection {target or '…'} on {radio_label}…"
         elif state == "empty":
             text = f"No callsign or group is currently selected in JS8Call on {radio_label}."
         elif state == "unsupported":
             text = f"JS8Call selected-target lookup is unavailable on {radio_label}."
+        elif state == "unavailable":
+            text = f"JS8Call selected-target clear is unavailable on {radio_label}: {getattr(self, '_compose_js8_selected_target_error', '') or 'check the JS8Call window and deselect manually.'}"
+        elif state == "changed":
+            text = f"JS8Call selection changed on {radio_label}; review the newly selected target before clearing again."
+        elif state == "cancelled":
+            text = f"JS8Call selection clear was cancelled for {radio_label}; refresh before trying again."
+        elif state == "failed":
+            text = f"Could not verify a cleared JS8Call selection on {radio_label}: {getattr(self, '_compose_js8_selected_target_error', '') or 'deselect manually in JS8Call.'}"
         else:
             text = f"JS8Call selected target has not been checked on {radio_label}."
         label.setText(text)
@@ -10084,8 +10563,15 @@ class MessageViewerTab(QWidget):
         use_btn.setVisible(active and state == "selected" and bool(target))
         use_btn.setText("Target in Use" if draft_uses_target else "Use Target")
         use_btn.setEnabled(active and state == "selected" and bool(target) and not draft_uses_target)
-        refresh_btn.setVisible(False)
-        refresh_btn.setEnabled(active and radio is not None and state != "refreshing")
+        clear_btn.setVisible(active and state == "selected" and bool(target))
+        clear_btn.setEnabled(active and state == "selected" and bool(target))
+        if state == "clearing":
+            clear_btn.setVisible(active)
+            clear_btn.setEnabled(False)
+            use_btn.setEnabled(False)
+        refresh_recovery = active and radio is not None and state != "selected"
+        refresh_btn.setVisible(refresh_recovery)
+        refresh_btn.setEnabled(refresh_recovery and state not in {"refreshing", "clearing"})
         try:
             theme = resolve_theme(self.settings)
             emphasized = state == "selected" and bool(target)
@@ -10099,6 +10585,7 @@ class MessageViewerTab(QWidget):
             )
             label.setStyleSheet(f"color: {label_color}; font-weight: {'700' if emphasized else '500'};")
             use_btn.setStyleSheet(button_style("secondary" if use_btn.isEnabled() else "muted", theme))
+            clear_btn.setStyleSheet(button_style("secondary" if clear_btn.isEnabled() else "muted", theme))
             refresh_btn.setStyleSheet(button_style("muted", theme))
         except Exception:
             pass
@@ -10393,6 +10880,7 @@ class MessageViewerTab(QWidget):
         parsed = payload.get("parsed", {})
         self._compose_parsed_form_cache = dict(parsed) if isinstance(parsed, dict) else {}
         self._apply_compose_family_entries(entries)
+        self._ensure_summary_blank_form()
         problems = [str(value or "").strip() for value in payload.get("problems", []) if str(value or "").strip()]
         if problems:
             self._set_compose_status(
@@ -11546,6 +12034,12 @@ class MessageViewerTab(QWidget):
         self._refresh_compose_radio_chips()
 
     def _refresh_compose_radios_clicked(self) -> None:
+        self._cancel_compose_js8_selected_target_worker()
+        self._compose_js8_selected_target_generation += 1
+        self._compose_js8_selected_target_pending_context = {}
+        self._compose_js8_selected_target_state = "unknown"
+        self._compose_js8_selected_target_value = ""
+        self._refresh_compose_js8_selected_target_cue()
         self._refresh_compose_setup_discovery(force=True)
         self._update_compose_preview()
 
@@ -12763,6 +13257,81 @@ class MessageViewerTab(QWidget):
     def show_compose_from_navigation(self) -> None:
         self._set_messages_mode("Compose", save=False)
 
+    def _open_traffic_summary(self) -> None:
+        from freqinout.gui.traffic_summary_dialog import TrafficSummaryDialog
+        path = self._db_path()
+        if path is None:
+            QMessageBox.warning(self, "Traffic Summary", "The station traffic database is not configured.")
+            return
+        dialog = getattr(self, "_traffic_summary_dialog", None)
+        if dialog is None or getattr(dialog, "_closing", False):
+            root = path.parent.parent / "reports" / "traffic-summaries"
+            dialog = TrafficSummaryDialog(str(path), root, self, station_callsign=self._compose_operator_callsign(),
+                                          reference_root=path.parent.parent / "cache" / "fcc_call_finder")
+            dialog.stageRequested.connect(self._receive_traffic_summary)
+            self._traffic_summary_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _ensure_summary_blank_form(self) -> None:
+        if getattr(self, "_compose_summary_context", None) is None or self._compose_mode != "nbems":
+            return
+        for index in range(self.compose_family_combo.count()):
+            entry = self.compose_family_combo.itemData(index)
+            if isinstance(entry, dict) and entry.get("kind") == "standard":
+                if self.compose_family_combo.currentIndex() != index:
+                    self.compose_family_combo.setCurrentIndex(index)
+                return
+        self.compose_family_combo.addItem("Standard Blank", {"kind": "standard", "key": "STANDARD", "label": "Standard Blank"})
+        self.compose_family_combo.setCurrentIndex(self.compose_family_combo.count() - 1)
+
+    def _receive_traffic_summary(self, snapshot, text: str) -> None:
+        """Prefill only; existing Compose retains explicit destination/stage choices."""
+        from freqinout.core.traffic_summary_stage import SummaryStageContext
+        current = self._compose_field_values().get("MESSAGE", "").strip()
+        if current and current != text.strip():
+            answer = QMessageBox.question(self, "Replace Compose draft?",
+                "Replace the current Compose message with the reviewed traffic summary?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if answer != QMessageBox.Yes:
+                return
+        dialog = self.sender()
+        if dialog is None:
+            dialog = getattr(self, "_traffic_summary_dialog", None)
+        excluded = tuple(getattr(dialog, "excluded_ids", ()))
+        path = self._db_path()
+        if path is None:
+            return
+        self.show_compose_from_navigation()
+        if self._compose_mode != "nbems":
+            self._apply_compose_mode_tab_changed(0)
+        entries = list(self._compose_family_entries_cache)
+        if not any(entry.get("kind") == "standard" for entry in entries):
+            entries.insert(0, {"kind": "standard", "key": "STANDARD", "label": "Standard Blank"})
+        self._apply_compose_family_entries(entries)
+        for index in range(self.compose_family_combo.count()):
+            entry = self.compose_family_combo.itemData(index)
+            if isinstance(entry, dict) and entry.get("kind") == "standard":
+                self.compose_family_combo.setCurrentIndex(index)
+                break
+        # A pre-existing Standard Blank selection may not emit a change.
+        if self._compose_template_kind != "blank":
+            self._on_compose_family_changed()
+        self._compose_set_widget_value("SUBJECT", "Station Traffic Summary")
+        self._compose_set_widget_value("MESSAGE", text)
+        self.compose_report_title_edit.setText("Station_Traffic_Summary")
+        self._compose_summary_context = SummaryStageContext(snapshot, text, excluded,
+            str(path.parent.parent / "reports" / "traffic-summaries"),
+            report_kind=getattr(dialog, "report_kind", "legacy"),
+            companion_text=getattr(dialog, "companion_text", ""),
+            target_minutes=getattr(dialog, "target_minutes", 3))
+        self._store_compose_form_draft()
+        self._update_compose_preview()
+        self._set_compose_status("Reviewed summary loaded. Choose file format, radio, signing and optional BBS locations, then Stage Files. No transmission is automatic.", role="info")
+        if dialog is not None:
+            dialog.hide()
+
     def _update_messages_mode_ui(self) -> None:
         if not hasattr(self, "messages_mode_stack"):
             return
@@ -13574,6 +14143,7 @@ class MessageViewerTab(QWidget):
         self._update_compose_preview()
 
     def _reset_compose_draft(self, *, status_text: str = "Compose draft reset.") -> None:
+        self._compose_summary_context = None
         mode = str(getattr(self, "_compose_mode", "nbems") or "nbems")
         self._compose_timestamp_utc = datetime.datetime.now(datetime.timezone.utc)
         self._compose_mode_drafts.pop(mode, None)
@@ -14418,6 +14988,12 @@ class MessageViewerTab(QWidget):
                 else:
                     hint = f"Connected · {payload_bytes}/{max_bytes} UTF-8 bytes · automatic relays remain off."
                 self.compose_mesh_hint_label.setText(hint)
+            self._update_compose_mesh_contact_controls()
+            theme = resolve_theme(self.settings)
+            if hasattr(self, "compose_mesh_contact_history_btn"):
+                self.compose_mesh_contact_history_btn.setStyleSheet(button_style("secondary", theme))
+            if hasattr(self, "compose_mesh_contact_favorite_btn"):
+                self.compose_mesh_contact_favorite_btn.setStyleSheet(button_style("secondary", theme))
         if hasattr(self, "compose_save_expect_btn"):
             self.compose_save_expect_btn.setEnabled(bool(
                 spotter_selected
@@ -14831,6 +15407,11 @@ class MessageViewerTab(QWidget):
         if self._compose_stage_inflight:
             self._set_compose_status("Compose staging is already in progress.", role="info")
             return
+        from freqinout.core.traffic_summary import REPORT_MARKER
+        if (getattr(self, "_compose_summary_context", None) is None
+                and REPORT_MARKER in self._compose_field_values().get("MESSAGE", "")):
+            self._set_compose_status("Load this saved report through Create Traffic Summary before staging, so its evidence, counts and retry identity can be verified.", role="warning")
+            return
         request = self._compose_stage_request_snapshot()
         if request is None:
             return
@@ -14838,7 +15419,16 @@ class MessageViewerTab(QWidget):
         self._set_compose_status("Staging compose files…", role="info")
         self._update_compose_preview()
         self._compose_stage_thread = QThread(self)
-        self._compose_stage_worker = _ComposeStageWorker(request)
+        context = getattr(self, "_compose_summary_context", None)
+        if context is not None:
+            if self._compose_template_kind != "blank":
+                self._compose_stage_inflight = False
+                self._set_compose_status("Traffic summaries must use Standard Blank. Reset the Compose draft to start another message.", role="warning")
+                self._compose_stage_thread.deleteLater()
+                self._compose_stage_thread = None
+                return
+            context = replace(context, edited_text=self._compose_field_values().get("MESSAGE", ""))
+        self._compose_stage_worker = _ComposeStageWorker(request, context)
         self._compose_stage_worker.moveToThread(self._compose_stage_thread)
         self._compose_stage_thread.started.connect(self._compose_stage_worker.run)
         self._compose_stage_worker.finished.connect(self._on_compose_stage_finished)
@@ -15536,6 +16126,15 @@ class MessageViewerTab(QWidget):
 
     def set_tab_active(self, active: bool) -> None:
         self._has_active_view = bool(active)
+        if not active:
+            self._invalidate_compose_mesh_contact()
+            self._cancel_compose_js8_selected_target_worker()
+            self._compose_js8_selected_target_generation += 1
+            self._compose_js8_selected_target_pending_context = {}
+            self._compose_js8_selected_target_state = "unknown"
+            self._compose_js8_selected_target_value = ""
+            self._compose_js8_selected_target_action = ""
+            self._refresh_compose_js8_selected_target_cue()
         if active and self._app_active:
             if self._clock_timer is None:
                 self._setup_clock_timer()
@@ -17174,6 +17773,15 @@ class MessageViewerTab(QWidget):
 
     def shutdown(self) -> None:
         self._is_shutting_down = True
+        lane = getattr(self, "_compose_mesh_contact_lane", None)
+        if lane is not None:
+            lane.shutdown()
+        self._compose_mesh_contact_generation = int(getattr(self, "_compose_mesh_contact_generation", 0)) + 1
+        self._compose_mesh_contact_pending = {}
+        contact_dialog = getattr(self, "_compose_mesh_contact_dialog", None)
+        if isinstance(contact_dialog, QDialog):
+            contact_dialog.close()
+            self._compose_mesh_contact_dialog = None
         cache = getattr(self, "_compose_brevity_read_cache", None)
         if cache is not None:
             cache.close()
@@ -17182,9 +17790,11 @@ class MessageViewerTab(QWidget):
             timer.stop()
         # Invalidate any endpoint result that races application shutdown.  The
         # selected-target endpoint worker is attached by the primary runtime.
+        self._cancel_compose_js8_selected_target_worker()
         self._compose_js8_selected_target_generation += 1
         self._compose_js8_selected_target_state = "unknown"
         self._compose_js8_selected_target_value = ""
+        self._compose_js8_selected_target_action = ""
         self._compose_js8_selected_target_pending_context = {}
         try:
             if self._persist_timer and self._persist_timer.isActive():

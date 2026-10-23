@@ -333,6 +333,28 @@ def icon_button_style(role: str, theme: Dict[str, str], widget: QWidget) -> str:
             + f" QToolButton::menu-button {{ width:{menu}px; }}")
 
 
+def fit_text_action_button(button: QAbstractButton) -> None:
+    """Use app text size and reserve arrow/menu space for text action buttons.
+
+    Cocoa gives QToolButton a smaller class font than form controls. Explicitly
+    inherit the user's app text scale and fit the complete label and indicators.
+    Geometry-only; safe for lazy construction and theme/font republication.
+    """
+    app = QApplication.instance()
+    if app is not None:
+        button.setFont(app.font())
+    button.ensurePolished()
+    metrics = button.fontMetrics()
+    label_width = metrics.horizontalAdvance(button.text().replace("&", ""))
+    reserve = 2 * control_height_for_font(button)
+    if hasattr(button, "arrowType") and button.arrowType() != Qt.NoArrow:
+        reserve += max(button.iconSize().width(), metrics.lineSpacing())
+    elif not button.icon().isNull():
+        reserve += button.iconSize().width() + metrics.horizontalAdvance(" ")
+    button.setMinimumWidth(max(button.sizeHint().width(), label_width + reserve))
+    button.setMinimumHeight(max(button_height_for_font(button), button.sizeHint().height()))
+
+
 def font_css(font: QFont) -> str:
     parts: list[str] = []
     try:

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import datetime
+import html
 import json
 import re
 import sqlite3
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QPoint, QTimer, Qt
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -26,6 +27,8 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QHeaderView,
     QScrollArea,
+    QTextBrowser,
+    QSizePolicy,
 )
 
 from freqinout.core.checkins_db import upsert_operator_metadata
@@ -34,6 +37,7 @@ from freqinout.core.settings_manager import SettingsManager
 from freqinout.utils.timezones import get_timezone
 from freqinout.gui.help_registry import resolve_help_host
 from freqinout.gui.theme import active_app_theme, resolve_theme, button_style, label_style
+from freqinout.gui.peer_evidence_lane import PeerEvidenceLane
 
 
 # Simple FEMA region mapping for filtering
@@ -449,6 +453,11 @@ class PeerSchedTab(QWidget):
         self._show_local_times = default_mode != "UTC"
         self._responsive_layout_mode = "wide"
         self._responsive_compact_width = 1200
+        self._peer_evidence_active = True
+        self._peer_evidence_generation = 0
+        self._peer_evidence_timezone = None
+        self._peer_evidence_lane = PeerEvidenceLane(self)
+        self._peer_evidence_lane.ready.connect(self._on_peer_evidence_ready)
         self._build_ui()
         self._load_operator_meta()
         self._load_data()
@@ -536,7 +545,27 @@ class PeerSchedTab(QWidget):
         self._peer_filter_layout.setContentsMargins(0, 0, 0, 0)
         self._peer_filter_layout.setSpacing(8)
         layout.addLayout(self._peer_filter_layout)
-        self._arrange_peer_action_rows(compact=False)
+
+        self.inspect_evidence_label = QLabel("Evidence callsign:")
+        self.inspect_evidence_edit = QLineEdit()
+        self.inspect_evidence_edit.setPlaceholderText("Callsign")
+        self.inspect_evidence_edit.setAccessibleName("Evidence callsign")
+        self.inspect_evidence_edit.setClearButtonEnabled(True)
+        self.inspect_evidence_btn = QPushButton("Inspect Evidence")
+        self.inspect_evidence_btn.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        self.inspect_evidence_btn.setToolTip("Read bounded retained evidence for the entered callsign.")
+        self.inspect_evidence_disclosure_btn = QPushButton("Evidence details")
+        self.inspect_evidence_disclosure_btn.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        self.inspect_evidence_disclosure_btn.setCheckable(True)
+        self.inspect_evidence_disclosure_btn.setChecked(False)
+        self.inspect_evidence_disclosure_btn.setToolTip("Show or hide retained evidence details.")
+        self.inspect_evidence_status = QLabel("Enter a callsign, or select a schedule row to fill it.")
+        self.inspect_evidence_status.setWordWrap(True)
+        self._peer_evidence_layout = QGridLayout()
+        self._peer_evidence_layout.setContentsMargins(0, 0, 0, 0)
+        self._peer_evidence_layout.setSpacing(8)
+        layout.addLayout(self._peer_evidence_layout)
+        layout.addWidget(self.inspect_evidence_status)
 
         # Table
         self.table = QTableWidget(0, len(self.COLS))
@@ -547,6 +576,16 @@ class PeerSchedTab(QWidget):
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.SingleSelection)
         layout.addWidget(self.table)
+
+        self.inspect_evidence_browser = QTextBrowser()
+        self.inspect_evidence_browser.setObjectName("peerEvidenceInspector")
+        self.inspect_evidence_browser.setReadOnly(True)
+        self.inspect_evidence_browser.setOpenExternalLinks(False)
+        self.inspect_evidence_browser.setMinimumHeight(0)
+        self.inspect_evidence_browser.setMaximumHeight(16777215)
+        self.inspect_evidence_browser.setVisible(False)
+        layout.addWidget(self.inspect_evidence_browser)
+        self._arrange_peer_action_rows(compact=False)
 
         # Signals
         self.add_btn.clicked.connect(self._add_schedule)
@@ -565,6 +604,9 @@ class PeerSchedTab(QWidget):
         self.help_btn.clicked.connect(lambda: self._open_context_help("tab.hf-peers"))
         self.table.cellClicked.connect(self._on_table_cell_clicked)
         self.table.itemSelectionChanged.connect(self._update_row_action_state)
+        self.inspect_evidence_edit.textChanged.connect(self._on_peer_evidence_entry_changed)
+        self.inspect_evidence_btn.clicked.connect(self._inspect_peer_evidence)
+        self.inspect_evidence_disclosure_btn.toggled.connect(self._toggle_peer_evidence_details)
         self.tz_toggle_btn.setText("Times: Local" if self._show_local_times else "Times: UTC")
         self._apply_theme()
         self._update_delete_button_state()
@@ -590,6 +632,17 @@ class PeerSchedTab(QWidget):
         self._responsive_layout_mode = mode
         self._arrange_peer_action_rows(compact=(mode == "compact"))
         self._apply_peer_table_sizing(compact=(mode == "compact"))
+        self._update_peer_evidence_geometry()
+
+    def _update_peer_evidence_geometry(self) -> None:
+        if not hasattr(self, "inspect_evidence_browser"):
+            return
+        line_height = max(1, self.fontMetrics().height())
+        browser_line_height = max(1, self.inspect_evidence_browser.fontMetrics().height())
+        minimum = max(line_height * 5, browser_line_height * 6) + line_height * 2
+        maximum = max(minimum * 3, browser_line_height * 18)
+        self.inspect_evidence_browser.setMinimumHeight(minimum)
+        self.inspect_evidence_browser.setMaximumHeight(maximum)
 
     @staticmethod
     def _clear_grid_layout(layout: QGridLayout) -> None:
@@ -606,7 +659,12 @@ class PeerSchedTab(QWidget):
             layout.addWidget(widget, row, col, row_span, col_span)
 
     def _arrange_peer_action_rows(self, *, compact: bool) -> None:
-        for grid in (self._peer_action_layout, self._peer_cleanup_layout, self._peer_filter_layout):
+        for grid in (
+            self._peer_action_layout,
+            self._peer_cleanup_layout,
+            self._peer_filter_layout,
+            self._peer_evidence_layout,
+        ):
             self._clear_grid_layout(grid)
 
         if compact:
@@ -644,6 +702,12 @@ class PeerSchedTab(QWidget):
                 (self.clear_filters_btn, 1, 5),
                 (self.tz_toggle_btn, 1, 6),
             ]
+            evidence_placements = [
+                (self.inspect_evidence_label, 0, 0),
+                (self.inspect_evidence_edit, 0, 1, 1, 3),
+                (self.inspect_evidence_btn, 1, 0),
+                (self.inspect_evidence_disclosure_btn, 1, 1),
+            ]
         else:
             self.delete_callsign_combo.setMinimumWidth(150)
             self.callsign_filter.setMinimumWidth(150)
@@ -676,25 +740,39 @@ class PeerSchedTab(QWidget):
                 (self.clear_filters_btn, 0, 8),
                 (self.tz_toggle_btn, 0, 9),
             ]
+            evidence_placements = [
+                (self.inspect_evidence_label, 0, 0),
+                (self.inspect_evidence_edit, 0, 1),
+                (self.inspect_evidence_btn, 0, 2),
+                (self.inspect_evidence_disclosure_btn, 0, 3),
+            ]
 
         self._place_grid_widgets(self._peer_action_layout, action_placements)
         self._place_grid_widgets(self._peer_cleanup_layout, cleanup_placements)
         self._place_grid_widgets(self._peer_filter_layout, filter_placements)
+        self._place_grid_widgets(self._peer_evidence_layout, evidence_placements)
         self._peer_action_layout.setColumnStretch(7 if not compact else 4, 1)
         self._peer_cleanup_layout.setColumnStretch(4, 1)
         self._peer_filter_layout.setColumnStretch(7 if not compact else 4, 1)
+        self._peer_evidence_layout.setColumnStretch(1, 1)
 
     def _apply_peer_table_sizing(self, *, compact: bool) -> None:
         if not hasattr(self, "table"):
             return
         header = self.table.horizontalHeader()
         header.setStretchLastSection(False)
-        stretch_columns = {0, 1, 3, self._overlap_col} if compact else {1, 3, self._overlap_col}
+        # Keep the identity column readable when the compact table owns its
+        # horizontal overflow; the table may scroll, but the page must not.
+        stretch_columns = {1, 3, self._overlap_col} if compact else {1, 3, self._overlap_col}
         for col in range(self.table.columnCount()):
             if col in stretch_columns:
                 header.setSectionResizeMode(col, QHeaderView.Stretch)
             else:
                 header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        if compact:
+            metrics = self.table.fontMetrics()
+            readable_width = metrics.horizontalAdvance("CALLSIGN") + metrics.horizontalAdvance("M") * 3
+            self.table.setColumnWidth(0, max(self.table.columnWidth(0), readable_width))
 
     # ---------- data ----------
 
@@ -754,6 +832,7 @@ class PeerSchedTab(QWidget):
         """
         Load peer schedules from DB and populate filters/table.
         """
+        self._fence_peer_evidence()
         self._load_operator_meta()
         self._rows = []
         try:
@@ -1014,6 +1093,7 @@ class PeerSchedTab(QWidget):
             self.table.setSortingEnabled(True)
             if 0 <= sort_col < self.table.columnCount():
                 self.table.sortItems(sort_col, sort_order)
+        self._apply_peer_table_sizing(compact=self._responsive_layout_mode == "compact")
         self._update_row_action_state()
 
     # ---------- helpers ----------
@@ -1350,7 +1430,10 @@ class PeerSchedTab(QWidget):
         self.help_btn.setStyleSheet(button_style("secondary", theme))
         self.delete_btn.setStyleSheet(button_style("muted", theme))
         self.clear_filters_btn.setStyleSheet(button_style("muted", theme))
+        self.inspect_evidence_btn.setStyleSheet(button_style("primary", theme))
+        self.inspect_evidence_disclosure_btn.setStyleSheet(button_style("secondary", theme))
         self._update_timezone_button_style()
+        self._update_peer_evidence_geometry()
         self._update_row_action_state()
 
     def apply_theme(self) -> None:
@@ -1391,15 +1474,300 @@ class PeerSchedTab(QWidget):
         payload = item.data(Qt.UserRole) if item is not None else None
         return dict(payload) if isinstance(payload, dict) else None
 
+    def _fence_peer_evidence(self) -> None:
+        self._peer_evidence_generation += 1
+        self._peer_evidence_lane.invalidate()
+
+    def _on_peer_evidence_entry_changed(self, _text: str) -> None:
+        # Entry edits are navigation within the inspector, never an implicit
+        # read.  They only fence a result that may belong to the old call.
+        self._fence_peer_evidence()
+        self.inspect_evidence_status.setText("Callsign changed; press Inspect Evidence to refresh retained evidence.")
+
+    def _evidence_local_call(self) -> str:
+        for key in ("operator_callsign", "callsign", "station_callsign"):
+            try:
+                value = str(self.settings.get(key, "") or "").strip().upper()
+            except Exception:
+                value = ""
+            if value:
+                return value
+        return ""
+
+    @staticmethod
+    def _evidence_call(value: object) -> str:
+        return str(value or "").strip().upper()
+
+    @staticmethod
+    def _evidence_html(value: object) -> str:
+        return html.escape(str(value if value is not None else ""), quote=True)
+
+    def _format_evidence_timestamp(self, value: object) -> str:
+        try:
+            timestamp = float(value)
+            utc = datetime.datetime.fromtimestamp(timestamp, tz=datetime.timezone.utc)
+            if self._peer_evidence_timezone is None:
+                self._peer_evidence_timezone = self._current_timezone()
+            local = utc.astimezone(self._peer_evidence_timezone)
+            return f"UTC {utc.strftime('%Y-%m-%d %H:%M:%S')} · local {local.strftime('%Y-%m-%d %H:%M:%S %Z')}"
+        except (TypeError, ValueError, OverflowError, OSError):
+            return "time unknown"
+
+    def _toggle_peer_evidence_details(self, visible: bool) -> None:
+        self.inspect_evidence_browser.setVisible(bool(visible))
+        self.inspect_evidence_disclosure_btn.setText(
+            "Hide evidence details" if visible else "Evidence details"
+        )
+
+    def _ensure_peer_evidence_visible(self, generation: int) -> None:
+        if (
+            not self._peer_evidence_active
+            or generation != self._peer_evidence_generation
+            or self._responsive_layout_mode != "compact"
+            or not self.inspect_evidence_browser.isVisible()
+        ):
+            return
+        self.peer_schedule_scroll_area.ensureWidgetVisible(
+            self.inspect_evidence_browser,
+            0,
+            self.fontMetrics().height(),
+        )
+        scroll_widget = self.peer_schedule_scroll_area.widget()
+        if scroll_widget is not None:
+            top = self.inspect_evidence_browser.mapTo(scroll_widget, QPoint(0, 0)).y()
+            bar = self.peer_schedule_scroll_area.verticalScrollBar()
+            bar.setValue(max(0, min(top - self.fontMetrics().height(), bar.maximum())))
+
+    def _inspect_peer_evidence(self) -> None:
+        if not self._peer_evidence_active:
+            self.inspect_evidence_status.setText("Evidence inspector is inactive; activate this tab before inspecting.")
+            return
+        callsign = self._evidence_call(self.inspect_evidence_edit.text())
+        if not callsign or not CALLSIGN_RE.match(callsign):
+            self._fence_peer_evidence()
+            self.inspect_evidence_status.setText("Enter a valid callsign to inspect retained evidence.")
+            self.inspect_evidence_disclosure_btn.setChecked(True)
+            self.inspect_evidence_browser.setHtml("<p>Evidence is waiting for a valid callsign.</p>")
+            return
+        # Capture only immutable request values.  The worker never receives a
+        # QWidget, SettingsManager, database connection, or bound reader.
+        db_path = Path(self._db_path())
+        local_call = self._evidence_local_call()
+        self._peer_evidence_timezone = self._current_timezone()
+        self.inspect_evidence_disclosure_btn.setChecked(True)
+        self.inspect_evidence_status.setText(f"Reading bounded retained evidence for {callsign}…")
+        self.inspect_evidence_browser.setHtml("<p>Loading retained evidence…</p>")
+        self._peer_evidence_generation = self._peer_evidence_lane.request(
+            db_path, callsign, local_call=local_call
+        )
+        generation = self._peer_evidence_generation
+        QTimer.singleShot(0, lambda: self._ensure_peer_evidence_visible(generation))
+
+    def _on_peer_evidence_ready(self, generation: int, snapshot: object) -> None:
+        if not self._peer_evidence_active or int(generation) != int(self._peer_evidence_generation):
+            return
+        if snapshot is None:
+            self.inspect_evidence_status.setText("Evidence could not be read.")
+            self.inspect_evidence_browser.setHtml("<p>Retained evidence is unavailable.</p>")
+            generation = self._peer_evidence_generation
+            QTimer.singleShot(0, lambda: self._ensure_peer_evidence_visible(generation))
+            return
+        callsign = self._evidence_call(getattr(snapshot, "callsign", ""))
+        coverage = getattr(snapshot, "coverage", None)
+        errors = tuple(getattr(coverage, "errors", ()) or ())
+        self.inspect_evidence_status.setText(
+            f"Evidence loaded for {callsign or self.inspect_evidence_edit.text().strip().upper()}."
+            + (" Coverage is incomplete." if errors else "")
+        )
+        self.inspect_evidence_browser.setHtml(self._render_peer_evidence(snapshot))
+        generation = self._peer_evidence_generation
+        QTimer.singleShot(0, lambda: self._ensure_peer_evidence_visible(generation))
+
+    def _render_peer_evidence(self, snapshot: object) -> str:
+        esc = self._evidence_html
+        callsign = esc(getattr(snapshot, "callsign", "") or "Unknown callsign")
+        coverage = getattr(snapshot, "coverage", None)
+        observations = tuple(getattr(snapshot, "observations", ()) or ())[:100]
+        schedules = tuple(getattr(snapshot, "schedules", ()) or ())
+        frequencies = tuple(getattr(snapshot, "frequency_summaries", ()) or ())
+        times = tuple(getattr(snapshot, "time_summaries", ()) or ())
+        candidates = tuple(getattr(snapshot, "relay_candidates", ()) or ())[:10]
+        errors = tuple(getattr(coverage, "errors", ()) or ())
+        parts = [f"<h3>Evidence for {callsign}</h3>"]
+        detail = getattr(coverage, "detail", "") if coverage is not None else ""
+        if detail:
+            parts.append(f"<p>{esc(detail)}</p>")
+        if errors:
+            parts.append("<p><b>Coverage unknown:</b> " + ", ".join(esc(item) for item in errors) + "</p>")
+
+        parts.append("<h4>Declared and inferred recurrence</h4>")
+        parts.append("<p>Recurrence confidence describes repeated retained observations, not RF delivery probability.</p>")
+        if schedules:
+            rows = []
+            for schedule in schedules[:20]:
+                source = str(getattr(schedule, "source_type", "") or "").upper()
+                kind = "Inferred" if source.startswith("INFERRED") else "Declared"
+                confidence = getattr(schedule, "confidence", None)
+                try:
+                    confidence_text = "unknown" if confidence is None else f"{float(confidence):.2f} recurrence confidence"
+                except (TypeError, ValueError):
+                    confidence_text = "unknown recurrence confidence"
+                rows.append(
+                    "<li>"
+                    + " · ".join(
+                        esc(value)
+                        for value in (
+                            kind,
+                            f"{getattr(schedule, 'day_utc', '') or 'ALL'} UTC",
+                            f"{getattr(schedule, 'start_utc', '')}-{getattr(schedule, 'end_utc', '')} UTC",
+                            getattr(schedule, "band", "") or "band unknown",
+                            getattr(schedule, "mode", "") or "mode unknown",
+                            getattr(schedule, "frequency", "") or "frequency unknown",
+                            confidence_text,
+                        )
+                    )
+                    + "</li>"
+                )
+            parts.append("<ul>" + "".join(rows) + "</ul>")
+        else:
+            parts.append("<p>No retained declared or inferred schedule rows.</p>")
+
+        if frequencies:
+            parts.append("<h4>Observed frequencies</h4><ul>")
+            for summary in frequencies[:20]:
+                freq = getattr(summary, "frequency_hz", None)
+                try:
+                    freq_text = "unknown" if freq is None else f"{float(freq) / 1_000_000:.6f} MHz"
+                except (TypeError, ValueError):
+                    freq_text = "unknown"
+                parts.append(
+                    "<li>"
+                    + esc(
+                        f"{getattr(summary, 'band', '') or 'band unknown'} · {freq_text} · "
+                        f"{getattr(summary, 'count', 0)} observation(s)"
+                    )
+                    + "</li>"
+                )
+            parts.append("</ul>")
+        if times:
+            parts.append("<h4>Observed UTC times</h4><ul>")
+            weekdays = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+            for summary in times[:20]:
+                day_value = getattr(summary, "day_utc", "?")
+                try:
+                    day_value = weekdays[int(day_value)]
+                except (TypeError, ValueError, IndexError):
+                    day_value = str(day_value)
+                parts.append(
+                    "<li>"
+                    + esc(
+                        f"weekday {day_value}, hour {getattr(summary, 'hour_utc', '?')} UTC · "
+                        f"{getattr(summary, 'count', 0)} observation(s)"
+                    )
+                    + "</li>"
+                )
+            parts.append("</ul>")
+
+        parts.append(f"<h4>Observations ({len(observations)} shown, bounded at 100)</h4>")
+        if observations:
+            parts.append("<ul>")
+            for observation in observations:
+                origin = getattr(observation, "origin", "") or "unknown origin"
+                destination = getattr(observation, "destination", "") or "unknown destination"
+                snr = getattr(observation, "snr", None)
+                try:
+                    if snr is None:
+                        snr_text = "SNR unknown"
+                    elif (
+                        str(getattr(observation, "classification", "") or "").lower() == "direct"
+                        and bool(getattr(observation, "direction_known", False))
+                        and bool(getattr(observation, "source_radio_id", ""))
+                    ):
+                        snr_text = f"measured SNR {float(snr):.1f} dB"
+                    else:
+                        snr_text = f"retained SNR {float(snr):.1f} dB (not a measured local edge)"
+                except (TypeError, ValueError):
+                    snr_text = "SNR unknown"
+                endpoint = getattr(observation, "source_radio_id", "") or "endpoint unknown"
+                source_app = getattr(observation, "source_app", "") or "app unknown"
+                details = [
+                    f"{origin} → {destination}",
+                    getattr(observation, "classification", "unknown") or "unknown class",
+                    snr_text,
+                    f"source {endpoint}/{source_app}",
+                    self._format_evidence_timestamp(getattr(observation, "observed_ts", None)),
+                    f"raw {getattr(observation, 'source_reference', '') or 'reference unknown'}",
+                ]
+                reporter = getattr(observation, "reporter", "")
+                subject = getattr(observation, "subject", "")
+                claimed_reporter = getattr(observation, "claimed_reporter", "")
+                transport_sender = getattr(observation, "transport_sender", "")
+                if reporter or subject:
+                    details.append(f"reporter {reporter or 'unknown'}; subject {subject or 'unknown'}")
+                if claimed_reporter:
+                    details.append(f"claimed reporter {claimed_reporter}")
+                if transport_sender:
+                    details.append(f"transport sender {transport_sender}")
+                parts.append("<li>" + esc(" · ".join(str(item) for item in details)) + "</li>")
+            parts.append("</ul>")
+        else:
+            parts.append("<p>No retained observations for this callsign.</p>")
+
+        parts.append(f"<h4>Receiving candidates ({len(candidates)} shown, bounded at 10)</h4>")
+        if candidates:
+            parts.append("<ul>")
+            for candidate in candidates:
+                path = " → ".join(str(value) for value in (getattr(candidate, "path", ()) or ()))
+                candidate_freq = getattr(candidate, "frequency_hz", None)
+                try:
+                    frequency_text = "unknown frequency" if candidate_freq is None else f"{float(candidate_freq) / 1_000_000:.6f} MHz"
+                except (TypeError, ValueError):
+                    frequency_text = "unknown frequency"
+                latest = getattr(candidate, "latest_observed_ts", None)
+                freshness = self._format_evidence_timestamp(latest)
+                parts.append(
+                    "<li>"
+                    + esc(
+                        f"{path or 'path unavailable'} · receiving candidate · unverified; not a send route · "
+                        f"{getattr(candidate, 'band', '') or 'band unknown'} · "
+                        f"frequency {frequency_text} · {getattr(candidate, 'edges', 0)} hop(s) · "
+                        f"endpoint {getattr(candidate, 'source_radio_id', '') or 'unknown'} · "
+                        f"app {getattr(candidate, 'source_app', '') or 'unknown'} · "
+                        f"freshness {freshness} · reverse evidence unknown · remote permission unknown"
+                    )
+                    + "</li>"
+                )
+            parts.append("</ul>")
+        else:
+            parts.append("<p>No fresh receiving path candidate is available.</p>")
+        return "".join(parts)
+
     def _update_row_action_state(self) -> None:
         theme = resolve_theme(self.settings)
         selected = self._selected_row_payload()
+        if selected:
+            callsign = self._evidence_call(selected.get("callsign"))
+            if callsign and self.inspect_evidence_edit.text().strip().upper() != callsign:
+                self.inspect_evidence_edit.setText(callsign)
         source_type = str((selected or {}).get("source_type") or "").strip().upper()
         explicit_selected = bool(selected) and source_type != "INFERRED"
         self.edit_btn.setEnabled(explicit_selected)
         self.delete_row_btn.setEnabled(explicit_selected)
         self.edit_btn.setStyleSheet(button_style("primary" if explicit_selected else "muted", theme))
         self.delete_row_btn.setStyleSheet(button_style("danger" if explicit_selected else "muted", theme))
+
+    def set_tab_active(self, active: bool) -> None:
+        self._peer_evidence_active = bool(active)
+        if not self._peer_evidence_active:
+            self._fence_peer_evidence()
+
+    def shutdown(self) -> None:
+        self._peer_evidence_active = False
+        self._peer_evidence_lane.shutdown()
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt virtual
+        self.shutdown()
+        event.accept()
 
     def _update_timezone_button_style(self) -> None:
         theme = resolve_theme(self.settings)

@@ -2,9 +2,9 @@
   <img src="assets/CommsPlan_logo.png" alt="CommsPlan logo" width="150">
 </p>
 
-# CommsPlan 2.0.6.1
+# CommsPlan 2.0.7
 
-See the CommsPlan 2.0.6.1 release page for available platform packages, source
+See the CommsPlan 2.0.7 release page for available platform packages, source
 archives, checksums, and release notes.
 
 ### CommsPlan makes your comms plan work.
@@ -29,6 +29,15 @@ own controls available to you.
 exercise messages. Radio readbacks and green Mesh connection status are simulated
 for illustration; no live radio or Mesh connection was used. Detail images show
 the individual workspaces.*
+
+## What is new in 2.0.7
+
+- Create paired RF Brief and Detailed traffic summaries from Messages, review their evidence, then save, export or review in Compose.
+- Review retained peer/Mesh evidence, received pins, exact-identity MeshCore contacts and cached support diagnostics.
+- Apply optional per-net FLDigi Center + Narrow tuning with explicit restoration.
+- Configure applications independently, recover unfinished radio drafts, and use clear save feedback and responsive controls.
+
+See the [2.0.7 guide](website/guide/whats-new.md#commsplan-2-0-7-and-setup-fixes) and [changelog](CHANGELOG.md) for scope and qualification limits.
 
 ## One operating picture for the station
 
@@ -159,7 +168,7 @@ decision support rather than a guarantee of current propagation or delivery.
 
 ![Offline operational map with station and regional context](docs/images/readme-2.0/operational-map.png)
 
-## Hotfixes in 2.0.6.1
+## Hotfixes in 2.0.7
 
 This release fixes fresh FLRig-only radio saves, supports independent Fast Light
 application choices, and keeps Save and Cancel reachable when application setup
@@ -229,10 +238,10 @@ storage and compatibility identities so companion applications and saved
 stations continue to work. Follow the installation guide when upgrading, and
 make a verified backup before the first upgrade.
 
-## Download CommsPlan 2.0.6.1
+## Download CommsPlan 2.0.7
 
 Use the [CommsPlan release page](https://github.com/N1MAG/CommsPlan/releases/latest)
-for available 2.0.6.1 installers, source archives, checksums, and release notes.
+for available 2.0.7 installers, source archives, checksums, and release notes.
 Use only the artifacts actually listed there. Unsigned Windows/macOS packages
 are identified in their filenames and release notes.
 
@@ -240,7 +249,7 @@ Verify downloaded files against the checksums published on the release page.
 
 ## Install or update from the public source release
 
-Clone the public repository and select the 2.0.6.1 release tag. For an existing
+Clone the public repository and select the 2.0.7 release tag. For an existing
 checkout, fetch the public tag and select it before running the installer.
 Close CommsPlan and its companion applications, use the same application folder
 as the existing installation, and require the final `Installation verified`
@@ -249,14 +258,14 @@ line before launching CommsPlan. A Git pull by itself is not a complete update.
 ```bash
 git clone https://github.com/N1MAG/CommsPlan.git
 cd CommsPlan
-git checkout v2.0.6.1
+git checkout v2.0.7
 ```
 
 For an existing checkout:
 
 ```bash
 git fetch origin --tags
-git checkout v2.0.6.1
+git checkout v2.0.7
 ```
 
 ### Windows PowerShell
@@ -283,7 +292,7 @@ The guided installer installs required system packages where supported,
 creates CommsPlan's virtual environment, and prepares the desktop launcher.
 Use `setup` for first setup, `update` for a source update, and `desktop` to
 refresh desktop integration after an update, including when an older package
-launcher is still installed. Run these commands from the checked-out 2.0.6.1
+launcher is still installed. Run these commands from the checked-out 2.0.7
 release:
 
 ```bash

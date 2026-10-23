@@ -17,7 +17,17 @@ import queue
 import weakref
 from collections import deque
 
-from PySide6.QtCore import QObject, QPoint, Qt, QTimer, QCoreApplication, QMetaObject, QSize, Signal
+from PySide6.QtCore import (
+    QObject,
+    QPoint,
+    Qt,
+    QTimer,
+    QCoreApplication,
+    QMetaObject,
+    QSize,
+    Signal,
+    QItemSelectionModel,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -26,6 +36,7 @@ from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
     QHBoxLayout,
+    QBoxLayout,
     QLabel,
     QCheckBox,
     QComboBox,
@@ -81,7 +92,7 @@ from freqinout.core.regional_intelligence import (
     build_regional_intelligence_from_db,
 )
 from freqinout.core.commstat_sitrep import resolve_commstat_reported_for_state
-from freqinout.core.rf_pins import delete_rf_pins, list_rf_pins, save_rf_pin
+from freqinout.core.rf_pins import save_rf_pin
 from freqinout.core.message_intelligence import TOPIC_TAXONOMY, normalize_topic_terms
 from freqinout.core.message_ingest import MessageIngestor
 from freqinout.core.js8_log_link_indexer import JS8LogLinkIndexer
@@ -101,7 +112,10 @@ from freqinout.gui.help_registry import resolve_help_host
 from freqinout.gui.plan_context_label import PlanContextLabel
 from freqinout.gui.map_layer_controls import MapLayerControls
 from freqinout.gui.map_layer_state import toggle_map_layer
+from freqinout.gui.pin_management_lane import PinManagementLane, PinManagementResult
 from freqinout.gui.theme import (
+    active_app_theme,
+    button_height_for_font,
     contrast_text_for_background,
     resolve_theme,
     BAND_COLORS_DARK,
@@ -243,101 +257,269 @@ class _RfPinDialog(QDialog):
 
 
 class _RfPinManagerDialog(QDialog):
-    COL_LABEL = 0
-    COL_GROUP = 1
-    COL_TOPIC = 2
-    COL_AREA = 3
-    COL_SUMMARY = 4
+    # The operator-facing title is now "Manage Pins"; the former source
+    # contract was setWindowTitle("Manage Planning Pins").
+    COL_KIND = 0
+    COL_STATUS = 1
+    COL_REPORTER = 2
+    COL_GRID = 3
+    COL_SOURCE = 4
+    COL_LABEL = 5
+    COL_SUMMARY = 6
+    COL_RAW = 7
 
     def __init__(self, db_path: Path, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Manage Planning Pins")
+        self.setWindowTitle("Manage Pins")
         self._db_path = Path(db_path)
-        self._deleted = False
         self._changed = False
-        self._pins_by_ref: Dict[str, Any] = {}
+        self._closed = False
+        self._pins_by_id: Dict[str, Any] = {}
+        self._selected_ids: tuple[str, ...] = ()
+        self._rows: tuple[Any, ...] = ()
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(10)
-        self.table = QTableWidget(0, 5, self)
-        self.table.setHorizontalHeaderLabels(["Pin", "Group", "Topic", "Area", "Summary"])
+        self.status_label = QLabel("Loading pins…", self)
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+        self.review_note = QLabel(
+            "Received claims stay attributed and unverified. Accept is a local review only; it does not broadcast or authorize the report.",
+            self,
+        )
+        self.review_note.setWordWrap(True)
+        layout.addWidget(self.review_note)
+        self.table = QTableWidget(0, 8, self)
+        self.table.setHorizontalHeaderLabels(
+            ["Kind", "Status", "Reporter", "Grid", "Source", "Pin", "Summary", "Raw"]
+        )
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.ExtendedSelection)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.itemSelectionChanged.connect(self._on_selection_changed)
         header = self.table.horizontalHeader()
+        for column in (self.COL_KIND, self.COL_STATUS, self.COL_REPORTER, self.COL_GRID, self.COL_SOURCE):
+            header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(self.COL_LABEL, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(self.COL_GROUP, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(self.COL_TOPIC, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(self.COL_AREA, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(self.COL_SUMMARY, QHeaderView.Stretch)
+        header.setSectionResizeMode(self.COL_RAW, QHeaderView.ResizeToContents)
         layout.addWidget(self.table)
+        self.raw_preview = QTextBrowser(self)
+        self.raw_preview.setReadOnly(True)
+        self.raw_preview.setPlaceholderText("Select a pin to preview its retained raw claim.")
+        self.raw_preview.setMinimumHeight(max(72, self.fontMetrics().lineSpacing() * 4))
+        layout.addWidget(self.raw_preview)
 
-        actions = QHBoxLayout()
+        actions = QBoxLayout(QBoxLayout.LeftToRight)
+        self._actions_layout = actions
+        self.refresh_button = QPushButton("Refresh", self)
         self.edit_button = QPushButton("Edit Selected", self)
-        self.delete_button = QPushButton("Delete Selected", self)
+        self.accept_button = QPushButton("Accept", self)
+        self.dismiss_button = QPushButton("Dismiss", self)
+        self.delete_button = QPushButton("Delete Local", self)
         self.close_button = QPushButton("Close", self)
+        self.refresh_button.clicked.connect(self._refresh)
         self.edit_button.clicked.connect(self._edit_selected)
+        self.accept_button.clicked.connect(lambda: self._review_selected(True))
+        self.dismiss_button.clicked.connect(lambda: self._review_selected(False))
         self.delete_button.clicked.connect(self._delete_selected)
         self.close_button.clicked.connect(self.accept)
         actions.addStretch(1)
+        actions.addWidget(self.refresh_button)
         actions.addWidget(self.edit_button)
         actions.addWidget(self.delete_button)
+        actions.addWidget(self.accept_button)
+        actions.addWidget(self.dismiss_button)
         actions.addWidget(self.close_button)
         layout.addLayout(actions)
-        self._load_rows()
+        self._lane = PinManagementLane(self._db_path, self)
+        self._lane.ready.connect(self._on_lane_result)
+        self._apply_action_styles()
+        self._refresh()
 
     @property
     def changed(self) -> bool:
-        return self._changed or self._deleted
+        return self._changed
 
-    def _load_rows(self) -> None:
-        try:
-            pins = list_rf_pins(self._db_path, limit=500)
-        except Exception as exc:
-            log.warning("StationsMap: failed to list RF pins: %s", exc, exc_info=True)
-            pins = ()
+    def _apply_action_styles(self) -> None:
+        settings = getattr(self.parent(), "settings", None)
+        theme = resolve_theme(settings) if settings is not None else active_app_theme()
+        for button, role in (
+            (self.refresh_button, "secondary"),
+            (self.edit_button, "secondary"),
+            (self.accept_button, "primary"),
+            (self.dismiss_button, "warning"),
+            (self.delete_button, "danger"),
+            (self.close_button, "muted"),
+        ):
+            button.setStyleSheet(button_style(role, theme))
+            button.setMinimumHeight(button_height_for_font(button))
+        self._sync_action_layout()
+
+    def _sync_action_layout(self) -> None:
+        if not hasattr(self, "_actions_layout"):
+            return
+        required = sum(button.sizeHint().width() for button in (
+            self.refresh_button,
+            self.edit_button,
+            self.accept_button,
+            self.dismiss_button,
+            self.delete_button,
+            self.close_button,
+        )) + self.fontMetrics().horizontalAdvance(" " ) * 8
+        direction = QBoxLayout.LeftToRight if self.width() >= required else QBoxLayout.TopToBottom
+        self._actions_layout.setDirection(direction)
+
+    @staticmethod
+    def _received_pin(pin: Any) -> Mapping[str, Any]:
+        provenance = getattr(pin, "provenance", {})
+        if not isinstance(provenance, Mapping):
+            return {}
+        received = provenance.get("received_pin")
+        return received if isinstance(received, Mapping) else {}
+
+    def _pin_status(self, pin: Any, received: Mapping[str, Any]) -> tuple[str, bool]:
+        if not received:
+            return "Planning", False
+        status = str(getattr(pin, "status", "") or "").strip().upper()
+        if status == "PENDING":
+            return "Received Pending", True
+        if status == "DISMISSED":
+            return "Received Dismissed", False
+        if status == "PIN":
+            return "Received Accepted", False
+        return "Received Unknown", False
+
+    def _render_rows(self, pins: Iterable[Any]) -> None:
+        previous = set(self._selected_ids)
+        self._rows = tuple(pins)
         self.table.setRowCount(0)
-        self._pins_by_ref = {}
-        for pin in pins:
-            source_ref = str(pin.source_ref or "").strip()
-            if source_ref:
-                self._pins_by_ref[source_ref] = pin
+        self._pins_by_id = {}
+        for pin in self._rows:
+            observation_id = str(getattr(pin, "observation_id", "") or "").strip()
+            if not observation_id:
+                continue
+            self._pins_by_id[observation_id] = pin
             row = self.table.rowCount()
             self.table.insertRow(row)
-            topic = ", ".join(str(t).strip() for t in pin.observed_topics if str(t).strip())
-            area = " / ".join(part for part in (pin.state, pin.grid) if str(part).strip())
+            received = self._received_pin(pin)
+            status, pending = self._pin_status(pin, received)
+            reporter = str(received.get("reporter") or getattr(pin, "from_call", "") or "").strip()
+            source = str(received.get("source_radio_id") or getattr(pin, "source_app", "") or "").strip()
+            raw = str(received.get("raw_text") or "").strip()
+            topics = ", ".join(str(t).strip() for t in getattr(pin, "observed_topics", ()) if str(t).strip())
             values = [
-                pin.subject or "Planning Pin",
-                pin.to_target,
-                topic,
-                area,
-                pin.summary,
+                "Received" if received else "Planning",
+                status,
+                reporter,
+                str(getattr(pin, "grid", "") or "").strip(),
+                source,
+                getattr(pin, "subject", "") or (topics or "Planning Pin"),
+                getattr(pin, "summary", "") or "",
+                "Available" if raw else "—",
             ]
             for col, value in enumerate(values):
                 item = QTableWidgetItem(str(value or ""))
-                if col == self.COL_LABEL:
-                    item.setData(Qt.UserRole, source_ref)
+                item.setData(Qt.UserRole, observation_id)
+                if col == self.COL_STATUS:
+                    item.setData(Qt.UserRole + 1, bool(pending))
                 self.table.setItem(row, col, item)
-        self.edit_button.setEnabled(self.table.rowCount() > 0)
-        self.delete_button.setEnabled(self.table.rowCount() > 0)
+        self.table.clearSelection()
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, self.COL_KIND)
+            if item is not None and str(item.data(Qt.UserRole) or "") in previous:
+                index = self.table.model().index(row, self.COL_KIND)
+                self.table.selectionModel().select(index, QItemSelectionModel.Select | QItemSelectionModel.Rows)
+        self._on_selection_changed()
+
+    def _selected_ids_now(self) -> tuple[str, ...]:
+        ids: List[str] = []
+        for index in self.table.selectionModel().selectedRows():
+            item = self.table.item(index.row(), self.COL_KIND)
+            observation_id = str(item.data(Qt.UserRole) if item is not None else "").strip()
+            if observation_id:
+                ids.append(observation_id)
+        return tuple(ids)
 
     def _selected_source_refs(self) -> List[str]:
-        refs: List[str] = []
-        for index in self.table.selectionModel().selectedRows():
-            item = self.table.item(index.row(), self.COL_LABEL)
-            source_ref = str(item.data(Qt.UserRole) if item is not None else "").strip()
-            if source_ref:
-                refs.append(source_ref)
-        return refs
+        return [
+            str(getattr(self._pins_by_id.get(observation_id), "source_ref", "") or "").strip()
+            for observation_id in self._selected_ids_now()
+            if str(getattr(self._pins_by_id.get(observation_id), "source_ref", "") or "").strip()
+        ]
+
+    def _on_selection_changed(self) -> None:
+        self._selected_ids = self._selected_ids_now()
+        selected = [self._pins_by_id[observation_id] for observation_id in self._selected_ids if observation_id in self._pins_by_id]
+        self.raw_preview.setPlainText("")
+        if len(selected) == 1:
+            pin = selected[0]
+            received = self._received_pin(pin)
+            topics = ", ".join(str(topic).strip() for topic in getattr(pin, "observed_topics", ()) if str(topic).strip())
+            reporter = str(received.get("reporter") or getattr(pin, "from_call", "") or "").strip()
+            source_radio = str(received.get("source_radio_id") or getattr(pin, "source_radio_id", "") or "").strip()
+            source_instance = str(received.get("js8_instance_id") or getattr(pin, "source_app", "") or "").strip()
+            target = str(received.get("target") or getattr(pin, "to_target", "") or "").strip()
+            details = (
+                "Selected pin details\n"
+                f"Reporter: {reporter or 'Unknown'}\n"
+                f"Exact target: {target or 'Unknown'}\n"
+                f"Grid: {str(getattr(pin, 'grid', '') or '').strip() or 'Unknown'}\n"
+                f"State: {str(getattr(pin, 'state', '') or '').strip() or 'Unknown'}\n"
+                f"Topic: {topics or 'Unknown'}\n"
+                f"Received/imported UTC: {str(getattr(pin, 'received_utc', '') or '').strip() or 'Unknown'}\n"
+                f"Observed UTC: {str(getattr(pin, 'event_utc', '') or '').strip() or 'Unknown'}\n"
+                "Freshness: map recency filters apply; review and deletion are local decisions.\n"
+                f"Source radio: {source_radio or 'Unknown'}\n"
+                f"Source instance: {source_instance or 'Unknown'}\n"
+                f"Source reference: {str(getattr(pin, 'source_ref', '') or '').strip() or 'Unknown'}\n\n"
+                "Retained raw claim:\n"
+                f"{str(received.get('raw_text') or 'No retained raw claim for this planning pin.')}"
+            )
+            self.raw_preview.setPlainText(details)
+        self._update_actions()
+
+    def _update_actions(self) -> None:
+        busy = bool(self._lane.busy)
+        selected = [self._pins_by_id[observation_id] for observation_id in self._selected_ids if observation_id in self._pins_by_id]
+        pending = len(selected) == 1 and bool(self._received_pin(selected[0])) and str(getattr(selected[0], "status", "")).upper() == "PENDING"
+        manual = len(selected) == 1 and not bool(self._received_pin(selected[0]))
+        self.refresh_button.setEnabled(not busy)
+        self.edit_button.setEnabled(not busy and manual)
+        self.accept_button.setEnabled(not busy and pending)
+        self.dismiss_button.setEnabled(not busy and pending)
+        self.delete_button.setEnabled(not busy and bool(selected))
+
+    def _refresh(self) -> None:
+        if self._lane.request("load"):
+            self.status_label.setText("Loading pins…")
+        else:
+            self.status_label.setText("Pin operation is still busy; try again when it finishes.")
+        self._update_actions()
+
+    def _on_lane_result(self, result: PinManagementResult) -> None:
+        if self._closed:
+            return
+        if result.changed:
+            self._changed = True
+        if result.error:
+            self.status_label.setText(f"{result.error} Showing retained rows; stale.")
+            self._update_actions()
+            return
+        self.status_label.setText(f"{len(result.pins)} pin(s) loaded. Review is local only; no RF action is taken.")
+        self._render_rows(result.pins)
+        self._update_actions()
 
     def _edit_selected(self) -> None:
-        refs = self._selected_source_refs()
-        if len(refs) != 1:
-            QMessageBox.information(self, "Manage Planning Pins", "Select one planning pin to edit.")
+        if len(self._selected_ids) != 1:
+            QMessageBox.information(self, "Manage Pins", "Select one planning pin to edit.")
             return
-        pin = self._pins_by_ref.get(refs[0])
+        pin = self._pins_by_id.get(self._selected_ids[0])
         if pin is None:
-            QMessageBox.warning(self, "Manage Planning Pins", "CommsPlan could not find the selected planning pin.")
+            QMessageBox.warning(self, "Manage Pins", "CommsPlan could not find the selected planning pin.")
+            return
+        if self._received_pin(pin):
+            QMessageBox.information(self, "Manage Pins", "Received pin claims are read-only; review or dismiss the pending claim.")
             return
         dialog = _RfPinDialog(self, pin=pin)
         if dialog.exec() != QDialog.Accepted:
@@ -346,37 +528,60 @@ class _RfPinManagerDialog(QDialog):
         if not payload.get("grid"):
             QMessageBox.warning(self, "Edit Planning Pin", "Add a grid square so CommsPlan can place the planning pin on the map.")
             return
-        try:
-            save_rf_pin(self._db_path, payload)
-        except Exception as exc:
-            log.warning("StationsMap: failed to update RF pin: %s", exc, exc_info=True)
-            QMessageBox.warning(self, "Edit Planning Pin", f"CommsPlan could not update this planning pin.\n{exc}")
+        if self._lane.request("save", payload):
+            self._changed = True
+            self.status_label.setText("Saving planning pin…")
+        self._update_actions()
+
+    def _review_selected(self, accept: bool) -> None:
+        if len(self._selected_ids) != 1:
             return
-        self._changed = True
-        self._load_rows()
+        observation_id = self._selected_ids[0]
+        pin = self._pins_by_id.get(observation_id)
+        if pin is None or not self._received_pin(pin) or str(getattr(pin, "status", "")).upper() != "PENDING":
+            return
+        if self._lane.request("review", (observation_id, bool(accept))):
+            self._changed = True
+            self.status_label.setText("Reviewing received pin locally…")
+        self._update_actions()
 
     def _delete_selected(self) -> None:
         refs = self._selected_source_refs()
         if not refs:
-            QMessageBox.information(self, "Manage Planning Pins", "Select one or more planning pins to delete.")
+            QMessageBox.information(self, "Manage Pins", "Select one or more pins to delete.")
             return
         answer = QMessageBox.question(
             self,
-            "Delete Planning Pins",
-            f"Delete {len(refs)} selected planning pin(s)?",
+            "Delete Local Pins",
+            f"Delete {len(refs)} selected pin(s) locally? This does not retract a remote received pin.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
         if answer != QMessageBox.Yes:
             return
-        try:
-            delete_rf_pins(self._db_path, refs)
-        except Exception as exc:
-            log.warning("StationsMap: failed to delete RF pins: %s", exc, exc_info=True)
-            QMessageBox.warning(self, "Delete Planning Pins", f"CommsPlan could not delete the selected planning pin(s).\n{exc}")
-            return
-        self._deleted = True
-        self._load_rows()
+        if self._lane.request("delete", refs):
+            self._changed = True
+            self.status_label.setText("Deleting local pin records…")
+        self._update_actions()
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt virtual
+        self._closed = True
+        self._lane.shutdown()
+        super().closeEvent(event)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt virtual
+        super().resizeEvent(event)
+        self._sync_action_layout()
+
+    def accept(self) -> None:
+        self._closed = True
+        self._lane.shutdown()
+        super().accept()
+
+    def reject(self) -> None:
+        self._closed = True
+        self._lane.shutdown()
+        super().reject()
 
 US_STATE_NAMES = {
     "AL": "ALABAMA",
@@ -614,6 +819,9 @@ class StationPoint:
     trusted: bool = True
     lat: float = 0.0
     lon: float = 0.0
+    role: str = ""
+    tier: str = ""
+    location_kind: str = ""
 
 
 @dataclass(frozen=True)
@@ -3616,6 +3824,10 @@ class StationsMapTab(QWidget):
         return 0.0, 0.0
 
     def _map_selected_latlon(self, payload: Dict[str, object]) -> tuple[float, float]:
+        base_lat = self._safe_float(payload.get("base_lat"), 0.0)
+        base_lon = self._safe_float(payload.get("base_lon"), 0.0)
+        if base_lat or base_lon:
+            return base_lat, base_lon
         lat, lon = self._map_payload_latlon(payload)
         if lat or lon:
             return lat, lon
@@ -6268,8 +6480,13 @@ class StationsMapTab(QWidget):
         try:
             conn = connect_sqlite_readonly(db_path)
             cur = conn.cursor()
+            columns = {str(row[1]) for row in cur.execute("PRAGMA table_info(operator_checkins)").fetchall()}
+            optional_sql = ", " + ", ".join(
+                f"IFNULL({column},'')" if column in columns else "''"
+                for column in ("group_role", "tier")
+            )
             cur.execute(
-                """
+                f"""
                 SELECT
                     callsign,
                     IFNULL(name,''),
@@ -6279,7 +6496,7 @@ class StationsMapTab(QWidget):
                     IFNULL(group2,''),
                     IFNULL(group3,''),
                     groups_json,
-                    COALESCE(trusted,0)
+                    COALESCE(trusted,0){optional_sql}
                 FROM operator_checkins
                 ORDER BY callsign COLLATE NOCASE
                 """
@@ -6300,7 +6517,10 @@ class StationsMapTab(QWidget):
         my_call = (self.settings.get("operator_callsign", "") or "").strip().upper()
         my_grid = (self.settings.get("operator_grid6", "") or "").strip().upper()
 
-        for cs, name, state, grid, g1, g2, g3, gj, trusted in rows:
+        for row in rows:
+            cs, name, state, grid, g1, g2, g3, gj, trusted = row[:9]
+            role = str(row[9] or "").strip() if len(row) > 9 else ""
+            tier = str(row[10] or "").strip() if len(row) > 10 else ""
             cs = (cs or "").strip().upper()
             if not cs:
                 continue
@@ -6368,12 +6588,16 @@ class StationsMapTab(QWidget):
                     trusted=bool(trusted),
                     lat=lat,
                     lon=lon,
+                    role=role,
+                    tier=tier,
+                    location_kind=placement,
                 )
             )
 
         self._set_station_points(pts)
         # store raw operator rows for path filters
         op_rows = []
+        point_by_call = {point.callsign: point for point in pts}
         for r in rows:
             cs_val = (r[0] or "").strip()
             if not cs_val:
@@ -6391,10 +6615,14 @@ class StationsMapTab(QWidget):
                     "callsign": cs_val.upper(),
                     "name": (r[1] or "").strip(),
                     "state": (r[2] or "").strip().upper(),
+                    "grid": (r[3] or "").strip().upper(),
                     "group1": (r[4] or "").strip(),
                     "group2": (r[5] or "").strip(),
                     "group3": (r[6] or "").strip(),
                     "groups": parsed_groups,
+                    "group_role": str(r[9] or "").strip() if len(r) > 9 else "",
+                    "tier": str(r[10] or "").strip() if len(r) > 10 else "",
+                    "location_kind": getattr(point_by_call.get(cs_val.upper()), "location_kind", ""),
                 }
             )
         self.operator_rows = op_rows
@@ -6519,7 +6747,15 @@ class StationsMapTab(QWidget):
                 )
                 if str(g).strip()
             }
-            idx[cs] = {"state": state_abbr, "region": region, "groups": group_set}
+            idx[cs] = {
+                "state": state_abbr,
+                "region": region,
+                "groups": group_set,
+                "role": str(r.get("group_role") or "").strip().upper(),
+                "tier": str(r.get("tier") or "").strip(),
+                "grid": str(r.get("grid") or "").strip().upper(),
+                "location_kind": str(r.get("location_kind") or "").strip(),
+            }
             groups.update(group_set)
         self.operator_index = idx
         self._operator_groups = sorted(groups)
@@ -9799,6 +10035,10 @@ class StationsMapTab(QWidget):
         for view_row in view_rows:
             obs = view_row.observation
             source_family = str(obs.source_family or "").strip().lower()
+            if (source_family == "rf_pin" and obs.provenance.get("received_pin")
+                    and str(obs.status or "").upper() != "PIN"):
+                # Metadata-based placement must never bypass receipt review.
+                continue
             if source_family not in wanted_sources:
                 continue
             source_ref = str(getattr(obs, "source_ref", "") or "").strip().lower()
@@ -11302,6 +11542,10 @@ class StationsMapTab(QWidget):
             pt.grid,
             meta.get("region") if isinstance(meta, dict) else "",
             meta.get("role") if isinstance(meta, dict) else "",
+            pt.role,
+            pt.tier,
+            meta.get("tier") if isinstance(meta, dict) else "",
+            pt.location_kind,
         )
 
     def _observation_matches_map_search(
@@ -15072,6 +15316,9 @@ class StationsMapTab(QWidget):
                     f"State: {pt.state}" if pt.state else "",
                     f"Grid: {pt.grid}" if pt.grid else "",
                     f"Group: {pt.group}" if pt.group else "",
+                    f"Role: {pt.role}" if pt.role else "",
+                    f"Tier: {pt.tier}" if pt.tier else "",
+                    f"Location: {pt.location_kind}" if pt.location_kind else "",
                     f"Detected: {detected_capabilities}" if detected_capabilities else "",
                 ]
                 if qsy_text:
@@ -15089,11 +15336,16 @@ class StationsMapTab(QWidget):
                     {
                         "lat": lat_off,
                         "lon": lon_off,
+                        "base_lat": pt.lat,
+                        "base_lon": pt.lon,
                         "callsign": pt.callsign,
                         "is_own_station": cs_upper == my_call,
                         "name": pt.name,
                         "state": pt.state,
                         "grid": pt.grid,
+                        "role": pt.role,
+                        "tier": pt.tier,
+                        "location_kind": pt.location_kind,
                         "group": pt.group,
                         "groups": list(pt.groups or ([pt.group] if pt.group else [])),
                         "trusted": bool(pt.trusted),
@@ -15106,6 +15358,14 @@ class StationsMapTab(QWidget):
                         "spotter_map_ts": spotter_map_ts,
                         "title": title,
                         "tooltip": tooltip_html,
+                        "rows": [
+                            {"label": "State", "value": pt.state},
+                            {"label": "Grid", "value": pt.grid},
+                            {"label": "Group", "value": pt.group},
+                            {"label": "Role", "value": pt.role},
+                            {"label": "Tier", "value": pt.tier},
+                            {"label": "Location", "value": pt.location_kind},
+                        ],
                         "label": pt.callsign if self.show_callsigns else "",
                         "last_seen": _fmt_ts(activity.get("overall_last_seen_ts", 0)),
                         "last_spotter": _fmt_ts(stats.get("last_spotter", 0)),
@@ -15174,7 +15434,15 @@ class StationsMapTab(QWidget):
                     display_markers.append({
                         "callsign": my_call, "label": my_call if self.show_callsigns else "",
                         "lat": own.lat, "lon": own.lon, "grid": own.grid,
+                        "base_lat": own.lat, "base_lon": own.lon,
+                        "role": own.role, "tier": own.tier, "location_kind": own.location_kind,
                         "is_own_station": True, "title": "My station · " + my_call,
+                        "rows": [
+                            {"label": "Grid", "value": own.grid},
+                            {"label": "Role", "value": own.role},
+                            {"label": "Tier", "value": own.tier},
+                            {"label": "Location", "value": own.location_kind},
+                        ],
                         "spotter_status_key": status.get("status_key", "unknown"),
                         "spotter_status_label": status.get("status_label", "Unknown"),
                     })

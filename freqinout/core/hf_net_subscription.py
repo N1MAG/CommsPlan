@@ -128,6 +128,7 @@ def build_hf_subscription_drafts(
             "net_name": str(getattr(entry, "name", None) or key),
             "fldigi_mode": "",
             "fldigi_offset": "",
+            "fldigi_tuning_json": session.fldigi_tuning_json,
             "net_session_key": session.net_session_key,
             "frequency_resource_key": session.frequency_resource_key,
             "accepted_session_version_hash": session.version_hash,

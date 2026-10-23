@@ -144,6 +144,7 @@ def ensure_resource_catalog_schema(conn: sqlite3.Connection) -> None:
             day_utc TEXT,
             effective_start_date TEXT, effective_end_date TEXT, exception_dates_json TEXT NOT NULL DEFAULT '[]',
             reminder_minutes INTEGER, mode TEXT, mode_details TEXT,
+            fldigi_tuning_json TEXT NOT NULL DEFAULT '{}',
             content_hash TEXT NOT NULL, version_hash TEXT NOT NULL,
             active INTEGER NOT NULL DEFAULT 1, retired INTEGER NOT NULL DEFAULT 0,
             replacement_net_session_key TEXT, created_utc TEXT NOT NULL, updated_utc TEXT NOT NULL
@@ -172,6 +173,8 @@ def ensure_resource_catalog_schema(conn: sqlite3.Connection) -> None:
         """,
     )
     session_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(net_directory_sessions)")}
+    if "fldigi_tuning_json" not in session_columns:
+        conn.execute("ALTER TABLE net_directory_sessions ADD COLUMN fldigi_tuning_json TEXT NOT NULL DEFAULT '{}'")
     if "day_utc" not in session_columns:
         conn.execute("ALTER TABLE net_directory_sessions ADD COLUMN day_utc TEXT")
 
@@ -511,10 +514,10 @@ class ResourceCatalogStore:
                 self._require_mutable_source(conn, session.source_key, old["source_key"])
             revision = self._revision(None) if not old else self._revision_from_hash(old["version_hash"])
             content_hash = _hash(self._session_payload(session)); version_hash = _hash({"content_hash": content_hash, "revision": revision}); created = old["created_utc"] if old else now
-            conn.execute("""INSERT INTO net_directory_sessions(net_session_key,net_entry_key,source_key,service,frequency_resource_key,recurrence,local_start_time,duration_minutes,timezone,effective_start_date,effective_end_date,exception_dates_json,reminder_minutes,mode,mode_details,day_utc,content_hash,version_hash,active,retired,replacement_net_session_key,created_utc,updated_utc)
-                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                            ON CONFLICT(net_session_key) DO UPDATE SET net_entry_key=excluded.net_entry_key,source_key=excluded.source_key,service=excluded.service,frequency_resource_key=excluded.frequency_resource_key,recurrence=excluded.recurrence,local_start_time=excluded.local_start_time,duration_minutes=excluded.duration_minutes,timezone=excluded.timezone,effective_start_date=excluded.effective_start_date,effective_end_date=excluded.effective_end_date,exception_dates_json=excluded.exception_dates_json,reminder_minutes=excluded.reminder_minutes,mode=excluded.mode,mode_details=excluded.mode_details,day_utc=excluded.day_utc,content_hash=excluded.content_hash,version_hash=excluded.version_hash,active=excluded.active,retired=excluded.retired,replacement_net_session_key=excluded.replacement_net_session_key,updated_utc=excluded.updated_utc""",
-                         (session.net_session_key,session.net_entry_key,session.source_key,session.service,session.frequency_resource_key,session.recurrence,session.local_start_time,session.duration_minutes,session.timezone,session.effective_start_date,session.effective_end_date,_canonical_json(session.exception_dates),session.reminder_minutes,session.mode,session.mode_details,session.day_utc,content_hash,version_hash,int(session.active),int(session.retired),session.replacement_net_session_key,created,now))
+            conn.execute("""INSERT INTO net_directory_sessions(net_session_key,net_entry_key,source_key,service,frequency_resource_key,recurrence,local_start_time,duration_minutes,timezone,effective_start_date,effective_end_date,exception_dates_json,reminder_minutes,mode,mode_details,day_utc,content_hash,version_hash,active,retired,replacement_net_session_key,created_utc,updated_utc,fldigi_tuning_json)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                            ON CONFLICT(net_session_key) DO UPDATE SET net_entry_key=excluded.net_entry_key,source_key=excluded.source_key,service=excluded.service,frequency_resource_key=excluded.frequency_resource_key,recurrence=excluded.recurrence,local_start_time=excluded.local_start_time,duration_minutes=excluded.duration_minutes,timezone=excluded.timezone,effective_start_date=excluded.effective_start_date,effective_end_date=excluded.effective_end_date,exception_dates_json=excluded.exception_dates_json,reminder_minutes=excluded.reminder_minutes,mode=excluded.mode,mode_details=excluded.mode_details,day_utc=excluded.day_utc,content_hash=excluded.content_hash,version_hash=excluded.version_hash,active=excluded.active,retired=excluded.retired,replacement_net_session_key=excluded.replacement_net_session_key,updated_utc=excluded.updated_utc,fldigi_tuning_json=excluded.fldigi_tuning_json""",
+                         (session.net_session_key,session.net_entry_key,session.source_key,session.service,session.frequency_resource_key,session.recurrence,session.local_start_time,session.duration_minutes,session.timezone,session.effective_start_date,session.effective_end_date,_canonical_json(session.exception_dates),session.reminder_minutes,session.mode,session.mode_details,session.day_utc,content_hash,version_hash,int(session.active),int(session.retired),session.replacement_net_session_key,created,now,session.fldigi_tuning_json))
         return dataclasses.replace(session, content_hash=content_hash, version_hash=version_hash, created_utc=created, updated_utc=now)
 
     def get_session(self, net_session_key: str) -> NetDirectorySession | None:
@@ -770,7 +773,7 @@ class ResourceCatalogStore:
     def _entry_from_row(row: sqlite3.Row) -> NetDirectoryEntry: return NetDirectoryEntry(**{name: row[name] for name in NetDirectoryEntry.__dataclass_fields__})
     @staticmethod
     def _session_from_row(row: sqlite3.Row) -> NetDirectorySession:
-        data = {name: row[name] for name in NetDirectorySession.__dataclass_fields__ if name != "exception_dates"}
+        data = {name: row[name] for name in NetDirectorySession.__dataclass_fields__ if name != "exception_dates" and name in row.keys()}
         try: data["exception_dates"] = tuple(json.loads(row["exception_dates_json"] or "[]"))
         except (TypeError, ValueError, json.JSONDecodeError): data["exception_dates"] = ()
         return NetDirectorySession(**data)

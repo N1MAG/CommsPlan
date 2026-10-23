@@ -150,6 +150,7 @@ from freqinout.gui.current_page_stack import CurrentPageStack
 from freqinout.gui.daily_schedule_tab import DailyScheduleTab  # HF Frequency Schedule tab
 from freqinout.gui.net_schedule_tab import NetScheduleTab
 from freqinout.gui.fldigi_net_control_tab import FldigiNetControlTab
+from freqinout.gui.net_tuning_actions import show_net_tuning_dialog
 from freqinout.gui.js8call_net_control_tab import JS8CallNetControlTab
 from freqinout.gui.freq_planner_tab import FreqPlannerTab
 from freqinout.gui.sop_tab import SOPTab
@@ -12725,6 +12726,45 @@ class MainWindow(QMainWindow):
         if dialog.exec() == QDialog.Accepted:
             self._save_operator_card_choices(radio_id, {"timer_policy": validated_timer_policy({k: combo.currentText() for k, combo in combos.items()})})
 
+    def _open_net_tuning_dialog_for_radio(self, radio_id: int) -> None:
+        """Open the cache-only NET FLDigi action for exactly one radio."""
+        ident = int(radio_id or 0)
+        profile = self._operator_card_target(ident)
+        scheduler = getattr(self, "scheduler", None)
+        if profile is None or scheduler is None:
+            return
+        show_net_tuning_dialog(
+            self,
+            scheduler,
+            ident,
+            radio_name=str(profile.get("name") or profile.get("label") or f"Radio {ident}"),
+        )
+
+    def _add_net_tuning_menu_action(self, menu: QMenu, radio_id: int, anchor: QWidget) -> QAction:
+        """Add the configured label from the scheduler cache without widening the menu."""
+        label = "Center + Narrow"
+        getter = getattr(getattr(self, "scheduler", None), "net_tuning_snapshot", None)
+        if callable(getter):
+            try:
+                snapshot = getter(int(radio_id or 0))
+                if isinstance(snapshot, Mapping):
+                    label = str(snapshot.get("label") or label).strip() or label
+            except Exception:
+                pass
+        full_text = f"{label}…"
+        font_metrics = anchor.fontMetrics()
+        width = max(
+            font_metrics.horizontalAdvance("Center + Narrow…"),
+            font_metrics.horizontalAdvance("M") * 28,
+        )
+        text = font_metrics.elidedText(full_text, Qt.ElideRight, width)
+        action = menu.addAction(text)
+        action.setToolTip(full_text)
+        action.triggered.connect(
+            lambda _checked=False, ident=int(radio_id or 0): self._open_net_tuning_dialog_for_radio(ident)
+        )
+        return action
+
     def _on_radio_card_net(self, radio_id: int) -> None:
         profile = self._operator_card_target(radio_id)
         if profile is None:
@@ -12733,18 +12773,27 @@ class MainWindow(QMainWindow):
         token = sessions.get((radio_id, "OPERATOR"))
         ncs_active = any(key[0] == radio_id and key[1] in {"FLDIGI", "JS8"} for key in sessions)
         if ncs_active:
-            QMessageBox.information(self, "Net control", "This radio has an active NCS session. End that session in its NCS workspace before returning to the schedule.")
+            menu = QMenu(self)
+            menu.addSection(f"NCS session active · {profile.get('name') or radio_id}")
+            note = menu.addAction("End the NCS session in its workspace to change net ownership")
+            note.setEnabled(False)
+            card = self.radio_control_panel._cards.get(radio_id)
+            if card is not None:
+                tune = self._add_net_tuning_menu_action(menu, radio_id, card.net_button)
+                menu.exec(card.net_button.mapToGlobal(card.net_button.rect().bottomLeft()))
             return
         lane = self._station_command_lane_for_radio(radio_id) or {}
         self._dismiss_radio_off_schedule_prompt(radio_id)
         if token or str(lane.get("current_source") or "").upper() == "NET":
             menu = QMenu(self)
             menu.addSection(f"{'End operator net' if token else 'Scheduled net'} · {profile.get('name') or radio_id}")
-            resume = menu.addAction("Resume current schedule")
-            paused = menu.addAction("Remain paused")
             card = self.radio_control_panel._cards.get(radio_id)
             if card is None:
                 return
+            tune = self._add_net_tuning_menu_action(menu, radio_id, card.net_button)
+            menu.addSeparator()
+            resume = menu.addAction("Resume current schedule")
+            paused = menu.addAction("Remain paused")
             chosen = menu.exec(card.net_button.mapToGlobal(card.net_button.rect().bottomLeft()))
             if chosen not in (resume, paused):
                 return

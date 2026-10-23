@@ -2,15 +2,20 @@ from __future__ import annotations
 
 import copy
 import datetime
+import time
 from typing import Callable, Iterable, Mapping, Optional
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QBrush
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
+    QBoxLayout,
+    QDialog,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QPlainTextEdit,
     QPushButton,
     QSizePolicy,
     QTabWidget,
@@ -22,9 +27,17 @@ from PySide6.QtWidgets import (
 
 from freqinout.core.settings_manager import SettingsManager
 from freqinout.core.station_health_summary import ScopeResolver, summarize_station_health
+from freqinout.core.support_report import build_support_report
+from freqinout import __version__
 from freqinout.gui.bounded_snapshot_worker import SnapshotWorkerController
 from freqinout.gui.help_registry import resolve_help_host
-from freqinout.gui.theme import active_app_theme, button_style, resolve_theme
+from freqinout.gui.theme import (
+    active_app_theme,
+    button_height_for_font,
+    button_style,
+    horizontal_layout_breakpoint,
+    resolve_theme,
+)
 
 
 class StationHealthTab(QWidget):
@@ -34,11 +47,14 @@ class StationHealthTab(QWidget):
         super().__init__(parent)
         self.settings = SettingsManager()
         self._tab_active = False
+        self._closed = False
         self._last_summary: dict[str, object] = {"issue_count": 0, "severity": "ok", "items": []}
         self._scope_resolver: Optional[ScopeResolver] = None
         self._runtime_item_provider: Optional[Callable[[], Iterable[Mapping[str, object]]]] = None
         self._runtime_source_provider: Optional[Callable[[], Iterable[Mapping[str, object]]]] = None
         self._runtime_source_rows: list[Mapping[str, object]] = []
+        self._last_snapshot_monotonic: float | None = None
+        self._support_report_dialog: QDialog | None = None
         self._issue_row_height_signature: tuple[object, ...] = ()
         self._runtime_source_row_height_signature: tuple[object, ...] = ()
         self._scheduler_row_height_signature: tuple[object, ...] = ()
@@ -60,6 +76,8 @@ class StationHealthTab(QWidget):
         self.destroyed.connect(self._stop_snapshot_worker)
 
     def _ensure_snapshot_worker(self) -> SnapshotWorkerController:
+        if self._closed:
+            raise RuntimeError("Station health is shut down")
         worker = self._snapshot_worker
         if worker is None:
             worker = SnapshotWorkerController(self, self._on_snapshot_ready)
@@ -75,10 +93,19 @@ class StationHealthTab(QWidget):
     def shutdown(self) -> None:
         """Stop the bounded refresh worker before an owning window exits."""
 
+        self._closed = True
+        self._tab_active = False
+        self._refresh_timer.stop()
+        self._snapshot_generation += 1
         self._stop_snapshot_worker()
+        dialog = self._support_report_dialog
+        self._support_report_dialog = None
+        if dialog is not None:
+            dialog.close()
+            dialog.deleteLater()
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt virtual
-        self._stop_snapshot_worker()
+        self.shutdown()
         super().closeEvent(event)
 
     def _build_ui(self) -> None:
@@ -102,11 +129,15 @@ class StationHealthTab(QWidget):
         self.summary_label.setWordWrap(True)
         layout.addWidget(self.summary_label)
 
-        action_row = QHBoxLayout()
-        action_row.setSpacing(8)
-        action_row.addStretch(1)
-        action_row.addWidget(self.refresh_btn, 0, Qt.AlignRight)
-        layout.addLayout(action_row)
+        self._station_action_row = QBoxLayout(QBoxLayout.LeftToRight)
+        self._station_action_row.setSpacing(8)
+        self._station_action_row.addStretch(1)
+        self._station_action_row.addWidget(self.refresh_btn, 0, Qt.AlignRight)
+        self.support_report_btn = QPushButton("Support report…")
+        self.support_report_btn.setToolTip("Preview a bounded report from cached station health evidence.")
+        self.support_report_btn.clicked.connect(self._open_support_report)
+        self._station_action_row.addWidget(self.support_report_btn, 0, Qt.AlignRight)
+        layout.addLayout(self._station_action_row)
 
         self.note_label = QLabel("Review current issues first; select a row for paths, timing, and diagnostics.")
         self.note_label.setWordWrap(True)
@@ -265,6 +296,34 @@ class StationHealthTab(QWidget):
         self._update_scheduler_table_empty_state()
         self.health_tabs.addTab(scheduler_tab, "Scheduler Log")
         self.apply_theme()
+        self._update_station_action_row()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt virtual
+        super().resizeEvent(event)
+        self._update_station_action_row()
+
+    def _update_station_action_row(self) -> None:
+        row = getattr(self, "_station_action_row", None)
+        if row is None:
+            return
+        for button in (getattr(self, "refresh_btn", None), getattr(self, "support_report_btn", None)):
+            if button is not None:
+                button.setMinimumHeight(button_height_for_font(button))
+        threshold = horizontal_layout_breakpoint(row, reserve_controls=1)
+        compact = threshold > 0 and self.width() < threshold
+        desired = QBoxLayout.TopToBottom if compact else QBoxLayout.LeftToRight
+        if row.direction() == desired:
+            return
+        while row.count():
+            row.takeAt(0)
+        row.setDirection(desired)
+        if compact:
+            row.addWidget(self.refresh_btn, 0, Qt.AlignRight)
+            row.addWidget(self.support_report_btn, 0, Qt.AlignRight)
+        else:
+            row.addStretch(1)
+            row.addWidget(self.refresh_btn, 0, Qt.AlignRight)
+            row.addWidget(self.support_report_btn, 0, Qt.AlignRight)
 
     def set_scope_resolver(self, resolver: Optional[ScopeResolver]) -> None:
         self._scope_resolver = resolver
@@ -284,6 +343,8 @@ class StationHealthTab(QWidget):
         self._request_registry_refresh()
 
     def set_tab_active(self, active: bool) -> None:
+        if self._closed:
+            return
         self._tab_active = bool(active)
         if active:
             self._request_registry_refresh()
@@ -311,6 +372,8 @@ class StationHealthTab(QWidget):
         paths.  Runtime polling and all later refreshes use the worker below.
         """
 
+        if self._closed:
+            return
         generation = self._snapshot_generation + 1
         self._snapshot_generation = generation
         summary, rows = self._read_registry_snapshot(
@@ -321,6 +384,8 @@ class StationHealthTab(QWidget):
         self._accept_registry_snapshot(generation, (summary, rows))
 
     def _request_registry_refresh(self) -> None:
+        if self._closed:
+            return
         self._snapshot_generation += 1
         generation = self._snapshot_generation
         resolver = self._scope_resolver
@@ -380,6 +445,7 @@ class StationHealthTab(QWidget):
         self._last_coherent_summary = copy.deepcopy(summary)
         self._last_summary = dict(self._last_coherent_summary)
         self._runtime_source_rows = [dict(row) for row in rows if isinstance(row, Mapping)]
+        self._last_snapshot_monotonic = time.monotonic()
         self._render_summary()
         self._render_runtime_sources()
         self._render_table()
@@ -393,6 +459,8 @@ class StationHealthTab(QWidget):
         self._theme_cache = dict(theme)
         self.refresh_btn.setStyleSheet(button_style("muted", theme))
         self.help_btn.setStyleSheet(button_style("secondary", theme))
+        if hasattr(self, "support_report_btn"):
+            self.support_report_btn.setStyleSheet(button_style("secondary", theme))
         if hasattr(self, "health_open_related_btn"):
             self.health_open_related_btn.setStyleSheet(button_style("secondary", theme))
         if hasattr(self, "runtime_source_open_related_btn"):
@@ -400,6 +468,77 @@ class StationHealthTab(QWidget):
         self.note_label.setStyleSheet(f"color: {theme.get('text_muted', '#666')};")
         self._render_runtime_sources()
         self._render_summary()
+
+    def _support_report_snapshot_age_s(self) -> float | None:
+        accepted = self._last_snapshot_monotonic
+        if accepted is None:
+            return None
+        try:
+            return max(0.0, time.monotonic() - float(accepted))
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    def _cached_support_report_text(self) -> str:
+        # The builder is a pure reader.  Keep the UI path bounded by handing it
+        # only the cached mapping and a small source prefix; copying an entire
+        # summary here could traverse unbounded provider metadata before the
+        # allowlist has a chance to discard it.
+        summary = self._last_coherent_summary
+        sources = self._runtime_source_rows[:101]
+        return build_support_report(
+            summary,
+            sources,
+            version=__version__,
+            snapshot_age_s=self._support_report_snapshot_age_s(),
+        )
+
+    def _open_support_report(self) -> None:
+        if self._closed:
+            return
+        existing = self._support_report_dialog
+        if existing is not None:
+            existing.raise_()
+            existing.activateWindow()
+            return
+        report = self._cached_support_report_text()
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Support report")
+        dialog.setModal(False)
+        dialog.setWindowModality(Qt.NonModal)
+        dialog.setAttribute(Qt.WA_DeleteOnClose, False)
+        dialog_layout = QVBoxLayout(dialog)
+        detail = QPlainTextEdit(dialog)
+        detail.setReadOnly(True)
+        detail.setPlainText(report)
+        detail.setAccessibleName("Cached support report")
+        detail.setMinimumWidth(detail.fontMetrics().horizontalAdvance("0" * 72))
+        detail.setMinimumHeight(button_height_for_font(detail, vertical_padding=18) * 8)
+        dialog_layout.addWidget(detail, 1)
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        copy_button = QPushButton("Copy", dialog)
+        close_button = QPushButton("Close", dialog)
+        copy_button.setStyleSheet(button_style("secondary", self._theme_cache))
+        close_button.setStyleSheet(button_style("muted", self._theme_cache))
+        copy_button.setMinimumHeight(button_height_for_font(copy_button))
+        close_button.setMinimumHeight(button_height_for_font(close_button))
+        copy_button.clicked.connect(lambda: QApplication.clipboard().setText(report))
+        close_button.clicked.connect(dialog.close)
+        button_row.addWidget(copy_button)
+        button_row.addWidget(close_button)
+        dialog_layout.addLayout(button_row)
+        dialog.finished.connect(self._support_report_dialog_finished)
+        self._support_report_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _support_report_dialog_finished(self, _result: int) -> None:
+        dialog = self.sender()
+        if dialog is self._support_report_dialog:
+            self._support_report_dialog = None
+        if isinstance(dialog, QDialog):
+            dialog.deleteLater()
 
     def _open_context_help(self, context_key: str) -> None:
         host = resolve_help_host(self)

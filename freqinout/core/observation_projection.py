@@ -375,6 +375,13 @@ def explain_map_eligibility(
         confirmed = observation.confirmed_state.upper() in CONFIRMED_STATES
         if not confirmed and not allow_unconfirmed_local:
             reasons.append("local report is unconfirmed")
+    received_pin_unreviewed = (
+        observation.source_family == "rf_pin"
+        and bool(observation.provenance.get("received_pin"))
+        and observation.status.upper() != "PIN"
+    )
+    if received_pin_unreviewed:
+        reasons.append("received pin is pending review or dismissed")
     if observation.lat is not None and observation.lon is not None:
         reasons.append("location:explicit")
     elif observation.grid:
@@ -385,6 +392,7 @@ def explain_map_eligibility(
         reasons.append("no mappable location")
     allowed = (
         bool(layer_enabled)
+        and not received_pin_unreviewed
         and not (observation.exercise_flag and not exercise_layer)
         and (observation.source_family != "local_report" or observation.confirmed_state.upper() in CONFIRMED_STATES or allow_unconfirmed_local)
         and (observation.lat is not None and observation.lon is not None or bool(observation.grid))

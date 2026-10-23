@@ -1596,6 +1596,7 @@ def _ensure_nets_db() -> None:
                 group_name TEXT,
                 fldigi_mode TEXT,
                 fldigi_offset TEXT,
+                fldigi_tuning_json TEXT NOT NULL DEFAULT '{}',
                 resource_id INTEGER,
                 net_session_key TEXT,
                 accepted_session_version_hash TEXT,
@@ -1629,6 +1630,7 @@ def _ensure_nets_db() -> None:
                 "group_name": "TEXT",
                 "fldigi_mode": "TEXT",
                 "fldigi_offset": "TEXT",
+                "fldigi_tuning_json": "TEXT NOT NULL DEFAULT '{}'",
                 "resource_id": "INTEGER",
                 "net_session_key": "TEXT",
                 "accepted_session_version_hash": "TEXT",
@@ -1660,6 +1662,7 @@ def _ensure_nets_db() -> None:
                 group_name TEXT,
                 fldigi_mode TEXT,
                 fldigi_offset TEXT,
+                fldigi_tuning_json TEXT NOT NULL DEFAULT '{}',
                 net_session_key TEXT,
                 accepted_session_version_hash TEXT,
                 accepted_resource_version_hash TEXT,
@@ -1691,6 +1694,7 @@ def _ensure_nets_db() -> None:
                 "group_name": "TEXT",
                 "fldigi_mode": "TEXT",
                 "fldigi_offset": "TEXT",
+                "fldigi_tuning_json": "TEXT NOT NULL DEFAULT '{}'",
                 "net_session_key": "TEXT",
                 "accepted_session_version_hash": "TEXT",
                 "accepted_resource_version_hash": "TEXT",
@@ -1725,6 +1729,7 @@ def _ensure_nets_db() -> None:
                 net_name TEXT,
                 fldigi_mode TEXT,
                 fldigi_offset TEXT,
+                fldigi_tuning_json TEXT NOT NULL DEFAULT '{}',
                 updated_utc TEXT
             )
             """
@@ -1754,6 +1759,7 @@ def _ensure_nets_db() -> None:
                 "net_name": "TEXT",
                 "fldigi_mode": "TEXT",
                 "fldigi_offset": "TEXT",
+                "fldigi_tuning_json": "TEXT NOT NULL DEFAULT '{}'",
                 "updated_utc": "TEXT",
             },
         )

@@ -46,6 +46,8 @@ from freqinout.core.condition_alerts import CONDITION_ALERT_RULES_SETTING_KEY
 from freqinout.core.message_intelligence import analyze_spotter_text
 from freqinout.core.message_projection_queue import ensure_source_dirty_triggers
 from freqinout.core.js8_message_schema import ensure_js8_message_cache_schema
+from freqinout.core.js8_receipt_context import api_receive_frequency, finite_number, receive_context
+from freqinout.core.js8_pin_review import received_pin_observation
 from freqinout.core.observation_projection import observation_from_message_intelligence
 from freqinout.core.observation_store import upsert_observation_conn
 from freqinout.core.settings_manager import SettingsManager
@@ -2398,6 +2400,7 @@ class MessageIngestor:
             return None
         raw_text = str(parts[4]).strip()
         sender, dest, payload = self._split_directed_js8_text(raw_text)
+        rx_sender = sender
         if not sender or not dest:
             return None
         decision = classify_js8_payload(directed_js8_payload(raw_text))
@@ -2445,6 +2448,11 @@ class MessageIngestor:
             "source_radio_id": source_radio_id,
             "js8_instance_id": js8_instance_id,
             "source_path": str(source_path or ""),
+            **receive_context(
+                sender=rx_sender,
+                frequency_hz=(finite_number(parts[1]) * 1_000_000 if finite_number(parts[1]) is not None else None),
+                snr=parts[3], kind="directed_txt", received_ts=time.time(),
+            ),
         }
 
     def _parse_directed_js8_message_event(
@@ -2472,6 +2480,7 @@ class MessageIngestor:
             dest = parsed_dest
         if not sender or not dest:
             return None
+        rx_sender = sender
         decision = classify_js8_payload(directed_js8_payload(text))
         if not decision.inbox_visible:
             return None
@@ -2515,6 +2524,7 @@ class MessageIngestor:
             f"directed-event|{stable}|{sender}|{dest}|{utc_str}|{text}",
             source_key_text,
         )
+        qualified_receipt = str(event.get("type") or "").upper() in {"RX.DIRECTED", "RX.DIRECTED.ME"}
         return {
             "msg_id": source_id,
             "from_call": sender,
@@ -2531,6 +2541,12 @@ class MessageIngestor:
             "source_radio_id": source_radio_id,
             "js8_instance_id": js8_instance_id,
             "source_path": "",
+            **receive_context(
+                sender=rx_sender if qualified_receipt else "",
+                frequency_hz=api_receive_frequency(params) if qualified_receipt else None,
+                snr=params.get("SNR") if qualified_receipt else None,
+                received_ts=time.time(), kind="rx_directed" if qualified_receipt else "",
+            ),
         }
 
     def _store_directed_js8_message(self, row: Mapping[str, Any]) -> bool:
@@ -2555,6 +2571,11 @@ class MessageIngestor:
                 source_radio_id=row.get("source_radio_id", ""),
                 js8_instance_id=row.get("js8_instance_id", ""),
                 source_path=row.get("source_path", ""),
+                rx_freq_hz=row.get("rx_freq_hz"),
+                rx_snr=row.get("rx_snr"),
+                rx_sender=row.get("rx_sender"),
+                receipt_kind=row.get("receipt_kind"),
+                received_ts=row.get("received_ts"),
             )
             if inserted:
                 try:
@@ -2591,6 +2612,11 @@ class MessageIngestor:
         source_radio_id: object = "",
         js8_instance_id: object = "",
         source_path: object = "",
+        rx_freq_hz: object = None,
+        rx_snr: object = None,
+        rx_sender: object = None,
+        receipt_kind: object = None,
+        received_ts: object = None,
     ) -> bool:
         db_path = self._local_js8_db()
         if not db_path:
@@ -2620,8 +2646,9 @@ class MessageIngestor:
                 """
                 INSERT INTO js8_messages
                     (id, from_call, to_call, msg_type, utc_str, utc_ts, raw_text, decoded_text, state, read_ts,
-                     source_key, source_id, source_radio_id, js8_instance_id, source_path)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     source_key, source_id, source_radio_id, js8_instance_id, source_path,
+                     rx_freq_hz, rx_band, rx_snr, rx_sender, receipt_kind, received_ts)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(source_key, source_id) DO NOTHING
                 """,
                 (
@@ -2640,9 +2667,23 @@ class MessageIngestor:
                     str(source_radio_id or ""),
                     str(js8_instance_id or ""),
                     str(source_path or ""),
+                    *receive_context(
+                        sender=str(rx_sender or ""), frequency_hz=rx_freq_hz,
+                        snr=rx_snr, kind=str(receipt_kind or ""), received_ts=received_ts,
+                    ).values(),
                 ),
             )
             inserted = int(cur.rowcount or 0) > 0
+            if inserted:
+                candidate = received_pin_observation({
+                    "receipt_kind": receipt_kind, "source_radio_id": source_radio_id,
+                    "raw_text": raw_text, "to_call": to_call, "rx_sender": rx_sender,
+                    "source_key": source_key, "source_id": native_id,
+                    "received_ts": received_ts, "utc_str": utc_str,
+                    "js8_instance_id": js8_instance_id,
+                })
+                if candidate is not None:
+                    upsert_observation_conn(conn, candidate)
             conn.commit()
             conn.close()
             return inserted

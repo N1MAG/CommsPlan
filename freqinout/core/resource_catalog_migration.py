@@ -414,6 +414,7 @@ def _upsert_net(conn: sqlite3.Connection, item: MigrationClassification, source_
         "timezone": "UTC", "reminder_minutes": int(row.get("early_checkin") or 0),
         "mode": _text(row.get("mode")) or None,
         "mode_details": _text(row.get("fldigi_mode")) or _text(row.get("comment")) or None,
+        "fldigi_tuning_json": row.get("fldigi_tuning_json") or "{}",
     }
     content_hash = _hash(session_payload)
     version_hash = _hash({"content_hash": content_hash, "source_row_hash": item.source_row_hash})
@@ -421,18 +422,18 @@ def _upsert_net(conn: sqlite3.Connection, item: MigrationClassification, source_
         """INSERT INTO net_directory_sessions
         (net_session_key,net_entry_key,source_key,service,frequency_resource_key,recurrence,local_start_time,
          duration_minutes,timezone,exception_dates_json,reminder_minutes,mode,mode_details,day_utc,content_hash,version_hash,
-         active,retired,created_utc,updated_utc)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         active,retired,created_utc,updated_utc,fldigi_tuning_json)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(net_session_key) DO UPDATE SET net_entry_key=excluded.net_entry_key,
         frequency_resource_key=excluded.frequency_resource_key,recurrence=excluded.recurrence,
         local_start_time=excluded.local_start_time,duration_minutes=excluded.duration_minutes,
         timezone=excluded.timezone,reminder_minutes=excluded.reminder_minutes,mode=excluded.mode,
         mode_details=excluded.mode_details,day_utc=excluded.day_utc,content_hash=excluded.content_hash,
-        version_hash=excluded.version_hash,updated_utc=excluded.updated_utc""",
+        version_hash=excluded.version_hash,updated_utc=excluded.updated_utc,fldigi_tuning_json=excluded.fldigi_tuning_json""",
         (item.net_session_key, item.net_entry_key, source_key, session_payload["service"],
          item.frequency_resource_key, session_payload["recurrence"], session_payload["local_start_time"],
          session_payload["duration_minutes"], "UTC", "[]", session_payload["reminder_minutes"],
-         session_payload["mode"], session_payload["mode_details"], session_payload["day_utc"], content_hash, version_hash, 1, 0, now, now),
+         session_payload["mode"], session_payload["mode_details"], session_payload["day_utc"], content_hash, version_hash, 1, 0, now, now, session_payload["fldigi_tuning_json"]),
     )
 
 

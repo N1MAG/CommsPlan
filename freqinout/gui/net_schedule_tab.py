@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QSpinBox,
     QCompleter,
     QToolButton,
     QMenu,
@@ -91,6 +92,160 @@ from freqinout.gui.theme import (
     resolve_theme, button_style, font_css, item_view_height_for_rows,
     font_derived_widget_height, control_height_for_font, fit_combo_box_to_contents,
 )
+
+from freqinout.core.fldigi_tuning import normalize_tuning_preset, tuning_preset_json
+
+
+def _normalized_fldigi_tuning_json(value: Any, *, strict: bool = False) -> str:
+    try:
+        return tuning_preset_json(value)
+    except (TypeError, ValueError) as exc:
+        if strict:
+            raise ValueError(str(exc)) from exc
+        log.debug("Net Schedule: invalid FLDigi tuning preset; using defaults: %s", exc)
+        return "{}"
+
+
+def _fldigi_tuning_summary(value: Any) -> str:
+    try:
+        preset = normalize_tuning_preset(value)
+    except (TypeError, ValueError):
+        return "FLDigi Tuning…"
+    if not bool(preset.get("enabled")):
+        return "FLDigi Tuning…"
+    label = str(preset.get("label") or "Center + Narrow").strip() or "Center + Narrow"
+    summary = f"FLDigi: {label}"
+    return summary if len(summary) <= 24 else summary[:23] + "…"
+
+
+def _fldigi_tuning_tooltip(value: Any) -> str:
+    try:
+        preset = normalize_tuning_preset(value)
+    except (TypeError, ValueError):
+        return "FLDigi tuning preset is invalid; open to repair it."
+    if not bool(preset.get("enabled")):
+        return "FLDigi tuning is disabled. Open to configure this receive-only preset."
+    filter_width = preset.get("filter_width_hz")
+    filter_text = "unchanged" if filter_width in (None, "") else f"{filter_width} Hz"
+    apply_text = "at net start" if preset.get("apply_at_start") else "manually during the net"
+    preserve_text = "preserve signal on USB/LSB" if preset.get("preserve_signal") else "leave the dial unchanged"
+    return (
+        f"{preset.get('label') or 'Center + Narrow'} · audio offset {preset.get('audio_offset_hz', 1500)} Hz · "
+        f"filter {filter_text} · {preserve_text} · apply {apply_text}. "
+        "Reads actual current radio values before applying; no transmit."
+    )
+
+
+class FldigiTuningDialog(QDialog):
+    """Small reusable editor for the optional receive-only FLDigi preset."""
+
+    def __init__(self, value: Any = None, parent: Optional[QWidget] = None, *, settings=None):
+        super().__init__(parent)
+        self.setWindowTitle("FLDigi Tuning")
+        self.setModal(True)
+        self._settings = settings
+        try:
+            preset = normalize_tuning_preset(value)
+        except (TypeError, ValueError):
+            preset = normalize_tuning_preset({})
+        form = QFormLayout(self)
+        form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        self.setMaximumWidth(self.fontMetrics().horizontalAdvance("M" * 48))
+
+        explanation = QLabel(
+            "Reads actual current radio/FLDigi values before applying. Apply once during the net, or optionally "
+            "at net start. Continue adjusting tuning freely afterward. Preserve signal automatically shifts the "
+            "dial for USB/LSB only. Filter width is the radio receiver bandwidth, not the modem. No transmit."
+        )
+        explanation.setWordWrap(True)
+        form.addRow(explanation)
+
+        self.enabled_check = QCheckBox("Enable preset")
+        self.enabled_check.setAccessibleName("Enable FLDigi tuning preset")
+        self.enabled_check.setChecked(bool(preset.get("enabled")))
+        form.addRow(self.enabled_check)
+
+        self.label_edit = QLineEdit(str(preset.get("label") or "Center + Narrow"))
+        self.label_edit.setAccessibleName("FLDigi tuning preset label")
+        self.label_edit.setMaxLength(40)
+        form.addRow("Label:", self.label_edit)
+
+        self.audio_offset_spin = QSpinBox()
+        self.audio_offset_spin.setAccessibleName("FLDigi audio offset in hertz")
+        self.audio_offset_spin.setRange(100, 4000)
+        self.audio_offset_spin.setValue(int(preset.get("audio_offset_hz") or 1500))
+        self.audio_offset_spin.setSuffix(" Hz")
+        form.addRow("Audio offset:", self.audio_offset_spin)
+
+        self.filter_width_edit = QLineEdit(
+            "" if preset.get("filter_width_hz") in (None, "") else str(preset.get("filter_width_hz"))
+        )
+        self.filter_width_edit.setPlaceholderText("Blank leaves current filter unchanged")
+        self.filter_width_edit.setAccessibleName("FLDigi receiver filter width in hertz")
+        self.filter_width_edit.setValidator(QRegularExpressionValidator(QRegularExpression(r"[0-9]*")))
+        form.addRow("Filter width:", self.filter_width_edit)
+
+        self.preserve_signal_check = QCheckBox("Preserve signal")
+        self.preserve_signal_check.setAccessibleName("Preserve signal while tuning FLDigi")
+        self.preserve_signal_check.setChecked(bool(preset.get("preserve_signal", True)))
+        form.addRow(self.preserve_signal_check)
+
+        self.apply_at_start_check = QCheckBox("Apply at schedule start")
+        self.apply_at_start_check.setAccessibleName("Apply FLDigi tuning at schedule start")
+        self.apply_at_start_check.setChecked(bool(preset.get("apply_at_start")))
+        form.addRow(self.apply_at_start_check)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel, parent=self)
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+        self._buttons = buttons
+        self._tuning_fields = (
+            self.label_edit,
+            self.audio_offset_spin,
+            self.filter_width_edit,
+            self.preserve_signal_check,
+            self.apply_at_start_check,
+        )
+        self.enabled_check.toggled.connect(self._set_enabled_fields)
+        self._set_enabled_fields(self.enabled_check.isChecked())
+        if settings is not None:
+            theme = resolve_theme(settings)
+            buttons.button(QDialogButtonBox.Save).setStyleSheet(button_style("eligible_primary", theme))
+            buttons.button(QDialogButtonBox.Cancel).setStyleSheet(button_style("muted", theme))
+
+    def _accept(self) -> None:
+        raw_width = self.filter_width_edit.text().strip()
+        if raw_width:
+            try:
+                width = int(raw_width)
+            except ValueError:
+                QMessageBox.warning(self, "Invalid FLDigi Tuning", "Filter width must be a whole number or blank.")
+                return
+            if not 50 <= width <= 12000:
+                QMessageBox.warning(self, "Invalid FLDigi Tuning", "Filter width must be between 50 and 12000 Hz.")
+                return
+        else:
+            width = None
+        value = {
+            "enabled": self.enabled_check.isChecked(),
+            "label": self.label_edit.text().strip() or "Center + Narrow",
+            "audio_offset_hz": self.audio_offset_spin.value(),
+            "filter_width_hz": width,
+            "preserve_signal": self.preserve_signal_check.isChecked(),
+            "apply_at_start": self.apply_at_start_check.isChecked(),
+        }
+        try:
+            self.result_json = tuning_preset_json(value)
+        except (TypeError, ValueError) as exc:
+            QMessageBox.warning(self, "Invalid FLDigi Tuning", str(exc))
+            return
+        self.accept()
+
+    def _set_enabled_fields(self, enabled: bool) -> None:
+        for widget in getattr(self, "_tuning_fields", ()):
+            widget.setEnabled(bool(enabled))
 
 
 # ---- Band / Mode metadata (keep in sync with HF tab) ----
@@ -249,6 +404,7 @@ class NetScheduleTab(QWidget):
     COL_AUTOTUNE = 14
     COL_TARGET_SCOPE = 15
     COL_TARGET = 16
+    COL_FLDIGI_TUNING = 17
     COMPACT_VISIBLE_COLUMNS = frozenset(
         {
             COL_SELECT,
@@ -260,6 +416,7 @@ class NetScheduleTab(QWidget):
             COL_START,
             COL_END,
             COL_NETNAME,
+            COL_FLDIGI_TUNING,
         }
     )
 
@@ -281,6 +438,7 @@ class NetScheduleTab(QWidget):
     RES_COL_COVERAGE = 15
     RES_COL_COMMENT = 16
     RES_COL_UPDATED = 17
+    RES_COL_FLDIGI_TUNING = 18
 
     def __init__(self, parent=None, *, plan_context_service: Optional[PlanContextService] = None):
         super().__init__(parent)
@@ -388,7 +546,7 @@ class NetScheduleTab(QWidget):
 
         # table
         self.table = QTableWidget()
-        self.table.setColumnCount(self.COL_TARGET + 1)
+        self.table.setColumnCount(self.COL_FLDIGI_TUNING + 1)
         self._set_headers()
         self.table.setSortingEnabled(False)
         self.table.setSelectionMode(QAbstractItemView.NoSelection)
@@ -507,7 +665,7 @@ class NetScheduleTab(QWidget):
         self._arrange_net_action_rows(compact=False)
 
         self.resources_table = QTableWidget()
-        self.resources_table.setColumnCount(18)
+        self.resources_table.setColumnCount(19)
         self.resources_table.setHorizontalHeaderLabels(
             [
                 "From",
@@ -528,6 +686,7 @@ class NetScheduleTab(QWidget):
                 "Coverage",
                 "Comment",
                 "Age",
+                "FLDigi Tuning",
             ]
         )
         self.resources_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -1376,6 +1535,7 @@ class NetScheduleTab(QWidget):
                     self.COL_FLDIGI_OFFSET,
                     self.COL_AUTOTUNE,
                     self.COL_TARGET_SCOPE,
+                    self.COL_FLDIGI_TUNING,
                 },
                 {self.COL_NETNAME, self.COL_TARGET},
             )
@@ -1397,6 +1557,7 @@ class NetScheduleTab(QWidget):
                 self.RES_COL_FLDIGI_MODE,
                 self.RES_COL_FLDIGI_OFFSET,
                 self.RES_COL_UPDATED,
+                self.RES_COL_FLDIGI_TUNING,
             },
             {self.RES_COL_GROUP, self.RES_COL_NETNAME, self.RES_COL_COVERAGE, self.RES_COL_COMMENT},
         )
@@ -1676,6 +1837,7 @@ class NetScheduleTab(QWidget):
                     "auto_tune": bool(row.get("auto_tune", False)),
                     "fldigi_mode": str(row.get("fldigi_mode") or "").strip(),
                     "fldigi_offset": str(row.get("fldigi_offset") or "").strip(),
+                    "fldigi_tuning_json": _normalized_fldigi_tuning_json(row.get("fldigi_tuning_json", "{}")),
                     "target_scope": str(row.get("target_scope") or TARGET_SCOPE_STATION),
                     "target_device_profile_id": row.get("target_device_profile_id"),
                     "target_operating_profile_id": row.get("target_operating_profile_id"),
@@ -1940,6 +2102,7 @@ class NetScheduleTab(QWidget):
                 "Auto-Tune",
                 "Target Scope",
                 "Target",
+                "FLDigi Tuning",
             ]
         )
         self.time_toggle_btn.setText("Times: Local" if self._show_local else "Times: UTC")
@@ -2118,6 +2281,8 @@ class NetScheduleTab(QWidget):
             sel_wrap.setProperty("fldigi_mode", fld_mode)
         if fld_off:
             sel_wrap.setProperty("fldigi_offset", fld_off)
+        tuning_json = _normalized_fldigi_tuning_json(row_data.get("fldigi_tuning_json", "{}"))
+        sel_wrap.setProperty("fldigi_tuning_json", tuning_json)
         self.table.setCellWidget(r, self.COL_SELECT, sel_wrap)
 
         # Day combo
@@ -2278,6 +2443,15 @@ class NetScheduleTab(QWidget):
         self.table.setCellWidget(r, self.COL_TARGET_SCOPE, target_scope_combo)
         self.table.setCellWidget(r, self.COL_TARGET, target_value_combo)
 
+        tuning_btn = QPushButton("FLDigi Tuning…")
+        tuning_btn.setAccessibleName("Edit FLDigi tuning preset for this net row")
+        tuning_btn.setStyleSheet(
+            button_style("info" if bool(normalize_tuning_preset(tuning_json).get("enabled")) else "muted", resolve_theme(self.settings))
+        )
+        tuning_btn.setToolTip(_fldigi_tuning_tooltip(tuning_json))
+        tuning_btn.clicked.connect(lambda _checked=False, row=r: self._open_fldigi_tuning_editor(row))
+        self.table.setCellWidget(r, self.COL_FLDIGI_TUNING, tuning_btn)
+
         # Freq / times as QTableWidgetItem
         def set_item(col: int, value: str | None):
             item = QTableWidgetItem(str(value) if value is not None else "")
@@ -2315,6 +2489,25 @@ class NetScheduleTab(QWidget):
         self._update_delete_button_state()
         self._mark_dirty()
         self._queue_net_geometry_refresh()
+
+    def _open_fldigi_tuning_editor(self, row: int) -> None:
+        select_widget = self.table.cellWidget(row, self.COL_SELECT)
+        if not isinstance(select_widget, QWidget):
+            return
+        current = str(select_widget.property("fldigi_tuning_json") or "{}")
+        dialog = FldigiTuningDialog(current, self, settings=self.settings)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        value = str(getattr(dialog, "result_json", "{}") or "{}")
+        select_widget.setProperty("fldigi_tuning_json", value)
+        tuning_btn = self.table.cellWidget(row, self.COL_FLDIGI_TUNING)
+        if isinstance(tuning_btn, QPushButton):
+            tuning_btn.setText("FLDigi Tuning…")
+            tuning_btn.setToolTip(_fldigi_tuning_tooltip(value))
+            tuning_btn.setStyleSheet(
+                button_style("info" if bool(normalize_tuning_preset(value).get("enabled")) else "muted", resolve_theme(self.settings))
+            )
+        self._mark_dirty()
 
     def _parse_month_weeks(self, txt: str) -> set[int]:
         out: set[int] = set()
@@ -2853,6 +3046,7 @@ class NetScheduleTab(QWidget):
                 fo = select_widget.property("fldigi_offset")
                 if not fldigi_offset and fo not in (None, ""):
                     fldigi_offset = str(fo).strip()
+                tuning_json = str(select_widget.property("fldigi_tuning_json") or "{}")
                 subscription_values = {
                     key: select_widget.property(key)
                     for key in (
@@ -2865,6 +3059,7 @@ class NetScheduleTab(QWidget):
                 }
             else:
                 subscription_values = {}
+                tuning_json = "{}"
 
             freq = self._frequency_value(r)
             start_txt = text(self.COL_START)
@@ -2988,6 +3183,7 @@ class NetScheduleTab(QWidget):
                     "auto_tune": bool(auto_tune),
                     "fldigi_mode": fldigi_mode,
                     "fldigi_offset": fldigi_offset,
+                    "fldigi_tuning_json": _normalized_fldigi_tuning_json(tuning_json, strict=True),
                     "target_scope": target_scope,
                     "target_device_profile_id": target_device_profile_id,
                     "target_operating_profile_id": target_operating_profile_id,
@@ -3026,6 +3222,19 @@ class NetScheduleTab(QWidget):
 
         return get_config_dir() / "config" / "freqinout_nets.db"
 
+    @staticmethod
+    def _db_table_columns(conn: sqlite3.Connection, table: str) -> Set[str]:
+        try:
+            return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        except Exception:
+            return set()
+
+    @staticmethod
+    def _normalize_loaded_schedule_row(row: Dict[str, Any]) -> Dict[str, Any]:
+        out = normalize_schedule_target_fields(dict(row))
+        out["fldigi_tuning_json"] = _normalized_fldigi_tuning_json(out.get("fldigi_tuning_json", "{}"))
+        return out
+
     def _load_from_db(self) -> List[Dict]:
         db_path = self._db_path()
         if not db_path.exists():
@@ -3042,11 +3251,14 @@ class NetScheduleTab(QWidget):
             if not has_new and not has_legacy:
                 return []
 
+            new_columns = self._db_table_columns(conn, "net_schedule_tab") if has_new else set()
+            legacy_columns = self._db_table_columns(conn, "net_schedule") if has_legacy else set()
+
             rows: List[Dict] = []
             if has_new:
                 try:
                     cur = conn.execute(
-                        """
+                        f"""
                         SELECT
                             id,
                             day_utc,
@@ -3075,6 +3287,7 @@ class NetScheduleTab(QWidget):
                             target_scope,
                             target_device_profile_id,
                             target_operating_profile_id
+                            {', fldigi_tuning_json' if 'fldigi_tuning_json' in new_columns else ''}
                         FROM net_schedule_tab
                         """
                     )
@@ -3106,9 +3319,11 @@ class NetScheduleTab(QWidget):
                         target_scope,
                         target_device_profile_id,
                         target_operating_profile_id,
+                        *tuning_value,
                     ) in cur.fetchall():
+                        fldigi_tuning_json = tuning_value[0] if tuning_value else "{}"
                         rows.append(
-                            normalize_schedule_target_fields(
+                            self._normalize_loaded_schedule_row(
                                 {
                                     "day_utc": day_utc or "",
                                     "recurrence": "Periodic" if (recurrence or "Weekly") == "Monthly" else recurrence or "Weekly",
@@ -3139,6 +3354,7 @@ class NetScheduleTab(QWidget):
                                     "target_scope": target_scope,
                                     "target_device_profile_id": target_device_profile_id,
                                     "target_operating_profile_id": target_operating_profile_id,
+                                    "fldigi_tuning_json": fldigi_tuning_json or "{}",
                                 }
                             )
                         )
@@ -3146,7 +3362,7 @@ class NetScheduleTab(QWidget):
                 except Exception:
                     try:
                         cur = conn.execute(
-                            """
+                            f"""
                             SELECT
                                 day_utc,
                                 band,
@@ -3161,6 +3377,7 @@ class NetScheduleTab(QWidget):
                                 net_name,
                                 fldigi_mode,
                                 fldigi_offset
+                                {', fldigi_tuning_json' if 'fldigi_tuning_json' in new_columns else ''}
                             FROM net_schedule_tab
                             """
                         )
@@ -3202,7 +3419,9 @@ class NetScheduleTab(QWidget):
                                 net_name,
                                 fldigi_mode,
                                 fldigi_offset,
+                                *tuning_value,
                             ) = row
+                            fldigi_tuning_json = tuning_value[0] if tuning_value else "{}"
                         else:
                             (
                                 day_utc,
@@ -3219,8 +3438,9 @@ class NetScheduleTab(QWidget):
                             ) = row
                             fldigi_mode = ""
                             fldigi_offset = ""
+                            fldigi_tuning_json = "{}"
                         rows.append(
-                            normalize_schedule_target_fields(
+                            self._normalize_loaded_schedule_row(
                                 {
                                     "day_utc": day_utc or "",
                                     "recurrence": "Weekly",
@@ -3240,6 +3460,7 @@ class NetScheduleTab(QWidget):
                                     "group_name": "",
                                     "fldigi_mode": fldigi_mode or "",
                                     "fldigi_offset": fldigi_offset or "",
+                                    "fldigi_tuning_json": fldigi_tuning_json or "{}",
                                 }
                             )
                         )
@@ -3248,7 +3469,7 @@ class NetScheduleTab(QWidget):
             if has_legacy:
                 try:
                     cur = conn.execute(
-                        """
+                        f"""
                         SELECT
                             day_utc,
                             recurrence,
@@ -3270,6 +3491,7 @@ class NetScheduleTab(QWidget):
                             target_scope,
                             target_device_profile_id,
                             target_operating_profile_id
+                            {', fldigi_tuning_json' if 'fldigi_tuning_json' in legacy_columns else ''}
                         FROM net_schedule
                         """
                     )
@@ -3294,9 +3516,11 @@ class NetScheduleTab(QWidget):
                         target_scope,
                         target_device_profile_id,
                         target_operating_profile_id,
+                        *tuning_value,
                     ) in cur.fetchall():
+                        fldigi_tuning_json = tuning_value[0] if tuning_value else "{}"
                         rows.append(
-                            normalize_schedule_target_fields(
+                            self._normalize_loaded_schedule_row(
                                 {
                                     "day_utc": day_utc or "",
                                     "recurrence": "Periodic" if (recurrence or "Weekly") == "Monthly" else recurrence or "Weekly",
@@ -3319,6 +3543,7 @@ class NetScheduleTab(QWidget):
                                     "target_scope": target_scope,
                                     "target_device_profile_id": target_device_profile_id,
                                     "target_operating_profile_id": target_operating_profile_id,
+                                    "fldigi_tuning_json": fldigi_tuning_json or "{}",
                                 }
                             )
                         )
@@ -3326,7 +3551,7 @@ class NetScheduleTab(QWidget):
                 except Exception:
                     try:
                         cur = conn.execute(
-                            """
+                            f"""
                             SELECT
                                 day_utc,
                                 band,
@@ -3340,6 +3565,7 @@ class NetScheduleTab(QWidget):
                                 net_name,
                                 fldigi_mode,
                                 fldigi_offset
+                                {', fldigi_tuning_json' if 'fldigi_tuning_json' in legacy_columns else ''}
                             FROM net_schedule
                             """
                         )
@@ -3379,7 +3605,9 @@ class NetScheduleTab(QWidget):
                                 net_name,
                                 fldigi_mode,
                                 fldigi_offset,
+                                *tuning_value,
                             ) = row
+                            fldigi_tuning_json = tuning_value[0] if tuning_value else "{}"
                         else:
                             (
                                 day_utc,
@@ -3395,8 +3623,9 @@ class NetScheduleTab(QWidget):
                             ) = row
                             fldigi_mode = ""
                             fldigi_offset = ""
+                            fldigi_tuning_json = "{}"
                         rows.append(
-                            normalize_schedule_target_fields(
+                            self._normalize_loaded_schedule_row(
                                 {
                                     "day_utc": day_utc or "",
                                     "recurrence": "Weekly",
@@ -3416,6 +3645,7 @@ class NetScheduleTab(QWidget):
                                     "group_name": "",
                                     "fldigi_mode": fldigi_mode or "",
                                     "fldigi_offset": fldigi_offset or "",
+                                    "fldigi_tuning_json": fldigi_tuning_json or "{}",
                                 }
                             )
                         )
@@ -3450,7 +3680,9 @@ class NetScheduleTab(QWidget):
                 data = self.settings.get("net_schedule", [])
                 if not isinstance(data, list):
                     data = []
-                data = [normalize_schedule_target_fields(row) for row in data if isinstance(row, dict)]
+                data = [self._normalize_loaded_schedule_row(row) for row in data if isinstance(row, dict)]
+            else:
+                data = [self._normalize_loaded_schedule_row(row) for row in data if isinstance(row, dict)]
             self._raw_rows = data
             for row in self._raw_rows:
                 self._add_row(self._to_view_row(row))
@@ -4088,6 +4320,7 @@ class NetScheduleTab(QWidget):
                         "net_name": normalized.get("net_name", ""),
                         "fldigi_mode": normalized.get("fldigi_mode", ""),
                         "fldigi_offset": normalized.get("fldigi_offset", ""),
+                        "fldigi_tuning_json": _normalized_fldigi_tuning_json(normalized.get("fldigi_tuning_json", "{}")),
                         "target_scope": normalized.get("target_scope", TARGET_SCOPE_STATION),
                         "target_device_profile_id": normalized.get("target_device_profile_id"),
                         "target_operating_profile_id": normalized.get("target_operating_profile_id"),
@@ -4134,82 +4367,45 @@ class NetScheduleTab(QWidget):
         self._insert_rows_inner(conn, rows)
 
     def _insert_rows_inner(self, conn: sqlite3.Connection, rows: List[Dict]) -> None:
+        new_columns = self._db_table_columns(conn, "net_schedule_tab")
+        legacy_columns = self._db_table_columns(conn, "net_schedule")
         for row in rows:
             normalized = normalize_schedule_target_fields(row)
-            conn.execute(
-                """
-                INSERT INTO net_schedule_tab
-                  (day_utc, recurrence, biweekly_offset_weeks, month_weeks, band, mode, vfo, frequency, start_utc, end_utc,
-                   early_checkin, auto_tune, primary_js8call_group, comment, net_name, group_name, fldigi_mode, fldigi_offset,
-                   resource_id, net_session_key, accepted_session_version_hash, accepted_resource_version_hash,
-                   accepted_snapshot_json, target_scope, target_device_profile_id, target_operating_profile_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    normalized.get("day_utc"),
-                    normalized.get("recurrence", "Weekly"),
-                    int(normalized.get("biweekly_offset_weeks", 0) or 0),
-                    normalized.get("month_weeks", ""),
-                    normalized.get("band"),
-                    normalized.get("mode"),
-                    normalized.get("vfo"),
-                    normalized.get("frequency"),
-                    normalized.get("start_utc"),
-                    normalized.get("end_utc"),
-                    int(normalized.get("early_checkin", "0") or 0),
-                    1 if normalized.get("auto_tune") else 0,
-                    normalized.get("primary_js8call_group"),
-                    normalized.get("comment"),
-                    normalized.get("net_name"),
-                    normalized.get("group_name"),
-                    normalized.get("fldigi_mode", ""),
-                    normalized.get("fldigi_offset", ""),
-                    normalized.get("_resource_id"),
-                    normalized.get("net_session_key"),
-                    normalized.get("accepted_session_version_hash"),
-                    normalized.get("accepted_resource_version_hash"),
-                    normalized.get("accepted_snapshot_json"),
-                    normalized.get("target_scope"),
-                    normalized.get("target_device_profile_id"),
-                    normalized.get("target_operating_profile_id"),
-                ),
-            )
-            conn.execute(
-                """
-                INSERT INTO net_schedule
-                  (day_utc, recurrence, biweekly_offset_weeks, month_weeks, band, mode, frequency, start_utc, end_utc,
-                   early_checkin, auto_tune, primary_js8call_group, comment, net_name, group_name, fldigi_mode, fldigi_offset,
-                   net_session_key, accepted_session_version_hash, accepted_resource_version_hash,
-                   accepted_snapshot_json, target_scope, target_device_profile_id, target_operating_profile_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    normalized.get("day_utc"),
-                    normalized.get("recurrence", "Weekly"),
-                    int(normalized.get("biweekly_offset_weeks", 0) or 0),
-                    normalized.get("month_weeks", ""),
-                    normalized.get("band"),
-                    normalized.get("mode"),
-                    normalized.get("frequency"),
-                    normalized.get("start_utc"),
-                    normalized.get("end_utc"),
-                    int(normalized.get("early_checkin", "0") or 0),
-                    1 if normalized.get("auto_tune") else 0,
-                    normalized.get("primary_js8call_group"),
-                    normalized.get("comment"),
-                    normalized.get("net_name"),
-                    normalized.get("group_name"),
-                    normalized.get("fldigi_mode", ""),
-                    normalized.get("fldigi_offset", ""),
-                    normalized.get("net_session_key"),
-                    normalized.get("accepted_session_version_hash"),
-                    normalized.get("accepted_resource_version_hash"),
-                    normalized.get("accepted_snapshot_json"),
-                    normalized.get("target_scope"),
-                    normalized.get("target_device_profile_id"),
-                    normalized.get("target_operating_profile_id"),
-                ),
-            )
+            fields = [
+                "day_utc", "recurrence", "biweekly_offset_weeks", "month_weeks", "band", "mode", "vfo",
+                "frequency", "start_utc", "end_utc", "early_checkin", "auto_tune", "primary_js8call_group",
+                "comment", "net_name", "group_name", "fldigi_mode", "fldigi_offset", "resource_id",
+                "net_session_key", "accepted_session_version_hash", "accepted_resource_version_hash",
+                "accepted_snapshot_json", "target_scope", "target_device_profile_id", "target_operating_profile_id",
+            ]
+            values = [
+                normalized.get("day_utc"), normalized.get("recurrence", "Weekly"),
+                int(normalized.get("biweekly_offset_weeks", 0) or 0), normalized.get("month_weeks", ""),
+                normalized.get("band"), normalized.get("mode"), normalized.get("vfo"), normalized.get("frequency"),
+                normalized.get("start_utc"), normalized.get("end_utc"), int(normalized.get("early_checkin", "0") or 0),
+                1 if normalized.get("auto_tune") else 0, normalized.get("primary_js8call_group"),
+                normalized.get("comment"), normalized.get("net_name"), normalized.get("group_name"),
+                normalized.get("fldigi_mode", ""), normalized.get("fldigi_offset", ""), normalized.get("_resource_id"),
+                normalized.get("net_session_key"), normalized.get("accepted_session_version_hash"),
+                normalized.get("accepted_resource_version_hash"), normalized.get("accepted_snapshot_json"),
+                normalized.get("target_scope"), normalized.get("target_device_profile_id"),
+                normalized.get("target_operating_profile_id"),
+            ]
+            if "fldigi_tuning_json" in new_columns:
+                fields.append("fldigi_tuning_json")
+                values.append(_normalized_fldigi_tuning_json(normalized.get("fldigi_tuning_json", "{}"), strict=True))
+            new_fields = [field for field in fields if field in new_columns]
+            new_values = [value for field, value in zip(fields, values) if field in new_columns]
+            marks = ", ".join("?" for _ in new_fields)
+            conn.execute(f"INSERT INTO net_schedule_tab ({', '.join(new_fields)}) VALUES ({marks})", tuple(new_values))
+            legacy_fields = [field for field in fields if field in legacy_columns and field not in {"vfo", "resource_id"}]
+            legacy_values = [value for field, value in zip(fields, values) if field in legacy_columns and field not in {"vfo", "resource_id"}]
+            if "fldigi_tuning_json" in legacy_columns and "fldigi_tuning_json" not in legacy_fields:
+                legacy_fields.append("fldigi_tuning_json")
+                legacy_values.append(_normalized_fldigi_tuning_json(normalized.get("fldigi_tuning_json", "{}"), strict=True))
+            marks = ", ".join("?" for _ in legacy_fields)
+            conn.execute(f"INSERT INTO net_schedule ({', '.join(legacy_fields)}) VALUES ({marks})", tuple(legacy_values))
+        return
 
     # --------- Net resources --------- #
 
@@ -4234,8 +4430,10 @@ class NetScheduleTab(QWidget):
             freq_num = float(freq_key)
         except Exception:
             freq_num = None
+        has_tuning = "fldigi_tuning_json" in self._db_table_columns(conn, "net_resources")
+        tuning_clause = " AND COALESCE(NULLIF(TRIM(fldigi_tuning_json),''),'{}')=?" if has_tuning else ""
         found = conn.execute(
-            """
+            f"""
             SELECT id, resource_set
             FROM net_resources
             WHERE TRIM(day_utc)=TRIM(?)
@@ -4253,6 +4451,7 @@ class NetScheduleTab(QWidget):
                     (CAST(? AS REAL) IS NOT NULL AND ABS(CAST(COALESCE(frequency,'0') AS REAL) - CAST(? AS REAL)) < 0.000001)
                     OR TRIM(COALESCE(frequency,''))=TRIM(?)
                   )
+              {tuning_clause}
             ORDER BY
               CASE LOWER(TRIM(COALESCE(source_type,'')))
                 WHEN 'builtin' THEN 0
@@ -4278,6 +4477,7 @@ class NetScheduleTab(QWidget):
                 freq_num if freq_num is not None else None,
                 freq_num if freq_num is not None else None,
                 freq_key,
+                *([_normalized_fldigi_tuning_json(normalized.get("fldigi_tuning_json", "{}"))] if has_tuning else []),
             ),
         ).fetchone()
         if not found:
@@ -4469,6 +4669,12 @@ class NetScheduleTab(QWidget):
             month_weeks = "1"
         fldigi_mode = (row.get("fldigi_mode") or "").strip()
         fldigi_offset = (row.get("fldigi_offset") or "").strip()
+        try:
+            fldigi_tuning_json = _normalized_fldigi_tuning_json(
+                row.get("fldigi_tuning_json", "{}"), strict=True
+            )
+        except ValueError:
+            return None
         coverage = (row.get("coverage") or row.get("Coverage") or "").strip()
         if not fldigi_mode or not fldigi_offset:
             d_mode, d_offset = self._default_fldigi_for_row(
@@ -4498,6 +4704,7 @@ class NetScheduleTab(QWidget):
             "net_name": (row.get("net_name") or "").strip(),
             "fldigi_mode": fldigi_mode,
             "fldigi_offset": fldigi_offset,
+            "fldigi_tuning_json": fldigi_tuning_json,
         }
         return normalized
 
@@ -4535,6 +4742,9 @@ class NetScheduleTab(QWidget):
         """Write through the single legacy/canonical compatibility boundary."""
         normalized = self._strip_internal_row(row)
         normalized["frequency"] = self._normalize_freq_key(normalized.get("frequency"))
+        normalized["fldigi_tuning_json"] = _normalized_fldigi_tuning_json(
+            normalized.get("fldigi_tuning_json", "{}"), strict=True
+        )
         return upsert_legacy_resource(
             conn,
             normalized,
@@ -4645,18 +4855,21 @@ class NetScheduleTab(QWidget):
             return
         conn = sqlite3.connect(db_path)
         try:
+            resource_columns = self._db_table_columns(conn, "net_resources")
             cur = conn.execute(
-                """
+                f"""
                 SELECT
                     id, resource_set, source_type, source_ref, readonly, day_utc, recurrence,
                     biweekly_offset_weeks, month_weeks, group_name, band, mode, frequency,
                     start_utc, end_utc, early_checkin, primary_js8call_group, coverage, comment, net_name,
                     fldigi_mode, fldigi_offset, updated_utc
+                    {', fldigi_tuning_json' if 'fldigi_tuning_json' in resource_columns else ''}
                   FROM net_resources
                 """
             )
             out: List[Dict[str, Any]] = []
             for row in cur.fetchall():
+                tuning_json = row[23] if len(row) > 23 else "{}"
                 out.append(
                     {
                         "id": int(row[0]),
@@ -4682,6 +4895,7 @@ class NetScheduleTab(QWidget):
                         "fldigi_mode": row[20] or "",
                         "fldigi_offset": row[21] or "",
                         "updated_utc": row[22] or "",
+                        "fldigi_tuning_json": _normalized_fldigi_tuning_json(tuning_json or "{}"),
                     }
                 )
             out.sort(
@@ -4755,6 +4969,7 @@ class NetScheduleTab(QWidget):
                 str(row.get("early_checkin") or ""),
                 str(row.get("fldigi_mode") or ""),
                 str(row.get("fldigi_offset") or ""),
+                str(row.get("fldigi_tuning_json") or ""),
                 str(row.get("net_name") or ""),
                 str(row.get("coverage") or ""),
                 str(row.get("comment") or ""),
@@ -4798,6 +5013,7 @@ class NetScheduleTab(QWidget):
                 str(row.get("coverage") or ""),
                 str(row.get("comment") or ""),
                 self._format_age_label(row.get("updated_utc")),
+                _fldigi_tuning_summary(row.get("fldigi_tuning_json", "{}")),
             ]
             for c, value in enumerate(values):
                 item = QTableWidgetItem(value)
@@ -4807,6 +5023,8 @@ class NetScheduleTab(QWidget):
                 if c == self.RES_COL_UPDATED:
                     raw_updated = str(row.get("updated_utc") or "").strip()
                     item.setToolTip(raw_updated if raw_updated else "No saved timestamp available.")
+                if c == self.RES_COL_FLDIGI_TUNING:
+                    item.setToolTip(_fldigi_tuning_tooltip(row.get("fldigi_tuning_json", "{}")))
                 self.resources_table.setItem(r, c, item)
         self.resources_table.setSortingEnabled(True)
         if hasattr(self, "resources_count_label"):
@@ -4915,6 +5133,7 @@ class NetScheduleTab(QWidget):
                     "net_name": r.get("net_name", ""),
                     "fldigi_mode": r.get("fldigi_mode", ""),
                     "fldigi_offset": r.get("fldigi_offset", ""),
+                    "fldigi_tuning_json": _normalized_fldigi_tuning_json(r.get("fldigi_tuning_json", "{}")),
                 }
             )
         payload_rows.sort(
@@ -5048,6 +5267,22 @@ class NetScheduleTab(QWidget):
         form.addRow("FLDigi Starting Mode:", fldigi_mode_edit)
         form.addRow("FLDigi Starting Offset (Hz):", fldigi_offset_edit)
 
+        tuning_state = {"json": _normalized_fldigi_tuning_json(row.get("fldigi_tuning_json", "{}"))}
+        tuning_btn = QPushButton("FLDigi Tuning…", dlg)
+        tuning_btn.setAccessibleName("Edit FLDigi tuning preset for this library row")
+        tuning_btn.setToolTip(_fldigi_tuning_tooltip(tuning_state["json"]))
+
+        def edit_tuning() -> None:
+            tuning_dialog = FldigiTuningDialog(tuning_state["json"], dlg, settings=self.settings)
+            if tuning_dialog.exec() != QDialog.Accepted:
+                return
+            tuning_state["json"] = str(getattr(tuning_dialog, "result_json", "{}") or "{}")
+            tuning_btn.setText("FLDigi Tuning…")
+            tuning_btn.setToolTip(_fldigi_tuning_tooltip(tuning_state["json"]))
+
+        tuning_btn.clicked.connect(edit_tuning)
+        form.addRow("FLDigi Tuning:", tuning_btn)
+
         net_name_edit = QLineEdit(str(row.get("net_name") or ""), dlg)
         coverage_edit = QLineEdit(str(row.get("coverage") or ""), dlg)
         comment_edit = QLineEdit(str(row.get("comment") or ""), dlg)
@@ -5081,6 +5316,7 @@ class NetScheduleTab(QWidget):
             "net_name": net_name_edit.text().strip(),
             "fldigi_mode": fldigi_mode_edit.currentText().strip(),
             "fldigi_offset": fldigi_offset_edit.text().strip(),
+            "fldigi_tuning_json": tuning_state["json"],
         }
         normalized = self._normalize_import_row(candidate)
         if normalized is None:
@@ -5191,6 +5427,7 @@ class NetScheduleTab(QWidget):
                     "net_name": row.get("net_name", ""),
                     "fldigi_mode": row.get("fldigi_mode", ""),
                     "fldigi_offset": row.get("fldigi_offset", ""),
+                    "fldigi_tuning_json": _normalized_fldigi_tuning_json(row.get("fldigi_tuning_json", "{}")),
                     "_resource_id": int(row.get("id") or 0),
                     "_resource_set": str(row.get("resource_set") or ""),
                 }
@@ -5380,12 +5617,14 @@ class NetScheduleTab(QWidget):
         rid = int(resource_id or 0)
         if rid <= 0:
             return None
+        resource_columns = self._db_table_columns(conn, "net_resources")
         row = conn.execute(
-            """
+            f"""
             SELECT
                 id, resource_set, source_type, day_utc, recurrence, biweekly_offset_weeks, month_weeks,
                 group_name, band, mode, frequency, start_utc, end_utc, early_checkin,
                 primary_js8call_group, comment, net_name, fldigi_mode, fldigi_offset
+                {', fldigi_tuning_json' if 'fldigi_tuning_json' in resource_columns else ''}
             FROM net_resources
             WHERE id = ?
             """,
@@ -5413,6 +5652,7 @@ class NetScheduleTab(QWidget):
             "net_name": str(row[16] or "").strip(),
             "fldigi_mode": str(row[17] or "").strip(),
             "fldigi_offset": str(row[18] or "").strip(),
+            "fldigi_tuning_json": _normalized_fldigi_tuning_json(row[19] if len(row) > 19 else "{}"),
         }
 
     def _find_builtin_resource_id_for_schedule_row(
@@ -5521,6 +5761,8 @@ class NetScheduleTab(QWidget):
             and str(schedule.get("net_name") or "").strip().upper() == str(resource_row.get("net_name") or "").strip().upper()
             and str(schedule.get("fldigi_mode") or "").strip().upper() == str(resource_row.get("fldigi_mode") or "").strip().upper()
             and str(schedule.get("fldigi_offset") or "").strip() == str(resource_row.get("fldigi_offset") or "").strip()
+            and _normalized_fldigi_tuning_json(schedule.get("fldigi_tuning_json", "{}"))
+            == _normalized_fldigi_tuning_json(resource_row.get("fldigi_tuning_json", "{}"))
         )
 
     def _save_selected_schedule_rows_as_resources(self) -> None:
@@ -5603,7 +5845,7 @@ class NetScheduleTab(QWidget):
 
     def _resource_import_key(
         self, row: Dict[str, Any]
-    ) -> Tuple[str, str, str, str, str, str, str, str, str]:
+    ) -> Tuple[str, str, str, str, str, str, str, str, str, str]:
         recurrence = str(row.get("recurrence") or "Weekly").strip()
         if recurrence == "Monthly":
             recurrence = "Periodic"
@@ -5626,6 +5868,7 @@ class NetScheduleTab(QWidget):
             self._normalize_hhmm(str(row.get("start_utc") or "")),
             self._normalize_hhmm(str(row.get("end_utc") or "")),
             str(row.get("fldigi_mode") or "").strip().upper(),
+            _normalized_fldigi_tuning_json(row.get("fldigi_tuning_json", "{}")),
         )
 
     def _upsert_resource_row_by_import_key(
@@ -5641,9 +5884,11 @@ class NetScheduleTab(QWidget):
         """Match the legacy import key, then write through the compatibility owner."""
         normalized = self._strip_internal_row(row)
         (day_key, recurrence_key, month_weeks_key, band_key, mode_key, freq_key,
-         start_key, end_key, fld_mode_key) = self._resource_import_key(normalized)
+         start_key, end_key, fld_mode_key, tuning_key) = self._resource_import_key(normalized)
+        resource_columns = self._db_table_columns(conn, "net_resources")
+        tuning_clause = " AND TRIM(COALESCE(fldigi_tuning_json,'{}'))=TRIM(?)" if "fldigi_tuning_json" in resource_columns else ""
         existing = conn.execute(
-            """SELECT id FROM net_resources
+            f"""SELECT id FROM net_resources
                  WHERE TRIM(resource_set)=TRIM(?)
                    AND TRIM(day_utc)=TRIM(?)
                    AND TRIM(COALESCE(recurrence,''))=TRIM(?)
@@ -5653,9 +5898,10 @@ class NetScheduleTab(QWidget):
                    AND TRIM(start_utc)=TRIM(?) AND TRIM(end_utc)=TRIM(?)
                    AND UPPER(TRIM(COALESCE(fldigi_mode,'')))=UPPER(TRIM(?))
                    AND TRIM(COALESCE(frequency,''))=TRIM(?)
+                   {tuning_clause}
                  ORDER BY id DESC LIMIT 1""",
             (resource_set, day_key, recurrence_key, month_weeks_key, band_key, mode_key,
-             start_key, end_key, fld_mode_key, freq_key),
+             start_key, end_key, fld_mode_key, freq_key, *(([tuning_key]) if tuning_clause else [])),
         ).fetchone()
         resource_id = int(existing[0]) if existing else None
         rid = self._upsert_resource_row(

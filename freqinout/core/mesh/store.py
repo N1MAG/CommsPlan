@@ -27,9 +27,11 @@ from freqinout.core.mesh.models import (
     utc_now,
 )
 from freqinout.core.message_intelligence import normalize_topic_terms
+from freqinout.core.mesh_intelligence import analyze_mesh_message
 from freqinout.core.message_projection_queue import DirtyProjectionItem, enqueue_dirty_conn
 from freqinout.core.observation_projection import Observation
 from freqinout.core.observation_store import delete_observations_by_source_refs, upsert_observation
+from freqinout.core.location_confidence import location_evidence_from_values, location_evidence_to_provenance
 from freqinout.core.source_connection import source_connection_from_mesh_health
 from freqinout.core.sqlite_utils import connect_sqlite, connect_sqlite_readonly
 
@@ -110,12 +112,20 @@ def ensure_mesh_schema(conn: sqlite3.Connection) -> None:
         "mesh_messages",
         {
             "public_key_or_hash": "TEXT NOT NULL DEFAULT ''",
+            "contact_node_id": "TEXT NOT NULL DEFAULT ''",
             "route_type": "TEXT",
             "direct_receive": "INTEGER",
             "via_node": "TEXT",
             "path_hops_json": "TEXT NOT NULL DEFAULT '[]'",
         },
     )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_mesh_contact_history ON "
+                "mesh_messages(adapter_id,transport,contact_node_id,public_key_or_hash,rx_utc DESC)")
+    cur.execute("""CREATE TABLE IF NOT EXISTS mesh_contact_favorites (
+        adapter_id TEXT NOT NULL, transport TEXT NOT NULL,
+        node_id TEXT NOT NULL, public_key TEXT NOT NULL,
+        PRIMARY KEY(adapter_id,transport,node_id,public_key)
+    )""")
     _ensure_columns(
         conn,
         "mesh_nodes",
@@ -408,9 +418,11 @@ def upsert_mesh_message(db_path: str | Path, message: MeshMessage, *, updated_ut
                     topics_json,
                     severity,
                     raw_payload_json,
-                    updated_utc
+                    updated_utc,
+                    public_key_or_hash,
+                    contact_node_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(source_ref) DO UPDATE SET
                     adapter_id=excluded.adapter_id,
                     transport=excluded.transport,
@@ -1067,10 +1079,44 @@ def store_mesh_message_with_channel_policy(
             to_target=target,
             groups=tuple(_clean(group) for group in groups if _clean(group)),
         )
-    projected_topics = _mesh_message_projection_topics(message, policy=policy, surfaces=surfaces)
+    structured = analyze_mesh_message(message.text) if "topic_scan" in surfaces else None
+    structured_topics = structured.topics if structured is not None and structured.recognized else ()
+    analysis_message = replace(message, topics=tuple((*message.topics, *structured_topics))) if structured_topics else message
+    if structured is not None and structured.recognized:
+        structured_provenance = structured.as_dict()
+        if structured.grid or structured.state:
+            payload_evidence = location_evidence_from_values(
+                grid=structured.grid,
+                state=structured.state,
+                location_kind="structured_report",
+                source_family=message.transport,
+                source_ref=source_ref,
+                observed_utc=observation.received_utc,
+                explanation="Location reported in the mesh body; transport coordinates remain separate.",
+            )
+            structured_provenance["payload_claim"] = {
+                "location_evidence": location_evidence_to_provenance(payload_evidence),
+            }
+            observation = replace(
+                observation,
+                lat=None,
+                lon=None,
+                grid=structured.grid or "",
+                state=structured.state or "",
+                location_confidence=payload_evidence.legacy_confidence,
+            )
+        provenance["mesh_structured"] = structured_provenance
+        observation = replace(
+            observation,
+            subject=structured.subject[:80] or observation.subject,
+            summary=structured.summary[:240] or observation.summary,
+            state=structured.state or observation.state,
+            grid=structured.grid or observation.grid,
+        )
+    projected_topics = _mesh_message_projection_topics(analysis_message, policy=policy, surfaces=surfaces)
     override = mesh_message_topic_override(db_path, source_ref)
     operator_attention = (
-        _mesh_message_needs_attention(message, projected_topics)
+        _mesh_message_needs_attention(analysis_message, projected_topics)
         if "ops_center" in surfaces
         else False
     )
@@ -1188,6 +1234,10 @@ def _apply_route_derived_location(db_path: str | Path, observation: Observation,
     if observation.lat is not None and observation.lon is not None:
         return observation
     if _clean(observation.grid):
+        return observation
+    structured = observation.provenance.get("mesh_structured") if isinstance(observation.provenance, Mapping) else None
+    payload_claim = structured.get("payload_claim") if isinstance(structured, Mapping) else None
+    if isinstance(payload_claim, Mapping) and isinstance(payload_claim.get("location_evidence"), Mapping):
         return observation
     located_node, location_kind = _first_located_message_node(db_path, message)
     if not located_node:
@@ -1595,6 +1645,8 @@ def _mesh_message_values(source_ref: str, message: MeshMessage, updated_utc: str
         _clean(message.severity) or "info",
         _json_dumps(message.raw),
         updated_utc,
+        _clean(message.public_key_or_hash),
+        _clean(message.contact_node_id),
     )
 
 

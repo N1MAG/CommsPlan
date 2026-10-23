@@ -69,6 +69,12 @@ def ensure_js8_message_cache_schema(conn: sqlite3.Connection) -> None:
             ("source_radio_id", "TEXT"),
             ("js8_instance_id", "TEXT"),
             ("source_path", "TEXT"),
+            ("rx_freq_hz", "REAL"),
+            ("rx_band", "TEXT"),
+            ("rx_snr", "REAL"),
+            ("rx_sender", "TEXT"),
+            ("receipt_kind", "TEXT"),
+            ("received_ts", "REAL"),
         ),
     )
     conn.execute("UPDATE js8_messages SET source_key='' WHERE source_key IS NULL")
