@@ -27610,7 +27610,7 @@ class SettingsTab(QWidget):
         if result is not None:
             if result.state == 'saved':
                 self._operator_radio_result = response.get('profile')
-            editor.set_result({'state':result.state,'draft_revision':result.draft_revision,'message':'Saved in CommsPlan.' if result.state == 'saved' else 'Saved · incomplete. ' + ' '.join(result.issues)})
+            editor.set_result({'state':result.state,'draft_revision':result.draft_revision,'message':'Saved in CommsPlan.' if result.state == 'saved' else 'Draft kept; radio settings were not changed. ' + ' '.join(result.issues)})
 
     def _apply_runtime_projection_widgets(self, data: Dict[str, Any]) -> None:
         ctrl = data.get("control_via", "FLRig") or "FLRig"

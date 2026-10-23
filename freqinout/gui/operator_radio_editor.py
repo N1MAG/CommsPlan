@@ -769,6 +769,10 @@ class OperatorRadioEditor(QDialog):
         if self._busy:
             return
         self._values[key] = deepcopy(value)
+        if key in {'flrig_host', 'flrig_port'}:
+            draft = self._application_drafts.get('fast_light')
+            if isinstance(draft, Mapping) and draft.get('operator_values', {}).get('flrig_enabled'):
+                draft['operator_values']['host' if key == 'flrig_host' else 'port'] = deepcopy(value)
         if key in self._application_checks:
             self._application_raw_values[key] = deepcopy(value)
             self._application_touched.add(key)
@@ -780,6 +784,17 @@ class OperatorRadioEditor(QDialog):
         self._dirty = True
         self._refresh_dirty_state()
         if key == "control_backend":
+            # Selecting a control application is an explicit operator choice.
+            # Carry it into Applications instead of opening a component editor
+            # whose selected set is empty. Loading an existing profile never
+            # goes through this setter and therefore does not enable software.
+            control_flag = {"flrig": "use_flrig", "js8call": "use_js8call"}.get(value)
+            if control_flag:
+                self._application_checks[control_flag].setChecked(True)
+            if value == "flrig":
+                for field, default in (("flrig_host", "127.0.0.1"), ("flrig_port", "12345")):
+                    if not self._field_widgets[field].text().strip():
+                        self._field_widgets[field].setText(default)
             self._backend_changed()
         self._refresh_summaries()
 
@@ -802,6 +817,7 @@ class OperatorRadioEditor(QDialog):
         return _first(self._base, "id", "radio_id", "device_profile_id", "profile_id")
 
     def _open_application_editor(self, family_key: str, component: str | None = None) -> None:
+        self._sync_values()
         seed = deepcopy(self._application_seeds.get(family_key, {}))
         existing_draft = self._application_drafts.get(family_key)
         if isinstance(existing_draft, Mapping):
@@ -810,6 +826,13 @@ class OperatorRadioEditor(QDialog):
                 seed.update(deepcopy(dict(draft_values)))
             else:
                 seed.update(deepcopy(dict(existing_draft)))
+        if family_key == 'fast_light':
+            for name in ('flrig', 'fldigi', 'flmsg', 'flamp'):
+                seed[f'{name}_enabled'] = bool(seed.get(f'{name}_enabled')
+                    or self._values.get(f'use_{name}') or component == name)
+            if seed.get('flrig_enabled'):
+                seed.setdefault('host', self._values.get('flrig_host') or '127.0.0.1')
+                seed.setdefault('port', str(self._values.get('flrig_port') or 12345))
         radio_id = self._profile_radio_id()
         if radio_id not in (None, ""):
             seed["radio_id"] = radio_id
@@ -868,6 +891,12 @@ class OperatorRadioEditor(QDialog):
         def accept_payload(payload: object) -> None:
             if isinstance(payload, Mapping):
                 self._application_drafts[family_key] = deepcopy(dict(payload))
+                if family_key == 'fast_light':
+                    application_values = payload.get('operator_values', {})
+                    if application_values.get('flrig_enabled'):
+                        for field, source in (('flrig_host', 'host'), ('flrig_port', 'port')):
+                            if source in application_values:
+                                self._field_widgets[field].setText(_text(application_values[source]))
                 self._values["application_drafts"] = deepcopy(self._application_drafts)
                 self._dirty = True
                 self._refresh_dirty_state()

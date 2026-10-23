@@ -5,8 +5,8 @@ import re
 from pathlib import Path
 from typing import List, Tuple
 
-from PySide6.QtCore import QEvent, Qt, QUrl
-from PySide6.QtGui import QFont, QImage, QTextDocument
+from PySide6.QtCore import QEvent, QSize, Qt, QUrl
+from PySide6.QtGui import QFont, QImage, QKeySequence, QShortcut, QTextCursor, QTextDocument
 from PySide6.QtPrintSupport import QPrinter
 from PySide6.QtWidgets import (
     QWidget,
@@ -17,16 +17,17 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QTextBrowser,
     QLabel,
+    QLineEdit,
+    QSizePolicy,
     QPushButton,
     QFileDialog,
     QMessageBox,
     QDialog,
     QPlainTextEdit,
     QApplication,
-    QStyle,
 )
 
-from freqinout.gui.theme import button_height_for_font, resolve_theme, button_style, label_style
+from freqinout.gui.theme import button_height_for_font, control_height_for_font, resolve_theme, button_style, label_style
 from freqinout.gui.bounded_snapshot_worker import SnapshotWorkerController
 from freqinout.core.settings_manager import SettingsManager
 from freqinout.core.logger import get_recent_issues
@@ -49,42 +50,99 @@ class HelpTab(QWidget):
         layout = QBoxLayout(QBoxLayout.LeftToRight, self)
         self._help_layout = layout
 
-        # Left: index with heading
-        toc_col = QVBoxLayout()
-        toc_col.setAlignment(Qt.AlignTop)
-        self.toc_title = QLabel("Table of Contents")
+        # The topic rail never takes vertical space away from the article.
+        self.toc_panel = QWidget()
+        self.toc_panel.setObjectName('helpContentsPanel')
+        self.toc_panel.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        toc_col = QVBoxLayout(self.toc_panel)
+        toc_col.setContentsMargins(0, 0, 0, 0)
+        self.toc_title = QLabel("Contents")
         self.toc_title.setStyleSheet(label_style("text", resolve_theme(self.settings), weight=700))
         toc_col.addWidget(self.toc_title)
+        self.topic_filter = QLineEdit()
+        self.topic_filter.setPlaceholderText('Filter topics')
+        self.topic_filter.setAccessibleName('Filter guide topics')
+        self.topic_filter.setClearButtonEnabled(True)
+        self.topic_filter.textChanged.connect(self._filter_topics)
+        toc_col.addWidget(self.topic_filter)
         self.toc_list = QListWidget()
+        self.toc_list.setAccessibleName('Guide contents')
+        self.toc_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.toc_list.setTextElideMode(Qt.ElideRight)
         self.toc_list.itemClicked.connect(self._on_toc_clicked)
-        toc_col.addWidget(self.toc_list)
-        layout.addLayout(toc_col)
+        self.toc_list.itemActivated.connect(self._on_toc_clicked)
+        toc_col.addWidget(self.toc_list, stretch=1)
+        self.no_topics = QLabel('No matching topics')
+        self.no_topics.setWordWrap(True)
+        self.no_topics.hide()
+        toc_col.addWidget(self.no_topics)
+        layout.addWidget(self.toc_panel)
 
         # Right: viewer
-        viewer_col = QVBoxLayout()
-        viewer_col.setAlignment(Qt.AlignTop)
+        self.viewer_panel = QWidget()
+        self.viewer_panel.setMinimumWidth(0)
+        viewer_col = QVBoxLayout(self.viewer_panel)
+        viewer_col.setContentsMargins(0, 0, 0, 0)
         header_row = QHBoxLayout()
         self.guide_title = QLabel("CommsPlan Guide")
         header_row.addWidget(self.guide_title)
         header_row.addStretch()
+        self.contents_btn = QPushButton('Contents')
+        self.contents_btn.setCheckable(True)
+        self.contents_btn.setChecked(True)
+        self.contents_btn.setAccessibleName('Show guide contents')
+        self.contents_btn.setToolTip('Show or hide the left topic sidebar')
+        self.contents_btn.toggled.connect(self.toc_panel.setVisible)
+        header_row.addWidget(self.contents_btn)
+        viewer_col.addLayout(header_row)
+        self.tools_row = QBoxLayout(QBoxLayout.LeftToRight)
         self.export_pdf_btn = QPushButton("Export to PDF")
         theme = resolve_theme(self.settings)
-        self.export_pdf_btn.setStyleSheet(button_style("primary", theme))
+        self.export_pdf_btn.setStyleSheet(button_style("secondary", theme))
         self.export_pdf_btn.clicked.connect(self._export_pdf)
-        header_row.addWidget(self.export_pdf_btn)
+        self.tools_row.addWidget(self.export_pdf_btn)
         self.recent_issues_btn = QPushButton("Recent Issues")
         self.recent_issues_btn.setStyleSheet(button_style("secondary", theme))
         self.recent_issues_btn.clicked.connect(self._show_recent_issues)
-        header_row.addWidget(self.recent_issues_btn)
-        viewer_col.addLayout(header_row)
+        self.tools_row.addWidget(self.recent_issues_btn)
+        self.tools_row.addStretch()
+        viewer_col.addLayout(self.tools_row)
+
+        search_row = QHBoxLayout()
+        self.guide_search = QLineEdit()
+        self.guide_search.setPlaceholderText('Find in guide')
+        self.guide_search.setAccessibleName('Find text in the guide')
+        self.guide_search.setClearButtonEnabled(True)
+        self.guide_search.setMinimumWidth(0)
+        self.guide_search.returnPressed.connect(self._find_next)
+        self.guide_search.textChanged.connect(lambda: self.search_status.clear())
+        search_row.addWidget(self.guide_search, stretch=1)
+        self.find_previous_btn = QPushButton('Previous')
+        self.find_previous_btn.setAccessibleName('Previous guide match')
+        self.find_previous_btn.clicked.connect(lambda: self._find_next(backward=True))
+        search_row.addWidget(self.find_previous_btn)
+        self.find_next_btn = QPushButton('Next')
+        self.find_next_btn.setAccessibleName('Next guide match')
+        self.find_next_btn.clicked.connect(lambda: self._find_next())
+        search_row.addWidget(self.find_next_btn)
+        viewer_col.addLayout(search_row)
+        self.search_status = QLabel()
+        self.search_status.setAccessibleName('Guide search result')
+        viewer_col.addWidget(self.search_status)
+        self.find_shortcut = QShortcut(QKeySequence.Find, self)
+        self.find_shortcut.activated.connect(self._focus_guide_search)
+        self.previous_shortcut = QShortcut(QKeySequence('Shift+Return'), self.guide_search)
+        self.previous_shortcut.setContext(Qt.WidgetShortcut)
+        self.previous_shortcut.activated.connect(lambda: self._find_next(backward=True))
 
         self.viewer = QTextBrowser()
         self.viewer.setOpenExternalLinks(True)
         self.viewer.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.viewer.setHtml("<p>Loading the CommsPlan guide…</p>")
-        viewer_col.addWidget(self.viewer)
+        self.viewer.setMinimumWidth(0)
+        viewer_col.addWidget(self.viewer, stretch=1)
 
-        layout.addLayout(viewer_col, stretch=1)
+        layout.addWidget(self.viewer_panel, stretch=1)
         self._update_responsive_layout()
         self.apply_theme()
         self._request_document_load()
@@ -203,33 +261,87 @@ class HelpTab(QWidget):
             self.apply_theme()
 
     def _update_responsive_layout(self) -> None:
-        """Stack navigation above guide content on compact screens."""
-        if not hasattr(self, "_help_layout"):
+        """Bound the left rail independently of the longest guide heading."""
+        if not hasattr(self, "toc_panel"):
             return
         metrics = self.fontMetrics()
-        toc_width = max(
-            metrics.horizontalAdvance(self.toc_title.text()) + metrics.averageCharWidth() * 6,
-            self.toc_list.sizeHintForColumn(0)
-            + self.style().pixelMetric(QStyle.PixelMetric.PM_ScrollBarExtent)
-            + metrics.averageCharWidth() * 4,
-        )
-        readable_guide_width = metrics.averageCharWidth() * 84
-        margins = self._help_layout.contentsMargins()
-        breakpoint = toc_width + readable_guide_width + self._help_layout.spacing() + margins.left() + margins.right()
-        compact = int(self.width() or 0) < breakpoint
-        self._help_layout.setDirection(
-            QBoxLayout.TopToBottom if compact else QBoxLayout.LeftToRight
-        )
-        self.toc_list.setMinimumWidth(0 if compact else toc_width)
+        # Content hints must never force the article below its navigation.
+        rail_width = min(metrics.averageCharWidth() * 30,
+                         max(metrics.averageCharWidth() * 18, self.width() // 3))
+        self.toc_panel.setFixedWidth(rail_width)
+        for index in range(self.toc_list.count()):
+            item = self.toc_list.item(index)
+            item.setSizeHint(QSize(0, control_height_for_font(self.toc_list)))
+        self.topic_filter.setMinimumHeight(control_height_for_font(self.topic_filter))
+        self.guide_search.setMinimumHeight(control_height_for_font(self.guide_search))
+        tool_width = sum(button.sizeHint().width() for button in
+                         (self.export_pdf_btn, self.recent_issues_btn)) + self.tools_row.spacing()
+        self.tools_row.setDirection(QBoxLayout.TopToBottom if self.viewer_panel.width() < tool_width
+                                   else QBoxLayout.LeftToRight)
+
+    def _focus_guide_search(self) -> None:
+        self.guide_search.setFocus()
+        self.guide_search.selectAll()
+
+    def _find_next(self, backward: bool = False) -> None:
+        query = self.guide_search.text().strip()
+        if not query:
+            self.search_status.setText('Enter text to find in the guide.')
+            self.guide_search.setFocus()
+            return
+        flags = QTextDocument.FindBackward if backward else QTextDocument.FindFlags()
+        if self.viewer.find(query, flags):
+            self.search_status.setText('Match found')
+            return
+        previous = self.viewer.textCursor()
+        cursor = QTextCursor(self.viewer.document())
+        cursor.movePosition(QTextCursor.End if backward else QTextCursor.Start)
+        self.viewer.setTextCursor(cursor)
+        if self.viewer.find(query, flags):
+            self.search_status.setText('Wrapped to last match' if backward else 'Wrapped to first match')
+        else:
+            self.viewer.setTextCursor(previous)
+            self.search_status.setText('No matches')
+
+    def _filter_topics(self, query: str) -> None:
+        query = query.strip().casefold()
+        ancestors = []
+        visible = set()
+        for index in range(self.toc_list.count()):
+            item = self.toc_list.item(index)
+            level = int(item.data(Qt.UserRole + 1) or 1)
+            while ancestors and ancestors[-1][1] >= level:
+                ancestors.pop()
+            breadcrumb = ' '.join(self.toc_list.item(parent).text() for parent, _ in ancestors)
+            if not query or query in (breadcrumb + ' ' + item.text()).casefold():
+                visible.add(index)
+                visible.update(parent for parent, _ in ancestors)
+            ancestors.append((index, level))
+        for index in range(self.toc_list.count()):
+            self.toc_list.item(index).setHidden(index not in visible)
+        self.no_topics.setVisible(not visible)
 
     def apply_theme(self) -> None:
         theme = resolve_theme(self.settings)
         self.toc_title.setStyleSheet(label_style("text", theme, weight=700))
         self.guide_title.setStyleSheet(label_style("text", theme, weight=700))
-        self.export_pdf_btn.setStyleSheet(button_style("primary", theme))
+        self.export_pdf_btn.setStyleSheet(button_style("secondary", theme))
         self.recent_issues_btn.setStyleSheet(button_style("secondary", theme))
-        for button in (self.export_pdf_btn, self.recent_issues_btn):
+        self.contents_btn.setStyleSheet(button_style("secondary", theme))
+        self.no_topics.setStyleSheet(label_style("muted", theme))
+        self.search_status.setStyleSheet(label_style("muted", theme))
+        for button in (self.find_previous_btn, self.find_next_btn):
+            button.setStyleSheet(button_style('secondary', theme))
+        for button in (self.export_pdf_btn, self.recent_issues_btn, self.contents_btn,
+                       self.find_previous_btn, self.find_next_btn):
             button.setMinimumHeight(button_height_for_font(button))
+        levels = [self.toc_list.item(index).data(Qt.UserRole + 1)
+                  for index in range(self.toc_list.count())]
+        base_level = min((level for level in levels if level), default=1)
+        for index, level in enumerate(levels):
+            font = QFont(self.toc_list.font())
+            font.setBold(level == base_level)
+            self.toc_list.item(index).setFont(font)
         self._update_responsive_layout()
 
     def _show_recent_issues(self) -> None:
@@ -252,7 +364,7 @@ class HelpTab(QWidget):
         close_btn = QPushButton("Close")
         theme = resolve_theme(self.settings)
         copy_btn.setStyleSheet(button_style("secondary", theme))
-        close_btn.setStyleSheet(button_style("primary", theme))
+        close_btn.setStyleSheet(button_style("secondary", theme))
         copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(box.toPlainText()))
         close_btn.clicked.connect(dialog.accept)
         btn_row.addWidget(copy_btn)
@@ -284,11 +396,11 @@ class HelpTab(QWidget):
 
     def _parse_headings(self, html_text: str) -> List[Tuple[int, str, str]]:
         """
-        Return a list of (level, anchor, text) for h1/h2/h3 tags that have ids.
+        Return a list of (level, anchor, text) for h1/h2/h3/h4 tags that have ids.
         """
         headings: List[Tuple[int, str, str]] = []
         pattern = re.compile(
-            r"<h([1-3])([^>]*)>(.*?)</h\1>",
+            r"<h([1-4])([^>]*)>(.*?)</h\1>",
             flags=re.IGNORECASE | re.DOTALL,
         )
         for match in pattern.finditer(html_text):
@@ -332,7 +444,10 @@ class HelpTab(QWidget):
                 continue
             stored = str(item.data(Qt.UserRole) or "").strip().lstrip("#")
             if stored == target:
+                if item.isHidden():
+                    self.topic_filter.clear()
                 self.toc_list.setCurrentRow(idx)
+                self.toc_list.scrollToItem(item)
                 break
 
     def _build_toc(self, html_text: str | None = None):
@@ -347,17 +462,23 @@ class HelpTab(QWidget):
         if not headings:
             self.toc_list.addItem("(No headings found)")
             return
+        # The guide title is already in the reading pane; emphasize sections
+        # rather than repeating it above every topic.
+        if any(level > 1 for level, _, _ in headings):
+            headings = [heading for heading in headings if heading[0] > 1]
+        base_level = min(level for level, _, _ in headings)
         for level, anchor, text in headings:
-            indent = "    " * (level - 1)
-            prefix = "• " if level == 1 else "– "
-            item = QListWidgetItem(f"{indent}{prefix}{text}")
+            indent = "    " * (level - base_level)
+            item = QListWidgetItem(f"{indent}{text}")
+            item.setToolTip(text)
+            item.setData(Qt.UserRole + 1, level)
             # Store anchor when available; otherwise store text for find() fallback
             item.setData(Qt.UserRole, anchor or text)
-            font: QFont = item.font()
-            if level == 1:
-                font.setBold(True)
+            font = QFont(self.toc_list.font())
+            font.setBold(level == base_level)
             item.setFont(font)
             self.toc_list.addItem(item)
+        self._filter_topics(self.topic_filter.text())
 
     def _on_toc_clicked(self, item: QListWidgetItem):
         target = item.data(Qt.UserRole)

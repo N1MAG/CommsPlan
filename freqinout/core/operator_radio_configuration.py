@@ -82,6 +82,19 @@ def save_operator_radio(store,payload):
     proposed['_schedule_plan_id'] = int(payload.get('schedule_plan_id',base.get('_schedule_plan_id',0)) or 0)
     proposed['_identity_generation'] = base.get('_identity_generation',0)
     drafts = deepcopy(dict(payload.get('application_drafts') or {}))
+    if (proposed.get('control_backend') == 'flrig' and proposed.get('use_flrig')
+            and not proposed.get('fast_light_config_id') and 'fast_light' not in drafts
+            and (radio_id is None or proposed.get('control_backend') != base.get('control_backend')
+                 or proposed.get('use_flrig') != base.get('use_flrig'))
+            and not any(proposed.get(f'use_{name}') for name in ('fldigi', 'flmsg', 'flamp'))):
+        # The Radio page already reviewed this control endpoint. FLRig may be
+        # operator-started without an executable/launcher or a sibling app.
+        drafts['fast_light'] = {'operator_base_values': {}, 'operator_values': {
+            'flrig_enabled': True, 'fldigi_enabled': False, 'flmsg_enabled': False, 'flamp_enabled': False,
+            'host': str(proposed.get('flrig_host') or '127.0.0.1'),
+            'port': str(proposed.get('flrig_port') or 12345),
+            'flrig_launch_control': 'operator', 'flrig_launch_at_startup': False,
+            'settings_identity_mode': 'default'}}
     base['_application_drafts'] = {}
     proposed['_application_drafts'] = drafts
     scope = f'radio:{radio_id or "new"}'
@@ -239,5 +252,17 @@ def save_operator_radio(store,payload):
             raise ValueError('Saved operating model or schedule readback did not match.')
         published=True
 
-    result=save_configuration_edit(store,scope,session.snapshot(),read_current=read,validate=validate,publish=publish)
-    return {'result':result,'profile':saved_profile or (store.get_device_profile(radio_id) if radio_id else None)}
+    original_radio_id = radio_id
+    try:
+        result=save_configuration_edit(store,scope,session.snapshot(),read_current=read,validate=validate,publish=publish)
+    except ConfigurationConflict:
+        raise
+    except ValueError as exc:
+        # The failed atomic publication has rolled back. Retain the reviewed
+        # raw draft in a separate transaction, never a provisional radio ID.
+        radio_id, saved_profile, published = original_radio_id, None, False
+        issues = (str(exc),)
+        result=save_configuration_edit(store,scope,session.snapshot(),read_current=read,
+                                       validate=lambda _values: issues,publish=publish)
+    return {'result':result,'profile':saved_profile if result.state == 'saved'
+            else (store.get_device_profile(original_radio_id) if original_radio_id else None)}

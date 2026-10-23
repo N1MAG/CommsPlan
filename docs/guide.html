@@ -31,7 +31,7 @@
   </div>
 
   <h1 id="guide-home">CommsPlan User Guide</h1>
-  <p><strong>Current version</strong>: 2.0.6.1. This is the CommsPlan 2.0.6.1 release guide. See the release notes for available packages, known issues, and platform upgrade qualification.</p>
+  <p><strong>Current version</strong>: 2.0.6.2. This is the CommsPlan 2.0.6.2 release guide. See the release notes for available packages, known issues, and platform upgrade qualification.</p>
   <div class="callout">
     <p><strong>Dedication</strong></p>
     <p>Dedicated to my Dad (SK), a U.S. Navy Radioman who learned HF Digital Tri-Mode at age 86.</p>
@@ -1628,8 +1628,28 @@
     <li><strong>Reachable settings</strong>: the application form scrolls within its section while Save and Cancel remain available. Suggestions appear after Find installed is requested; an empty suggestions panel does not take space from the form.</li>
     <li><strong>Browse and Find</strong>: browse buttons choose a path and Find may offer cache-backed discovery suggestions. A suggestion is applied only when you explicitly choose it; manual path edits stay intact and no native preparation runs automatically.</li>
     <li><strong>Offline setup</strong>: an unavailable executable, endpoint, or native application is a structural warning or incomplete field. Save keeps the operator's raw choices for correction; it does not require a live connection.</li>
-    <li><strong>Cancel and return</strong>: Cancel leaves unsaved edits alone. Navigation between steps does not commit changes, and returning to Main does not enable scheduling.</li>
+    <li><strong>Cancel and return</strong>: navigation between steps does not commit changes. In Radio setup, Cancel may ask whether to Save, Discard, or Stay; see <a href="#settings-radio-cancel-recovery">Cancel, Discard, and Recover a Radio Draft</a>. Returning to Main does not enable scheduling.</li>
     <li><strong>After save</strong>: reopen the same radio and application family to correct a saved field. The editor preserves unknown saved fields so later versions do not silently discard configuration.</li>
+  </ul>
+
+  <h4 id="settings-first-radio">Add a Radio and Choose Its Applications</h4>
+  <ol class="section-list">
+    <li>Open <code>Configuration &gt; Radios</code> and choose <code>Add Radio</code>. On a fresh installation, <code>Set up station</code> also leads to the station checklist; open <code>Radios &amp; applications</code> from there.</li>
+    <li>On <code>Radio</code>, enter the radio name and role. Choose the <code>Control backend</code> that actually controls this radio: <code>FLRig</code>, <code>rigctld</code>, <code>JS8Call</code>, or <code>Manual</code>. FLRig and JS8Call control select their corresponding application. For FLRig, review the host and control port (normally <code>127.0.0.1:12345</code>); for rigctld, enter its Hamlib host and port (normally <code>127.0.0.1:4532</code>). Use the actual remote host when the service runs elsewhere.</li>
+    <li>On <code>Applications</code>, check <code>Use</code> only for software this radio uses. FLRig, FLDigi, FLMsg, and FLAmp are independent selections within the Fast Light family. FLRig control does not require FLDigi, and rigctld does not require FLRig. FLDigi alone, JS8Call alone, VarAC alone, any pair of FLDigi/JS8Call/VarAC, or all three can be selected. These choices assign software in CommsPlan; they do not install external programs.</li>
+    <li>Choose <code>Configure…</code> beside each selected application to review its own fields. Confirm the endpoint, native profile or INI, message paths, and launch responsibility as applicable. FLDigi's XML-RPC port is normally <code>7362</code>; JS8Call uses the TCP API port configured in JS8Call. Leave unused applications unchecked. An application you start yourself or run remotely does not require a local CommsPlan executable/launcher.</li>
+    <li>Choose <code>Save</code> in the application dialog to return its settings to the radio draft. This does not yet commit the new radio. Review <code>Operating behavior</code>, <code>Schedule</code>, and <code>Review</code>, then choose <code>Save</code> in <code>Radio setup</code> to commit the radio and its reviewed application settings together.</li>
+    <li>After a successful save, select the same radio to review or edit it. Use <code>Software &gt; Change software used…</code> to change its selected applications. Saving a new radio does not activate runtime participation or scheduling: choose <code>Radio actions &gt; Use Radio</code> when ready, and separately review and enable scheduling.</li>
+  </ol>
+  <p><strong>Auxiliary JS8 applications:</strong> CommsPlan Spotter, External JS8Spotter, and CommStat use their <code>Software settings…</code> actions. For a new or changed radio, choose <code>Save &amp; Open</code> to save the radio before opening that application's owning Software page. <code>Cancel</code> in that handoff keeps you editing the radio.</p>
+
+  <h4 id="settings-radio-cancel-recovery">Cancel, Discard, and Recover a Radio Draft</h4>
+  <ul class="section-list">
+    <li><strong>Already-saved radio:</strong> <code>Cancel</code> closes a clean editor. With unsaved changes, the prompt offers <code>Save</code>, <code>Discard</code>, or <code>Stay</code>. <code>Discard</code> abandons the current edits; the saved radio and its previous application settings remain. <code>Stay</code> returns to editing.</li>
+    <li><strong>New radio never saved:</strong> <code>Discard</code> abandons its uncommitted setup. No saved radio has been created. Saving an application dialog inside Radio setup is only part of this radio draft; complete the outer radio <code>Save</code> to keep the new radio.</li>
+    <li><strong>Save reports “Draft kept; radio settings were not changed”:</strong> the radio changes were not committed. Correct the reported field and choose <code>Save</code> again, or close the editor and later reopen Add Radio (for a new radio) or the same saved radio. Choose <code>Recover unfinished</code> to restore the retained draft, review it, and save again. Previously committed radios remain unchanged.</li>
+    <li><strong>Discard unfinished:</strong> deliberately removes the retained unfinished draft. It does not remove a saved radio or delete external application files. Use this only when you no longer need that recoverable copy.</li>
+    <li><strong>Endpoint conflict:</strong> if another radio genuinely owns the selected application's endpoint, review the named owner and configure the intended distinct instance/port. Do not change ports merely to bypass a message naming the same radio. If FLRig-only setup asks you to add another Fast Light component or reports its own endpoint as another owner, keep the draft and report the installed CommsPlan version and error; adding an unused application is not part of setup.</li>
   </ul>
 
   <h4 id="settings-schedule-approval">Scheduling Approval and Disable</h4>
@@ -1669,7 +1689,7 @@
     <thead><tr><th>Software</th><th>What makes the instance distinct</th><th>What CommsPlan persists and checks</th></tr></thead>
     <tbody>
       <tr><td>JS8Call 2.2.0, Improved 3.0.3, or Subspace</td><td>Radio assignment, <code>--rig-name</code>, TCP API port, optional UDP port, settings file, and application-data folder.</td><td>CommsPlan stores the launch identity and message-root evidence, passes the rig name at launch, and blocks duplicate ports, rig names, or exclusive storage. Subspace uses the same rig-scoped assumption; confirm it in Health with live file evidence.</td></tr>
-      <tr><td>Fast Light</td><td>A paired FLRig and FLDigi workflow with separate XML-RPC ports and, for independent local launches, separate native profile folders.</td><td>CommsPlan stores both endpoints and applications, launches FLRig before FLDigi, and names new native profile folders from the radio name. Display names may contain spaces; generated folder segments use portable hyphens and never expose an internal CommsPlan identifier. CommsPlan blocks endpoint or profile reuse between independent instances.</td></tr>
+      <tr><td>Fast Light</td><td>Any selected combination of FLRig, FLDigi, FLMsg, and FLAmp. Selected control/modem applications use their own endpoints and, for independent local launches, native profile folders.</td><td>CommsPlan stores the selected components and their launch choices. When both FLRig and FLDigi are selected for CommsPlan launch, FLRig starts first. New native profile folders use the radio name. Display names may contain spaces; generated folder segments use portable hyphens and never expose an internal CommsPlan identifier. CommsPlan blocks endpoint or profile reuse between independent instances.</td></tr>
       <tr><td>Cluster VarAC</td><td>A VarAC node with its own INI, database, incoming folder, outbox, launch command, cluster, and positive cluster instance number.</td><td>CommsPlan saves the node, radio link, cluster membership, and launch identity together. Duplicate node paths or cluster instance numbers are rejected and the prior configuration is retained.</td></tr>
     </tbody>
   </table>
@@ -1687,7 +1707,7 @@
   <h3 id="settings-freqinout-details">CommsPlan Settings Details</h3>
   <ul class="section-list">
     <li><strong>Theme and Text Size</strong>: make the screen easier to read for your operating environment. These choices do not change radio behavior.</li>
-    <li><strong>Frequency Control</strong>: tells CommsPlan which tool should be treated as the main way to read or guide the radio frequency. Choose <code>FLRig</code> when FLRig is your radio-control bridge, <code>JS8Call</code> when JS8Call is the practical source of radio state, or <code>Manual</code> when CommsPlan should advise without assuming it can control the radio.</li>
+    <li><strong>Frequency Control</strong>: tells CommsPlan which tool should be treated as the main way to read or guide the radio frequency. Choose <code>FLRig</code> when FLRig is your radio-control bridge, <code>rigctld</code> for a Hamlib rigctld service, <code>JS8Call</code> when JS8Call is the practical source of radio state, or <code>Manual</code> when CommsPlan should advise without assuming it can control the radio.</li>
     <li><strong>Use CommsPlan Scheduler</strong>: turns schedule help on or off. When enabled, CommsPlan watches the active schedule and helps the station move to the expected frequency, mode, or offset according to your enforcement choices.</li>
     <li><strong>Software Used</strong>: check only the programs this station actually uses. This keeps readiness warnings focused. For example, do not check CommStat or JS8Spotter unless you want CommsPlan to expect their launcher or forms settings.</li>
     <li><strong>Per-radio timers</strong>: open <code>Configuration &gt; Radios</code>, choose the radio, and open <code>Schedule Control</code>. Frequency, FLDigi mode, JS8 offset, prompt interval, scheduler automation, and default hold duration belong to that radio and are not edited on Main.</li>
@@ -1705,7 +1725,7 @@
     </thead>
     <tbody>
       <tr><td><code>Use CommsPlan Scheduler</code></td><td>This is the main on/off switch for schedule ownership.</td><td>When it is on, CommsPlan watches the active plan and can help return the radio to it. When it is off, CommsPlan may still show schedule information, but it should not act like it owns schedule changes.</td></tr>
-      <tr><td><code>Frequency Control</code></td><td>This tells CommsPlan which outside program is the best path for reading or guiding the radio frequency.</td><td><code>FLRig</code> is the usual radio-control bridge. <code>JS8Call</code> is useful when JS8Call is the practical source of radio state. <code>Manual</code> means CommsPlan should advise instead of assuming it can control the radio.</td></tr>
+      <tr><td><code>Frequency Control</code></td><td>This tells CommsPlan which outside program is the best path for reading or guiding the radio frequency.</td><td><code>FLRig</code> uses the configured FLRig endpoint; <code>rigctld</code> uses the configured Hamlib service. <code>JS8Call</code> is useful when JS8Call is the practical source of radio state. <code>Manual</code> means CommsPlan should advise instead of assuming it can control the radio.</td></tr>
       <tr><td><code>On Schedule Change</code></td><td>CommsPlan applies that item when the active schedule row changes.</td><td>This feels automatic. It is best when you want the station to follow the plan without stopping to ask every time.</td></tr>
       <tr><td><code>Prompt</code></td><td>Reviews off-schedule differences at the chosen reminder interval.</td><td>This is not approval before every write. New schedule entries and explicit apply/resume actions retain their own behavior. Use Pause or Net control when you need to retain manual control.</td></tr>
       <tr><td><code>Prompt Interval</code></td><td>This is the reminder pace for prompt-mode mismatches.</td><td>A shorter interval is more insistent during an operation. A longer interval is quieter when you may stay off plan on purpose.</td></tr>
@@ -2008,7 +2028,8 @@
   <h2 id="help">Help</h2>
   <p><strong>Purpose</strong>: in-app documentation viewer for this guide.</p>
   <ul class="section-list">
-    <li><strong>Table of Contents</strong> (left): click headings to navigate.</li>
+    <li><strong>Contents</strong> (left): choose a topic, or use the arrow keys and Enter. Section headings are bold; subtopics are indented. <code>Filter topics</code> narrows the index while retaining the matching section context. Long names have full-text tooltips. The <code>Contents</code> button hides or restores this sidebar for more reading space.</li>
+    <li><strong>Find in guide</strong>: searches the full article text, independently of the topic filter. Press <code>Ctrl+F</code> (<code>Command+F</code> on macOS), enter text, then press Enter or choose <code>Next</code>. Use <code>Previous</code> or <code>Shift+Enter</code> to search backward. Matches are selected in the guide; the result line reports wrapping or no matches.</li>
     <li><strong>Guide viewer</strong> (right): renders <code>docs/guide.html</code>.</li>
     <li><strong>Export to PDF</strong>: exports the displayed guide.</li>
     <li><strong>Usage notes</strong>: when a Help button opens a specific section, the purpose text and nearby workflow notes identify the screen's role and related dependencies beyond the control list.</li>

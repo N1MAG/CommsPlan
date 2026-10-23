@@ -3509,6 +3509,47 @@ def _save_varac_node_conn(conn: sqlite3.Connection, values: Mapping[str, Any]) -
     )
 
 
+def _fast_light_endpoint_components_conn(conn, values, evidence=None) -> set[str]:
+    """Required typed default ports are not proof that an app was selected."""
+    def selected(data):
+        operator = data.get('operator_values')
+        if isinstance(operator, Mapping) and any(f'{name}_enabled' in operator for name in ('flrig', 'fldigi', 'flmsg', 'flamp')):
+            return {name for name in ('flrig', 'fldigi') if operator.get(f'{name}_enabled')}
+        recipe = data.get('launch_recipe')
+        if isinstance(recipe, Mapping) and 'components' in recipe:
+            return {str(part.get('component_key')) for part in recipe['components']
+                    if isinstance(part, Mapping)} & {'flrig', 'fldigi'}
+        return None
+
+    if isinstance(evidence, Mapping):
+        explicit = selected(evidence)
+        if explicit is not None:
+            return explicit
+    radios = (conn.execute('SELECT use_flrig, use_fldigi FROM device_profiles WHERE fast_light_config_id=?',
+                           (values['id'],)).fetchall() if values.get('id') else [])
+    active = {name for name in ('flrig', 'fldigi') if any(row[f'use_{name}'] for row in radios)}
+    if values.get('system_key'):
+        claims = []
+        for row in conn.execute("SELECT evidence_json FROM software_instance_manifests WHERE family_key='fast_light' AND application_system_key=?",
+                                (values['system_key'],)).fetchall():
+            try:
+                explicit = selected(json.loads(row[0] or '{}'))
+            except (ValueError, TypeError, AttributeError):
+                explicit = None
+            if explicit is not None:
+                claims.append(explicit)
+        if claims:
+            return set().union(active, *claims)
+    paths = {name for name in ('flrig', 'fldigi') if str(values.get(f'{name}_path') or '').strip()}
+    if paths:
+        return paths | active
+    if radios:
+        return active
+    # An older unassigned endpoint-only record has no selected-set evidence.
+    # Preserve conservative ownership rather than making its endpoints free.
+    return {'flrig', 'fldigi'}
+
+
 def _validate_software_application_claims_conn(
     conn: sqlite3.Connection,
     family_key: str,
@@ -3516,6 +3557,7 @@ def _validate_software_application_claims_conn(
     *,
     allowed_varac_shared_db_path: str = "",
     reviewed_existing_id: Optional[int] = None,
+    fast_light_evidence: Optional[Mapping[str, Any]] = None,
 ) -> None:
     """Reject collisions in legacy application rows that predate manifests."""
 
@@ -3553,6 +3595,7 @@ def _validate_software_application_claims_conn(
             raise ValueError(f"JS8Call TCP endpoint {host}:{port} is already used by {row[0]}.")
         return
     if family == "fast_light":
+        selected_components = _fast_light_endpoint_components_conn(conn, payload, fast_light_evidence)
         claims = (
             (
                 "FLRig",
@@ -3572,9 +3615,10 @@ def _validate_software_application_claims_conn(
                 "fldigi_port",
             ),
         )
+        claims = tuple(claim for claim in claims if claim[0].lower() in selected_components)
         normalized_endpoints = [('127.0.0.1' if host == 'localhost' else host, port)
                                 for _, host, port, _, _ in claims]
-        if normalized_endpoints[0] == normalized_endpoints[1]:
+        if len(normalized_endpoints) == 2 and normalized_endpoints[0] == normalized_endpoints[1]:
             raise ValueError("FLRig and FLDigi must use different local TCP endpoints.")
         for label, host, port, host_column, port_column in claims:
             host_key = '127.0.0.1' if host == 'localhost' else host
@@ -3584,23 +3628,24 @@ def _validate_software_application_claims_conn(
                               and port == int(prior.get(port_column) or (12345 if host_column == 'flrig_host' else 7362)))
             row = conn.execute(
                 f"""
-                SELECT name FROM fast_light_configs
+                SELECT * FROM fast_light_configs
                  WHERE (CASE WHEN LOWER(TRIM(COALESCE({host_column}, '127.0.0.1')))='localhost'
                              THEN '127.0.0.1' ELSE LOWER(TRIM(COALESCE({host_column}, '127.0.0.1'))) END)=? AND {port_column}=?
                    AND (enabled<>0 OR EXISTS (SELECT 1 FROM device_profiles d WHERE d.fast_light_config_id=fast_light_configs.id))
-                   AND (? IS NULL OR id<>?) LIMIT 1
+                   AND (? IS NULL OR id<>?)
                 """,
                 (host_key, port, record_id, record_id),
-            ).fetchone()
+            ).fetchall()
             if same_claim:
-                row = conn.execute(f'''SELECT a.name FROM fast_light_configs a
+                row = conn.execute(f'''SELECT a.* FROM fast_light_configs a
                     JOIN device_profiles d ON d.fast_light_config_id=a.id
                     WHERE a.id<>? AND
                     (CASE WHEN LOWER(TRIM(COALESCE(a.{host_column},'127.0.0.1')))='localhost' THEN '127.0.0.1'
-                     ELSE LOWER(TRIM(COALESCE(a.{host_column},'127.0.0.1'))) END)=? AND a.{port_column}=? LIMIT 1''',
-                    (record_id, host_key, port)).fetchone()
-            if row is not None:
-                raise ValueError(f"{label} endpoint {host}:{port} is already used by {row[0]}.")
+                     ELSE LOWER(TRIM(COALESCE(a.{host_column},'127.0.0.1'))) END)=? AND a.{port_column}=?''',
+                    (record_id, host_key, port)).fetchall()
+            for candidate in row:
+                if label.lower() in _fast_light_endpoint_components_conn(conn, dict(candidate)):
+                    raise ValueError(f"{label} endpoint {host}:{port} is already used by {candidate['name']}.")
         return
     if family == "varac":
         for label, column, value in (
@@ -9100,6 +9145,7 @@ class MultiRadioStore:
                     app_values,
                     allowed_varac_shared_db_path=allowed_varac_shared_db_path,
                     reviewed_existing_id=(actual_current if _coerce_optional_int(app_values.get('id')) == actual_current else None),
+                    fast_light_evidence=requested_evidence if family == 'fast_light' else None,
                 )
                 if family == "js8call":
                     saved_app = _save_js8_instance_conn(conn, app_values)

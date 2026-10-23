@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.0.6.2]
+- Fixed: Choosing FLRig or JS8Call control carries that application selection into radio setup. Fast Light Configure opens with the reviewed components enabled, including FLRig alone.
+- Fixed: Unselected Fast Light default ports no longer claim endpoints or create false conflicts between independent applications. Nested and radio-page FLRig endpoint edits stay consistent during correction and retry.
+- Fixed: Failed radio publication rolls back partial changes and retains an unfinished draft for recovery. Cancelling edits preserves the saved radio and its application identities.
+- Changed: Help uses a compact left contents sidebar with clearer heading hierarchy, topic filtering, full-guide text search, Previous/Next results and Ctrl+F (Command+F on macOS). Contents can be hidden for full-width reading.
+- Updated: Setup guidance covers single-app, bi-mode and trimode choices, FLRig/rigctld/JS8Call/Manual control, inner application Save versus outer radio Save, and Cancel/Discard/recovery behavior.
+- Qualification: Automated setup selection, recovery and Help checks pass. Native package and installed-platform qualification is reported by the build. A macOS Cocoa accessibility crash was observed on full-window radio dialog closure; native form/modal tests pass, but this observed issue remains under investigation. Existing 2.0.6 known limitations remain applicable.
+
 ## [2.0.6.1]
 - Fixed: Fresh radio setup saves FLRig-only configurations without false application-path readback errors or a database error from the unused FLDigi port.
 - Fixed: FLRig, FLDigi, FLMsg and FLAmp can each be configured independently. Hidden endpoint fields preserve existing ports, and edited FLMsg/FLAmp executable paths save correctly.
