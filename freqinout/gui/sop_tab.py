@@ -337,6 +337,7 @@ class _LegacySOPTab(QWidget):
         *,
         plan_context_service: Optional[PlanContextService] = None,
         defer_initial_load: bool = False,
+        settings_manager: SettingsManager | None = None,
     ):
         super().__init__(parent)
         # SOP is not part of the first visible shell.  MainWindow opts into a
@@ -345,10 +346,10 @@ class _LegacySOPTab(QWidget):
         self._defer_initial_load = bool(defer_initial_load)
         self._initial_data_loaded = False
         self._initial_data_load_pending = False
-        self.settings = SettingsManager()
+        self.settings = settings_manager if settings_manager is not None else SettingsManager()
         self._summary_timezone = get_timezone(str(self.settings.all().get("timezone") or "UTC"))
         self.plan_context_service = plan_context_service or PlanContextService()
-        self.manager = SOPManager()
+        self.manager = SOPManager(settings=SettingsManager(initialized_source=self.settings))
         self._profiles: List[Dict[str, Any]] = []
         self._selected_profile_id: int | None = None
         self._upcoming_rows: List[Dict[str, Any]] = []

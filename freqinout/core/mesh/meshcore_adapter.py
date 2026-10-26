@@ -1677,8 +1677,13 @@ class MeshCorePythonAdapter(MeshCoreBleAdapter):
                 raise MeshConnectionError("Choose a numeric MeshCore channel before sending.") from exc
             if channel_index < 0 or channel_index > 7:
                 raise MeshConnectionError("MeshCore channel must be between 0 and 7.")
+            async def submit_channel():
+                if request.expected_connection_fingerprint:
+                    from freqinout.core.manual_forward_runtime import validate_mesh_forward_at_io
+                    validate_mesh_forward_at_io(request, self.config)
+                return await client.send_channel_message(channel_index, text)
             event = runner.run(
-                client.send_channel_message(channel_index, text),
+                submit_channel(),
                 timeout_sec=timeout_sec,
             )
             if _meshcore_event_is_error(event):
@@ -1704,13 +1709,13 @@ class MeshCorePythonAdapter(MeshCoreBleAdapter):
         if not destination:
             raise MeshConnectionError("Choose a MeshCore node for a direct message.")
         try:
+            async def submit_direct():
+                if request.expected_connection_fingerprint:
+                    from freqinout.core.manual_forward_runtime import validate_mesh_forward_at_io
+                    validate_mesh_forward_at_io(request, self.config)
+                return await client.send_direct_message(destination, text, require_ack=bool(request.require_ack), timeout_sec=timeout_sec)
             event = runner.run(
-                client.send_direct_message(
-                    destination,
-                    text,
-                    require_ack=bool(request.require_ack),
-                    timeout_sec=timeout_sec,
-                ),
+                submit_direct(),
                 timeout_sec=timeout_sec + 1.0,
             )
         except ValueError as exc:

@@ -6,9 +6,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping, Optional
 
-from freqinout.core.checkins_db import ensure_operator_checkins_schema
 from freqinout.core.group_utils import normalize_group_name
 from freqinout.core.logger import log
+from freqinout.core.sqlite_utils import connect_sqlite_readonly
 
 
 @dataclass(frozen=True)
@@ -32,18 +32,20 @@ def load_operator_group_families(db_path: str | Path | None) -> dict[str, Operat
         return {}
     conn: Optional[sqlite3.Connection] = None
     try:
-        conn = sqlite3.connect(str(path), timeout=1.0)
-        ensure_operator_checkins_schema(conn)
+        conn = connect_sqlite_readonly(path, timeout=1.0)
+        # Startup/migration owns repairs. A traffic-context read must never
+        # rebuild an index or invalidate a concurrent scheduler snapshot.
+        columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(operator_checkins)")}
+        if "callsign" not in columns:
+            return {}
+        names = ("callsign", "groups_json", "group1", "group2", "group3", "trusted",
+                 "roster_parent_group", "roster_region", "group_role", "tier", "state")
+        fields = []
+        for name in names:
+            default = "0" if name == "trusted" else "''"
+            fields.append(f"COALESCE({name}, {default})" if name in columns else default)
         cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT callsign, COALESCE(groups_json, ''), COALESCE(group1, ''),
-                   COALESCE(group2, ''), COALESCE(group3, ''), COALESCE(trusted, 0),
-                   COALESCE(roster_parent_group, ''), COALESCE(roster_region, ''),
-                   COALESCE(group_role, ''), COALESCE(tier, ''), COALESCE(state, '')
-            FROM operator_checkins
-            """
-        )
+        cur.execute("SELECT " + ", ".join(fields) + " FROM operator_checkins")
         return build_operator_group_families(
             {
                 "callsign": callsign,

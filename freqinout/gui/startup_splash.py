@@ -18,8 +18,7 @@ class StartupSplash:
         "HF Digital Tri-Mode at age 86."
     )
     SUPPORT_MESSAGE = (
-        f"If {DISPLAY_NAME} benefits your station, please encourage its continued "
-        "development. There's more to come."
+        f"Support {DISPLAY_NAME}’s continued development"
     )
     SUPPORT_URL = "buymeacoffee.com/n1mag"
 
@@ -58,15 +57,13 @@ class StartupSplash:
             title_font.setPointSizeF(logical_base_size * 2.4)
             title_font.setBold(True)
             painter.setFont(title_font)
-            painter.drawText(30, 54, f"Starting {DISPLAY_NAME}")
+            painter.drawText(30, 54, DISPLAY_NAME)
 
             subtitle_font = QFont(base_font)
             subtitle_font.setPointSizeF(logical_base_size)
             painter.setFont(subtitle_font)
             painter.setPen(QColor(theme["text_muted"]))
-            subtitle = DISPLAY_NAME
-            if version:
-                subtitle = f"{subtitle} {version}"
+            subtitle = f"Version {version}" if version else ""
             painter.drawText(32, 82, subtitle)
 
             painter.setPen(QColor(theme["border"]))

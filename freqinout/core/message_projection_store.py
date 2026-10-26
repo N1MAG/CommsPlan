@@ -1388,6 +1388,7 @@ def query_projected_message_page(
     page_size: int = MAX_PROJECTED_MESSAGE_PAGE_SIZE,
     cursor: MessageProjectionPageCursor | None = None,
     include_total: bool = False,
+    strict_errors: bool = False,
 ) -> MessageProjectionPage:
     """Read one 200-row-at-most projection page using indexed keyset paging.
 
@@ -1486,6 +1487,8 @@ def query_projected_message_page(
             total_count = _count_projected_messages_on_connection(conn, base_where, base_params)
         generation = _message_projection_generation_on_connection(conn)
     except sqlite3.Error:
+        if strict_errors:
+            raise
         rows = []
         total_count = 0 if include_total else None
         generation = 0
@@ -1509,6 +1512,7 @@ def query_projected_inbox_focus_counts(
     group_names: Sequence[str] | None = None,
     received_after_ts: float = 0.0,
     received_before_ts: float = 0.0,
+    strict_errors: bool = False,
 ) -> MessageProjectionFocusCounts:
     """Return all Inbox focus counters with one scalar aggregate read.
 
@@ -1597,6 +1601,8 @@ def query_projected_inbox_focus_counts(
                 counts["bbs"] += unread_count
         return MessageProjectionFocusCounts(counts=counts, generation=generation)
     except sqlite3.Error:
+        if strict_errors:
+            raise
         return MessageProjectionFocusCounts(counts=empty, generation=0)
     finally:
         if conn is not None:
@@ -1939,6 +1945,8 @@ def load_projected_message_detail(db_path: str | Path, message_id: str) -> dict[
 def load_projected_external_refs_for_messages(
     db_path: str | Path,
     message_ids: Sequence[str],
+    *,
+    strict_errors: bool = False,
 ) -> dict[str, list[sqlite3.Row]]:
     clean_ids = list(dict.fromkeys(
         str(value or "").strip() for value in message_ids if str(value or "").strip()
@@ -1970,6 +1978,8 @@ def load_projected_external_refs_for_messages(
                 out.setdefault(str(row["message_id"] or ""), []).append(row)
         return out
     except sqlite3.Error:
+        if strict_errors:
+            raise
         return out
     finally:
         if conn is not None:

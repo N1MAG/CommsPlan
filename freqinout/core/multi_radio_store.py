@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import re
 import sqlite3
@@ -2218,6 +2219,8 @@ def _schedule_assignment_validation_status_conn(
     warnings: List[str] = []
     blocked: List[str] = []
     events: List[Dict[str, Any]] = []
+    cautions: List[str] = []
+    caution_keys: set[tuple[int, str]] = set()
     device_id = int(device.get("id", 0) or 0)
     plan_id = int(frequency_plan.get("id", 0) or 0)
     plan_overrides: Dict[int, int] = {}
@@ -2266,7 +2269,6 @@ def _schedule_assignment_validation_status_conn(
                 ON devices.id = assigned_plans.device_profile_id
              WHERE assigned_plans.device_profile_id<>?
                AND assigned_plans.assignment_state IN ({placeholders})
-               AND COALESCE(devices.enabled, 1)=1
                AND UPPER(COALESCE(devices.band_overlap_guard_group, ''))=?
             """,
             (device_id, *tuple(EFFECTIVE_ASSIGNMENT_STATES), overlap_group),
@@ -2281,12 +2283,30 @@ def _schedule_assignment_validation_status_conn(
                 continue
             peer_overlap_mode = normalize_rf_guard_mode(peer.get("band_overlap_guard_mode", "warn"))
             effective_overlap_mode = stricter_rf_guard_mode(overlap_mode, peer_overlap_mode)
+            peer_enabled = int(peer.get("enabled", 1) or 0) == 1
+            peer_running = int(peer.get("runtime_active", 0) or 0) == 1
+            peer_name = str(peer.get("name", "") or "another radio")
             for band in _frequency_plan_overlapping_bands(frequency_plan, peer_plan):
+                caution = (
+                    f"Potential RF exposure between {str(device.get('name', '') or 'this radio')} and {peer_name} "
+                    f"in Prevent Band Overlap group {overlap_group}. Confirm suitable RF isolation or protection "
+                    f"before starting {peer_name} while transmitting."
+                )
+                if not peer_enabled or not peer_running:
+                    caution_key = (peer_id, "band_overlap:" + overlap_group)
+                    if caution_key not in caution_keys:
+                        caution_keys.add(caution_key)
+                        cautions.append(caution)
                 message = (
                     f"{str(device.get('name', '') or 'Radio')} and {str(peer.get('name', '') or 'another radio')} "
                     f"would both be assigned on {band} in Prevent Band Overlap group {overlap_group}."
                 )
-                target = blocked if effective_overlap_mode == "block" else warnings
+                # A disabled configured peer is a potential exposure caution,
+                # not a live block. Active peers retain the configured block
+                # policy, including when they are currently stopped.
+                target = warnings if not peer_enabled else (blocked if effective_overlap_mode == "block" else warnings)
+                if not peer_enabled:
+                    message = "Warning: " + message + " " + caution
                 target.append(message)
                 events.append(
                     {
@@ -2297,7 +2317,7 @@ def _schedule_assignment_validation_status_conn(
                         "peer_device_profile_id": int(peer.get("id", 0) or 0),
                         "frequency_plan_id": plan_id,
                         "band": band,
-                        "decision": "blocked" if effective_overlap_mode == "block" else "warning",
+                        "decision": "warning" if not peer_enabled else ("blocked" if effective_overlap_mode == "block" else "warning"),
                         "message": message,
                     }
                 )
@@ -2317,7 +2337,6 @@ def _schedule_assignment_validation_status_conn(
                 ON devices.id = assigned_plans.device_profile_id
              WHERE assigned_plans.device_profile_id<>?
                AND assigned_plans.assignment_state IN ({placeholders})
-               AND COALESCE(devices.enabled, 1)=1
                AND UPPER(COALESCE(devices.advanced_frequency_guard_group, ''))=?
                AND COALESCE(devices.advanced_frequency_guard_window_hz, 0)>0
             """,
@@ -2342,6 +2361,9 @@ def _schedule_assignment_validation_status_conn(
                 continue
             peer_mode = normalize_rf_guard_mode(peer.get("advanced_frequency_guard_mode", "warn"))
             effective_mode = stricter_rf_guard_mode(advanced_mode, peer_mode)
+            peer_enabled = int(peer.get("enabled", 1) or 0) == 1
+            peer_running = int(peer.get("runtime_active", 0) or 0) == 1
+            peer_name = str(peer.get("name", "") or "another radio")
             for freq_hz in plan_frequencies:
                 for peer_freq_hz in peer_frequencies:
                     delta_hz = abs(int(freq_hz) - int(peer_freq_hz))
@@ -2353,7 +2375,21 @@ def _schedule_assignment_validation_status_conn(
                         f"would be within {threshold_hz} Hz in Advanced Guard group {advanced_group} "
                         f"({freq_hz} Hz vs {peer_freq_hz} Hz)."
                     )
-                    target = blocked if effective_mode == "block" else warnings
+                    caution = (
+                        f"Potential RF exposure between {str(device.get('name', '') or 'this radio')} and {peer_name} "
+                        f"in Advanced Guard group {advanced_group}. Confirm suitable RF isolation or protection "
+                        f"before starting {peer_name} while transmitting."
+                    )
+                    if not peer_enabled or not peer_running:
+                        caution_key = (peer_id, "advanced_frequency:" + advanced_group)
+                        if caution_key not in caution_keys:
+                            caution_keys.add(caution_key)
+                            cautions.append(caution)
+                    # Preserve live block policies. A disabled configured peer
+                    # contributes an informational caution until it is enabled.
+                    target = warnings if not peer_enabled else (blocked if effective_mode == "block" else warnings)
+                    if not peer_enabled:
+                        message = "Warning: " + message + " " + caution
                     target.append(message)
                     events.append(
                         {
@@ -2365,7 +2401,7 @@ def _schedule_assignment_validation_status_conn(
                             "frequency_plan_id": plan_id,
                             "band": band,
                             "frequency": str(freq_hz),
-                            "decision": "blocked" if effective_mode == "block" else "warning",
+                            "decision": "warning" if not peer_enabled else ("blocked" if effective_mode == "block" else "warning"),
                             "message": message,
                         }
                     )
@@ -2388,6 +2424,7 @@ def _schedule_assignment_validation_status_conn(
         "plan_bands": plan_bands,
         "supported_bands": supported_bands,
         "warnings": warnings,
+        "cautions": cautions,
         "blocked": blocked,
         "messages": messages + warnings + blocked,
         "device_profile_id": device_id,
@@ -2411,6 +2448,83 @@ def _operating_profile_has_observer_assignments(conn: sqlite3.Connection, operat
         (int(operating_profile_id), *tuple(EFFECTIVE_ASSIGNMENT_STATES)),
     ).fetchone()
     return row is not None
+
+
+def _swap_configuration_fingerprint_conn(conn: sqlite3.Connection) -> str:
+    """Return a CAS token for the saved assignment/RF configuration snapshot."""
+    snapshot = {
+        "devices": _fetchall_dicts(conn, "SELECT * FROM device_profiles ORDER BY id"),
+        "assignments": _fetchall_dicts(
+            conn,
+            "SELECT * FROM assigned_plans WHERE assignment_state IN (?, ?) ORDER BY id",
+            tuple(EFFECTIVE_ASSIGNMENT_STATES),
+        ),
+        "plans": _fetchall_dicts(conn, "SELECT * FROM frequency_plans ORDER BY id"),
+    }
+    encoded = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _swap_assignment_preview_conn(
+    conn: sqlite3.Connection,
+    first_device_profile_id: int,
+    second_device_profile_id: int,
+) -> Dict[str, Any]:
+    first_id = int(first_device_profile_id)
+    second_id = int(second_device_profile_id)
+    if first_id <= 0 or second_id <= 0 or first_id == second_id:
+        raise ValueError("Select two different radios with assigned Frequency Plans.")
+    first_assignment = _effective_assigned_plan_for_device(conn, first_id)
+    second_assignment = _effective_assigned_plan_for_device(conn, second_id)
+    if not first_assignment or not second_assignment:
+        raise ValueError("Both selected radios must already have assigned Frequency Plans before swapping.")
+    first_plan_id = int(first_assignment.get("frequency_plan_id") or 0)
+    second_plan_id = int(second_assignment.get("frequency_plan_id") or 0)
+    if first_plan_id <= 0 or second_plan_id <= 0:
+        raise ValueError("Both selected radios must already have assigned Frequency Plans before swapping.")
+    if first_plan_id == second_plan_id:
+        raise ValueError("The selected radios already use the same Frequency Plan.")
+    first_device = _record_by_id(conn, "device_profiles", first_id) or {}
+    second_device = _record_by_id(conn, "device_profiles", second_id) or {}
+    first_plan = _record_by_id(conn, "frequency_plans", second_plan_id) or {}
+    second_plan = _record_by_id(conn, "frequency_plans", first_plan_id) or {}
+    if not first_device or not second_device or not first_plan or not second_plan:
+        raise ValueError("Both radios and their assigned Frequency Plans must still exist before swapping.")
+    _validate_schedule_assignment_compatibility(first_device, first_plan)
+    _validate_schedule_assignment_compatibility(second_device, second_plan)
+    overrides = {first_id: second_plan_id, second_id: first_plan_id}
+    first_validation = _schedule_assignment_validation_status_conn(
+        conn, first_device, first_plan, emit_events=False, assignment_plan_overrides=overrides,
+    )
+    second_validation = _schedule_assignment_validation_status_conn(
+        conn, second_device, second_plan, emit_events=False, assignment_plan_overrides=overrides,
+    )
+    blocked = list(dict.fromkeys(
+        list(first_validation.get("blocked") or []) + list(second_validation.get("blocked") or [])
+    ))
+    warnings = list(dict.fromkeys(
+        list(first_validation.get("warnings") or []) + list(second_validation.get("warnings") or [])
+    ))
+    cautions = list(dict.fromkeys(
+        list(first_validation.get("cautions") or []) + list(second_validation.get("cautions") or [])
+    ))
+    return {
+        "fingerprint": _swap_configuration_fingerprint_conn(conn),
+        "first_device_profile_id": first_id,
+        "second_device_profile_id": second_id,
+        "first_device_name": str(first_device.get("name") or f"Radio {first_id}"),
+        "second_device_name": str(second_device.get("name") or f"Radio {second_id}"),
+        "first_plan_id": second_plan_id,
+        "second_plan_id": first_plan_id,
+        "first_plan_name": str(first_plan.get("name") or f"Plan {second_plan_id}"),
+        "second_plan_name": str(second_plan.get("name") or f"Plan {first_plan_id}"),
+        "first": first_validation,
+        "second": second_validation,
+        "blocked": blocked,
+        "warnings": warnings,
+        "cautions": cautions,
+        "state": "blocked" if blocked else "warning" if warnings or cautions else "ok",
+    }
 
 
 def _frequency_plan_has_observer_assignments(conn: sqlite3.Connection, frequency_plan_id: int) -> bool:
@@ -3255,8 +3369,9 @@ def ensure_multi_radio_settings_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def get_multi_rig_migration_version(conn: sqlite3.Connection) -> int:
-    ensure_multi_radio_settings_schema(conn)
+def get_multi_rig_migration_version(conn: sqlite3.Connection, *, ensure_schema: bool = True) -> int:
+    if ensure_schema:
+        ensure_multi_radio_settings_schema(conn)
     cur = conn.execute("SELECT value FROM kv WHERE key=?", (MULTI_RIG_MIGRATION_VERSION_KEY,))
     row = cur.fetchone()
     if row is None:
@@ -3294,8 +3409,9 @@ def set_multi_rig_migration_deferred(conn: sqlite3.Connection, deferred: bool) -
     conn.commit()
 
 
-def get_multi_rig_migration_deferred(conn: sqlite3.Connection) -> bool:
-    ensure_multi_radio_settings_schema(conn)
+def get_multi_rig_migration_deferred(conn: sqlite3.Connection, *, ensure_schema: bool = True) -> bool:
+    if ensure_schema:
+        ensure_multi_radio_settings_schema(conn)
     cur = conn.execute("SELECT value FROM kv WHERE key=?", (MULTI_RIG_MIGRATION_DEFERRED_KEY,))
     row = cur.fetchone()
     if row is None:
@@ -3312,8 +3428,10 @@ def detect_existing_fio_usage(
     settings_values: Mapping[str, Any],
     *,
     legacy_config_exists: bool = False,
+    ensure_schema: bool = True,
 ) -> bool:
-    ensure_multi_radio_settings_schema(conn)
+    if ensure_schema:
+        ensure_multi_radio_settings_schema(conn)
     if legacy_config_exists:
         return True
     ignored_keys = set(FIO_EXISTING_USE_IGNORED_KEYS) | {MULTI_RIG_MIGRATION_COMPLETED_AT_KEY}
@@ -6495,23 +6613,53 @@ class MultiRadioStore:
         # may still arrive first, so assure once per store instead of walking
         # every settings table and column on every runtime operation.
         self._schema_ready = False
+        self._schema_identity = None
         self._schema_lock = threading.Lock()
         self._transaction_local = threading.local()
 
     def _open_connection(self) -> sqlite3.Connection:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        try:
-            conn.execute("PRAGMA foreign_keys=ON")
-        except Exception:
-            pass
-        if not self._schema_ready:
-            with self._schema_lock:
-                if not self._schema_ready:
-                    ensure_multi_radio_settings_schema(conn)
-                    self._schema_ready = True
-        return conn
+        for _attempt in range(3):
+            try:
+                before = self.db_path.stat()
+                before_id = (before.st_dev, before.st_ino)
+            except FileNotFoundError:
+                # Establish a path identity even on a first-ever open. Never
+                # truncate a file another initializer won the race to create.
+                try:
+                    with self.db_path.open("xb"):
+                        pass
+                except FileExistsError:
+                    pass
+                before = self.db_path.stat()
+                before_id = (before.st_dev, before.st_ino)
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                conn.execute("PRAGMA foreign_keys=ON")
+                stat = self.db_path.stat()
+                file_id = (stat.st_dev, stat.st_ino)
+                # Never associate a handle to the retired file with the new
+                # path's readiness. Retry boundedly if a replace crossed open.
+                if before_id != file_id:
+                    conn.close()
+                    continue
+                identity = (*file_id, conn.execute("PRAGMA schema_version").fetchone()[0])
+                if not self._schema_ready or identity != self._schema_identity:
+                    with self._schema_lock:
+                        if not self._schema_ready or identity != self._schema_identity:
+                            ensure_multi_radio_settings_schema(conn)
+                            after = self.db_path.stat()
+                            if file_id != (after.st_dev, after.st_ino):
+                                conn.close()
+                                continue
+                            self._schema_identity = (*file_id, conn.execute("PRAGMA schema_version").fetchone()[0])
+                            self._schema_ready = True
+                return conn
+            except Exception:
+                conn.close()
+                raise
+        raise sqlite3.OperationalError("Settings database replaced repeatedly during open")
 
     def _connect(self) -> sqlite3.Connection:
         active = getattr(self._transaction_local, "connection", None)
@@ -6731,16 +6879,18 @@ class MultiRadioStore:
     ) -> Dict[str, Any]:
         """Read the runtime-status inputs from one database snapshot."""
         with self._connect() as conn:
+            # A deferred transaction pins all inputs without a writer reservation.
+            # Guided transactions already provide a snapshot owned by the caller.
+            if not conn.in_transaction:
+                conn.execute("BEGIN")
             values = dict(settings_values) if settings_values is not None else _load_kv_settings(conn)
-            migration_version = get_multi_rig_migration_version(conn)
-            migration_deferred = get_multi_rig_migration_deferred(conn)
+            migration_version = get_multi_rig_migration_version(conn, ensure_schema=False)
+            migration_deferred = get_multi_rig_migration_deferred(conn, ensure_schema=False)
             migration_current = migration_version >= CURRENT_MULTI_RIG_MIGRATION_VERSION
             if existing_fio_usage is not None:
                 detected_usage = bool(existing_fio_usage)
-            elif migration_current:
-                detected_usage = detect_existing_fio_usage(conn, values)
             else:
-                detected_usage = detect_existing_fio_usage(conn, values)
+                detected_usage = detect_existing_fio_usage(conn, values, ensure_schema=False)
             primary_row: Optional[Dict[str, Any]] = None
             active_rows: List[Dict[str, Any]] = []
             if migration_current:
@@ -7614,7 +7764,8 @@ class MultiRadioStore:
                 # Source materialization must not overwrite a plan edited while
                 # its expensive projection was computed. Hold only the short
                 # compare/write transaction, never the projection itself.
-                conn.execute("BEGIN IMMEDIATE")
+                if not conn.in_transaction:
+                    conn.execute("BEGIN IMMEDIATE")
                 current = _record_by_id(conn, "frequency_plans", int(values.get("id") or 0))
                 if current != dict(expected):
                     raise ValueError("Frequency Plan changed during source projection; retry required")
@@ -7631,8 +7782,53 @@ class MultiRadioStore:
                         )
             return _save_frequency_plan_conn(conn, payload)
 
+    def materialize_frequency_plan_with_revision_delta(self, values: Mapping[str, Any], *, expected: Mapping[str, Any]):
+        """Count only this derived save's writes, including revocation triggers."""
+        with self.configuration_save_transaction() as transaction:
+            with self.connect() as conn:
+                before = conn.execute("SELECT revision FROM _fio_schedule_revision WHERE id=1").fetchone()[0]
+            saved = self.save_frequency_plan(values, expected=expected)
+            with self.connect() as conn:
+                after = conn.execute("SELECT revision FROM _fio_schedule_revision WHERE id=1").fetchone()[0]
+            transaction.complete()
+        return saved, int(after) - int(before)
+
+    @staticmethod
+    def _assert_schedule_source_unused(conn: sqlite3.Connection, dependency_refs: set[str]) -> None:
+        for dependent in conn.execute("SELECT id, name, source_refs_json FROM frequency_plans"):
+            try:
+                refs = json.loads(dependent["source_refs_json"] or "[]")
+            except (TypeError, ValueError):
+                continue
+            if isinstance(refs, list) and dependency_refs.intersection(str(ref) for ref in refs):
+                raise ValueError(
+                    f"Cannot delete this schedule source; Frequency Plan '{dependent['name']}' still uses it."
+                )
+
+    def delete_legacy_schedule_source(self, category: str, set_id: str) -> None:
+        keys = {
+            "hf_daily_schedule": ("freqplanner_hf_daily_schedule_sets", "freqplanner_selected_hf_daily_schedule_set_id"),
+            "hf_net_schedule": ("freqplanner_hf_net_schedule_sets", "freqplanner_selected_hf_net_schedule_set_id"),
+        }
+        sets_key, selected_key = keys[category]
+        with self._connect() as conn:
+            if not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")
+            self._assert_schedule_source_unused(conn, {f"{category}:{set_id}"})
+            saved = conn.execute("SELECT value FROM kv WHERE key=?", (sets_key,)).fetchone()
+            rows = json.loads(saved[0]) if saved else []
+            if not isinstance(rows, list):
+                raise ValueError("Saved schedule sources are unavailable; deletion was cancelled.")
+            remaining = [row for row in rows if not isinstance(row, dict) or str(row.get("id") or "").strip() != set_id]
+            conn.executemany("INSERT OR REPLACE INTO kv(key,value) VALUES(?,?)", [
+                (sets_key, json.dumps(remaining)), (selected_key, json.dumps("__live__")),
+            ])
+            conn.commit()
+
     def delete_frequency_plan(self, frequency_plan_id: int) -> None:
         with self._connect() as conn:
+            if not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")
             plan = _record_by_id(conn, "frequency_plans", int(frequency_plan_id))
             if not plan:
                 raise KeyError(f"Unknown Frequency Plan id: {frequency_plan_id}")
@@ -7649,6 +7845,14 @@ class MultiRadioStore:
             ).fetchone()
             if assigned is not None:
                 raise ValueError("Cannot delete a Frequency Plan while it is assigned to a radio.")
+            # Component plans are dependencies, not direct radio assignments.
+            # Hold the write transaction across this check and the delete.
+            dependency_refs = {
+                f"hf_daily_schedule:plan:{int(frequency_plan_id)}",
+                f"hf_net_schedule:plan:{int(frequency_plan_id)}",
+                f"sop_schedule_plan:{int(frequency_plan_id)}",
+            }
+            self._assert_schedule_source_unused(conn, dependency_refs)
             conn.execute("DELETE FROM assigned_plans WHERE frequency_plan_id=?", (int(frequency_plan_id),))
             conn.execute("DELETE FROM frequency_plans WHERE id=?", (int(frequency_plan_id),))
             conn.commit()
@@ -7705,30 +7909,30 @@ class MultiRadioStore:
         second_device_profile_id: int,
         *,
         reason: str = "Swapped Frequency Plans in Settings.",
+        expected_preview_fingerprint: str = "",
     ) -> List[Dict[str, Any]]:
         first_id = int(first_device_profile_id or 0)
         second_id = int(second_device_profile_id or 0)
         if first_id <= 0 or second_id <= 0 or first_id == second_id:
             raise ValueError("Select two different radios with assigned Frequency Plans.")
         with self._connect() as conn:
-            first_assignment = _effective_assigned_plan_for_device(conn, first_id)
-            second_assignment = _effective_assigned_plan_for_device(conn, second_id)
-            if not first_assignment or not second_assignment:
-                raise ValueError("Both selected radios must already have assigned Frequency Plans before swapping.")
-            first_plan_id = int(first_assignment.get("frequency_plan_id") or 0)
-            second_plan_id = int(second_assignment.get("frequency_plan_id") or 0)
-            if first_plan_id <= 0 or second_plan_id <= 0:
-                raise ValueError("Both selected radios must already have assigned Frequency Plans before swapping.")
-            if first_plan_id == second_plan_id:
-                raise ValueError("The selected radios already use the same Frequency Plan.")
+            if not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")
+            preview = _swap_assignment_preview_conn(conn, first_id, second_id)
+            if expected_preview_fingerprint and str(expected_preview_fingerprint) != str(preview["fingerprint"]):
+                raise ValueError("Schedule configuration changed while reviewing this swap; review it again before saving.")
+            if preview["blocked"]:
+                raise ValueError(str(preview["blocked"][0]))
+            first_plan_id = int(preview["first_plan_id"])
+            second_plan_id = int(preview["second_plan_id"])
             overrides = {
-                first_id: second_plan_id,
-                second_id: first_plan_id,
+                first_id: first_plan_id,
+                second_id: second_plan_id,
             }
             first_row = _set_assigned_plan_conn(
                 conn,
                 first_id,
-                second_plan_id,
+                first_plan_id,
                 assignment_state="active",
                 reason=reason,
                 created_by="settings_ui_swap",
@@ -7738,7 +7942,7 @@ class MultiRadioStore:
             second_row = _set_assigned_plan_conn(
                 conn,
                 second_id,
-                first_plan_id,
+                second_plan_id,
                 assignment_state="active",
                 reason=reason,
                 created_by="settings_ui_swap",
@@ -7747,6 +7951,18 @@ class MultiRadioStore:
             )
             conn.commit()
             return [first_row, second_row]
+
+    def preview_swap_assigned_frequency_plans(
+        self,
+        first_device_profile_id: int,
+        second_device_profile_id: int,
+    ) -> Dict[str, Any]:
+        """Preview both post-swap RF Guard states without writing configuration."""
+        first_id = int(first_device_profile_id or 0)
+        second_id = int(second_device_profile_id or 0)
+        with self._connect_readonly() as conn:
+            conn.execute("BEGIN")
+            return _swap_assignment_preview_conn(conn, first_id, second_id)
 
     def validate_frequency_plan_for_device(
         self,

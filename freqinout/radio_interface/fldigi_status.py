@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -15,7 +16,7 @@ from freqinout.core.settings_manager import SettingsManager
 _RX_LINE_RE = re.compile(r"^RX\s+\d+\s+:\s+.+?\((\d{4}-\d{2}-\d{2} \d{2}:\d{2})Z\):\s*(.*)$")
 _CALLSIGN_RE = re.compile(r"\bDE\s+[A-Z0-9/]{3,}\b", re.IGNORECASE)
 _TOKEN_RE = re.compile(r"[A-Za-z']+")
-_PRINTABLE_RE = re.compile(r"[ -~]")
+_NON_PRINTABLE_RE = re.compile(r"[^ -~]")
 
 _FLMSG_MARKERS = (
     "[WRAP:beg]",
@@ -42,6 +43,7 @@ _COMMON_WORDS = {
     "with", "you", "your", "thanks", "thank", "hello", "hi", "copy", "de", "73"
 }
 _FLMSG_MARKERS_LOWER = tuple(marker.lower() for marker in _FLMSG_MARKERS)
+_MAX_PARTIAL_LINE_REWIND_BYTES = 64 * 1024
 
 
 @lru_cache(maxsize=4096)
@@ -124,6 +126,10 @@ class FldigiLogStatusClient:
         self.max_read_bytes = max(4096, int(max_read_bytes))
         self._last_path: Optional[Path] = None
         self._last_offset: int = 0
+        self._last_file_identity: Optional[tuple[int, int]] = None
+        self._last_observed_size: int = 0
+        self._last_opened_mtime_ns: Optional[int] = None
+        self._last_read_end: int = 0
         self._last_valid_ts: Optional[datetime.datetime] = None
         self._last_valid_reason: Optional[str] = None
         self._last_gibberish_ts: Optional[datetime.datetime] = None
@@ -235,31 +241,37 @@ class FldigiLogStatusClient:
             score += (1.0 - s)
         avg_noise = score / max(1, len(tokens))
         valid_ratio = valid / max(1, len(tokens))
-        printable = len(_PRINTABLE_RE.findall(text))
-        non_printable_ratio = 1.0 - (printable / max(1, len(text)))
+        non_printable = len(_NON_PRINTABLE_RE.findall(text))
+        non_printable_ratio = non_printable / max(1, len(text))
         gib = 0.6 * avg_noise + 0.3 * (1.0 - valid_ratio) + 0.1 * non_printable_ratio
         return min(max(gib, 0.0), 1.0), len(tokens)
 
     def _classify_payload(self, payload: str) -> Tuple[bool, Optional[str]]:
+        valid, reason, _gibberish = self._classify_payload_with_gibberish(payload)
+        return valid, reason
+
+    def _classify_payload_with_gibberish(
+        self, payload: str
+    ) -> Tuple[bool, Optional[str], bool]:
         raw = payload.strip()
         if not raw:
-            return False, None
+            return False, None, False
         upper = raw.upper()
         raw_lower = raw.lower()
         for marker in _FLMSG_MARKERS_LOWER:
             if marker in raw_lower:
-                return True, "flmsg"
+                return True, "flmsg", False
         if _CALLSIGN_RE.search(raw):
-            return True, "callsign"
+            return True, "callsign", False
         if "MODE CHANGE TO" in upper:
-            return True, "mode_change"
+            return True, "mode_change", False
         for prefix in _FLAMP_PREFIXES:
             if raw.lstrip().startswith(prefix):
-                return True, "flamp"
+                return True, "flamp", False
         gib_score, token_count = self._gibberish_score(raw)
-        if token_count >= self.min_words and gib_score < self.gibberish_threshold:
-            return True, "text"
-        return False, None
+        valid = token_count >= self.min_words and gib_score < self.gibberish_threshold
+        gibberish = token_count > 0 and gib_score >= self.gibberish_threshold
+        return bool(valid), "text" if valid else None, bool(gibberish)
 
     def _is_gibberish(self, payload: str) -> bool:
         raw = payload.strip()
@@ -281,29 +293,58 @@ class FldigiLogStatusClient:
             "gibberish": 0,
         }
         with perf_span("fldigi_status.update_from_log", settings=self.settings, meta=meta, min_ms=5.0):
-            try:
-                stat = path.stat()
-            except Exception:
-                return stats
+            data = b""
+            read_start = 0
+            opened_size = 0
+            opened_identity: tuple[int, int] | None = None
+            opened_mtime_ns: int | None = None
             discard_partial_line = False
-            if self._last_path != path:
-                self._last_path = path
-                self._last_offset = max(0, stat.st_size - self.max_read_bytes)
-                discard_partial_line = self._last_offset > 0
-            if stat.st_size < self._last_offset:
-                # log rotation/truncate
-                self._last_offset = max(0, stat.st_size - self.max_read_bytes)
-                discard_partial_line = self._last_offset > 0
-            elif stat.st_size - self._last_offset > self.max_read_bytes:
-                self._last_offset = max(0, stat.st_size - self.max_read_bytes)
-                discard_partial_line = self._last_offset > 0
             try:
-                with path.open("rb") as fh:
-                    fh.seek(self._last_offset)
-                    data = fh.read()
-                    self._last_offset = fh.tell()
+                read_meta = {"max_bytes": self.max_read_bytes}
+                with perf_span("fldigi_status.read_log", settings=self.settings, meta=read_meta, min_ms=2.0):
+                    with path.open("rb") as fh:
+                        opened_stat = os.fstat(fh.fileno())
+                        opened_size = int(opened_stat.st_size)
+                        opened_identity = (int(opened_stat.st_dev), int(opened_stat.st_ino))
+                        opened_mtime_ns = int(opened_stat.st_mtime_ns)
+                        identity_changed = (
+                            self._last_path != path
+                            or self._last_file_identity != opened_identity
+                        )
+                        truncated = (
+                            opened_size < self._last_observed_size
+                            or opened_size < self._last_offset
+                        )
+                        discard_partial_line = False
+                        offset = self._last_offset
+                        if identity_changed or truncated:
+                            offset = max(0, opened_size - self.max_read_bytes)
+                            discard_partial_line = offset > 0
+                        elif opened_size - offset > self.max_read_bytes:
+                            offset = max(0, opened_size - self.max_read_bytes)
+                            discard_partial_line = offset > 0
+                        unchanged = (
+                            not identity_changed
+                            and not truncated
+                            and opened_size == self._last_observed_size
+                            and opened_mtime_ns == self._last_opened_mtime_ns
+                            and self._last_read_end >= opened_size
+                        )
+                        if unchanged:
+                            return stats
+                        read_start = offset
+                        fh.seek(read_start)
+                        data = fh.read(self.max_read_bytes)
+                        read_end = fh.tell()
             except Exception:
                 return stats
+            # Publish cursor and identity only after seek/read/tell all succeed.
+            self._last_offset = read_end
+            self._last_read_end = read_end
+            self._last_path = path
+            self._last_file_identity = opened_identity
+            self._last_observed_size = opened_size
+            self._last_opened_mtime_ns = opened_mtime_ns
             stats["bytes"] = len(data)
             meta["bytes"] = stats["bytes"]
             if not data:
@@ -312,34 +353,67 @@ class FldigiLogStatusClient:
                 # A bounded tail may begin midway through a line.
                 newline = data.find(b"\n")
                 data = data[newline + 1 :] if newline >= 0 else b""
-            text = data.decode("utf-8", errors="replace")
+            with perf_span(
+                "fldigi_status.decode_log",
+                settings=self.settings,
+                meta={"bytes": len(data)},
+                min_ms=2.0,
+            ):
+                text = data.decode("utf-8", errors="replace")
             lines = text.splitlines()
             stats["lines"] = len(lines)
             meta["lines"] = stats["lines"]
-            for line in lines:
-                m = _RX_LINE_RE.match(line.strip())
-                if not m:
-                    continue
-                stats["rx_lines"] += 1
-                meta["rx_lines"] = stats["rx_lines"]
-                ts_str, payload = m.group(1), m.group(2)
-                ts_val = _parse_rx_timestamp_utc(ts_str)
-                if ts_val is None:
-                    continue
-                valid, reason = self._classify_payload(payload)
-                if valid:
-                    self._last_valid_ts = ts_val
-                    self._last_valid_reason = reason
-                    self._last_gibberish_ts = None
-                    self._gibberish_run_start = None
-                    stats["valid"] += 1
-                    meta["valid"] = stats["valid"]
-                elif self._is_gibberish(payload):
-                    self._last_gibberish_ts = ts_val
-                    if self._gibberish_run_start is None:
-                        self._gibberish_run_start = ts_val
-                    stats["gibberish"] += 1
-                    meta["gibberish"] = stats["gibberish"]
+            classification_meta = {"rx_lines": 0, "valid": 0, "gibberish": 0}
+            with perf_span(
+                "fldigi_status.classify_log",
+                settings=self.settings,
+                meta=classification_meta,
+                min_ms=2.0,
+            ):
+                for line in lines:
+                    m = _RX_LINE_RE.match(line.strip())
+                    if not m:
+                        continue
+                    stats["rx_lines"] += 1
+                    classification_meta["rx_lines"] = stats["rx_lines"]
+                    meta["rx_lines"] = stats["rx_lines"]
+                    ts_str, payload = m.group(1), m.group(2)
+                    ts_val = _parse_rx_timestamp_utc(ts_str)
+                    if ts_val is None:
+                        continue
+                    valid, reason, gibberish = self._classify_payload_with_gibberish(payload)
+                    if valid:
+                        self._last_valid_ts = ts_val
+                        self._last_valid_reason = reason
+                        self._last_gibberish_ts = None
+                        self._gibberish_run_start = None
+                        stats["valid"] += 1
+                        classification_meta["valid"] = stats["valid"]
+                        meta["valid"] = stats["valid"]
+                    elif gibberish:
+                        self._last_gibberish_ts = ts_val
+                        if self._gibberish_run_start is None:
+                            self._gibberish_run_start = ts_val
+                        stats["gibberish"] += 1
+                        classification_meta["gibberish"] = stats["gibberish"]
+                        meta["gibberish"] = stats["gibberish"]
+
+            # The old reader classified an unterminated final line immediately.
+            # Keep that behavior, then rewind small trailing lines so a later
+            # append reparses their continuation. Very large lines use a
+            # strictly bounded rewind that advances the cursor. The initial
+            # truncated tail fragment remains discarded and is never rewound.
+            if data and not data.endswith(b"\n"):
+                last_newline = data.rfind(b"\n")
+                partial_bytes = len(data) - last_newline - 1
+                if partial_bytes >= self.max_read_bytes:
+                    rewind = min(
+                        _MAX_PARTIAL_LINE_REWIND_BYTES,
+                        self.max_read_bytes - 1,
+                    )
+                    self._last_offset = max(read_start + 1, self._last_offset - rewind)
+                elif partial_bytes <= _MAX_PARTIAL_LINE_REWIND_BYTES:
+                    self._last_offset = max(read_start, self._last_offset - partial_bytes)
         return stats
 
     def get_status(self) -> FldigiLogStatus:

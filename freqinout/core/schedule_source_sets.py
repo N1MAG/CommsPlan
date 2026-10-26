@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime
 import json
 import re
+import sqlite3
 from typing import Any, Dict, List, Optional
 
 from freqinout.core.multi_radio_store import MultiRadioStore
@@ -574,58 +575,100 @@ def reproject_frequency_plans_for_source_update(
     return [store.save_frequency_plan(payload) for payload in updated]
 
 
-def refresh_source_backed_frequency_plans(settings: Any) -> List[Dict[str, Any]]:
-    """Rebuild stale source-backed Frequency Plans from their current components."""
+def _source_backed_plan_payload(settings: Any, plan: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Validate/materialize one plan without writing or affecting another plan."""
+    plan_id = int(plan.get("id", 0) or 0)
+    if plan_id <= 0:
+        return None
+    plan_category = str(plan.get("category") or "").strip().lower()
+    if plan_category in {HF_DAILY_SOURCE_CATEGORY, HF_NET_SOURCE_CATEGORY}:
+        return None
+    source_refs = _parse_ref_values(plan.get("source_refs_json", plan.get("source_refs", "[]")))
+    daily_set_id = _dependency_set_id(source_refs, HF_DAILY_SOURCE_CATEGORY)
+    net_set_id = _dependency_set_id(source_refs, HF_NET_SOURCE_CATEGORY)
+    if not daily_set_id and not net_set_id:
+        if any(ref.startswith(f"{SOP_SCHEDULE_LAYER_CATEGORY}:") for ref in source_refs):
+            _sop_sources_for_plan(settings, plan, source_refs)
+        return None
+    daily_rows = _rows_for_dependency(settings, HF_DAILY_SOURCE_CATEGORY, daily_set_id) if daily_set_id else []
+    net_rows = _rows_for_dependency(settings, HF_NET_SOURCE_CATEGORY, net_set_id) if net_set_id else []
+    sop_rows, policies = _sop_sources_for_plan(settings, plan, source_refs)
+    projection = build_blended_schedule_projection(
+        daily_rows,
+        net_rows,
+        sop_rows,
+        policies,
+        week_start_utc=_week_start_sunday_utc(datetime.datetime.now(datetime.timezone.utc)),
+    )
+    refs = _normalized_ref_items(projection.schedule_refs())
+    frequency_refs = projection.frequency_refs()
+    group_refs = projection.group_refs()
+    if (
+        _refs_equivalent(refs, plan.get("schedule_refs_json", plan.get("schedule_refs", "[]")))
+        and _refs_equivalent(
+            frequency_refs,
+            plan.get("frequency_refs_json", plan.get("frequency_refs", "[]")),
+        )
+        and _refs_equivalent(group_refs, plan.get("group_refs_json", plan.get("group_refs", "[]")))
+    ):
+        return None
+    payload = dict(plan)
+    payload["id"] = plan_id
+    payload["schedule_refs"] = refs
+    payload["frequency_refs"] = frequency_refs
+    payload["group_refs"] = group_refs
+    payload["notes"] = (
+        f"Refreshed from source schedules {datetime.datetime.now(datetime.timezone.utc).isoformat()}."
+    )
+    return payload
 
-    store = MultiRadioStore()
+
+def refresh_source_backed_frequency_plans(
+    settings: Any, *, source_errors: Optional[Dict[int, str]] = None,
+    revision_writes: Optional[List[int]] = None,
+    store: Optional[MultiRadioStore] = None,
+) -> List[Dict[str, Any]]:
+    """Rebuild plans; scheduler callers may isolate invalid dependencies by plan.
+
+    Infrastructure/CAS failures still abort publication. Strict callers validate
+    every plan before saving any derived rows, retaining their existing contract.
+    """
+    if store is None:
+        store = MultiRadioStore()
+        plans = store.list_frequency_plans()
+    else:
+        # Scheduler owns a migrated store; enumerating sources must not repeat
+        # schema assurance or acquire a write lock on each materialization.
+        with store.configuration_read_transaction():
+            plans = store.list_frequency_plans()
     updated: List[Dict[str, Any]] = []
     expected_by_id = {}
-    for plan in store.list_frequency_plans():
-        plan_id = int(plan.get("id", 0) or 0)
-        if plan_id <= 0:
+    for plan in plans:
+        try:
+            payload = _source_backed_plan_payload(settings, plan)
+        except (ScheduleSourceError, ValueError) as exc:
+            cause = exc
+            while cause is not None:
+                if isinstance(cause, (sqlite3.Error, OSError)):
+                    raise
+                cause = cause.__cause__
+            if source_errors is None:
+                raise
+            source_errors[int(plan["id"])] = str(exc)
             continue
-        plan_category = str(plan.get("category") or "").strip().lower()
-        if plan_category in {HF_DAILY_SOURCE_CATEGORY, HF_NET_SOURCE_CATEGORY}:
-            continue
-        source_refs = _parse_ref_values(plan.get("source_refs_json", plan.get("source_refs", "[]")))
-        daily_set_id = _dependency_set_id(source_refs, HF_DAILY_SOURCE_CATEGORY)
-        net_set_id = _dependency_set_id(source_refs, HF_NET_SOURCE_CATEGORY)
-        if not daily_set_id and not net_set_id:
-            continue
-        daily_rows = _rows_for_dependency(settings, HF_DAILY_SOURCE_CATEGORY, daily_set_id) if daily_set_id else []
-        net_rows = _rows_for_dependency(settings, HF_NET_SOURCE_CATEGORY, net_set_id) if net_set_id else []
-        sop_rows, policies = _sop_sources_for_plan(settings, plan, source_refs)
-        projection = build_blended_schedule_projection(
-            daily_rows,
-            net_rows,
-            sop_rows,
-            policies,
-            week_start_utc=_week_start_sunday_utc(datetime.datetime.now(datetime.timezone.utc)),
-        )
-        refs = _normalized_ref_items(projection.schedule_refs())
-        frequency_refs = projection.frequency_refs()
-        group_refs = projection.group_refs()
-        if (
-            _refs_equivalent(refs, plan.get("schedule_refs_json", plan.get("schedule_refs", "[]")))
-            and _refs_equivalent(
-                frequency_refs,
-                plan.get("frequency_refs_json", plan.get("frequency_refs", "[]")),
-            )
-            and _refs_equivalent(group_refs, plan.get("group_refs_json", plan.get("group_refs", "[]")))
-        ):
-            continue
-        payload = dict(plan)
-        payload["id"] = plan_id
-        payload["schedule_refs"] = refs
-        payload["frequency_refs"] = frequency_refs
-        payload["group_refs"] = group_refs
-        payload["notes"] = (
-            f"Refreshed from source schedules {datetime.datetime.now(datetime.timezone.utc).isoformat()}."
-        )
-        expected_by_id[plan_id] = dict(plan)
-        updated.append(payload)
-    return [store.save_frequency_plan(payload, expected=expected_by_id[int(payload["id"])])
-            for payload in updated]
+        if payload is not None:
+            expected_by_id[int(payload["id"])] = dict(plan)
+            updated.append(payload)
+    saved = []
+    for payload in updated:
+        expected = expected_by_id[int(payload["id"])]
+        if revision_writes is None:
+            saved.append(store.save_frequency_plan(payload, expected=expected))
+        else:
+            row, delta = store.materialize_frequency_plan_with_revision_delta(payload, expected=expected)
+            saved.append(row)
+            revision_writes.append(delta)
+    return saved
 
 
 def source_sets_for_category(settings: Any, legacy_key: str, category: str) -> List[Dict[str, Any]]:
@@ -830,9 +873,9 @@ def delete_source_schedule(settings: Any, sets_key: str, selected_key: str, set_
             if hasattr(settings, "save"):
                 settings.save()
             return True
-    remaining = [row for row in source_sets(settings, sets_key) if str(row.get("id") or "").strip() != target]
-    settings.set(sets_key, remaining)
-    settings.set(selected_key, LIVE_SOURCE_SET_ID)
-    if hasattr(settings, "save"):
-        settings.save()
+    # Dependency check and source removal share the settings DB write lock.
+    # Read the latest persisted list rather than overwriting concurrent edits
+    # from this SettingsManager's potentially older in-memory source list.
+    MultiRadioStore(getattr(settings, "db_path", None)).delete_legacy_schedule_source(expected_category, target)
+    settings.reload()
     return True

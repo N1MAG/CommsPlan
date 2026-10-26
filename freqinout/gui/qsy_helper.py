@@ -354,6 +354,7 @@ def _publish_schedule_control_feedback(
     summary: str,
     detail: str = "",
     source_surface: str = "qsy_helper_schedule_control",
+    qsy_request: Optional[Dict] = None,
 ) -> bool:
     try:
         service = getattr(window, "action_feedback_service", None) if window is not None else None
@@ -362,8 +363,13 @@ def _publish_schedule_control_feedback(
     if service is None or not hasattr(service, "publish"):
         return False
     radio_profile_id, target_label = _qsy_feedback_target(window)
+    if qsy_request and qsy_request.get("radio_profile_id"):
+        requested_radio = str(qsy_request["radio_profile_id"])
+        if requested_radio != radio_profile_id:
+            target_label = f"Radio {requested_radio}"
+        radio_profile_id = requested_radio
     try:
-        service.publish(
+        event = service.publish(
             scope="scheduler",
             action_type=action_type,
             status=status,
@@ -373,6 +379,9 @@ def _publish_schedule_control_feedback(
             detail=str(detail or "").strip(),
             source_surface=source_surface,
         )
+        tracker = getattr(window, "_track_qsy_feedback", None)
+        if qsy_request and callable(tracker):
+            tracker(event, qsy_request)
         return True
     except Exception as e:
         log.debug("QSY helper: failed to publish schedule control feedback: %s", e)
@@ -396,6 +405,14 @@ def _submit_manual_qsy(
 ) -> bool:
     """Submit QSY without describing a pending safety check as a sent command."""
 
+    requested_at = time.monotonic()
+    radio_id = entry.get("target_device_profile_id") or _qsy_feedback_target(window)[0]
+    frequency = parse_frequency_mhz(entry.get("frequency"))
+    qsy_request = {
+        "radio_profile_id": str(radio_id) if radio_id else None,
+        "frequency_hz": round(frequency * 1_000_000) if frequency else None,
+        "requested_monotonic": requested_at,
+    }
     try:
         result = scheduler.apply_manual_qsy(
             entry,
@@ -427,6 +444,7 @@ def _submit_manual_qsy(
                 "The QSY will continue automatically when safe."
             ),
             source_surface="qsy_helper_preflight",
+            qsy_request=qsy_request,
         )
         return True
     if disposition in {"queued", "pending", "already_applied"}:
@@ -441,6 +459,7 @@ def _submit_manual_qsy(
             ),
             detail="CommsPlan will report the endpoint readback separately.",
             source_surface="qsy_helper_submit",
+            qsy_request=qsy_request if disposition != "already_applied" else None,
         )
         return True
     if disposition == "manual":
@@ -672,8 +691,8 @@ def perform_qsy(window, meta: Dict) -> bool:
     }
     # Cards make an explicit hold choice; other QSY entry points preserve
     # their established existing-future-deadline policy.
-    if meta.get("manual_hold_policy") == "until_resume":
-        entry["manual_hold_policy"] = "until_resume"
+    if meta.get("manual_hold_policy") in {"until_resume", "until_transition"}:
+        entry["manual_hold_policy"] = meta["manual_hold_policy"]
     try:
         target_device_profile_id = int(meta.get("target_device_profile_id") or 0)
     except Exception:

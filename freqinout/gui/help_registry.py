@@ -164,7 +164,7 @@ HELP_CONTEXTS: Dict[str, HelpContext] = {
         key="settings.station_setup",
         anchor="settings-station-setup",
         title="Station Setup Help",
-        summary="Saved-setup checklist, editor-owned Save actions, per-radio scheduling review and enable, and immediate scheduling disable.",
+        summary="Saved-setup checklist, editor-owned Save actions, assigned-schedule validation, and per-radio Hold/Resume control.",
     ),
     "settings.freqinout": HelpContext(
         key="settings.freqinout",

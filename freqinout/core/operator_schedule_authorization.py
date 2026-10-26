@@ -205,7 +205,8 @@ def review_schedule(store, radio_id, *, now=None):
                 snapshot.db_path=store.db_path
                 live_sop,_policies=load_sop_projection_sources(snapshot,profile_ids)
                 rows=[row for row in rows if str(row.get('source') or '').upper()!='SOP']+live_sop
-        enabled = [row for row in rows if isinstance(row,dict) and _truth(row.get('enabled',1))]
+        enabled = [row for row in rows if isinstance(row,dict) and _truth(row.get('enabled',1))
+                   and not row.get('implicit_continuation') and not row.get('_resolution_implicit_continuation')]
         if plan and not enabled:
             issues.append('The assigned schedule has no enabled entries.')
         # Reuse the scheduler's recurrence evaluator without constructing a
@@ -221,7 +222,7 @@ def review_schedule(store, radio_id, *, now=None):
                 issues.append(prefix+group_issue)
                 continue
             if str(row.get('time_basis') or 'UTC').upper() != 'UTC' or row.get('timezone') not in (None,'','UTC','Etc/UTC'):
-                issues.append(prefix+'save the schedule in supported UTC time before enabling.')
+                issues.append(prefix+'save the schedule in supported UTC time.')
                 continue
             start=_parse_hhmm_to_minutes(str(row.get('start_utc') or ''))
             end=_parse_hhmm_to_minutes(str(row.get('end_utc') or ''))
@@ -229,8 +230,8 @@ def review_schedule(store, radio_id, *, now=None):
                 issues.append(prefix+'enter valid start/end UTC times.')
                 continue
             recurrence=str(row.get('recurrence') or 'Weekly')
-            if recurrence not in {'Daily','Weekly','Periodic','Monthly'}:
-                issues.append(prefix+'unsupported recurrence; choose Daily, Weekly or Periodic.')
+            if recurrence not in {'Daily','Weekly','Bi-Weekly','Periodic','Monthly'}:
+                issues.append(prefix+'unsupported recurrence; choose Daily, Weekly, Bi-Weekly or Periodic.')
                 continue
             day=str(row.get('day_utc') or 'ALL').upper()
             if day not in {'ALL','MONDAY','TUESDAY','WEDNESDAY','THURSDAY','FRIDAY','SATURDAY','SUNDAY'}:
@@ -254,7 +255,7 @@ def review_schedule(store, radio_id, *, now=None):
             # Every supported recurrence repeats within four calendar months, including a
             # fifth weekday missing in the current month. This is a semantic
             # bound for these supported recurrences, not a today-only test.
-            candidates=engine._row_start_candidates(row,now_utc=now,horizon_days=124 if recurrence in {"Periodic","Monthly"} else 8)
+            candidates=engine._row_start_candidates(row,now_utc=now,horizon_days=124 if recurrence in {"Periodic","Monthly"} else 15 if recurrence == "Bi-Weekly" else 8)
             if candidates:
                 next_events.append(min(candidates))
             else:
@@ -264,9 +265,9 @@ def review_schedule(store, radio_id, *, now=None):
                 hf=[row for row in enabled if str(row.get('source') or 'HF').upper()=='HF']
                 active=engine._find_active_hf_entry(now,hf) or engine._find_active_net_entry(now,enabled)
                 if active:
-                    warnings.append('An event is active now. Enabling scheduling may apply it immediately when the required connection and safety checks permit.')
+                    warnings.append('An event is active now. Assigning this schedule may apply it when connection and safety checks permit.')
             except Exception as exc:
-                issues.append('Resolve the schedule conflict before enabling: '+str(exc))
+                issues.append('Resolve the schedule conflict: '+str(exc))
         warnings.append('CP scheduling requires current connection, identity and RF/PTT checks. Application startup and existing holds are separate choices.')
         if plan:
             validation=store.validate_frequency_plan_for_device(int(radio_id),plan)
@@ -290,14 +291,18 @@ def review_schedule(store, radio_id, *, now=None):
             issues.append('Schedule sources changed during review. Check again.')
         valid=not issues
         approved=bool(valid and approval.get('enabled') and approval.get('fingerprint')==fingerprint and tokens_current(store.db_path,json.loads(approval.get('source_evidence_json') or '{}')))
-        paused=bool(approval and not approved and approval.get('reason') != 'operator disabled')
-        state='enabled' if approved else 'paused' if paused else 'ready' if valid else 'needs_attention'
-        label=('Scheduling enabled' if approved else 'Scheduling paused — configuration changed' if paused
-               else 'Scheduling off — ready' if valid else 'Scheduling off — schedule needed' if not plan else 'Scheduling off — needs attention')
+        operator_paused=bool(approval.get('reason') == 'operator disabled' and not approval.get('enabled'))
+        state='operator_paused' if operator_paused else 'enabled' if approved else 'checking' if valid else 'needs_attention'
+        label=('Scheduling paused — operator' if operator_paused else 'Following assigned schedule' if approved
+               else 'Assigned schedule — checking inputs' if valid else 'No assigned schedule' if not plan
+               else 'Schedule blocked — '+str(issues[0] if issues else 'check the assigned plan'))
         next_event=min(next_events).isoformat() if next_events else ''
-        return dict(state=state,label=label,fingerprint=fingerprint,valid=valid,issues=list(dict.fromkeys(issues)),warnings=warnings,
+        from freqinout.core.schedule_assignment_information import frequency_plan_schedule_information
+        information=frequency_plan_schedule_information(plan) if plan else []
+        return dict(state=state,label=label,fingerprint=fingerprint,valid=valid,information=information,issues=list(dict.fromkeys(issues)),warnings=warnings,
             next_event=next_event,plan_name=plan.get('name') or '',time_basis='UTC (fixed; no DST shift)',enabled=approved,
             approval_token=approval.get('approval_token') if approved else '',radio_name=profile.get('name') or '',
+            operator_paused=operator_paused,operator_pause_token=approval.get('approval_token') if operator_paused else '',
             source_evidence=sources,binding_evidence=_binding_evidence(store._transaction_local.connection,int(radio_id)),launch_summaries=launch_summaries(store,int(radio_id)))
 
 
@@ -342,6 +347,69 @@ def set_schedule_authorization(store,radio_id,*,enable,expected_fingerprint=''):
     return review_schedule(store,int(radio_id))
 
 
+def _configuration_revision(conn):
+    exists=conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='_fio_schedule_revision'").fetchone()
+    return int(conn.execute("SELECT revision FROM _fio_schedule_revision WHERE id=1").fetchone()[0]) if exists else 0
+
+
+def ensure_assigned_schedule_authority(store, radio_id, *, sources_prepared=False):
+    """Worker-only validation proof for assignment intent; preserve operator pause.
+
+    Return the detached review and exact owned configuration-revision delta.
+    Configuration/source revocation and dispatch token checks remain mandatory.
+    """
+    if not sources_prepared:
+        _prepare_source_revisions(store)
+    # Most refreshes only confirm an existing proof. Do not reserve SQLite's
+    # writer for recurrence/RF validation and cross-database source reads.
+    # Any mutation still re-reviews under the original atomic write boundary.
+    with store.configuration_read_transaction():
+        review = review_schedule(store, int(radio_id))
+        with store.connect_readonly() as conn:
+            current = conn.execute(f'SELECT enabled FROM {TABLE} WHERE radio_id=?', (int(radio_id),)).fetchone()
+        if (review.get('operator_paused') or review.get('enabled')
+                or (not review['valid'] and not (current and current[0]))):
+            return review, 0
+    with store.configuration_save_transaction() as transaction:
+        review=review_schedule(store,int(radio_id))
+        with store.connect() as conn:
+            before=_configuration_revision(conn)
+            current=conn.execute(f'SELECT enabled,reason FROM {TABLE} WHERE radio_id=?',(int(radio_id),)).fetchone()
+            if review.get('operator_paused') or review.get('enabled'):
+                transaction.complete()
+                return review,0
+            if review['valid']:
+                token=uuid4().hex
+                conn.execute(f"""INSERT INTO {TABLE}(radio_id,fingerprint,approval_token,enabled,reviewed_utc,reason,source_evidence_json,binding_evidence_json)
+                    VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(radio_id) DO UPDATE SET fingerprint=excluded.fingerprint,
+                    approval_token=excluded.approval_token,enabled=excluded.enabled,reviewed_utc=excluded.reviewed_utc,
+                    reason=excluded.reason,source_evidence_json=excluded.source_evidence_json,binding_evidence_json=excluded.binding_evidence_json""",
+                    (int(radio_id),review['fingerprint'],token,1,datetime.now(timezone.utc).isoformat(),
+                     'automatic validation',json.dumps(review['source_evidence'],sort_keys=True),json.dumps(review['binding_evidence'],sort_keys=True)))
+            elif current and current[0]:
+                conn.execute(f"UPDATE {TABLE} SET enabled=0,reason='validation failed',approval_token=? WHERE radio_id=?",
+                             (uuid4().hex,int(radio_id)))
+            delta=_configuration_revision(conn)-before
+        transaction.complete()
+    if review['valid']:
+        review.update(enabled=True,state='enabled',label='Following assigned schedule',approval_token=token)
+    return review,delta
+
+
+def clear_legacy_schedule_pause(store, radio_id, expected_token):
+    """Only an explicit Resume may clear an exact legacy disabled intent."""
+    if not expected_token:
+        return 0
+    with store.configuration_save_transaction() as transaction:
+        with store.connect() as conn:
+            before=_configuration_revision(conn)
+            conn.execute(f"UPDATE {TABLE} SET reason='resume requested',approval_token=? WHERE radio_id=? AND enabled=0 AND reason='operator disabled' AND approval_token=?",
+                         (uuid4().hex,int(radio_id),str(expected_token)))
+            delta=_configuration_revision(conn)-before
+        transaction.complete()
+    return delta
+
+
 def dispatch_approval_current(db_path,radio_id,token):
     """Command-worker check only: one indexed row, no schema work or scans."""
     if not token or not radio_id:
@@ -363,6 +431,12 @@ def dispatch_approval_current(db_path,radio_id,token):
 
 def review_station_setup(store):
     _prepare_source_revisions(store)
+    from freqinout.core.schedule_source_inputs import ScheduleSourceError
+    for profile in store.list_device_profiles():
+        try:
+            ensure_assigned_schedule_authority(store,int(profile['id']))
+        except (ValueError, ScheduleSourceError):
+            pass  # The read-only per-radio review below publishes its error.
     with store.configuration_read_transaction():
         with store.connect_readonly() as conn:
             kv={row['key']:_data(row['value'],{}) if row['key']=='operating_groups' else row['value'] for row in conn.execute(

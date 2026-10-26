@@ -93,12 +93,12 @@ class _DeviceProfileVaultSettings:
 
     def set(self, key: str, value) -> None:
         if str(key or "").startswith(("spotter_directed_offset", "expect_directed_offset")):
-            try:
-                self.fallback_settings.set(key, value)
-                if hasattr(self.fallback_settings, "save"):
-                    self.fallback_settings.save()
-            except Exception:
-                pass
+            # Tail checkpoint failure must reach the ingest owner. Swallowing
+            # it reports success while the next poll replays the old offset.
+            writer = getattr(self.fallback_settings, "set_runtime_checkpoint", self.fallback_settings.set)
+            writer(key, value)
+            if hasattr(self.fallback_settings, "save"):
+                self.fallback_settings.save()
             return
         self.profile[key] = value
         if key in {"varac_bbs_vault_runtime_state_v1", "varac_bbs_vault_last_summary"}:
@@ -154,6 +154,8 @@ class BackgroundIngestController(QObject):
     def __init__(self, settings: SettingsManager, *, expect_guard_preflight: Optional[GuardPreflightCallback] = None):
         super().__init__()
         self.settings = settings
+        self._runtime_store_local = threading.local()
+        self._runtime_settings_db_path = getattr(settings, "db_path", None)
         self.expect_guard_preflight = expect_guard_preflight
         self._js8_links_timer: Optional[QTimer] = None
         self._messages_timer: Optional[QTimer] = None
@@ -409,6 +411,15 @@ class BackgroundIngestController(QObject):
         # schema, migration, or launch-bundle adoption work.
         return SettingsManager(runtime_worker=True)
 
+    def _runtime_store(self) -> MultiRadioStore:
+        # Connections remain operation-local; only schema readiness is retained
+        # per worker. MultiRadioStore checks file/schema identity on each open.
+        store = getattr(self._runtime_store_local, "store", None)
+        if store is None:
+            store = MultiRadioStore(self._runtime_settings_db_path)
+            self._runtime_store_local.store = store
+        return store
+
     def _runtime_active_profiles(self) -> list[Dict[str, object]]:
         """Return one configuration-generation-fenced linked-profile snapshot.
 
@@ -423,7 +434,7 @@ class BackgroundIngestController(QObject):
             if self._runtime_profile_cache_generation == generation:
                 return [dict(profile) for profile in self._runtime_profile_cache]
         try:
-            store = MultiRadioStore()
+            store = self._runtime_store()
             runtime_status = build_multi_rig_runtime_status(store)
             if runtime_status.background_ingest_scope != SCOPE_ALL_ACTIVE_RUNTIME:
                 profiles: tuple[Dict[str, object], ...] = ()
@@ -972,7 +983,7 @@ class BackgroundIngestController(QObject):
         cached = self._runtime_inventory_cache
         if cached is not None and (now - float(self._runtime_inventory_cache_ts or 0.0)) < self._runtime_inventory_cache_ttl_sec:
             return cached
-        inventory = active_runtime_ingest_inventory()
+        inventory = active_runtime_ingest_inventory(self._runtime_store())
         self._runtime_inventory_cache = inventory
         self._runtime_inventory_cache_ts = now
         return inventory
@@ -1064,7 +1075,7 @@ class BackgroundIngestController(QObject):
         self, *, profiles: Optional[Sequence[Mapping[str, object]]] = None
     ) -> None:
         selected_profiles = list(profiles) if profiles is not None else self._active_js8_spotter_profiles()
-        store = MultiRadioStore()
+        store = self._runtime_store()
         profile_fallback = self._new_worker_settings()
         try:
             for profile_row in selected_profiles:
@@ -1128,7 +1139,7 @@ class BackgroundIngestController(QObject):
             profiles=profiles,
             guard_preflight=self.expect_guard_preflight,
         )
-        store = MultiRadioStore()
+        store = self._runtime_store()
         try:
             for profile in profiles:
                 self._cancel_checkpoint()
@@ -1221,7 +1232,7 @@ class BackgroundIngestController(QObject):
 
     def _run_multi_radio_js8_message_ingest(self) -> None:
         active_profiles = self._active_js8_spotter_profiles()
-        reconcile_store = MultiRadioStore()
+        reconcile_store = self._runtime_store()
         mapping_changed = False
         for profile in active_profiles:
             try:
@@ -1577,7 +1588,7 @@ class BackgroundIngestController(QObject):
             str(profile.get("id", "") or profile.get("system_key", "") or "").strip(): profile
             for profile in profiles
         }
-        store = MultiRadioStore()
+        store = self._runtime_store()
         worker_settings = self._new_worker_settings()
         coordinator = ExpectAutomationCoordinator(
             worker_settings,
@@ -1770,7 +1781,7 @@ class BackgroundIngestController(QObject):
             profiles = self._active_varac_vault_profiles()
             if not profiles:
                 return build_varac_bbs_vault_activity_signature(worker_settings)
-            store = MultiRadioStore()
+            store = self._runtime_store()
             signatures = []
             for profile in profiles:
                 profile_id = str(profile.get("id", "") or profile.get("system_key", "") or profile.get("name", "") or "")
@@ -1860,7 +1871,7 @@ class BackgroundIngestController(QObject):
             if not varac_sources:
                 ingest_varac(worker_settings)
                 return
-            store = MultiRadioStore()
+            store = self._runtime_store()
             profiles_by_id = {str(profile.get("id", "") or profile.get("system_key", "") or ""): profile for profile in self._active_varac_profiles()}
             for source in varac_sources:
                 profile = profiles_by_id.get(str(source.radio_id or ""))
@@ -1940,7 +1951,7 @@ class BackgroundIngestController(QObject):
         try:
             profiles = self._active_varac_vault_profiles()
             if profiles:
-                store = MultiRadioStore()
+                store = self._runtime_store()
                 try:
                     catalog_db_path = bbs_library_db_path_from_settings(worker_settings)
                     with connect_sqlite(catalog_db_path) as catalog_conn:
@@ -1969,25 +1980,38 @@ class BackgroundIngestController(QObject):
                     if key:
                         by_live_dir.setdefault(key, []).append(profile)
                 duplicate_dirs = {key for key, rows in by_live_dir.items() if len(rows) > 1}
+                warning_signature = tuple(sorted(
+                    (key, tuple(sorted((str(row.get("id", "")), str(row.get("name", ""))) for row in by_live_dir[key])))
+                    for key in duplicate_dirs
+                ))
+                warn_duplicates = warning_signature != getattr(self, "_duplicate_bbs_warning_signature", None)
+                self._duplicate_bbs_warning_signature = warning_signature
                 for profile in profiles:
                     profile_name = str(profile.get("name", "") or profile.get("system_key", "") or profile.get("id", "") or "radio").strip()
                     live_key = self._normalized_bbs_dir(profile.get("varac_bbs_dir", ""))
                     if live_key in duplicate_dirs:
-                        profile["varac_bbs_vault_last_summary"] = (
+                        summary = (
                             "Managed BBS Library skipped: duplicate live BBS directory is configured on more than one active radio."
                         )
                         try:
                             profile_id = int(profile.get("id", 0) or 0)
-                            if profile_id > 0:
+                            # Runtime discovery may return a cached profile;
+                            # compare the persisted warning on this worker.
+                            saved_profile = store.get_device_profile(profile_id) if profile_id > 0 else None
+                            # This job repeats every few seconds. An unchanged
+                            # warning must not rewrite radio configuration and
+                            # invalidate every schedule/Plan Builder projection.
+                            if saved_profile and saved_profile.get("varac_bbs_vault_last_summary") != summary:
                                 store.save_device_profile(
                                     {
                                         "id": profile_id,
-                                        "varac_bbs_vault_last_summary": profile["varac_bbs_vault_last_summary"],
+                                        "varac_bbs_vault_last_summary": summary,
                                     }
                                 )
                         except Exception as exc:
                             log.debug("BackgroundIngest: failed to persist duplicate BBS warning for %s: %s", profile_name, exc)
-                        log.warning("BackgroundIngest: VarAC vault skipped duplicate live BBS directory for %s", profile_name)
+                        if warn_duplicates:
+                            log.warning("BackgroundIngest: VarAC vault skipped duplicate live BBS directory for %s", profile_name)
                         continue
                     vault_result = run_varac_bbs_vault(_DeviceProfileVaultSettings(profile, worker_settings, store))
                     results.append(vault_result)
@@ -1997,6 +2021,7 @@ class BackgroundIngestController(QObject):
                         log.debug("BackgroundIngest: VarAC vault [%s] %s", profile_name, vault_result.summary)
                 return results
             else:
+                self._duplicate_bbs_warning_signature = ()
                 vault_result = run_varac_bbs_vault(worker_settings)
                 if bool(vault_result.enabled) and (
                     int(vault_result.processed_events or 0) > 0 or bool(vault_result.published)
@@ -2017,7 +2042,7 @@ class BackgroundIngestController(QObject):
             if not profiles:
                 run_varac_guard(worker_settings)
                 return
-            store = MultiRadioStore(worker_settings.db_path)
+            store = self._runtime_store()
             from freqinout.core.varac_bbs_sync import _station_values
             try:
                 station_callsigns = ",".join(_station_values(store)["allowed_callsigns"])
@@ -2117,7 +2142,7 @@ class BackgroundIngestController(QObject):
             self._record_job_skip("sitreps:commstat", decision.reason)
             self._job_refresh_skip_reasons["sitreps:commstat"] = decision.reason
             return
-        store = MultiRadioStore()
+        store = self._runtime_store()
         profiles_by_id = {str(profile.get("id", "") or profile.get("system_key", "") or ""): profile for profile in store.list_runtime_active_device_profiles()}
         batch_limit = self._commstat_source_ingest_batch_limit(worker_settings)
         for source in commstat_sources:

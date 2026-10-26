@@ -15,7 +15,7 @@ if __name__ == "__main__" and sys.argv[1:2] == ["--migration-preparation"]:
     from freqinout.core.brand_migration_native import main as native_preparation
     raise SystemExit(native_preparation(sys.argv[2:], require_report=True))
 
-from PySide6.QtCore import QEventLoop, QLockFile, QTimer
+from PySide6.QtCore import QEventLoop, QLockFile, QTimer, Qt
 from PySide6.QtWidgets import QApplication, QMessageBox
 from PySide6.QtGui import QIcon
 from freqinout.core import db_initializer
@@ -39,6 +39,28 @@ from freqinout.gui.startup_splash import StartupSplash
 from freqinout.gui.startup_surface_trace import install_windows_startup_surface_trace
 from freqinout.gui.theme import apply_app_theme, resolve_theme, resolve_ui_text_scale
 from freqinout.version import __version__
+
+
+STATION_DATA_STARTUP_ERROR = (
+    "Station data could not be prepared. Startup is continuing with an error."
+)
+
+
+def _show_station_data_startup_notice(parent) -> QMessageBox:
+    """Keep a startup failure visible until acknowledged, without blocking work."""
+
+    notice = QMessageBox(parent)
+    notice.setWindowTitle(f"{DISPLAY_NAME} — Startup issue")
+    notice.setIcon(QMessageBox.Icon.Warning)
+    notice.setTextFormat(Qt.TextFormat.PlainText)
+    notice.setText(STATION_DATA_STARTUP_ERROR)
+    notice.setInformativeText("Review Log Viewer for details.")
+    notice.setStandardButtons(QMessageBox.StandardButton.Ok)
+    notice.setWindowModality(Qt.WindowModality.NonModal)
+    notice.setModal(False)
+    notice.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+    notice.show()
+    return notice
 
 
 def _write_fatal_startup_log(exc: BaseException) -> Path:
@@ -249,8 +271,8 @@ def main():
     try:
         if surface_trace is not None:
             surface_trace.set_stage("splash_show")
-        splash = StartupSplash(app, version=f"v{__version__}")
-        splash.show("Checking database...")
+        splash = StartupSplash(app, version=__version__)
+        splash.show("Preparing station data…")
         _emit_startup_stage("splash_visible", stage_started, app_start=startup_started)
     except Exception as e:
         splash = None
@@ -262,7 +284,7 @@ def main():
         try:
             from freqinout.core.packaged_profile_guard import prepare_packaged_profile
             if splash is not None:
-                splash.update_status("Verifying station upgrade backup...")
+                splash.update_status("Preparing station upgrade backup…")
             backup_record = prepare_packaged_profile(get_config_dir(), __version__, held_lock_pid=os.getpid())
             log.info("Packaged startup preparation: %s; backup=%s", backup_record["state"], backup_record["backup"])
         except Exception as exc:
@@ -282,6 +304,7 @@ def main():
     _emit_startup_stage("apply_startup_theme", stage_started, app_start=startup_started)
 
     # Ensure SQLite schema is present while the operator can see startup progress.
+    station_data_error = False
     stage_started = time.perf_counter()
     try:
         if surface_trace is not None:
@@ -289,8 +312,9 @@ def main():
         db_initializer.ensure_all_tables()
     except Exception as e:
         log.error("Database initialization failed: %s", e)
+        station_data_error = True
         if splash is not None:
-            splash.update_status("Database check had a problem. Opening CommsPlan...")
+            splash.update_status("Station data could not be prepared.")
     finally:
         _emit_startup_stage("database_init", stage_started, app_start=startup_started)
 
@@ -325,12 +349,12 @@ def main():
             surface_trace.stop(stage="upgrade_not_completed")
         return
     if splash is not None:
-        splash.show("Preparing main window...")
+        splash.show("Preparing station workspace…")
 
     win = None
     try:
         if splash is not None:
-            splash.update_status("Preparing main window...")
+            splash.update_status("Preparing station workspace…")
         stage_started = time.perf_counter()
         from freqinout.gui.main_window import MainWindow
 
@@ -349,7 +373,7 @@ def main():
         _emit_startup_stage("main_window_construct", stage_started, app_start=startup_started)
 
         if splash is not None:
-            splash.update_status("Opening CommsPlan...")
+            splash.update_status_without_event_pump("Opening station workspace…")
         if surface_trace is not None:
             surface_trace.set_stage("main_window_show")
         stage_started = time.perf_counter()
@@ -364,6 +388,8 @@ def main():
             record_startup_evidence(args.migration_session, get_config_dir(), Path(__file__).resolve().parents[1], __version__)
         if splash is not None:
             splash.finish(win)
+        if station_data_error:
+            win._station_data_startup_notice = _show_station_data_startup_notice(win)
         if surface_trace is not None:
             surface_trace.stop(stage="startup_complete")
         _emit_startup_stage("startup_complete", startup_started)

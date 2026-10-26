@@ -150,17 +150,35 @@ class _StationBleAuthority:
     def __init__(self) -> None:
         self._condition = threading.Condition()
         self._owner: object | None = None
+        self._retired_process: Any | None = None
 
     def acquire(self, owner: object, timeout_sec: float) -> bool:
         deadline = time.monotonic() + max(0.0, float(timeout_sec))
         with self._condition:
             while self._owner is not None and self._owner is not owner:
+                retired = self._retired_process
+                if retired is not None and not retired.is_alive():
+                    retired.join(timeout=0.0)
+                    close_process = getattr(retired, "close", None)
+                    if callable(close_process):
+                        close_process()
+                    self._retired_process = None
+                    self._owner = None
+                    self._condition.notify_all()
+                    break
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return False
-                self._condition.wait(remaining)
+                self._condition.wait(min(remaining, 0.1) if retired is not None else remaining)
             self._owner = owner
             return True
+
+    def retain_unreaped(self, owner: object, process: Any) -> None:
+        # Discovery has no persistent adapter object. Keep its lease and
+        # process handle until a later explicit acquire can prove it exited.
+        with self._condition:
+            if self._owner is owner:
+                self._retired_process = process
 
     def release(self, owner: object) -> None:
         with self._condition:
@@ -337,29 +355,45 @@ class LinuxMeshCoreBleSupervisorAdapter:
             self._retire_helper(deadline=time.monotonic() + 1.0)
             if self._process is not None:
                 raise MeshConnectionError("The previous MeshCore helper has not retired. Reconnect paused; choose Connect again later.")
+        if self._cancel_event.is_set():
+            raise MeshOperationCancelled("MeshCore Bluetooth operation cancelled.")
         if not self._authority_owned:
             if not _STATION_BLE_AUTHORITY.acquire(self._authority_token, 6.0):
                 raise MeshConnectionError(
                     "Another MeshCore Bluetooth scan or connection is still finishing. Wait a moment and retry."
                 )
             self._authority_owned = True
+        if self._cancel_event.is_set():
+            self._retire_helper(deadline=time.monotonic() + 1.0)
+            raise MeshOperationCancelled("MeshCore Bluetooth operation cancelled.")
         self._generation += 1
-        parent_control, child_control = self._context.Pipe(duplex=True)
-        parent_data, child_data = self._context.Pipe(duplex=False)
-        process = self._context.Process(
-            target=_broker_main,
-            args=(child_control, child_data, self.config, self._generation),
-            name=f"FIO MeshCore BLE broker {self.adapter_id}",
-            daemon=True,
-        )
-        self._process = process
-        self._control = parent_control
-        self._data = parent_data
-        self._cancel_event.clear()
-        self._set_state(LinuxBleState.STARTING)
-        process.start()
-        child_control.close()
-        child_data.close()
+        child_control = child_data = None
+        try:
+            parent_control, child_control = self._context.Pipe(duplex=True)
+            self._control = parent_control
+            parent_data, child_data = self._context.Pipe(duplex=False)
+            self._data = parent_data
+            process = self._context.Process(
+                target=_broker_main,
+                args=(child_control, child_data, self.config, self._generation),
+                name=f"FIO MeshCore BLE broker {self.adapter_id}",
+                daemon=True,
+            )
+            self._process = process
+            self._set_state(LinuxBleState.STARTING)
+            process.start()
+        except BaseException:
+            self._retire_helper(deadline=time.monotonic() + 1.0)
+            raise
+        finally:
+            # Parent must close child pipe ends even when allocation/spawn
+            # fails. connect's fault path retires parent ends and the lease.
+            for connection in (child_control, child_data):
+                if connection is not None:
+                    try:
+                        connection.close()
+                    except OSError:
+                        pass
         ready = self._wait_control(request_id="", deadline=time.monotonic() + 4.0, expected="ready")
         if ready.get("kind") != "ready":
             self._fault_and_retire("MeshCore Bluetooth helper did not become ready.")
@@ -432,6 +466,7 @@ class LinuxMeshCoreBleSupervisorAdapter:
         if not self.config.enabled:
             self._state = LinuxBleState.DISABLED
             raise MeshConnectionError("MeshCore adapter is disabled.")
+        self._cancel_event.clear()
         self._set_state(LinuxBleState.STARTING if self._state != LinuxBleState.STARTING else self._state)
         try:
             self._start_helper()
@@ -502,7 +537,10 @@ class LinuxMeshCoreBleSupervisorAdapter:
             except Exception:
                 pass
         if process is not None:
-            process.join(timeout=max(0.0, min(0.75, deadline - time.monotonic())))
+            # multiprocessing rejects join() before start(). A failed spawn
+            # with no pid and no live child has nothing to join.
+            if process.is_alive() or getattr(process, "pid", None) is not None:
+                process.join(timeout=max(0.0, min(0.75, deadline - time.monotonic())))
             if process.is_alive():
                 process.terminate()
                 process.join(timeout=max(0.0, min(0.5, deadline - time.monotonic())))
@@ -515,6 +553,13 @@ class LinuxMeshCoreBleSupervisorAdapter:
                 # may still be running. A later explicit stop can retry reaping.
                 self._state = LinuxBleState.NEEDS_ATTENTION
                 return
+        if process is not None:
+            close_process = getattr(process, "close", None)
+            if callable(close_process):
+                try:
+                    close_process()
+                except OSError:
+                    pass
         for connection in (self._control, self._data):
             try:
                 if connection is not None:
@@ -524,7 +569,6 @@ class LinuxMeshCoreBleSupervisorAdapter:
         self._process = None
         self._control = None
         self._data = None
-        self._cancel_event.clear()
         if self._authority_owned:
             _STATION_BLE_AUTHORITY.release(self._authority_token)
             self._authority_owned = False
@@ -623,22 +667,29 @@ def discover_meshcore_ble_devices_supervised(
     owner = object()
     if not _STATION_BLE_AUTHORITY.acquire(owner, 6.0):
         raise MeshConnectionError("A MeshCore Bluetooth connection is active. Disconnect it before scanning.")
-    context = multiprocessing.get_context("spawn")
-    parent_control, child_control = context.Pipe(duplex=True)
-    parent_data, child_data = context.Pipe(duplex=False)
-    generation = int(time.monotonic_ns())
-    process = context.Process(
-        target=_broker_main,
-        args=(child_control, child_data, None, generation),
-        name="FIO MeshCore BLE discovery broker",
-        daemon=True,
-    )
+    parent_control = child_control = parent_data = child_data = process = None
     try:
+        if cancel_event is not None and cancel_event.is_set():
+            raise MeshOperationCancelled("MeshCore BLE scan cancelled.")
+        context = multiprocessing.get_context("spawn")
+        parent_control, child_control = context.Pipe(duplex=True)
+        parent_data, child_data = context.Pipe(duplex=False)
+        generation = int(time.monotonic_ns())
+        process = context.Process(
+            target=_broker_main,
+            args=(child_control, child_data, None, generation),
+            name="FIO MeshCore BLE discovery broker",
+            daemon=True,
+        )
         process.start()
         child_control.close()
         child_data.close()
         deadline = time.monotonic() + 4.0
         while time.monotonic() < deadline:
+            if cancel_event is not None and cancel_event.is_set():
+                raise MeshOperationCancelled("MeshCore BLE scan cancelled.")
+            if not process.is_alive():
+                raise MeshConnectionError("MeshCore Bluetooth scan helper exited unexpectedly.")
             if parent_control.poll(0.1):
                 ready = _validated_message(parent_control.recv(), generation=generation)
                 if ready.get("kind") == "ready":
@@ -673,15 +724,38 @@ def discover_meshcore_ble_devices_supervised(
             return tuple(message.get("result", ()) or ())
         raise MeshConnectionError("MeshCore Bluetooth scan exceeded its deadline.")
     finally:
-        if process.is_alive():
-            process.terminate()
-            process.join(timeout=0.75)
-        if process.is_alive() and hasattr(process, "kill"):
-            process.kill()
-            process.join(timeout=0.5)
-        parent_control.close()
-        parent_data.close()
-        _STATION_BLE_AUTHORITY.release(owner)
+        unwinding = sys.exc_info()[0] is not None
+        reaped = process is None
+        try:
+            if process is not None:
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=0.75)
+                if process.is_alive() and hasattr(process, "kill"):
+                    process.kill()
+                    process.join(timeout=0.5)
+                reaped = not process.is_alive()
+                if reaped:
+                    if getattr(process, "pid", None) is not None:
+                        process.join(timeout=0.0)
+                    close_process = getattr(process, "close", None)
+                    if callable(close_process):
+                        close_process()
+        finally:
+            for connection in (parent_control, child_control, parent_data, child_data):
+                if connection is not None:
+                    try:
+                        connection.close()
+                    except Exception:
+                        pass
+            if reaped:
+                _STATION_BLE_AUTHORITY.release(owner)
+            elif process is not None:
+                _STATION_BLE_AUTHORITY.retain_unreaped(owner, process)
+                log.error("MeshCore BLE scan helper has not retired; reconnect remains paused")
+                if not unwinding:
+                    raise MeshConnectionError("MeshCore Bluetooth scan helper has not retired. Reconnect paused; try again after it stops.")
+
 
 
 __all__ = [

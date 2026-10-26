@@ -1558,6 +1558,8 @@ class SettingsTab(QWidget):
         action_feedback_service: ActionFeedbackService | None = None,
         *,
         defer_initial_load: bool = False,
+        settings_manager: SettingsManager | None = None,
+        startup_gated: bool = False,
     ):
         super().__init__(parent)
         # Settings has several database-backed administration projections.  It
@@ -1567,7 +1569,9 @@ class SettingsTab(QWidget):
         self._defer_initial_load = bool(defer_initial_load)
         self._initial_settings_loaded = False
         self._initial_settings_load_pending = False
-        self.settings = SettingsManager()
+        self._startup_shell_ready = not startup_gated
+        with perf_span("settings.construct.settings", min_ms=0.0):
+            self.settings = settings_manager if settings_manager is not None else SettingsManager()
         self.action_feedback_service = action_feedback_service or ActionFeedbackService()
         self._last_action_feedback_event = None
         self._guided_software_discovery = GuidedSoftwareDiscoveryCoordinator(
@@ -1587,8 +1591,9 @@ class SettingsTab(QWidget):
             self._status_service.snapshot_changed.connect(self._on_dependency_status_snapshot_changed)
         except Exception:
             pass
-        self.launch_orchestrator = LaunchOrchestrator(self.settings, self)
-        self.multi_radio_store = MultiRadioStore()
+        with perf_span("settings.construct.launch_services", settings=self.settings, min_ms=0.0):
+            self.launch_orchestrator = LaunchOrchestrator(self.settings, self)
+            self.multi_radio_store = MultiRadioStore()
 
         self.PROGRAMS: Dict[str, Dict[str, str]] = {
             "FLRig": {"setting_key": "path_flrig", "autostart_key": "autostart_flrig"},
@@ -1632,7 +1637,8 @@ class SettingsTab(QWidget):
         self._varac_native_generation = 0
         self._varac_native_preparations: Dict[str, VarACNativePreparationResult] = {}
         self._varac_native_recovery_started = False
-        QTimer.singleShot(0, self._start_varac_native_recovery)
+        if self._startup_shell_ready:
+            QTimer.singleShot(0, self._start_varac_native_recovery)
         self._guided_radio_autofill_callbacks: Dict[int, Tuple[Any, Any]] = {}
         self._guided_radio_autofill_finished.connect(self._on_guided_radio_autofill_finished)
         self._guided_radio_autofill_failed.connect(self._on_guided_radio_autofill_failed)
@@ -1769,10 +1775,12 @@ class SettingsTab(QWidget):
         self._last_varac_bbs_lookup_reload_ts = 0.0
         self._varac_bbs_lookup_reload_interval_sec = 20.0
 
-        self._build_ui()
-        if not self._defer_initial_load:
-            self._load_settings()
-            self._initial_settings_loaded = True
+        with perf_span("settings.construct.ui", settings=self.settings, min_ms=0.0):
+            self._build_ui()
+        with perf_span("settings.construct.initial_data", settings=self.settings, min_ms=0.0):
+            if not self._defer_initial_load:
+                self._load_settings()
+                self._initial_settings_loaded = True
 
         # Auto-save on application exit (no popup)
         app = QApplication.instance()
@@ -5940,7 +5948,7 @@ class SettingsTab(QWidget):
         schedule_assignments_layout = QVBoxLayout(schedule_assignments_container)
         schedule_assignments_layout.setSpacing(8)
         schedule_assignments_hint = QLabel(
-            "Assign one built Frequency Plan to the radio that should follow it. RF Guard checks run before the assignment is saved. Restore Plan returns a temporary assignment to its prior plan; Restore Default Plan returns a radio to its default assigned plan."
+            "Assign one built Frequency Plan to a radio and review the RF Guard result. Assignment selects the active schedule; CommsPlan follows it when saved schedule, connection, PTT, and RF checks permit. Hold/Resume pauses automatic changes, and schedule gaps keep the current frequency. Restore Plan returns a temporary assignment to its prior plan; Restore Default Plan returns a radio to its default assigned plan."
         )
         schedule_assignments_hint.setWordWrap(True)
         schedule_assignments_layout.addWidget(schedule_assignments_hint)
@@ -5954,7 +5962,7 @@ class SettingsTab(QWidget):
             self.schedule_assignments_guidance_status_label,
             title="Schedule Assignment",
             text=(
-                "Choose a radio and Frequency Plan, then save with RF Guard before the schedule changes."
+                "Choose a radio and Frequency Plan, then save with RF Guard. This records the active assignment; CommsPlan follows it when saved schedule, connection, PTT, and RF checks permit. Hold/Resume pauses automatic changes, and schedule gaps keep the current frequency."
             ),
             level="info",
         )
@@ -6022,8 +6030,21 @@ class SettingsTab(QWidget):
         self.schedule_assignments_table = QTableWidget(0, 7)
         self.schedule_assignments_table.setObjectName("scheduleAssignmentsTable")
         self.schedule_assignments_table.setHorizontalHeaderLabels(
-            ["Selected", "Active", "Default", "Radio", "Frequency Plan", "State", "Guard Status"]
+            ["Selected", "Radio active", "Default", "Radio", "Frequency Plan", "Assignment state", "RF Guard"]
         )
+        schedule_header_tooltips = {
+            0: "Select this radio for assignment actions.",
+            1: "Radio active shows the runtime/profile status. The assigned Frequency Plan remains the schedule selection.",
+            2: "Default indicates the radio's default assigned plan relationship.",
+            3: "Radio profile receiving the selected Frequency Plan assignment.",
+            4: "Frequency Plan selected for this radio assignment.",
+            5: "Assignment state records whether this saved schedule assignment is active, held, or otherwise paused.",
+            6: "RF Guard is the validation result for the saved assignment and its RF path.",
+        }
+        for index, tooltip in schedule_header_tooltips.items():
+            header_item = self.schedule_assignments_table.horizontalHeaderItem(index)
+            if header_item is not None:
+                header_item.setToolTip(tooltip)
         self.schedule_assignments_table.verticalHeader().setVisible(False)
         self.schedule_assignments_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.schedule_assignments_table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -6407,7 +6428,10 @@ class SettingsTab(QWidget):
         self.op_group_fastlight_unsigned_combo.addItem(".b2s", "b2s")
         self.op_group_fastlight_form_family_combo = QComboBox()
         self.op_group_fastlight_form_family_combo.addItem("No preferred form family", "group_default")
-        self._refresh_op_group_fastlight_form_family_options()
+        # Directory probes belong to the later administration load/selection,
+        # especially when configured form paths are on a slow remote mount.
+        if not self._defer_initial_load:
+            self._refresh_op_group_fastlight_form_family_options()
         self.op_group_add_config_btn = QPushButton("Add Configuration")
         self.op_group_add_config_btn.clicked.connect(self._add_operating_group_inline)
         self.op_group_save_btn = QPushButton("Save Changes")
@@ -10086,7 +10110,10 @@ class SettingsTab(QWidget):
         main_layout.addLayout(bottom_row)
         self._wire_dirty_tracking()
         self._configure_unified_radio_navigation()
-        self._refresh_launch_control_table()
+        # The shell has a separate cached launch monitor projection. Populate
+        # this administrative table when deferred Settings data is first loaded.
+        if not self._defer_initial_load:
+            self._refresh_launch_control_table()
         self._set_save_button_state("success")
         self._refresh_section_titles()
         self._apply_settings_nav_scope_visibility()
@@ -18622,7 +18649,7 @@ class SettingsTab(QWidget):
             QMessageBox.critical(self, "Error", f"Could not open log folder:\n{e}")
 
     def _export_diagnostics(self) -> None:
-        default_name = f"freqinout_diagnostics_{datetime.datetime.now():%Y%m%d_%H%M%S}.zip"
+        default_name = f"commsplan_diagnostics_{datetime.datetime.now():%Y%m%d_%H%M%S}.zip"
         out_path, _ = QFileDialog.getSaveFileName(
             self,
             "Export Diagnostics",
@@ -26105,7 +26132,85 @@ class SettingsTab(QWidget):
             )
             return
         try:
-            self.multi_radio_store.swap_assigned_frequency_plans(first_id, second_id)
+            preview = self.multi_radio_store.preview_swap_assigned_frequency_plans(first_id, second_id)
+        except ValueError as exc:
+            self._set_schedule_assignment_guidance("RF Guard Blocked Plan Swap", str(exc), "warning")
+            return
+        except Exception:
+            log.exception("Failed previewing schedule assignment swap.")
+            self._set_schedule_assignment_guidance(
+                "Schedule Assignment",
+                "Unable to preview the selected schedule assignment swap.",
+                "danger",
+            )
+            return
+        blocked = [str(item).strip() for item in preview.get("blocked", []) if str(item).strip()]
+        warnings = [str(item).strip() for item in preview.get("warnings", []) if str(item).strip()]
+        cautions = [str(item).strip() for item in preview.get("cautions", []) if str(item).strip()]
+        from freqinout.core.schedule_assignment_information import (
+            frequency_plan_schedule_information,
+            frequency_plan_schedule_issues,
+        )
+        proposed_plans = []
+        for plan_id in (preview.get("first_plan_id"), preview.get("second_plan_id")):
+            try:
+                requested_id = int(plan_id or 0)
+            except (TypeError, ValueError):
+                requested_id = 0
+            proposed_plans.append(
+                next(
+                    (dict(plan) for plan in getattr(self, "frequency_plans", [])
+                     if isinstance(plan, dict) and int(plan.get("id", 0) or 0) == requested_id),
+                    {},
+                )
+            )
+        schedule_issues = list(dict.fromkeys(
+            issue
+            for plan in proposed_plans
+            for issue in frequency_plan_schedule_issues(plan)
+        ))
+        schedule_information = list(dict.fromkeys(
+            info
+            for plan in proposed_plans
+            for info in frequency_plan_schedule_information(plan)
+        ))
+        if blocked:
+            self._set_schedule_assignment_guidance("RF Guard Blocked Plan Swap", blocked[0], "warning")
+            return
+        if warnings or cautions or schedule_issues:
+            details = [
+                f"{preview.get('first_device_name', 'First radio')} would follow {preview.get('first_plan_name', 'the selected plan')};",
+                f"{preview.get('second_device_name', 'Second radio')} would follow {preview.get('second_plan_name', 'the selected plan')}.\n",
+            ]
+            if schedule_issues:
+                details.extend(["Schedule entry checks to review before assigning:", *schedule_issues])
+            if warnings or cautions:
+                details.extend([
+                    "RF Guard cautions for the proposed post-swap assignments:",
+                    *dict.fromkeys(warnings + cautions),
+                    "\nConfirm suitable RF isolation or protection before starting the other radio while transmitting.",
+                ])
+            details.append("These entry checks are separate from RF Guard; continuing does not bypass an RF block.")
+            response = QMessageBox.question(
+                self,
+                "Confirm schedule assignment checks",
+                "\n".join(details),
+                QMessageBox.Yes | QMessageBox.Cancel,
+                QMessageBox.Cancel,
+            )
+            if response != QMessageBox.Yes:
+                self._set_schedule_assignment_guidance(
+                    "Schedule Assignment",
+                    "Swap cancelled; no assignments were changed.",
+                    "info",
+                )
+                return
+        try:
+            self.multi_radio_store.swap_assigned_frequency_plans(
+                first_id,
+                second_id,
+                expected_preview_fingerprint=str(preview.get("fingerprint") or ""),
+            )
         except ValueError as exc:
             self._set_schedule_assignment_guidance("RF Guard Blocked Plan Swap", str(exc), "warning")
             return
@@ -26125,12 +26230,14 @@ class SettingsTab(QWidget):
         second_name = str(selected[1].get("device_name", "") or "second radio").strip()
         self._set_schedule_assignment_guidance(
             "Schedule Assignment Saved",
-            f"Swapped assigned Frequency Plans between {first_name} and {second_name} with RF Guard.",
+            f"Swapped assigned Frequency Plans between {first_name} and {second_name} with RF Guard."
+            + (" " + " ".join(schedule_information) if schedule_information else ""),
             "success",
         )
         self._publish_settings_action_feedback(
             status="succeeded",
             summary=f"Swapped schedule assignments between {first_name} and {second_name}.",
+            detail=" ".join(schedule_information),
             action_type="schedule_assignment_swap",
         )
 
@@ -26256,7 +26363,8 @@ class SettingsTab(QWidget):
     def _schedule_assignment_validation_message(self, validation: Mapping[str, Any]) -> Tuple[str, str]:
         blocked = [str(item).strip() for item in validation.get("blocked", []) if str(item).strip()]
         warnings = [str(item).strip() for item in validation.get("warnings", []) if str(item).strip()]
-        if not blocked and not warnings:
+        cautions = [str(item).strip() for item in validation.get("cautions", []) if str(item).strip()]
+        if not blocked and not warnings and not cautions:
             return "", ""
         supported = [str(item).strip() for item in validation.get("supported_bands", []) if str(item).strip()]
         plan_bands = [str(item).strip() for item in validation.get("plan_bands", []) if str(item).strip()]
@@ -26268,7 +26376,9 @@ class SettingsTab(QWidget):
                 "Choose a different plan, update the supported antenna bands, or do not transmit until the antenna path is confirmed."
             )
         else:
-            detail = blocked[0] if blocked else warnings[0]
+            detail = blocked[0] if blocked else (warnings[0] if warnings else cautions[0])
+        if cautions and cautions[0] not in detail:
+            detail += " " + cautions[0]
         return ("blocked" if blocked else "warning"), detail
 
     def _update_schedule_assignment_editor_hint(self) -> None:
@@ -26290,8 +26400,8 @@ class SettingsTab(QWidget):
         if state == "temporary_override":
             bits.append("Temporary Override applies immediately. Ends UTC is metadata in this checkpoint.")
         else:
-            bits.append("Active assignments become the current schedule plan for the selected radio immediately.")
-        bits.append("Save with RF Guard runs the assignment check before the radio schedule changes.")
+            bits.append("Active follows the assigned Frequency Plan when saved schedule, connection, PTT, and RF checks permit. Hold/Resume pauses automatic changes; schedule gaps keep the current frequency.")
+        bits.append("Save with RF Guard checks the assignment and RF path before CommsPlan follows the selected schedule.")
         if len(rows) == 1 and plan is not None:
             try:
                 device_id = int(rows[0].get("device_profile_id", 0) or 0)
@@ -26469,6 +26579,70 @@ class SettingsTab(QWidget):
         if state == "temporary_override" and not reason_value:
             reason_value = "Temporary schedule override from Settings."
         ends_value = self.schedule_assignment_ends_edit.text().strip()
+        from freqinout.core.schedule_assignment_information import (
+            frequency_plan_schedule_information,
+            frequency_plan_schedule_issues,
+        )
+        schedule_issues = frequency_plan_schedule_issues(selected_plan or {})
+        schedule_information = frequency_plan_schedule_information(selected_plan or {})
+        preflight_blocked: List[str] = []
+        preflight_warnings: List[str] = []
+        preflight_cautions: List[str] = []
+        validator = getattr(self.multi_radio_store, "validate_frequency_plan_for_device", None)
+        if callable(validator):
+            for row in selected:
+                try:
+                    validation = validator(int(row.get("device_profile_id", 0) or 0), selected_plan or {})
+                except ValueError as exc:
+                    preflight_blocked.append(str(exc))
+                    continue
+                except Exception as exc:
+                    log.exception("Failed preflighting selected schedule assignment.")
+                    preflight_blocked.append(f"Unable to validate the selected assignment before saving: {exc}")
+                    continue
+                if not isinstance(validation, Mapping):
+                    preflight_blocked.append("Unable to validate the selected assignment before saving.")
+                    continue
+                preflight_blocked.extend(str(item).strip() for item in validation.get("blocked", []) if str(item).strip())
+                preflight_warnings.extend(str(item).strip() for item in validation.get("warnings", []) if str(item).strip())
+                preflight_cautions.extend(str(item).strip() for item in validation.get("cautions", []) if str(item).strip())
+        else:
+            # Compatibility fixtures may expose only the assignment writer. The
+            # real MultiRadioStore always provides this preflight; commit-time
+            # assignment validation remains authoritative for those fixtures.
+            log.warning("Schedule assignment preflight is unavailable on the configured store.")
+        preflight_blocked = list(dict.fromkeys(preflight_blocked))
+        preflight_warnings = list(dict.fromkeys(preflight_warnings))
+        preflight_cautions = list(dict.fromkeys(preflight_cautions))
+        if preflight_blocked:
+            self._set_schedule_assignment_guidance("RF Guard Blocked Assignment", preflight_blocked[0], "warning")
+            return
+        if schedule_issues or preflight_warnings or preflight_cautions:
+            details = ["Review the selected schedule assignment before saving:"]
+            if schedule_issues:
+                details.extend(["Schedule entry checks:", *schedule_issues])
+                details.append("Automatic changes will wait until these entries are corrected. Save assignment anyway?")
+            if preflight_warnings or preflight_cautions:
+                details.extend([
+                    "RF Guard warnings for the selected assignment:",
+                    *dict.fromkeys(preflight_warnings + preflight_cautions),
+                    "Confirm suitable RF isolation or protection before starting the other radio while transmitting.",
+                ])
+            details.append("These checks are separate from RF Guard blocks; continuing does not bypass a block.")
+            response = QMessageBox.question(
+                self,
+                "Confirm schedule assignment checks",
+                "\n".join(details),
+                QMessageBox.Yes | QMessageBox.Cancel,
+                QMessageBox.Cancel,
+            )
+            if response != QMessageBox.Yes:
+                self._set_schedule_assignment_guidance(
+                    "Schedule Assignment",
+                    "Assignment cancelled; no schedule assignments were changed.",
+                    "info",
+                )
+                return
         saved_assignments: List[Dict[str, Any]] = []
         try:
             for row in selected:
@@ -26520,20 +26694,28 @@ class SettingsTab(QWidget):
                 warning_tone = tone or "warning"
                 break
         if warning_text:
+            if schedule_information:
+                warning_text += " " + " ".join(schedule_information)
             self._set_schedule_assignment_guidance(
                 "RF Guard Blocked Assignment" if warning_tone == "blocked" else "RF Guard Needs Review",
                 warning_text,
                 "warning",
             )
         else:
+            saved_text = f"Saved with RF Guard for {len(selected)} radio{'s' if len(selected) != 1 else ''}."
+            if schedule_issues:
+                saved_text += " Automatic changes will wait until these entries are corrected: " + " ".join(schedule_issues)
+            if schedule_information:
+                saved_text += " " + " ".join(schedule_information)
             self._set_schedule_assignment_guidance(
                 "Schedule Assignment Saved",
-                f"Saved with RF Guard for {len(selected)} radio{'s' if len(selected) != 1 else ''}.",
+                saved_text,
                 "success",
             )
         self._publish_settings_action_feedback(
             status="succeeded",
             summary=f"Updated schedule assignment for {len(selected)} radio{'s' if len(selected) != 1 else ''}.",
+            detail=" ".join(schedule_information + schedule_issues),
             action_type="schedule_assignment",
         )
 
@@ -26634,7 +26816,7 @@ class SettingsTab(QWidget):
         else:
             self._set_schedule_assignment_guidance(
                 "Schedule Assignment",
-                "Assign built Frequency Plans to radios here. Save with RF Guard checks the selected radio before the schedule changes.",
+                "Assign built Frequency Plans to radios here. Save with RF Guard checks the selected radio and records the active schedule assignment. Hold/Resume pauses automatic changes; schedule gaps keep the current frequency.",
                 "info",
             )
         if refresh_section_titles:
@@ -29078,10 +29260,18 @@ class SettingsTab(QWidget):
         thread.started.connect(worker.run)
         thread.start()
 
+    def set_startup_shell_ready(self) -> None:
+        if self._startup_shell_ready or getattr(self, "_software_autofill_shutdown", False):
+            return
+        self._startup_shell_ready = True
+        self._start_varac_native_recovery()
+
     def _start_varac_native_recovery(self) -> None:
         """Resolve only journaled unfinished applies on a bounded startup worker."""
 
-        if bool(getattr(self, "_varac_native_recovery_started", False)):
+        if (not getattr(self, "_startup_shell_ready", True)
+                or getattr(self, "_software_autofill_shutdown", False)
+                or bool(getattr(self, "_varac_native_recovery_started", False))):
             return
         self._varac_native_recovery_started = True
         self._start_varac_native_job(

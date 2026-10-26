@@ -188,13 +188,10 @@ def ensure_source_dirty_triggers(conn: sqlite3.Connection) -> tuple[str, ...]:
             source_expr = str(spec["source_id"]).format(row=row_name)
             version_expr = str(spec["version"]).format(row=row_name)
             trigger_name = f"trg_mip_dirty_{table}_{operation}"
-            # Trigger definitions are versioned in code. Recreate them during
-            # the startup migration so source-identity fixes apply to an
-            # existing installation as well as a fresh database.
-            conn.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
-            conn.execute(
-                f"""
-                CREATE TRIGGER IF NOT EXISTS {trigger_name}
+            # Ingest workers also call this assurance. Recreating unchanged
+            # triggers changes schema_version and can starve concurrent schedule
+            # loads even though no schedule input changed.
+            definition = f"""CREATE TRIGGER {trigger_name}
                 AFTER {operation.upper()} ON {table}
                 BEGIN
                     INSERT INTO message_projection_dirty (
@@ -218,9 +215,23 @@ def ensure_source_dirty_triggers(conn: sqlite3.Connection) -> tuple[str, ...]:
                         last_error_code=NULL,
                         lease_owner=NULL,
                         lease_expires_utc=NULL;
-                END
-                """
-            )
+                END"""
+            existing = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+                (trigger_name,),
+            ).fetchone()
+            if existing is None or existing[0] != definition:
+                # DDL must replace atomically even on a connection without a
+                # caller-owned write transaction. Never expose a missing trigger.
+                conn.execute("SAVEPOINT mip_dirty_trigger_upgrade")
+                try:
+                    conn.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+                    conn.execute(definition)
+                except Exception:
+                    conn.execute("ROLLBACK TO mip_dirty_trigger_upgrade")
+                    raise
+                finally:
+                    conn.execute("RELEASE mip_dirty_trigger_upgrade")
             installed.append(trigger_name)
     return tuple(installed)
 

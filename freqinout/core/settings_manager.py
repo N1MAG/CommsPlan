@@ -4,6 +4,7 @@ import json
 import sqlite3
 import threading
 import time
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -40,7 +41,26 @@ class SettingsManager:
     Values are JSON-encoded to preserve existing data structures.
     """
 
-    def __init__(self, *, runtime_worker: bool = False) -> None:
+    def __init__(self, *, runtime_worker: bool = False, initialized_source: Optional[SettingsManager] = None) -> None:
+        self._startup_initialized = False
+        if initialized_source is not None:
+            initialized_source._assert_thread_affinity()
+            if runtime_worker or not getattr(initialized_source, "_startup_initialized", False) or initialized_source._conn is None:
+                raise ValueError("A UI settings view requires an open, initialized owner on this thread")
+            # Independent connection and detached cached values: tabs must not
+            # share partially edited UI state or repeat startup migrations.
+            self.config_dir = initialized_source.config_dir
+            self.db_path = initialized_source.db_path
+            self._config_path = self.db_path
+            self._conn = None
+            self._thread_id = threading.get_ident()
+            self._runtime_worker = False
+            self._last_timezone_sync_monotonic = initialized_source._last_timezone_sync_monotonic
+            self._data = deepcopy(initialized_source._data)
+            self._station_bbs_catalog = deepcopy(getattr(initialized_source, "_station_bbs_catalog", None))
+            self._conn = connect_sqlite_runtime_write(self.db_path)
+            self._startup_initialized = True
+            return
         # Prefer a user-writable config dir (works for both source and frozen builds)
         self.config_dir = get_config_dir() / "config"
         self.config_dir.mkdir(parents=True, exist_ok=True)
@@ -133,6 +153,7 @@ class SettingsManager:
             self.reload()
         self._ensure_launch_bundle_migration()
         self._sync_system_timezone(force=True)
+        self._startup_initialized = True
 
     # ---------- internal I/O ---------- #
 
@@ -315,6 +336,29 @@ class SettingsManager:
         except Exception as e:
             log.error("SettingsManager: failed to write key %s: %s", key, e)
             raise
+
+    def set_runtime_checkpoint(self, key: str, value: Any) -> None:
+        """Bounded worker-only retry; memory advances only after durable commit."""
+        self._assert_thread_affinity()
+        if not self._runtime_worker or not str(key).startswith(("spotter_directed_offset", "expect_directed_offset")):
+            raise ValueError("Runtime checkpoint writes require a worker and an ingest offset key")
+        encoded = json.dumps(value)
+        previous_timeout = int(self._conn.execute("PRAGMA busy_timeout").fetchone()[0])
+        try:
+            self._conn.execute("PRAGMA busy_timeout=100")
+            for attempt in range(4):
+                try:
+                    with self._conn:
+                        self._conn.execute("INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE kv.value IS NOT excluded.value", (key, encoded))
+                    self._data[key] = value
+                    return
+                except sqlite3.OperationalError as exc:
+                    code = getattr(exc, "sqlite_errorcode", 0) or 0
+                    if (code & 255) not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED) or attempt == 3:
+                        raise
+                    time.sleep((0.02, 0.05, 0.1)[attempt])
+        finally:
+            self._conn.execute(f"PRAGMA busy_timeout={previous_timeout}")
 
     def set_many(self, values: Dict[str, Any], *, save: bool = True) -> None:
         """

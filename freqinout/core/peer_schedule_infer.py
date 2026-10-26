@@ -167,9 +167,7 @@ def _ensure_inferred_tables(conn: sqlite3.Connection) -> None:
         ON peer_hf_schedule_inferred(owner_callsign, day_utc, start_utc, end_utc)
         """
     )
-    cur.execute("DROP VIEW IF EXISTS peer_hf_schedule_effective")
-    cur.execute(
-        """
+    view_sql = """
         CREATE VIEW IF NOT EXISTS peer_hf_schedule_effective AS
         SELECT
             owner_callsign,
@@ -208,7 +206,14 @@ def _ensure_inferred_tables(conn: sqlite3.Connection) -> None:
             WHERE UPPER(TRIM(e.owner_callsign)) = UPPER(TRIM(i.owner_callsign))
         )
         """
-    )
+    existing = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='view' AND name='peer_hf_schedule_effective'"
+    ).fetchone()
+    def normalized_sql(value: str) -> str:
+        return "".join(value.casefold().split()).replace("ifnotexists", "")
+    if existing is None or normalized_sql(str(existing[0] or "")) != normalized_sql(view_sql):
+        cur.execute("DROP VIEW IF EXISTS peer_hf_schedule_effective")
+        cur.execute(view_sql)
 
 
 def _load_explicit_callsigns(conn: sqlite3.Connection) -> Set[str]:

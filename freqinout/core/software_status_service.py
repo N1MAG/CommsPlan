@@ -8,12 +8,14 @@ import socket
 import threading
 import time
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 import psutil
 
 from freqinout.core.dependency_health import get_dependency_health_registry
 from freqinout.core.logger import log
+from freqinout.core.perf_metrics import span as perf_span
 from freqinout.core.custom_rigctld import parse_custom_rigctld
 from freqinout.radio_interface.js8_api_client import JS8ApiClient, JS8ApiEndpoint
 
@@ -119,10 +121,14 @@ class SoftwareStatusService:
 
     # Shared caches across all service instances to avoid duplicated polling work.
     _shared_instance_evidence = {}
-    _shared_proc_snapshot: List[str] = []
-    _shared_proc_records: List[Dict[str, object]] = []
+    _shared_proc_snapshot: Sequence[str] = ()
+    _shared_proc_records: Sequence[Mapping[str, object]] = ()
     _shared_proc_snapshot_ts: float = 0.0
     _shared_proc_lock = threading.Lock()
+    _shared_proc_refresh_lock = threading.Lock()
+    _shared_proc_target_tokens: frozenset[str] = frozenset()
+    _shared_proc_inspect_all = False
+    _shared_proc_generation = 0
     _shared_js8_api_cache: Dict[tuple[str, int, bool], tuple[float, bool]] = {}
     _shared_js8_capability_cache: Dict[tuple[str, int], tuple[float, Dict[str, object]]] = {}
     _shared_js8_shadow_cache: Dict[tuple[str, int], tuple[float, Dict[str, object]]] = {}
@@ -130,9 +136,11 @@ class SoftwareStatusService:
 
     def __init__(self, settings: Any) -> None:
         self.settings = settings
-        self._proc_snapshot: List[str] = []
-        self._proc_records: List[Dict[str, object]] = []
+        self._proc_snapshot: Sequence[str] = ()
+        self._proc_records: Sequence[Mapping[str, object]] = ()
         self._proc_snapshot_ts: float = 0.0
+        self._process_snapshot_pinned = False
+        self._process_extra_tokens: frozenset[str] = frozenset()
         # Process inventory is station-wide and comparatively expensive on
         # some Linux /proc implementations. Endpoint reachability still has
         # its own shorter cache, while launch/manual refreshes explicitly force
@@ -297,29 +305,75 @@ class SoftwareStatusService:
         status = str(record.get("status") or "").strip().casefold()
         return status not in _INACTIVE_PROCESS_STATUSES
 
+    def _capture_process_inventory(self):
+        """Capture one published generation; never wait for process enumeration."""
+        if getattr(self, "_process_snapshot_pinned", False):
+            return self._proc_snapshot, self._proc_records, self._proc_snapshot_ts
+        cls = type(self)
+        with cls._shared_proc_lock:
+            return cls._shared_proc_snapshot, cls._shared_proc_records, cls._shared_proc_snapshot_ts
+
+    def pin_process_inventory(self, *, force=False, inspect_all=False, extra_tokens=()) -> None:
+        """Pin one complete observation for a short-lived dependency worker."""
+        self._process_extra_tokens = frozenset(str(token).lower() for token in extra_tokens if token)
+        self._refresh_process_snapshot(force=force, inspect_all=inspect_all)
+        self._process_snapshot_pinned = True
+
     def _refresh_process_snapshot(
         self,
         *,
         force: bool = False,
         inspect_all: bool = False,
     ) -> None:
+        if getattr(self, "_process_snapshot_pinned", False):
+            return
         cls = type(self)
+        requested_at = time.monotonic()
         with cls._shared_proc_lock:
-            now = time.monotonic()
-            if not force and (now - float(cls._shared_proc_snapshot_ts or 0.0)) < self._snapshot_ttl_sec:
-                self._proc_snapshot = cls._shared_proc_snapshot
-                self._proc_records = cls._shared_proc_records
-                self._proc_snapshot_ts = float(cls._shared_proc_snapshot_ts or now)
+            requested_generation = cls._shared_proc_generation
+        target_tokens = frozenset(
+            token for program_name in PROGRAM_TOKENS
+            for token in self._target_tokens(program_name) if token
+        ) | self._process_extra_tokens | frozenset(PROCESS_WRAPPER_TOKENS)
+        # Wrapper details are needed by routine scoped consumers too (Wine
+        # hosts VarAC/VARA, Python hosts scripts). Capture the full record once,
+        # including exe/status/cwd, and publish that coverage with this generation.
+        # Merely claiming coverage of the old command-line-only wrapper read
+        # would leave later executable-path matching incomplete.
+
+        def adopt_fresh() -> bool:
+            # Caller holds the publication lock. Coverage belongs to this exact
+            # generation; a new custom executable must not reuse partial detail.
+            stamp = float(cls._shared_proc_snapshot_ts or 0.0)
+            age = time.monotonic() - stamp
+            fresh_for_request = (
+                not force or (cls._shared_proc_generation > requested_generation and stamp >= requested_at)
+            )
+            if (fresh_for_request and stamp > 0.0 and 0 <= age < self._snapshot_ttl_sec
+                    and (cls._shared_proc_inspect_all or (
+                        not inspect_all and target_tokens <= cls._shared_proc_target_tokens))):
+                self._proc_snapshot, self._proc_records, self._proc_snapshot_ts = (
+                    cls._shared_proc_snapshot, cls._shared_proc_records, stamp)
+                return True
+            return False
+
+        with cls._shared_proc_lock:
+            if adopt_fresh():
                 return
-            started = time.perf_counter()
+        started = time.perf_counter()
+        meta = {"force": int(force), "inspect_all": int(inspect_all)}
+        # Serialize walks separately. Fresh readers can still adopt the prior
+        # immutable generation while a forced walk is blocked in /proc.
+        with cls._shared_proc_refresh_lock, perf_span(
+            "process_inventory.walk", settings=self.settings, meta=meta, min_ms=2.0
+        ):
+            meta["wait_ms"] = round((time.perf_counter() - started) * 1000.0, 3)
+            with cls._shared_proc_lock:
+                if adopt_fresh():
+                    return
+            now = time.monotonic()
             snap: List[str] = []
             records: List[Dict[str, object]] = []
-            target_tokens = {
-                token
-                for program_name in PROGRAM_TOKENS
-                for token in self._target_tokens(program_name)
-                if token
-            }
             # Reading exe/cmdline for every process is disproportionately slow on
             # some Linux systems (and can block on inaccessible/FUSE-backed proc
             # entries). Start with the cheap name inventory and inspect details
@@ -402,17 +456,24 @@ class SoftwareStatusService:
                     )
                 except Exception:
                     continue
-            cls._shared_proc_snapshot = snap
-            cls._shared_proc_records = records
-            cls._shared_proc_snapshot_ts = now
-            self._proc_snapshot = cls._shared_proc_snapshot
-            self._proc_records = cls._shared_proc_records
-            self._proc_snapshot_ts = now
+            # Tuples and read-only records are never mutated after publication.
+            # Keep compatibility attributes, but all readers capture them together.
+            meta.update(processes=len(records), tokens=len(snap))
+            published_tokens = tuple(snap)
+            published_records = tuple(MappingProxyType(record) for record in records)
+            with cls._shared_proc_lock:
+                cls._shared_proc_snapshot = published_tokens
+                cls._shared_proc_records = published_records
+                cls._shared_proc_snapshot_ts = now
+                cls._shared_proc_target_tokens = target_tokens
+                cls._shared_proc_inspect_all = bool(inspect_all)
+                cls._shared_proc_generation += 1
+                self._proc_snapshot, self._proc_records, self._proc_snapshot_ts = (
+                    published_tokens, published_records, now)
         log.debug(
-            "PROCESS_INVENTORY|refreshed|processes=%s|tokens=%s|duration_ms=%.1f",
-            len(records),
-            len(snap),
-            (time.perf_counter() - started) * 1000.0,
+            "PROCESS_INVENTORY|refreshed|processes=%s|tokens=%s|duration_ms=%.1f|wait_ms=%.1f",
+            len(records), len(snap), (time.perf_counter() - started) * 1000.0,
+            meta["wait_ms"],
         )
 
     def _configured_tokens(self, program_name: str) -> List[str]:
@@ -479,10 +540,7 @@ class SoftwareStatusService:
 
     def cached_program_is_running(self, program_name: str) -> bool:
         """Read the shared process snapshot without ever starting an inventory walk."""
-        cls = type(self)
-        self._proc_snapshot = cls._shared_proc_snapshot
-        self._proc_records = cls._shared_proc_records
-        self._proc_snapshot_ts = cls._shared_proc_snapshot_ts
+        self._proc_snapshot, self._proc_records, self._proc_snapshot_ts = self._capture_process_inventory()
         if not self._proc_snapshot and not self._proc_records:
             return False
         targets = set(self._target_tokens(program_name))
@@ -498,12 +556,11 @@ class SoftwareStatusService:
     ) -> int:
         """Count cached process records carrying this program's family token."""
 
-        cls = type(self)
-        records = cls._shared_proc_records if process_records is None else process_records
         if process_records is None:
-            self._proc_snapshot = cls._shared_proc_snapshot
-            self._proc_records = cls._shared_proc_records
-            self._proc_snapshot_ts = cls._shared_proc_snapshot_ts
+            self._proc_snapshot, self._proc_records, self._proc_snapshot_ts = self._capture_process_inventory()
+            records = self._proc_records
+        else:
+            records = process_records
         targets = set(self._target_tokens(program_name))
         if not targets:
             normalized = str(program_name or "").strip().casefold()
@@ -628,8 +685,7 @@ class SoftwareStatusService:
         if not targets:
             normalized = program_name.strip().lower()
             targets = {normalized, f"{normalized}.exe"}
-        cls = type(self)
-        records = cls._shared_proc_records if process_records is None else process_records
+        records = self._capture_process_inventory()[1] if process_records is None else process_records
         for record in records:
             if not self._process_record_is_active(record):
                 continue
@@ -685,10 +741,9 @@ class SoftwareStatusService:
         unknown; neither a wrapper PID nor a basename establishes ownership.
         """
         from freqinout.core.varac_launch_recipe import _wine_identity
-        cls = type(self)
-        with cls._shared_proc_lock:
-            records = tuple(cls._shared_proc_records if process_records is None else process_records)
-            stamp = float(cls._shared_proc_snapshot_ts if checked_monotonic is None else checked_monotonic)
+        _tokens, captured_records, captured_stamp = self._capture_process_inventory()
+        records = tuple(captured_records if process_records is None else process_records)
+        stamp = float(captured_stamp if checked_monotonic is None else checked_monotonic)
         out = dict(running=None, checked_monotonic=stamp, reason="Could not verify", pids=())
         if not stamp or not 0 <= time.monotonic() - stamp <= max_age_s:
             out['reason'] = 'Process observation is stale or unavailable'
@@ -774,10 +829,8 @@ class SoftwareStatusService:
         Unknown/ambiguous identity is distinct from a fresh observed absence.
         The original inventory timestamp must survive downstream publications.
         """
-        cls = type(self)
-        with cls._shared_proc_lock:
-            stamp = float(cls._shared_proc_snapshot_ts or 0.0)
-            records = tuple(cls._shared_proc_records)
+        _tokens, records, stamp = self._capture_process_inventory()
+        stamp = float(stamp or 0.0)
         result: Dict[str, object] = {"running": None, "checked_monotonic": stamp}
         age = time.monotonic() - stamp
         if not configured_target or stamp <= 0 or not 0 <= age <= max_age_s:

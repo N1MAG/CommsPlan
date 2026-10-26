@@ -188,6 +188,11 @@ class MeshSendRequest:
     requested_at: datetime = field(default_factory=utc_now)
     timeout_sec: float = 12.0
     require_ack: bool = True
+    # Optional immutable configuration fence for source-linked manual forwarding.
+    expected_connection_fingerprint: str = ""
+    forwarding_db_path: str = ""
+    forwarding_relay_id: str = ""
+    forwarding_attempt: int = 0
 
 
 @dataclass(frozen=True)

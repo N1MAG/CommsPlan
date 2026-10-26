@@ -382,7 +382,7 @@ class MainWindow(QMainWindow):
         with perf_span("startup.construct.plan_context", min_ms=0.0):
             self.plan_context_service = PlanContextService()
         self._action_feedback_unsubscribe = None
-        self._notify_startup_status("Loading application settings...")
+        self._notify_startup_status("Loading station settings…")
         self._clear_stale_ncs_activity_on_startup()
         self.dependency_status_service = _construct_startup_component(
             "dependency_status",
@@ -449,6 +449,8 @@ class MainWindow(QMainWindow):
                 self,
                 action_feedback_service=self.action_feedback_service,
                 defer_initial_load=True,
+                settings_manager=SettingsManager(initialized_source=self.settings),
+                startup_gated=True,
             ),
         )
         self._sync_settings_runtime_status(
@@ -474,6 +476,7 @@ class MainWindow(QMainWindow):
                 self,
                 plan_context_service=self.plan_context_service,
                 defer_initial_load=True,
+                settings_manager=SettingsManager(initialized_source=self.settings),
             ),
         )
         if hasattr(self.sop_tab, "local_net_return_requested"):
@@ -493,8 +496,11 @@ class MainWindow(QMainWindow):
                 self,
                 plan_context_service=self.plan_context_service,
                 defer_initial_refresh=True,
+                settings_manager=SettingsManager(initialized_source=self.settings),
+                startup_gated=True,
             ),
         )
+        workspace_started = time.perf_counter()
         if hasattr(self.controlfreq_tab, "set_local_nets_outlook_provider"):
             self.controlfreq_tab.set_local_nets_outlook_provider(self._build_local_nets_outlook)
         if hasattr(self.controlfreq_tab, "set_shortwave_listening_outlook_provider"):
@@ -582,7 +588,7 @@ class MainWindow(QMainWindow):
             ("Settings", self.settings_tab),
             ("Help", self._placeholder_widget("Help")),
         ]
-        self._notify_startup_status("Building station dashboard...")
+        self._notify_startup_status("Preparing station workspace…")
         self._screen_index_by_label = {label: idx for idx, (label, _w) in enumerate(self._screens)}
         self._condition_levels_signature: tuple[tuple[str, int], ...] = tuple()
         self._condition_levels_refresh_pending = False
@@ -1248,6 +1254,8 @@ class MainWindow(QMainWindow):
             else self._new_varac_status_client()
         )
         self.fldigi_log_status = FldigiLogStatusClient()
+        emit_span("startup.construct.workspace_shell", (time.perf_counter() - workspace_started) * 1000.0,
+                  settings=self.settings, min_ms=0.0)
         self.scheduler = _construct_startup_component(
             "scheduler",
             lambda: SchedulerEngine(
@@ -1274,7 +1282,7 @@ class MainWindow(QMainWindow):
             set_scheduler_enabled_override(bool(startup_policy.get("scheduler_enabled", True)))
         except Exception:
             pass
-        self._notify_startup_status("Starting scheduler services...")
+        self._notify_startup_status("Preparing schedule services…")
         self.scheduler.start()
         self.receiver_qualification = ReceiverQualificationCoordinator(
             self.scheduler.shared_endpoint_lane_registry(),
@@ -1504,11 +1512,10 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self.launch_orchestrator.set_schedule_handoff_provider(self.scheduler.launch_schedule_apply_status)
-        QTimer.singleShot(1200, self._start_launch_control_startup)
         self._window_preferences = QSettings(str(self.settings.config_dir / "window-state.ini"), QSettings.IniFormat)
         restore_full_window_geometry(self, self._window_preferences)
         self._screen_fit_controller = WindowScreenFitController(self, self._reflow_screen_geometry)
-        self._notify_startup_status("Opening CommsPlan...")
+        self._notify_startup_status("Opening station workspace…")
 
     def _reflow_screen_geometry(self) -> None:
         if getattr(self, "_shutting_down", False):
@@ -1593,6 +1600,11 @@ class MainWindow(QMainWindow):
         return 6000
 
     def _hide_action_feedback_banner(self) -> None:
+        self._action_feedback_event_id = None
+        self._pending_qsy_feedback = None
+        timer = getattr(self, "_qsy_feedback_timer", None)
+        if timer is not None:
+            timer.stop()
         if hasattr(self, "_action_feedback_clear_timer"):
             self._action_feedback_clear_timer.stop()
         if hasattr(self, "action_feedback_banner"):
@@ -1661,6 +1673,11 @@ class MainWindow(QMainWindow):
         summary = str(event.summary or "").strip()
         if not summary:
             return
+        self._action_feedback_event_id = event.id
+        self._pending_qsy_feedback = None
+        timer = getattr(self, "_qsy_feedback_timer", None)
+        if timer is not None:
+            timer.stop()
         detail = str(event.detail or "").strip()
         status = str(event.status or "").strip().lower()
         self.action_feedback_label.setText(summary)
@@ -1671,6 +1688,65 @@ class MainWindow(QMainWindow):
         timeout_ms = self._action_feedback_display_ms(status)
         if timeout_ms > 0:
             self._action_feedback_clear_timer.start(timeout_ms)
+
+    def _track_qsy_feedback(self, event: ActionFeedbackEvent, request: Mapping[str, object]) -> None:
+        """Follow only the currently displayed QSY using published command results."""
+        if (getattr(self, "_action_feedback_event_id", None) != event.id
+                or not request.get("radio_profile_id") or not request.get("frequency_hz")):
+            return
+        self._pending_qsy_feedback = {**dict(request), "event": event}
+        timer = getattr(self, "_qsy_feedback_timer", None)
+        if timer is None:
+            timer = self._qsy_feedback_timer = QTimer(self)
+            timer.setInterval(200)
+            timer.timeout.connect(self._refresh_qsy_feedback_banner)
+        timer.start()
+        self._refresh_qsy_feedback_banner()
+
+    def _refresh_qsy_feedback_banner(self) -> None:
+        """Cache-only completion; never initiate a radio or status request."""
+        pending = getattr(self, "_pending_qsy_feedback", None)
+        if not pending:
+            return
+        event = pending["event"]
+        if getattr(self, "_action_feedback_event_id", None) != event.id:
+            self._pending_qsy_feedback = None
+            self._qsy_feedback_timer.stop()
+            return
+        getter = getattr(getattr(self, "scheduler", None), "command_result_snapshot", None)
+        result = getter(int(pending["radio_profile_id"])) if callable(getter) else {}
+        if (not result or result.get("source") != "QSY"
+                or result.get("frequency_hz") != pending["frequency_hz"]
+                or float(result.get("completed_monotonic") or 0) < float(pending["requested_monotonic"])):
+            return
+        status = result.get("status")
+        messages = {
+            "applied_and_verified": ("succeeded", "QSY verified for the selected radio."),
+            "applied_unverified": ("partial", "QSY sent · awaiting readback."),
+            "rejected": ("blocked", "QSY blocked for the selected radio."),
+            "failed": ("failed", "QSY failed for the selected radio."),
+            "timed_out": ("failed", "QSY timed out · confirmation unavailable."),
+        }
+        if status == "superseded":
+            self._hide_action_feedback_banner()
+            return
+        if status not in messages:
+            return
+        if status == "applied_unverified" and pending.get("sent_reported"):
+            return
+        self._pending_qsy_feedback = None
+        self._qsy_feedback_timer.stop()
+        feedback_status, summary = messages[status]
+        summary = summary.replace("for the selected radio", f"for {event.target_label or 'the target radio'}")
+        completion_event = self.action_feedback_service.publish(
+            scope="scheduler", action_type="qsy", status=feedback_status,
+            summary=summary, radio_profile_id=event.radio_profile_id,
+            target_label=event.target_label,
+            detail=str(result.get("reason_code") or "").replace("_", " "),
+            source_surface="qsy_completion", related_event_id=event.id,
+        )
+        if status == "applied_unverified":
+            self._track_qsy_feedback(completion_event, {**pending, "sent_reported": True})
 
     @staticmethod
     def _recent_action_line(event: ActionFeedbackEvent) -> str:
@@ -1981,7 +2057,9 @@ class MainWindow(QMainWindow):
         self._flush_status_refresh()
         try:
             widget = self.stack.currentWidget() if hasattr(self, "stack") else None
-            if widget is not None and hasattr(widget, "on_tab_activated"):
+            if reason == "heavy_content_refresh_complete" and hasattr(widget, "on_background_refresh_complete"):
+                QTimer.singleShot(0, widget.on_background_refresh_complete)
+            elif widget is not None and hasattr(widget, "on_tab_activated"):
                 QTimer.singleShot(0, widget.on_tab_activated)
         except Exception:
             pass
@@ -6332,7 +6410,11 @@ class MainWindow(QMainWindow):
             settings=self.settings,
             min_ms=5.0,
         ):
-            self.message_viewer_tab = MessageViewerTab(self, plan_context_service=self.plan_context_service)
+            self.message_viewer_tab = MessageViewerTab(
+                self, plan_context_service=self.plan_context_service,
+                settings_manager=SettingsManager(initialized_source=self.settings),
+                defer_compose=True,
+            )
             try:
                 self.settings_tab.settings_saved.connect(self.message_viewer_tab.on_settings_saved)
             except Exception:
@@ -7170,15 +7252,23 @@ class MainWindow(QMainWindow):
         than once.
         """
 
-        if self._shutting_down or self._post_shell_services_started:
+        if self._shutting_down:
             return
-        self._post_shell_services_started = True
-        # Connecting optional radios/mesh transports is runtime work, not shell
-        # construction.  Some BLE stacks take tens of seconds to time out; even
-        # though the adapter owns a worker, starting it during MainWindow.__init__
-        # creates enough callback and discovery pressure to delay the first
-        # painted frame on slower systems.
-        self._start_mesh_runtime_if_enabled()
+        first_start = not self._post_shell_services_started
+        if first_start:
+            self._post_shell_services_started = True
+            for tab in (getattr(self, "settings_tab", None), getattr(self, "controlfreq_tab", None)):
+                if hasattr(tab, "set_startup_shell_ready"):
+                    tab.set_startup_shell_ready()
+            launch_startup = getattr(self, "_start_launch_control_startup", None)
+            if callable(launch_startup):
+                QTimer.singleShot(1200, launch_startup)
+            # Connecting optional radios/mesh transports is runtime work, not shell
+            # construction.  Some BLE stacks take tens of seconds to time out; even
+            # though the adapter owns a worker, starting it during MainWindow.__init__
+            # creates enough callback and discovery pressure to delay the first
+            # painted frame on slower systems.
+            self._start_mesh_runtime_if_enabled()
         background = getattr(self, "background_ingest", None)
         if self._background_ingest_start_pending and background is not None:
             try:
@@ -7190,9 +7280,10 @@ class MainWindow(QMainWindow):
                 # Leave the request pending so a later explicit lifecycle call
                 # can retry without blocking or failing application startup.
                 log.warning("MainWindow: post-shell background ingest start failed: %s", exc)
-        self.request_message_projection_catchup(reason="post_shell")
-        self._schedule_message_projection_reconcile()
-        self._publish_watchdog_diagnostic_snapshot()
+        if first_start:
+            self.request_message_projection_catchup(reason="post_shell")
+            self._schedule_message_projection_reconcile()
+            self._publish_watchdog_diagnostic_snapshot()
 
     def present_first_run_onboarding(self) -> None:
         """Present fresh-station guidance after the usable shell is painted."""
@@ -7224,7 +7315,7 @@ class MainWindow(QMainWindow):
         dialog.setIcon(QMessageBox.Information)
         dialog.setText("No existing CommsPlan station was found.")
         dialog.setInformativeText(
-            "Choose your operator information, groups, radios, applications, and operating behavior. Scheduling stays off until you review and enable it."
+            "Choose your operator information, groups, radios, applications, and operating behavior. Assign a schedule when ready; it follows after current validation and safety checks permit."
         )
         setup_button = dialog.addButton("Set Up Station…", QMessageBox.AcceptRole)
         later_button = dialog.addButton("Set Up Later", QMessageBox.RejectRole)
@@ -8023,6 +8114,10 @@ class MainWindow(QMainWindow):
 
     def _station_command_next_minutes(self, snapshot: object) -> int | None:
         """Return the next meaningful plan transition for one radio."""
+        if not MainWindow._station_command_bool(
+            MainWindow._station_command_value(snapshot, "scheduler_enabled", True), default=True,
+        ):
+            return None
         transition = self._station_command_next_transition(snapshot)
         if not isinstance(transition, Mapping) or transition.get("state") != "ready":
             return None
@@ -8202,11 +8297,15 @@ class MainWindow(QMainWindow):
         transition record.  It must not replay schedule recurrence to choose a
         destination independently from the countdown.
         """
+        status_getter = getattr(getattr(self, "scheduler", None), "schedule_projection_status", None)
+        projection_status = status_getter() if callable(status_getter) else None
+        if projection_status == "unavailable":
+            return {"state": "unavailable", "entry": {}, "start_utc": None}
         ident = MainWindow._station_command_snapshot_id(snapshot)
         lane_getter = getattr(self, "_station_command_lane_for_radio", None)
         lane = lane_getter(ident) if callable(lane_getter) and ident > 0 else None
         if not isinstance(lane, Mapping):
-            return {"state": "no_next", "entry": {}, "start_utc": None}
+            return {"state": "pending" if projection_status == "updating" else "no_next", "entry": {}, "start_utc": None}
         if lane.get("schedule_projection_pending"):
             return {"state": "pending", "entry": {}, "start_utc": None}
 
@@ -8252,6 +8351,10 @@ class MainWindow(QMainWindow):
 
     def _station_command_manual_qsy_meta_for_radio(self, device_profile_id: int) -> dict[str, object] | None:
         meta = getattr(self, "_station_command_manual_qsy_meta", None)
+        if (isinstance(meta, Mapping) and meta.get("manual_hold_policy") == "until_transition"
+                and self._station_command_manual_control_service_available()
+                and self._station_command_manual_control_state_for_radio(device_profile_id) is None):
+            return None  # A completed Quick QSY must not retain a UI-only hold.
         return station_command_manual_qsy_meta_for_radio(
             meta=meta if isinstance(meta, Mapping) else None,
             meta_profile_id=getattr(self, "_station_command_manual_qsy_profile_id", 0),
@@ -8660,19 +8763,44 @@ class MainWindow(QMainWindow):
         fallback = self._station_command_compact_state_text(self._station_command_state_text(snapshot))
         scheduler = getattr(self, 'scheduler', None)
         if getattr(scheduler, '_require_operator_schedule_approval', False):
-            review = next((lane.get('schedule_review') or {} for lane in scheduler._cached_active_schedule_lane_rows()
-                           if int(lane.get('device_profile_id') or 0) == int(radio_id or 0)), {})
-            if not review.get('enabled'):
-                fallback = str(review.get('label') or 'Scheduling off — review required')
+            display_getter = getattr(self, "_station_command_lane_for_radio", None)
+            review_lane = display_getter(radio_id) if callable(display_getter) else {}
+            review_lane = review_lane if isinstance(review_lane, Mapping) else {}
+            review = review_lane.get('schedule_review') if isinstance(review_lane, Mapping) else {}
+            if not isinstance(review, Mapping):
+                review = {}
+            if isinstance(review, Mapping) and bool(review.get("operator_paused")):
+                fallback = str(review.get("label") or "Paused by operator")
+            elif not review.get("enabled") and (review.get("issues") or review_lane.get("schedule_source_error")):
+                fallback = str(review.get("label") or "Schedule needs repair")
+            elif review_lane.get("schedule_projection_pending"):
+                fallback = "Checking assigned schedule"
+            elif review.get("enabled") and review.get("valid") and bool(review_lane.get("schedule_gap")):
+                fallback = "Schedule gap · holding frequency"
+            elif not review.get('enabled'):
+                # Missing internal proof during the assignment worker's
+                # publication window is not an operator consent step. Keep
+                # source/validation failures specific, otherwise report a
+                # calm cache state while the assignment is checked.
+                issues = review.get("issues") or review.get("blocked") or review.get("warnings")
+                fallback = str(review.get('label') or ("Schedule needs repair" if issues else "Checking assigned schedule"))
+        if kind == "manual_qsy" and getattr(state, "reason_code", "") == "operator_quick_qsy":
+            return "Quick QSY · until next schedule change" + (
+                f" · {fallback}" if fallback.lower().startswith(("scheduling off", "scheduler off", "schedule gap", "schedule blocked", "schedule needs repair", "scheduling paused", "checking assigned", "assigned schedule — checking", "no assigned")) else ""
+            )
         return authority_text(kind, hold.get("remaining_sec"), fallback)
 
     def _station_command_is_held(self, snapshot: object) -> bool:
         radio_id = self._station_command_snapshot_id(snapshot)
         state = self._station_command_manual_control_state_for_radio(radio_id)
+        lane = self._station_command_lane_for_radio(radio_id)
+        review = lane.get("schedule_review") if isinstance(lane, Mapping) else None
+        legacy_operator_paused = isinstance(review, Mapping) and bool(review.get("operator_paused"))
         return (str(getattr(state, "state", "")) in {"manual_qsy", "manual_hold", "manual_suspend"}
                 or self._station_command_scheduler_manual_qsy_active_for_radio(radio_id)
                 or self._station_command_scheduler_suspended_manually_for_radio(radio_id)
                 or bool(self._station_command_hold_snapshot_for_radio(radio_id).get("active"))
+                or legacy_operator_paused
                 or not self._station_command_bool(self._station_command_value(snapshot, "scheduler_enabled", True), default=True))
 
     def _station_command_qsy_progress_text(self, snapshot: object) -> str:
@@ -8826,6 +8954,8 @@ class MainWindow(QMainWindow):
             )
             if transition is not None:
                 state = str(transition.get("state") or "").strip().lower()
+                if state == "unavailable":
+                    return "Schedule unavailable"
                 if state == "pending":
                     return "Schedule updating"
                 if state == "expired":
@@ -9192,7 +9322,9 @@ class MainWindow(QMainWindow):
             action_type="qsy",
             status="partial" if ok else "blocked",
             summary=f"QSY requested: {freq_label}" if ok else f"QSY blocked: {freq_label}",
-            detail="Scheduler is suspended in manual QSY state until Resume Schedule or the configured timed hold expires." if ok else "",
+            detail=("Quick QSY stays on this frequency until the next active schedule change. Existing scheduling approval is preserved."
+                    if meta.get("manual_hold_policy") == "until_transition"
+                    else "Scheduler is suspended in manual QSY state until Resume Schedule or the configured timed hold expires.") if ok else "",
         )
         self._refresh_station_command_controls_after_state_change()
 
@@ -9297,14 +9429,40 @@ class MainWindow(QMainWindow):
             target_profile_id = int(target_device_profile_id or getattr(self, "_station_command_selected_profile_id", 0) or 0) or None
         except Exception:
             target_profile_id = None
+        legacy_paused = False
+        if target_profile_id is not None:
+            lane = self._station_command_lane_for_radio(target_profile_id)
+            review = lane.get("schedule_review") if isinstance(lane, Mapping) else None
+            legacy_paused = isinstance(review, Mapping) and bool(review.get("operator_paused"))
+        legacy_ok = True
+        if legacy_paused:
+            scheduler = getattr(self, "scheduler", None)
+            resume_legacy = getattr(scheduler, "resume_legacy_schedule_pause", None)
+            if not callable(resume_legacy):
+                legacy_ok = False
+            else:
+                try:
+                    legacy_ok = bool(resume_legacy(int(target_profile_id)))
+                except Exception as exc:
+                    log.debug("MainWindow: legacy schedule pause resume failed: %s", exc)
+                    legacy_ok = False
+        had_local_hold = False
+        if target_profile_id is not None:
+            try:
+                had_local_hold = bool(self._station_command_hold_snapshot_for_radio(target_profile_id).get("active"))
+                had_local_hold = had_local_hold or self._station_command_scheduler_manual_qsy_active_for_radio(target_profile_id)
+                had_local_hold = had_local_hold or self._station_command_scheduler_suspended_manually_for_radio(target_profile_id)
+            except Exception:
+                had_local_hold = False
         try:
-            ok = resume_schedule_hold(
+            hold_ok = resume_schedule_hold(
                 self,
                 self.settings,
                 target_device_profile_id=target_profile_id,
             )
         except TypeError:
-            ok = False if target_profile_id is not None else resume_schedule_hold(self, self.settings)
+            hold_ok = False if target_profile_id is not None else resume_schedule_hold(self, self.settings)
+        ok = legacy_ok and (hold_ok or not had_local_hold) if legacy_paused else bool(hold_ok)
         if ok:
             self._station_command_clear_manual_qsy_meta(target_profile_id)
             self._station_command_clear_pending_qsy_for_radio(target_profile_id)
@@ -12409,6 +12567,9 @@ class MainWindow(QMainWindow):
             authority = "Schedule sources off"
             next_text = "Sources off"
             next_tooltip = "Automatic tuning disabled: all schedule sources are off for this radio."
+        elif isinstance(transition, Mapping) and transition.get("state") == "unavailable":
+            next_text = "Schedule unavailable"
+            next_tooltip = "Schedule refresh failed. Automatic tuning is held while CommsPlan retries. See Station Health."
         elif lane.get("schedule_projection_pending"):
             next_text = "Schedule updating"
             next_tooltip = "Schedule updating: automatic tuning waits for the refreshed plan."
@@ -12581,9 +12742,9 @@ class MainWindow(QMainWindow):
         if not self._activate_station_command_radio(int(radio_id or 0)):
             return
         self._dismiss_radio_off_schedule_prompt(radio_id)
-        if duration is None:
+        if duration is None or duration == -1:
             if payload is not None:
-                payload["manual_hold_policy"] = "until_resume"
+                payload["manual_hold_policy"] = "until_transition" if duration == -1 else "until_resume"
             self._on_station_command_qsy_now_clicked(payload)
         else:
             self._on_station_command_qsy_hold_clicked(payload, duration)
@@ -12661,28 +12822,144 @@ class MainWindow(QMainWindow):
         profile = self._operator_card_target(radio_id)
         if profile is None:
             return
+        ident = int(radio_id or 0)
         menu = QMenu(self)
-        menu.addSection(f"Schedule sources · {profile.get('name') or radio_id}")
-        review_action = menu.addAction('Review & enable scheduling…')
-        def open_review():
-            self.open_settings_section('operator_station_setup', radio_id=radio_id, settings_nav_context='main')
-            self.settings_tab._operator_station_setup.set_step('review')
-        review_action.triggered.connect(open_review)
-        disable_action = menu.addAction('Disable scheduling')
-        disable_action.triggered.connect(lambda: self.settings_tab._operator_station_disable_requested(radio_id))
+        name = str(profile.get("name") or ident).strip()
+        menu.addSection(f"Schedule calendar · {name}")
+        assigned_plan = self._station_command_assigned_plan_for_radio(ident)
+        assigned_name = self._station_command_assigned_plan_name_for_radio(ident)
+        plan_id = int(assigned_plan.get("id") or 0) if isinstance(assigned_plan, Mapping) else 0
+        if not assigned_name:
+            assigned_name = "Unassigned"
+        assigned_action = menu.addAction(f"Assigned schedule: {assigned_name}")
+        assigned_action.setEnabled(False)
+        lane = self._station_command_lane_for_radio(ident) or {}
+        runtime_status_getter = getattr(self, "_station_command_calendar_runtime_status_for_radio", None)
+        runtime_status = runtime_status_getter(ident) if callable(runtime_status_getter) else ""
+        assignment_status = self._station_command_assignment_status_text(
+            assigned_plan, lane, runtime_status=runtime_status
+        )
+        status_action = menu.addAction(f"Status: {assignment_status}")
+        status_action.setEnabled(False)
+        view_action = menu.addAction("View assigned schedule")
+        view_action.setEnabled(plan_id > 0)
+        view_action.triggered.connect(lambda _checked=False, target=ident: self._on_radio_card_plan(target))
+        change_action = menu.addAction("Change or swap schedule…")
+        change_action.triggered.connect(
+            lambda _checked=False, target=ident: self._open_schedule_assignment_for_radio(target)
+        )
         menu.addSeparator()
 
-        current = self.scheduler.radio_operator_choices(radio_id)
+        sources_menu = menu.addMenu("Schedule options")
+
+        current = self.scheduler.radio_operator_choices(ident)
         for key, label in (("routine_schedule_enabled", "Daily / Net schedule"), ("sop_tuning_enabled", "SOP tuning")):
-            action = menu.addAction(label)
+            action = sources_menu.addAction(label)
             action.setCheckable(True)
             action.setChecked(current.get(key) is not False)
-            action.triggered.connect(lambda checked, k=key, ident=radio_id: self._save_operator_card_choices(ident, {k: checked}))
-        note = menu.addAction("SOP profiles and reminders remain active")
+            action.triggered.connect(lambda checked, k=key, target=ident: self._save_operator_card_choices(target, {k: checked}))
+        note = sources_menu.addAction("Source options affect source participation; assignment remains the active plan")
         note.setEnabled(False)
-        card = self.radio_control_panel._cards.get(radio_id)
+        card = self.radio_control_panel._cards.get(ident)
         if card is not None:
             menu.exec(card.sources_button.mapToGlobal(card.sources_button.rect().bottomLeft()))
+
+    @staticmethod
+    def _station_command_assignment_status_text(
+        assigned_plan: Mapping[str, object] | None,
+        lane: Mapping[str, object] | None,
+        *,
+        runtime_status: str = "",
+    ) -> str:
+        """Summarize cached assignment/validation state for the calendar menu."""
+
+        try:
+            assigned_id = int(assigned_plan.get("id") or 0) if isinstance(assigned_plan, Mapping) else 0
+        except (TypeError, ValueError):
+            assigned_id = 0
+        if assigned_id <= 0:
+            return "Unassigned"
+        lane = lane if isinstance(lane, Mapping) else {}
+        review = lane.get("schedule_review")
+        if isinstance(review, Mapping) and bool(review.get("operator_paused")):
+            return "Paused by operator"
+        if lane.get("operator_paused"):
+            return "Paused by operator"
+        if lane.get("manual_hold") or lane.get("schedule_hold") or lane.get("timed_suspend"):
+            return "Paused by operator"
+        source_error = str(lane.get("schedule_source_error") or "").strip()
+        if source_error:
+            return "Blocked · schedule source needs repair"
+        try:
+            validation = json.loads(str(lane.get("assignment_validation_status_json") or "{}"))
+        except (TypeError, ValueError):
+            validation = {}
+        if isinstance(validation, Mapping):
+            validation_state = str(validation.get("state") or "").strip().lower()
+            if validation_state == "blocked":
+                return "Blocked · RF Guard"
+            if validation_state == "warning":
+                return "Needs review · RF Guard"
+        if isinstance(review, Mapping) and not review.get("enabled"):
+            return str(review.get("label") or "Checking assigned schedule")
+        if str(runtime_status or "").strip():
+            return str(runtime_status).strip()
+        if lane.get("schedule_projection_pending"):
+            return "Updating"
+        if lane.get("schedule_gap"):
+            return "Schedule gap · holding frequency"
+        if not lane:
+            return "Awaiting current validation"
+        return "Following assigned schedule"
+
+    def _station_command_calendar_runtime_status_for_radio(self, device_profile_id: int) -> str:
+        """Return cached per-radio manual authority for calendar presentation."""
+        try:
+            radio_id = int(device_profile_id or 0)
+        except Exception:
+            return ""
+        if radio_id <= 0:
+            return ""
+        try:
+            state = self._station_command_manual_control_state_for_radio(radio_id)
+        except Exception:
+            state = None
+        try:
+            hold = self._station_command_hold_snapshot_for_radio(radio_id)
+        except Exception:
+            hold = {}
+        remaining_sec = hold.get("remaining_sec") if isinstance(hold, Mapping) else None
+        state_name = str(getattr(state, "state", "") or "").strip()
+        reason = str(getattr(state, "reason_code", "") or "").strip()
+        if state_name == "manual_qsy":
+            if reason == "operator_quick_qsy":
+                return "Quick QSY · until next schedule change"
+            return authority_text("manual_qsy", remaining_sec, "")
+        if state_name == "manual_hold":
+            if self._station_command_manual_state_has_qsy_target(state):
+                return authority_text("manual_qsy", remaining_sec, "")
+            return authority_text("manual_hold", remaining_sec, "")
+        if state_name == "manual_suspend":
+            return "Schedule held · until Resume"
+        try:
+            if self._station_command_scheduler_manual_qsy_active_for_radio(radio_id):
+                meta = self._station_command_manual_qsy_meta_for_radio(radio_id) or {}
+                if str(meta.get("manual_hold_policy") or "") == "until_transition":
+                    return "Quick QSY · until next schedule change"
+                return "Manual QSY · until Resume"
+        except Exception:
+            pass
+        try:
+            if self._station_command_scheduler_suspended_manually_for_radio(radio_id):
+                return "Schedule held · until Resume"
+        except Exception:
+            pass
+        try:
+            if isinstance(hold, Mapping) and hold.get("active"):
+                return authority_text("manual_hold", remaining_sec, "")
+        except Exception:
+            pass
+        return ""
 
     def _on_radio_card_policy(self, radio_id: int) -> None:
         profile = self._operator_card_target(radio_id)
@@ -14886,6 +15163,8 @@ class MainWindow(QMainWindow):
             pass
 
     def _start_launch_control_startup(self) -> None:
+        if getattr(self, "_shutting_down", False):
+            return
         try:
             if hasattr(self, "launch_orchestrator"):
                 self.launch_orchestrator.start_startup_sequence()

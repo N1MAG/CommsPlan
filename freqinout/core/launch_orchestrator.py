@@ -242,6 +242,7 @@ class LaunchOrchestrator(QObject):
         self._poll_timer.setInterval(LAUNCH_READINESS_INITIAL_POLL_MS)
         self._poll_timer.timeout.connect(self._poll_current_readiness)
         self._launched_processes: Dict[int, Any] = {}
+        self._launched_process_labels: Dict[int, str] = {}
         self._process_reaper_timer = QTimer(self)
         self._process_reaper_timer.setInterval(LAUNCH_PROCESS_REAPER_INTERVAL_MS)
         self._process_reaper_timer.timeout.connect(self._reap_launched_processes)
@@ -2491,7 +2492,7 @@ class LaunchOrchestrator(QObject):
                 cwd=cwd,
                 env=environment,
             )
-            self._track_launched_process(process)
+            self._track_launched_process(process, label=name)
             self._schedule_process_window_title(queue_item, process)
             if sequence_identity:
                 self._sequence_claimed_identities = getattr(
@@ -2532,7 +2533,7 @@ class LaunchOrchestrator(QObject):
             self.sequence_progress.emit(result)
             self._schedule_advance_queue(0)
 
-    def _track_launched_process(self, process: Any) -> None:
+    def _track_launched_process(self, process: Any, *, label: str = "") -> None:
         """Retain and non-blockingly reap a process started by FIO."""
 
         poll = getattr(process, "poll", None)
@@ -2548,6 +2549,11 @@ class LaunchOrchestrator(QObject):
             owned = {}
             self._launched_processes = owned
         owned[key] = process
+        labels = getattr(self, "_launched_process_labels", None)
+        if not isinstance(labels, dict):
+            labels = {}
+            self._launched_process_labels = labels
+        labels[key] = str(label or "application")[:160]
         self._reap_launched_processes()
         timer = getattr(self, "_process_reaper_timer", None)
         if owned and timer is not None:
@@ -2574,10 +2580,11 @@ class LaunchOrchestrator(QObject):
             if return_code is None:
                 continue
             owned.pop(key, None)
-            log.info(
-                "LaunchOrchestrator: reaped launched process pid=%s return_code=%s",
-                key,
-                return_code,
+            labels = getattr(self, "_launched_process_labels", {})
+            label = labels.pop(key, "application")
+            (log.warning if return_code else log.info)(
+                "LaunchOrchestrator: reaped launched process name=%s pid=%s return_code=%s",
+                label, key, return_code,
             )
         timer = getattr(self, "_process_reaper_timer", None)
         if not owned and timer is not None:
@@ -2880,13 +2887,15 @@ class LaunchOrchestrator(QObject):
                 if not passed:
                     self._radio_control_gate_states[radio_id] = "blocked"
                 (log.info if passed else log.warning)(
-                        "LaunchOrchestrator: radio %s schedule handoff %s", radio_id,
-                        status if passed else "unavailable; dependent apps blocked")
+                        "LaunchOrchestrator: radio %s schedule handoff %s status=%s elapsed_s=%.1f", radio_id,
+                        status if passed else "unavailable; dependent apps blocked", status, elapsed)
                 self.sequence_progress.emit({
                     "name": name, "status": "schedule_ready" if passed else "schedule_unavailable",
                     "detail": ("current frequency verified" if status == "ready" else
                                "automatic frequency change not required" if passed else
-                               "current schedule frequency could not be verified"),
+                               "Schedule verification timed out; review Station Health before retrying Launch Control."
+                               if status == "pending" else
+                               "Schedule verification is unavailable; review Station Health before retrying Launch Control."),
                     "counts_toward_total": False, "radio_ids": [radio_id],
                 })
                 self._current_name = None

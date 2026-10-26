@@ -37,7 +37,7 @@ from freqinout.core.message_projection_store import (
 from freqinout.core.message_projection_repair import plan_legacy_projection_merges
 from freqinout.core.scheduler_serial_executor import DaemonSerialExecutor
 from freqinout.core.sqlite_utils import connect_sqlite_runtime_write
-from freqinout.core.perf_metrics import emit_span
+from freqinout.core.perf_metrics import emit_span, span as perf_span
 
 
 # Difference/signature preparation happens before ``BEGIN IMMEDIATE`` and can
@@ -526,7 +526,9 @@ class ProjectionBundleWriter:
             future.set_result(self._deferred_result("backpressure", prepared))
             return future
         try:
-            submitted = self._executor.submit(self.write_batch, prepared, cancel_event=cancel_event)
+            submitted = self._executor.submit(
+                self._queued_write, self.write_batch, prepared, cancel_event, time.monotonic()
+            )
         except BaseException as exc:
             self._pending_slots.release()
             future.set_result(self._deferred_result("closed", prepared, str(exc)))
@@ -537,6 +539,12 @@ class ProjectionBundleWriter:
 
         submitted.add_done_callback(release_slot)
         return submitted
+
+    @staticmethod
+    def _queued_write(operation, items, cancel_event, queued_at):
+        emit_span("messages.writer.queue_wait", (time.monotonic() - queued_at) * 1000.0,
+                  meta={"bundles": len(items), "operation": getattr(operation, "__name__", "write")}, min_ms=2.0)
+        return operation(items, cancel_event=cancel_event)
 
     def submit_deletions(
         self,
@@ -568,7 +576,7 @@ class ProjectionBundleWriter:
             return future
         try:
             submitted = self._executor.submit(
-                self.write_deletions, items, cancel_event=cancel_event
+                self._queued_write, self.write_deletions, items, cancel_event, time.monotonic()
             )
         except BaseException as exc:
             self._pending_slots.release()
@@ -1064,6 +1072,7 @@ class ProjectionBundleWriter:
         retries = max(0, int(initial_busy_retries))
         max_transaction_ms = 0.0
         committed_ids: list[str] = []
+        difference_limit = self._bundle_limit
         while index < len(items):
             if self._cancelled(cancel_event):
                 return self._result(
@@ -1073,7 +1082,9 @@ class ProjectionBundleWriter:
                     max_transaction_ms=max_transaction_ms,
                 )
             candidates = items[index : index + self._bundle_limit]
-            attempt, busy_retries = self._write_with_busy_retry(conn, candidates, cancel_event)
+            attempt, busy_retries = self._write_with_busy_retry(
+                conn, candidates, cancel_event, difference_limit=difference_limit
+            )
             retries += busy_retries
             if attempt.busy:
                 return self._result(
@@ -1099,6 +1110,10 @@ class ProjectionBundleWriter:
                 )
             max_transaction_ms = max(max_transaction_ms, float(attempt.transaction_ms or 0.0))
             index += attempt.processed
+            # A short SQL time slice must not repeatedly compare the entire
+            # unprocessed tail. Adapt this batch only; fast batches stay large.
+            # The full candidate window still defines source metadata precedence.
+            difference_limit = min(difference_limit, max(1, attempt.processed))
             if attempt.committed_bundles:
                 transactions += 1
             committed += attempt.committed_bundles
@@ -1132,6 +1147,8 @@ class ProjectionBundleWriter:
         conn: sqlite3.Connection,
         candidates: tuple[ProjectionBundle, ...],
         cancel_event: threading.Event | None,
+        *,
+        difference_limit: int | None = None,
     ) -> tuple[_TransactionResult, int]:
         retry_start = time.monotonic()
         delay = INITIAL_BUSY_RETRY_SECONDS
@@ -1140,7 +1157,9 @@ class ProjectionBundleWriter:
             if self._cancelled(cancel_event):
                 return _TransactionResult(processed=0, committed_bundles=0, skipped_bundles=0, source_upserts=0, message_upserts=0, ref_upserts=0, artifact_upserts=0, indexed_messages=0, committed_message_ids=(), cancelled=True), retries
             try:
-                return self._write_transaction(conn, candidates, cancel_event), retries
+                return self._write_transaction(
+                    conn, candidates, cancel_event, difference_limit=difference_limit
+                ), retries
             except sqlite3.OperationalError as exc:
                 if not self._is_busy_error(exc):
                     return _TransactionResult(processed=0, committed_bundles=0, skipped_bundles=0, source_upserts=0, message_upserts=0, ref_upserts=0, artifact_upserts=0, indexed_messages=0, committed_message_ids=(), error=str(exc)), retries
@@ -1149,7 +1168,9 @@ class ProjectionBundleWriter:
                 if elapsed >= self._busy_retry_seconds:
                     return _TransactionResult(processed=0, committed_bundles=0, skipped_bundles=0, source_upserts=0, message_upserts=0, ref_upserts=0, artifact_upserts=0, indexed_messages=0, committed_message_ids=(), busy=True, error=str(exc)), retries
                 sleep_for = min(delay, self._busy_retry_seconds - elapsed)
-                if not self._sleep_until_retry(sleep_for, cancel_event):
+                with perf_span("messages.writer.busy_retry_sleep", min_ms=2.0):
+                    retry_ready = self._sleep_until_retry(sleep_for, cancel_event)
+                if not retry_ready:
                     return _TransactionResult(processed=0, committed_bundles=0, skipped_bundles=0, source_upserts=0, message_upserts=0, ref_upserts=0, artifact_upserts=0, indexed_messages=0, committed_message_ids=(), cancelled=True), retries
                 delay = min(self._busy_retry_seconds, delay * 2.0)
             except Exception as exc:
@@ -1160,8 +1181,18 @@ class ProjectionBundleWriter:
         conn: sqlite3.Connection,
         candidates: tuple[ProjectionBundle, ...],
         cancel_event: threading.Event | None,
+        *,
+        difference_limit: int | None = None,
     ) -> _TransactionResult:
-        prepared = self._prepare_differences(conn, candidates)
+        limit = len(candidates) if difference_limit is None else max(1, int(difference_limit))
+        prefix = candidates[:limit]
+        meta = {"bundles": len(prefix), "candidates": len(candidates)}
+        with perf_span("messages.writer.prepare_differences", meta=meta, min_ms=2.0):
+            cpu_started = time.thread_time()
+            try:
+                prepared = self._prepare_differences(conn, prefix, source_bundles=candidates)
+            finally:
+                meta["thread_cpu_ms"] = (time.thread_time() - cpu_started) * 1000.0
         if self._cancelled(cancel_event):
             return _TransactionResult(processed=0, committed_bundles=0, skipped_bundles=0, source_upserts=0, message_upserts=0, ref_upserts=0, artifact_upserts=0, indexed_messages=0, committed_message_ids=(), cancelled=True)
         if not any(item.has_write for item in prepared):
@@ -1171,7 +1202,7 @@ class ProjectionBundleWriter:
                 indexed_messages=0, committed_message_ids=(),
             )
 
-        source_records = self._desired_source_records(prepared)
+        source_records = self._desired_source_records(candidates)
         source_written: set[str] = set()
         processed = committed = skipped = source_upserts = message_upserts = ref_upserts = artifact_upserts = indexed_messages = 0
         committed_ids: list[str] = []
@@ -1179,7 +1210,8 @@ class ProjectionBundleWriter:
         transaction_open = False
         transaction_start = 0.0
         try:
-            conn.execute("BEGIN IMMEDIATE")
+            with perf_span("messages.writer.begin_wait", min_ms=2.0):
+                conn.execute("BEGIN IMMEDIATE")
             transaction_open = True
             transaction_start = time.monotonic()
             for item in prepared:
@@ -1244,7 +1276,8 @@ class ProjectionBundleWriter:
                         """,
                         (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),),
                     )
-                conn.commit()
+                with perf_span("messages.writer.commit", min_ms=2.0):
+                    conn.commit()
                 transaction_open = False
             else:
                 conn.rollback()
@@ -1279,11 +1312,16 @@ class ProjectionBundleWriter:
         self,
         conn: sqlite3.Connection,
         bundles: Sequence[ProjectionBundle],
+        *,
+        source_bundles: Sequence[ProjectionBundle] | None = None,
     ) -> tuple[_PreparedBundle, ...]:
-        desired_sources = self._desired_source_records(bundles)
+        source_context = bundles if source_bundles is None else source_bundles
+        prefix_source_ids = {_clean_text(bundle.source.source_id) for bundle in bundles}
+        desired_sources = {key: value for key, value in self._desired_source_records(source_context).items()
+                           if key in prefix_source_ids}
         source_rows = self._load_source_rows(conn, desired_sources)
         source_needs = {
-            source_id: row is None or _stored_source_signature(row) != self._source_signature_for(source_id, bundles)
+            source_id: row is None or _stored_source_signature(row) != self._source_signature_for(source_id, source_context)
             for source_id, row in source_rows.items()
         }
         message_rows = self._load_message_rows(conn, [_clean_text(bundle.message.message_id) for bundle in bundles])

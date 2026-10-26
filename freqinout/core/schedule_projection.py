@@ -13,6 +13,7 @@ from freqinout.core.schedule_targeting import (
     schedule_target_identity_parts,
     schedule_targets_may_overlap,
 )
+from freqinout.core.schedule_recurrence import biweekly_week_is_eligible
 
 
 DAY_NAMES = ("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday")
@@ -299,11 +300,7 @@ def _row_applies_on_day(row: Mapping[str, Any], day: str, week_start: dt.date) -
         weeks = _parse_month_weeks(row.get("month_weeks")) or [1]
         return _month_week_index(date_value) in weeks
     if recurrence == "BI-WEEKLY":
-        try:
-            offset = int(row.get("biweekly_offset_weeks") or 0)
-        except Exception:
-            offset = 0
-        return ((int(date_value.isocalendar()[1]) - offset) % 2) == 0
+        return biweekly_week_is_eligible(row, date_value)
     return True
 
 

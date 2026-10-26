@@ -44,7 +44,7 @@ _STEPS = (
     ("radios", "Radios & applications"),
     ("behavior", "Operating behavior"),
     ("schedule", "Schedule"),
-    ("review", "Review & enable"),
+    ("review", "Review schedule"),
 )
 
 
@@ -134,11 +134,11 @@ class OperatorStationSetup(QWidget):
         for button in (*self.step_buttons.values(), self.back_button, self.next_button, self.main_button):
             button.setEnabled(True)
         self.radio_combo.setEnabled(True)
+        # The normal completion action is assignment, not a second enable
+        # step.  Keep the compatibility Resume control fenced to the cached
+        # legacy operator-pause state only.
         self.enable_button.setEnabled(not self._busy and self.enable_button.isVisible())
-        # Disabling an already-approved schedule remains an immediate escape
-        # while a review check is in flight.  The Settings host fences and
-        # serializes the resulting worker actions.
-        self.disable_button.setEnabled(self.disable_button.isVisible())
+        self.disable_button.setEnabled(False)
 
     # ----- construction --------------------------------------------------
 
@@ -221,8 +221,8 @@ class OperatorStationSetup(QWidget):
         footer.addWidget(self.next_button)
         footer.addStretch(1)
         self.main_button = QPushButton("Go to Main")
-        self.main_button.setAccessibleName("Go to Main without enabling scheduling")
-        self.main_button.setToolTip("Return to Main. Scheduling remains unchanged.")
+        self.main_button.setAccessibleName("Go to Main")
+        self.main_button.setToolTip("Return to Main. Assignment and pause state remain unchanged.")
         self.main_button.clicked.connect(self._go_to_main)
         footer.addWidget(self.main_button)
         outer.addLayout(footer)
@@ -239,12 +239,17 @@ class OperatorStationSetup(QWidget):
             self.review_summary_label = QLabel()
             self.review_summary_label.setWordWrap(True)
             layout.addWidget(self.review_summary_label)
-            self.enable_button = QPushButton("Enable scheduling")
-            self.enable_button.setAccessibleName("Enable scheduling for reviewed radio")
+            # Retain these attributes for older Settings hosts, but do not
+            # expose an activation prerequisite.  Only a cached explicit
+            # legacy operator pause may reveal Resume scheduling.
+            self.enable_button = QPushButton("Resume scheduling pause")
+            self.enable_button.setAccessibleName("Resume legacy scheduling pause")
             self.enable_button.clicked.connect(self._enable_selected)
-            self.disable_button = QPushButton("Disable scheduling")
-            self.disable_button.setAccessibleName("Disable scheduling for reviewed radio")
+            self.disable_button = QPushButton("Legacy pause compatibility")
+            self.disable_button.setAccessibleName("Legacy pause compatibility")
             self.disable_button.clicked.connect(self._disable_selected)
+            self.enable_button.setVisible(False)
+            self.disable_button.setVisible(False)
             layout.addWidget(self.enable_button, 0, Qt.AlignmentFlag.AlignLeft)
             layout.addWidget(self.disable_button, 0, Qt.AlignmentFlag.AlignLeft)
             self.review_button = QPushButton("Review saved setup")
@@ -324,8 +329,8 @@ class OperatorStationSetup(QWidget):
         self._set_step("groups", "Complete" if group_complete else "Needs attention", "No groups is valid when no group-dependent function is selected.")
         self._set_step("radios", "Complete" if radio_complete else ("Needs attention" if radios else "Not required"), "Review saved applications, endpoints, startup choices, and settings identity.")
         self._set_step("behavior", self._generic_step_state("behavior"), "Review who controls tuning and PTT for each radio.")
-        self._set_step("schedule", self._generic_step_state("schedule"), "Review saved plans; scheduling is enabled separately at the final review.")
-        self._set_step("review", "Complete" if review_complete else ("Not required" if radios and all(not bool(row.get("schedule_required", True)) for row in radios) else "Needs attention"), "Inspect the selected radio before enabling scheduling.")
+        self._set_step("schedule", self._generic_step_state("schedule"), "Review assigned plans, sources, and the next scheduled event.")
+        self._set_step("review", "Complete" if review_complete else ("Not required" if radios and all(not bool(row.get("schedule_required", True)) for row in radios) else "Needs attention"), "Inspect the assigned schedule and current validation status.")
 
     def _generic_step_state(self, key: str) -> str:
         value = self._snapshot.get(f"{key}_state", self._snapshot.get(key))
@@ -357,6 +362,14 @@ class OperatorStationSetup(QWidget):
                 lines.append("; ".join(_text(item) for item in issues if _text(item).strip()))
             else:
                 lines.append(_text(issues))
+        information = review.get("information")
+        if information:
+            if isinstance(information, (list, tuple)):
+                information_text = "; ".join(_text(item) for item in information if _text(item).strip())
+            else:
+                information_text = _text(information)
+            if information_text:
+                lines.append("Information: " + information_text)
         warnings = review.get("warnings")
         if warnings:
             if isinstance(warnings, (list, tuple)):
@@ -383,12 +396,17 @@ class OperatorStationSetup(QWidget):
         if review.get("time_basis"):
             lines.append("Time basis: " + _text(review.get("time_basis")))
         self.review_summary_label.setText("\n".join(line for line in lines if line.strip()))
-        enabled = bool(review.get("enabled", row.get("enabled", False)))
         valid = bool(review.get("valid", False)) and bool(fingerprint)
-        self.enable_button.setVisible(bool(not enabled and valid))
-        self.disable_button.setVisible(bool(enabled))
-        self.enable_button.setEnabled(bool(not self._busy and not enabled and valid))
-        self.disable_button.setEnabled(bool(enabled))
+        operator_paused = bool(review.get("operator_paused", False))
+        # ``enable_requested`` is retained as a compatibility signal for the
+        # legacy authorization worker.  It is a Resume action only and never
+        # appears for a normal valid/unassigned review.
+        self.enable_button.setVisible(bool(operator_paused and valid))
+        self.enable_button.setEnabled(bool(not self._busy and operator_paused and valid))
+        self.disable_button.setVisible(False)
+        self.disable_button.setEnabled(False)
+        self.enable_button.setText("Resume scheduling")
+        self.enable_button.setAccessibleName("Resume legacy operator pause")
 
     @staticmethod
     def _format_next_event(value: object) -> str:
@@ -442,13 +460,15 @@ class OperatorStationSetup(QWidget):
         row = self._selected_radio()
         review = row.get("review") if isinstance(row.get("review"), Mapping) else {}
         fingerprint = _text(review.get("fingerprint") or "").strip()
-        if bool(review.get("valid", False)) and fingerprint and not bool(review.get("enabled", row.get("enabled", False))):
+        if bool(review.get("valid", False)) and fingerprint and bool(review.get("operator_paused", False)):
             self.enable_requested.emit(_radio_id(row), fingerprint)
 
     def _disable_selected(self) -> None:
         row = self._selected_radio()
         review = row.get("review") if isinstance(row.get("review"), Mapping) else {}
-        if bool(review.get("enabled", row.get("enabled", False))):
+        # Retained only for old hosts that may still invoke the method.  The
+        # assignment-driven UI never exposes this path.
+        if bool(review.get("legacy_disable_requested", False)):
             self.disable_requested.emit(_radio_id(row))
 
     # ----- shared theme --------------------------------------------------

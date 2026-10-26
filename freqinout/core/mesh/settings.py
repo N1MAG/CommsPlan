@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import hashlib
 from enum import Enum
 from importlib import import_module
 import json
@@ -8,9 +9,14 @@ from pathlib import Path
 import re
 import sys
 from typing import Mapping, Sequence
-
 from freqinout.core.config_paths import get_config_dir
 
+
+def mesh_connection_fingerprint(config) -> str:
+    """Opaque identity fence; contains no displayed connection credentials."""
+    from dataclasses import asdict
+    return hashlib.sha256(json.dumps(asdict(config), sort_keys=True, default=str,
+                                     separators=(",", ":")).encode()).hexdigest()
 
 class MeshConnectionType(str, Enum):
     TCP = "tcp"

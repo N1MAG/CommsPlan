@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+from contextlib import contextmanager
 import faulthandler
 import itertools
 import json
@@ -13,6 +14,7 @@ import traceback
 from collections import Counter
 from pathlib import Path
 from typing import Any, Mapping, Optional
+from uuid import uuid4
 
 from PySide6.QtCore import QObject, QTimer
 
@@ -87,6 +89,35 @@ def cache_safe_diagnostic_snapshot(
     return cleaned if isinstance(cleaned, dict) else {"value": cleaned}
 
 
+@contextmanager
+def _atomic_diagnostic_report(path: Path, *, max_reports: int, pattern: str):
+    """Publish only complete reports; failed captures never evict old evidence."""
+    partial = path.with_name(f".{path.name}.{uuid4().hex}.partial")
+    try:
+        with partial.open("x", encoding="utf-8") as handle:
+            yield handle
+            handle.flush()
+            os.fsync(handle.fileno())
+        partial.replace(path)
+    except BaseException:
+        try:
+            partial.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    # Retention is best-effort and applies only after successful publication.
+    try:
+        reports = sorted(path.parent.glob(pattern))
+        stale_reports = [report for report in reports if report != path]
+        for stale in stale_reports[:max(0, len(reports) - max_reports)]:
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+    except OSError as exc:
+        log.debug("Diagnostic report retention failed for %s: %s", path.parent, exc)
+
+
 class UiEventLoopWatchdog(QObject):
     """
     Record a diagnostic thread dump if the Qt event loop stops ticking.
@@ -104,12 +135,14 @@ class UiEventLoopWatchdog(QObject):
         stall_threshold_sec: float = 8.0,
         check_interval_sec: float = 2.0,
         report_cooldown_sec: float = 60.0,
+        max_reports: int = 8,
     ) -> None:
         super().__init__(parent)
         self._heartbeat_interval_ms = max(250, int(heartbeat_interval_ms))
         self._stall_threshold_sec = max(2.0, float(stall_threshold_sec))
         self._check_interval_sec = max(0.5, float(check_interval_sec))
         self._report_cooldown_sec = max(5.0, float(report_cooldown_sec))
+        self._max_reports = max(1, int(max_reports))
         self._lock = threading.Lock()
         self._last_heartbeat = time.monotonic()
         self._last_report = 0.0
@@ -197,13 +230,15 @@ class UiEventLoopWatchdog(QObject):
                 self._last_report = now
             self._write_hang_dump(stale_for)
 
-    def _write_hang_dump(self, stale_for: float) -> None:
+    def _write_hang_dump(self, stale_for: float) -> Optional[Path]:
+        path = None
         try:
             dump_dir = Path(get_config_dir()) / "ui_hang_dumps"
             dump_dir.mkdir(parents=True, exist_ok=True)
-            stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%SZ")
+            stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S-%fZ")
             path = dump_dir / f"fio_ui_hang_{stamp}_{os.getpid()}.txt"
-            with path.open("w", encoding="utf-8") as handle:
+            with _atomic_diagnostic_report(path, max_reports=self._max_reports,
+                                           pattern="fio_ui_hang_*.txt") as handle:
                 handle.write("CommsPlan UI hang watchdog report\n")
                 handle.write(f"UTC: {stamp}\n")
                 handle.write(f"PID: {os.getpid()}\n")
@@ -218,8 +253,10 @@ class UiEventLoopWatchdog(QObject):
                 handle.flush()
                 faulthandler.dump_traceback(file=handle, all_threads=True)
             log.error("UI watchdog detected an event-loop stall; wrote %s", path)
+            return path
         except Exception as e:
-            log.error("UI watchdog failed to write hang dump: %s", e)
+            log.error("UI watchdog failed to write hang dump at %s: %s", path, e)
+            return None
 
 
 class ProcessCpuWatchdog:
@@ -364,19 +401,15 @@ class ProcessCpuWatchdog:
         return "".join(sections), dict(hot_locations.most_common(24))
 
     def _write_hotspot_dump(self, cpu_percent: float) -> Optional[Path]:
+        path = None
         try:
             dump_dir = Path(get_config_dir()) / "cpu_hotspots"
             dump_dir.mkdir(parents=True, exist_ok=True)
-            existing = sorted(dump_dir.glob("fio_cpu_hotspot_*.txt"))
-            for stale in existing[: max(0, len(existing) - self._max_reports + 1)]:
-                try:
-                    stale.unlink()
-                except OSError:
-                    pass
             stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S-%fZ")
             path = dump_dir / f"fio_cpu_hotspot_{stamp}_{os.getpid()}.txt"
             stacks, hot_locations = self._thread_stack_snapshot()
-            with path.open("w", encoding="utf-8") as handle:
+            with _atomic_diagnostic_report(path, max_reports=self._max_reports,
+                                           pattern="fio_cpu_hotspot_*.txt") as handle:
                 handle.write("CommsPlan sustained CPU hotspot report\n")
                 handle.write(f"UTC: {stamp}\n")
                 handle.write(f"PID: {os.getpid()}\n")
@@ -399,5 +432,5 @@ class ProcessCpuWatchdog:
                 handle.write("\n")
             return path
         except Exception as exc:
-            log.error("CPU watchdog failed to write hotspot dump: %s", exc)
+            log.error("CPU watchdog failed to write hotspot dump at %s: %s", path, exc)
             return None

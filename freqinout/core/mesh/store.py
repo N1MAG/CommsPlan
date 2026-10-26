@@ -333,7 +333,7 @@ def mesh_send_policy_issue(
             if channel_issue:
                 return channel_issue
         destination = str(request.destination_id or "").strip()
-        nodes = list_mesh_nodes(db_path, adapter_id=request.adapter_id, limit=1000)
+        nodes = list_mesh_nodes(db_path, adapter_id=request.adapter_id, transport=transport, destination_id=destination, native_identity=transport, limit=1, read_only=True)
         known = any(
             destination
             in {
@@ -1560,6 +1560,10 @@ def list_mesh_nodes(
     callsign: str = "",
     limit: int = 200,
     read_only: bool = False,
+    query: str = "",
+    offset: int = 0,
+    destination_id: str = "",
+    native_identity: str = "",
 ) -> list[dict[str, Any]]:
     clauses: list[str] = []
     params: list[Any] = []
@@ -1572,8 +1576,20 @@ def list_mesh_nodes(
     if callsign:
         clauses.append("callsign=?")
         params.append(_clean(callsign).upper())
+    if destination_id:
+        native_column = {"meshcore": "public_key_or_hash", "meshtastic": "node_id"}.get(native_identity)
+        if native_column:
+            clauses.append(native_column + "=?")
+            params.append(destination_id)
+        else:
+            clauses.append("(node_id=? OR public_key_or_hash=?)")
+            params.extend((destination_id, destination_id))
+    if query:
+        clauses.append("instr(lower(COALESCE(long_name,'') || ' ' || COALESCE(short_name,'') || ' ' || COALESCE(callsign,'') || ' ' || COALESCE(node_id,'') || ' ' || COALESCE(public_key_or_hash,'')), lower(?)) > 0")
+        params.append(str(query)[:200])
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
     params.append(max(1, int(limit or 200)))
+    params.append(max(0, int(offset)))
 
     conn = (connect_sqlite_readonly(db_path, timeout=0.25, row_factory=sqlite3.Row)
             if read_only else connect_sqlite(db_path, row_factory=sqlite3.Row))
@@ -1609,7 +1625,7 @@ def list_mesh_nodes(
             FROM mesh_nodes
             {where}
             ORDER BY COALESCE(last_heard_utc, updated_utc, '') DESC, source_ref DESC
-            LIMIT ?
+            LIMIT ? OFFSET ?
             """,
             tuple(params),
         ).fetchall()

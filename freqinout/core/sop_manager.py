@@ -19,6 +19,7 @@ from freqinout.core.operating_group_frequency import (
 )
 from freqinout.core.propagation_outcome_ingest import STATE_TO_FEMA_REGION
 from freqinout.core.schedule_targeting import normalize_schedule_target_fields
+from freqinout.core.schedule_recurrence import biweekly_week_is_eligible
 from freqinout.core.settings_manager import SettingsManager
 
 
@@ -226,10 +227,10 @@ class SOPManager:
     Persistence and reminder logic for SOP profiles/actions.
     """
 
-    def __init__(self, db_path: Optional[Path] = None):
+    def __init__(self, db_path: Optional[Path] = None, *, settings: Optional[SettingsManager] = None):
         self.db_path = db_path or NETS_DB
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.settings = SettingsManager()
+        self.settings = settings if settings is not None else SettingsManager()
         self._active_hf_conflicts_cache: Optional[List[Dict[str, Any]]] = None
         self._active_hf_conflicts_cache_monotonic: float = 0.0
         self._active_hf_conflicts_cache_ttl_seconds: float = 3.0
@@ -2139,12 +2140,7 @@ class SOPManager:
                 weeks = [1]
             return self._month_week_index(date_val) in weeks
         if recurrence == "Bi-Weekly":
-            try:
-                offset = int(row.get("biweekly_offset_weeks") or 0)
-            except Exception:
-                offset = 0
-            week_idx = int(date_val.isocalendar()[1])
-            return ((week_idx - offset) % 2) == 0
+            return biweekly_week_is_eligible(row, date_val)
         return True
 
     def _load_group_schedule_rows(

@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.0.8]
+- Fixed: Assigned schedules follow automatically after validation, without a separate enablement step. Schedule reads remain isolated to the assigned radio and source; Quick QSY stays until its next eligible transition, and gaps retain current tuning.
+- Fixed: Scheduler and QSY feedback clears after verified completion. Schedule refreshes retain their last display, and schema reads no longer repeatedly rebuild valid indexes or invalidate schedule snapshots. Incorrect legacy identity indexes still repair automatically without deleting roster data.
+- Changed: Plan Builder shows radio assignments and provides schedule review/swapping with RF Guard checks and informational cautions for conflicting radios, including inactive peers. Compact actions, source selectors, tooltips and font-aware sizing leave more room for schedule rows.
+- Added: Reviewed manual Mesh-to-JS8Call and JS8Call-to-Mesh forwarding from the Inbox reader, with connection-scoped group/channel or callsign/node selection, type-to-filter recipients, exact addressed preview, byte limits, expiry, drafts and forwarding activity. Saved drafts do not send automatically.
+- Added: Forwarding can explicitly clear and verify a conflicting JS8Call selection. Unsupported icons and non-ASCII/control content are removed from outgoing Mesh sender/body text for JS8; the original remains available. Oversized or empty cleaned messages are blocked.
+- Fixed: Mesh/Any time Inbox filtering accepts the latest requested results and displays delayed progress. Background verification-policy reads, durable ingest retries, bounded file scans, projection writes and repeated presentation work have been improved to reduce stalls and contention.
+- Changed: Hidden Compose work and optional startup work are deferred until needed. Process inventories are shared across routine consumers, FLDigi log reads are bounded, and repeated unchanged warning/widget work is reduced.
+- Fixed: Linux MeshCore Bluetooth helper allocation, cancellation and cleanup retain exclusive ownership until a child has stopped. Uncertain failures keep reconnect paused for operator action. Diagnostics now publish complete reports with bounded retention and clearer launch/heartbeat details.
+- Changed: Help and startup wording match assignment-driven scheduling, the cleaner Plan Builder and reviewed forwarding workflow.
+- Known limitations: High process CPU remains under investigation despite improved responsiveness. The previously recorded macOS/PySide Compose comments crash remains unresolved. Automated package checks do not establish live RF, physical Mesh/Bluetooth reliability, every display configuration or successful message delivery. The full Linux two-radio restart/readback/soak and Bluetooth hardware/24-hour soak matrices remain unverified; the maintainer reports improved responsiveness, working scheduling and a successful Bluetooth session. Automatic cross-transport bridging/mailbox workflows and the complete worker-published Plan Builder input catalog remain deferred.
+
 ## [2.0.7]
 - Added: Offline Station Traffic Summaries with independently editable RF Brief and Detailed reports, evidence review, group/source/path/geographic filters, paired draft persistence, export and Compose staging.
 - Added: SpotterX review enrichments: verified JS8 Clear selection; peer history and passive hearing paths; policy-filtered structured Mesh analysis; reviewed received PINs; roster/map distance and bearing; redacted support reports; MeshCore contact favorites/history.

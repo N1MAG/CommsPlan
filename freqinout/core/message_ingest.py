@@ -979,37 +979,38 @@ class MessageIngestor:
         db_path = self._backlog_db_path()
         if not db_path:
             return
+        conn = None
         try:
+            resolved = str(Path(db_path).resolve())
+            try:
+                stat = Path(db_path).stat()
+                path_key = (resolved, stat.st_dev, stat.st_ino)
+            except FileNotFoundError:
+                path_key = (resolved, None, None)
+            if path_key[1] is not None and getattr(self, "_backlog_schema_ready_path", None) == path_key:
+                return
             conn = sqlite3.connect(db_path)
-            cur = conn.cursor()
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS autoquery_backlog (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    callsign TEXT NOT NULL,
-                    msg_id TEXT,
-                    kind TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'PENDING',
-                    attempts INTEGER DEFAULT 0,
-                    last_attempt_ts REAL,
-                    created_ts REAL
-                )
-                """
-            )
-            for column, col_type in (
-                ("source_key", "TEXT"),
-                ("source_radio_id", "TEXT"),
-                ("js8_instance_id", "TEXT"),
-                ("source_path", "TEXT"),
-            ):
-                try:
-                    cur.execute(f"ALTER TABLE autoquery_backlog ADD COLUMN {column} {col_type}")
-                except Exception:
-                    pass
+            columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(autoquery_backlog)")}
+            if not columns:
+                conn.execute("""CREATE TABLE IF NOT EXISTS autoquery_backlog (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, callsign TEXT NOT NULL,
+                    msg_id TEXT, kind TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'PENDING',
+                    attempts INTEGER DEFAULT 0, last_attempt_ts REAL, created_ts REAL
+                )""")
+            for column in ("source_key", "source_radio_id", "js8_instance_id", "source_path"):
+                if column not in columns:
+                    conn.execute(f"ALTER TABLE autoquery_backlog ADD COLUMN {column} TEXT")
             conn.commit()
-            conn.close()
+            stat = Path(db_path).stat()
+            after_key = (resolved, stat.st_dev, stat.st_ino)
+            # Never stamp the new path's inode with assurance of an old open
+            # connection. Fresh creation also gets one confirming next probe.
+            self._backlog_schema_ready_path = after_key if after_key == path_key else None
         except Exception as e:
             log.debug("MessageIngest: failed to ensure backlog table: %s", e)
+        finally:
+            if conn is not None:
+                conn.close()
 
     def _enqueue_next_msg_id(
         self,

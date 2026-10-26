@@ -3,8 +3,12 @@ from __future__ import annotations
 import atexit
 import threading
 import time
+import os
+import shlex
+from copy import deepcopy
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Dict, Mapping, Optional
 
 from PySide6.QtCore import Qt, QObject, QCoreApplication, QTimer, Signal, Slot
@@ -12,10 +16,18 @@ from PySide6.QtCore import Qt, QObject, QCoreApplication, QTimer, Signal, Slot
 from freqinout.core.logger import log
 from freqinout.core.software_status_service import (
     STATUS_KEYS,
+    PROGRAM_PATH_KEYS,
     SoftwareStatusService,
 )
 from freqinout.core.worker_lifecycle import CancellationToken, OperationCancelled
 
+
+# Only cached scalar configuration needed by status workers. Never borrow the
+# GUI SQLite connection or copy the full BBS/configuration projection.
+_WORKER_SETTINGS_KEYS = frozenset(PROGRAM_PATH_KEYS.values()) | {
+    "control_via", "js8_host", "js8_port", "flrig_host", "flrig_port",
+    "fldigi_host", "fldigi_port", "rig_host", "rig_port", "perf_metrics_enabled",
+}
 
 LEGACY_PRIMARY_DEPENDENCY_SCOPE = "legacy_primary"
 PROCESS_STATUS_CADENCE_SEC = 10.0
@@ -112,6 +124,7 @@ class DependencySnapshot:
     process_records: tuple[Mapping[str, object], ...] = ()
     reason: str = ""
     sequence: int = 0
+    settings_generation: int = 0
 
     def is_fresh_enough(self, max_age_sec: Optional[float] = None, *, now: Optional[float] = None) -> bool:
         if not self.generated_at:
@@ -183,6 +196,10 @@ class DependencyStatusService(QObject):
         super().__init__(parent)
         self.settings = settings
         self._lock = threading.RLock()
+        self._settings_owner_thread = threading.get_ident()
+        self._settings_snapshot = None
+        self._settings_generation = 0
+        self._capture_owner_settings()
         self._latest_snapshot = _initial_snapshot()
         self._scoped_snapshots: Dict[str, DependencySnapshot] = {}
         self._scoped_pending: set[str] = set()
@@ -206,6 +223,42 @@ class DependencyStatusService(QObject):
             except Exception:
                 pass
         QTimer.singleShot(0, lambda: self.refresh_now(reason="startup"))
+
+    def _capture_owner_settings(self) -> bool:
+        if threading.get_ident() != self._settings_owner_thread:
+            with self._lock:
+                return self._settings_snapshot is not None
+        try:
+            missing = object()
+            values = {}
+            for key in _WORKER_SETTINGS_KEYS:
+                value = self.settings.get(key, missing)
+                if value is not missing:
+                    values[key] = deepcopy(value)
+        except Exception as exc:
+            # A failed read must not turn into a fresh observation using defaults.
+            with self._lock:
+                if self._settings_snapshot is not None:
+                    self._settings_generation += 1
+                self._settings_snapshot = None
+                getattr(self, "_scoped_snapshots", {}).clear()
+            log.warning("DEPENDENCY_STATUS|settings_snapshot_failed|error=%s", exc)
+            return False
+        with self._lock:
+            if values != self._settings_snapshot:
+                self._settings_generation += 1
+                getattr(self, "_scoped_snapshots", {}).clear()
+            self._settings_snapshot = values
+        return True
+
+    def _worker_settings_context(self):
+        with self._lock:
+            if self._settings_snapshot is None:
+                raise RuntimeError("Dependency settings snapshot is unavailable")
+            return deepcopy(self._settings_snapshot), self._settings_generation
+
+    def _detached_worker_settings(self):
+        return self._worker_settings_context()[0]
 
     def latest_snapshot(self) -> DependencySnapshot:
         with self._lock:
@@ -251,6 +304,7 @@ class DependencyStatusService(QObject):
         returns the shared process snapshot while the endpoint-specific probe is
         queued; subsequent calls return the completed immutable scoped snapshot.
         """
+        settings_ready = self._capture_owner_settings()
         overrides: Dict[str, object] = {
             "port_override": port_override,
             "host_override": host_override,
@@ -265,7 +319,7 @@ class DependencyStatusService(QObject):
             "control_probe_only": bool(control_probe_only),
         }
         exact_identities = {
-            str(name): dict(identity)
+            str(name): deepcopy(dict(identity))
             for name, identity in (instance_identities or {}).items()
             if isinstance(identity, Mapping)
         }
@@ -282,7 +336,7 @@ class DependencyStatusService(QObject):
             return cached.to_software_status_snapshot() if cached is not None else self.software_status_snapshot()
         if cached is not None and cached.is_fresh_enough(SCOPED_STATUS_REFRESH_AFTER_SEC) and not force:
             return cached.to_software_status_snapshot()
-        if not pending:
+        if not pending and settings_ready:
             with self._lock:
                 if scope not in self._scoped_pending and not self._stopped:
                     self._scoped_pending.add(scope)
@@ -291,14 +345,23 @@ class DependencyStatusService(QObject):
                 else:
                     sequence = 0
             if sequence:
-                future = self._executor.submit(
-                    self._build_endpoint_snapshot,
-                    sequence,
-                    scope,
-                    overrides,
-                    bool(force),
-                    bool(force_process_snapshot),
-                )
+                try:
+                    future = self._executor.submit(
+                        self._build_endpoint_snapshot,
+                        sequence,
+                        scope,
+                        overrides,
+                        bool(force),
+                        bool(force_process_snapshot),
+                        self._worker_settings_context(),
+                    )
+                except RuntimeError as exc:
+                    with self._lock:
+                        self._scoped_pending.discard(scope)
+                        stopped = self._stopped
+                    if not stopped:
+                        log.warning("DEPENDENCY_STATUS|submit_failed|error=%s", exc)
+                    return cached.to_software_status_snapshot() if cached is not None else self.software_status_snapshot()
                 with self._lock:
                     self._active_futures.add(future)
                 future.add_done_callback(lambda done, scoped=scope: self._on_scoped_worker_done(scoped, done))
@@ -324,27 +387,44 @@ class DependencyStatusService(QObject):
 
     def refresh_now(self, *, reason: str = "manual", force: bool = False) -> DependencySnapshot:
         requested_reason = str(reason or "manual")
+        if force and requested_reason == "timer":
+            requested_reason = "forced:timer"
+        if not self._capture_owner_settings():
+            return self.latest_snapshot()
         with self._lock:
             if self._stopped:
                 return self._latest_snapshot
             # A forced refresh bypasses freshness, not the single-flight rule.
             # Queueing another whole process walk behind an in-flight one only
             # makes the returned snapshot older and delays scoped requests.
-            # Launch safety is the exception: an unrelated timer/startup walk
-            # is not launch-owned evidence, so retain one coalesced dedicated
-            # walk behind it rather than letting the caller accept that result.
+            # A forced request during an older walk retains one coalesced
+            # followup. Launch preflight retains priority and full attribution;
+            # its caller cannot accept unrelated timer/startup evidence.
             if self._worker_pending:
-                if force and requested_reason.startswith("launch-preflight:"):
-                    self._queued_process_refresh_reason = requested_reason
+                if force:
+                    queued = self._queued_process_refresh_reason
+                    # Preserve launch-owned full attribution against a later
+                    # ordinary manual/post-launch request; coalesce one followup.
+                    if not queued.startswith("launch-preflight:") or requested_reason.startswith("launch-preflight:"):
+                        self._queued_process_refresh_reason = requested_reason
                 return self._latest_snapshot
             self._worker_pending = True
             self._sequence += 1
             sequence = self._sequence
-        future = self._executor.submit(
-            self._build_process_snapshot,
-            sequence,
-            requested_reason,
-        )
+        try:
+            future = self._executor.submit(
+                self._build_process_snapshot,
+                sequence,
+                requested_reason,
+                self._worker_settings_context(),
+            )
+        except RuntimeError as exc:
+            with self._lock:
+                self._worker_pending = False
+                stopped = self._stopped
+            if not stopped:
+                log.warning("DEPENDENCY_STATUS|submit_failed|error=%s", exc)
+            return self.latest_snapshot()
         with self._lock:
             self._active_futures.add(future)
         future.add_done_callback(self._on_worker_done)
@@ -424,17 +504,24 @@ class DependencyStatusService(QObject):
         with self._lock:
             if self._stopped:
                 return
+            outdated = bool(snapshot.settings_generation and
+                            snapshot.settings_generation != self._settings_generation)
             if snapshot.scope == LEGACY_PRIMARY_DEPENDENCY_SCOPE:
-                self._latest_snapshot = snapshot
+                if not outdated:
+                    self._latest_snapshot = snapshot
                 self._worker_pending = False
                 queued_reason = self._queued_process_refresh_reason
                 self._queued_process_refresh_reason = ""
+                if outdated and not queued_reason and self._settings_snapshot is not None:
+                    queued_reason = "settings_changed"
             else:
-                self._scoped_snapshots[snapshot.scope] = snapshot
+                if not outdated:
+                    self._scoped_snapshots[snapshot.scope] = snapshot
                 self._scoped_pending.discard(snapshot.scope)
         if queued_reason:
             self.refresh_now(reason=queued_reason, force=True)
-        self.snapshot_changed.emit(snapshot)
+        if not outdated:
+            self.snapshot_changed.emit(snapshot)
 
     @staticmethod
     def _endpoint_scope(overrides: Mapping[str, object]) -> str:
@@ -451,12 +538,32 @@ class DependencyStatusService(QObject):
         overrides: Mapping[str, object],
         force: bool,
         force_process_snapshot: bool,
+        settings_context=None,
     ) -> DependencySnapshot:
         started = time.perf_counter()
         self._cancel_token.checkpoint()
         checked_at = time.time()
-        probe = SoftwareStatusService(self.settings)
+        settings, settings_generation = settings_context if settings_context is not None else self._worker_settings_context()
+        probe = SoftwareStatusService(settings)
         kwargs = {str(key): value for key, value in overrides.items()}
+        identities = kwargs.get("instance_identities", {})
+        extra_tokens = []
+        for identity in identities.values():
+            if not isinstance(identity, Mapping):
+                continue
+            target = str(identity.get("target") or "")
+            # Target may be a literal path containing spaces or a shell-quoted
+            # command (custom rigctld). Cover both interpretations conservatively.
+            extra_tokens.append(probe._basename_token(target))
+            try:
+                parts = shlex.split(target, posix=os.name != "nt")
+            except ValueError:
+                parts = ()
+            if parts:
+                extra_tokens.append(probe._basename_token(parts[0]))
+        probe.pin_process_inventory(
+            force=bool(force and force_process_snapshot), extra_tokens=extra_tokens)
+
         rows = probe.status_snapshot(
             force=bool(force),
             force_process_snapshot=bool(force_process_snapshot),
@@ -500,21 +607,26 @@ class DependencyStatusService(QObject):
             process=statuses,
             reason="endpoint",
             sequence=sequence,
+            settings_generation=settings_generation,
         )
 
-    def _build_process_snapshot(self, sequence: int, reason: str) -> DependencySnapshot:
+    def _build_process_snapshot(self, sequence: int, reason: str, settings_context=None) -> DependencySnapshot:
         started = time.perf_counter()
         checked_at = time.time()
-        probe = SoftwareStatusService(self.settings)
+        settings, settings_generation = settings_context if settings_context is not None else self._worker_settings_context()
+        probe = SoftwareStatusService(settings)
         # Launch authorization needs complete command-line attribution. Keep
         # routine timer/UI inventories cheap, but make the launch-owned walk
         # inspect every process off the GUI thread before absence can authorize
         # a spawn.
-        probe._refresh_process_snapshot(
-            force=True,
+        probe.pin_process_inventory(
+            force=str(reason or "") != "timer",
             inspect_all=str(reason or "").startswith("launch-preflight:"),
         )
-        process_records = tuple(dict(record) for record in probe._proc_records)
+        # Cached reuse retains the original observation time. Assembly time is
+        # not new process evidence (including after a slow scan).
+        checked_at = time.time() - max(0.0, time.monotonic() - probe._proc_snapshot_ts)
+        process_records = tuple(MappingProxyType(dict(record)) for record in probe._proc_records)
         statuses: Dict[str, DependencyStatus] = {}
         for status_key in STATUS_KEYS:
             self._cancel_token.checkpoint()
@@ -581,6 +693,7 @@ class DependencyStatusService(QObject):
             process_records=process_records,
             reason=reason,
             sequence=sequence,
+            settings_generation=settings_generation,
         )
 
     def _process_tooltip(

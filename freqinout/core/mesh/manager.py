@@ -304,6 +304,18 @@ class MeshConnectionManager:
             raise MeshConnectionError("Mesh send request is invalid.")
         adapter_id = str(request.adapter_id or "").strip()
         config = self._require_config(adapter_id)
+        if request.expected_connection_fingerprint:
+            from freqinout.core.mesh.settings import mesh_connection_fingerprint
+            from datetime import datetime, timezone
+            if mesh_connection_fingerprint(config) != request.expected_connection_fingerprint:
+                raise MeshConnectionError("The reviewed Mesh connection changed before dispatch.")
+            age = (datetime.now(timezone.utc) - request.requested_at).total_seconds()
+            if age < 0 or age > request.timeout_sec:
+                raise MeshConnectionError("The manual forwarding request expired before dispatch.")
+            from freqinout.core.manual_forward_runtime import forward_authorization_reason
+            issue = forward_authorization_reason(request.forwarding_db_path, request.forwarding_relay_id, request.forwarding_attempt)
+            if issue:
+                raise MeshConnectionError(issue)
         if not config.enabled:
             raise MeshConnectionError("This mesh connection is disabled.")
         if not config.send_enabled:
@@ -326,6 +338,10 @@ class MeshConnectionManager:
             raise MeshConnectionError("Mesh destination kind must be direct, channel, or broadcast.")
         adapter = self._require_adapter(adapter_id)
         capabilities = self.send_capabilities(adapter_id)
+        if request.expected_connection_fingerprint:
+            limit = int(capabilities.max_text_bytes or 0)
+            if limit <= 0 or len(text.encode("utf-8")) > limit:
+                raise MeshConnectionError("The forwarded payload exceeds the selected adapter's verified byte budget, or its budget is unavailable.")
         if not capabilities.supported:
             raise MeshConnectionError(capabilities.guidance)
         if kind == "direct" and not capabilities.direct_send:
@@ -343,6 +359,13 @@ class MeshConnectionManager:
             send = getattr(adapter, "send_message", None)
             if not callable(send):
                 raise MeshConnectionError("This mesh adapter does not implement sending.")
+            if request.expected_connection_fingerprint:
+                # Health/capability discovery above may have taken time. Recheck
+                # the durable lease at the actual adapter boundary as well.
+                issue = forward_authorization_reason(request.forwarding_db_path, request.forwarding_relay_id, request.forwarding_attempt)
+                age = (datetime.now(timezone.utc) - request.requested_at).total_seconds()
+                if issue or age < 0 or age > request.timeout_sec:
+                    raise MeshConnectionError(issue or "The forwarding request expired before adapter submission.")
             result = send(request)
             if not isinstance(result, MeshSendResult):
                 raise MeshConnectionError("Mesh adapter returned an invalid send result.")

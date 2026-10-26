@@ -3,9 +3,15 @@ from __future__ import annotations
 import base64
 import os
 import re
+import stat as stat_module
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
+
+from freqinout.core.perf_metrics import emit_span
+from freqinout.core.worker_lifecycle import OperationCancelled
 
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".webp", ".raw"}
@@ -130,6 +136,14 @@ class FileScanDelta:
             return indexed
 
         before, after = index(base_records), index(current_records)
+
+        def source_identity(record: FileRecord, origin: str) -> str:
+            explicit = str(record.source_id or "")
+            if explicit:
+                return explicit
+            resolved_origin = str(record.origin or origin or "file").strip().lower() or "file"
+            return f"{resolved_origin}:{file_path_key(record.path.parent)}"
+
         added: list[FileRecord] = []
         removed: list[FileRecord] = []
         unchanged: list[FileRecord] = []
@@ -139,15 +153,49 @@ class FileScanDelta:
             prior = before.get(key)
             if prior is None:
                 added.append(current)
-            elif int(prior.size or 0) != int(current.size or 0) or float(prior.mtime or 0.0) != float(current.mtime or 0.0):
-                added.append(current)
-                replaced.append((prior, current))
             else:
-                unchanged.append(current)
+                version_changed = (
+                    int(prior.size or 0) != int(current.size or 0)
+                    or float(prior.mtime or 0.0) != float(current.mtime or 0.0)
+                )
+                source_changed = source_identity(prior, key[0]) != source_identity(current, key[0])
+                label_changed = str(prior.source_label or "") != str(current.source_label or "")
+                if version_changed or source_changed or label_changed:
+                    added.append(current)
+                if version_changed or source_changed:
+                    # Tombstone only when the old external reference is a
+                    # different version or belongs to a different source.
+                    # A label-only update reuses the same source/ref identity.
+                    replaced.append((prior, current))
+                if not (version_changed or source_changed or label_changed):
+                    unchanged.append(current)
         for key in sorted(before):
             if key not in after:
                 removed.append(before[key])
         return cls(tuple(added), tuple(removed), tuple(unchanged), tuple(replaced))
+
+
+class DirectoryMtimeSnapshot(dict[str, float]):
+    """Legacy-compatible directory mtimes with process-local identity hints.
+
+    This remains an ordinary dict for callers which persist, compare, or
+    serialize the historical path-to-float mapping.  Filesystem identities
+    are an additive in-memory hint and are intentionally not part of that
+    mapping's serialized shape.
+    """
+
+    def __init__(self, *args, identities: Optional[Dict[str, tuple[int, int, int]]] = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.identities: Dict[str, tuple[int, int, int]] = dict(identities or {})
+
+    def record(self, path: str | Path, stat_result: os.stat_result) -> None:
+        path_key = os.path.normcase(os.path.normpath(str(path)))
+        self[path_key] = float(stat_result.st_mtime)
+        self.identities[path_key] = (
+            int(stat_result.st_dev),
+            int(stat_result.st_ino),
+            int(stat_result.st_mtime_ns),
+        )
 
 
 def is_fio_bbs_helper_file_name(name: object) -> bool:
@@ -165,7 +213,9 @@ class MessageFileScanner:
         force: bool,
         base_records: Optional[Dict[str, List[FileRecord]]] = None,
         base_dir_mtimes: Optional[Dict[str, float]] = None,
+        cancel_event: threading.Event | None = None,
     ) -> None:
+        self._cancel_event = cancel_event
         self._watch_dirs = list(watch_dirs)
         self._force = bool(force)
         self._base_records = base_records or {}
@@ -175,14 +225,57 @@ class MessageFileScanner:
                 self._base_dir_mtimes[self._norm_path(key)] = float(value)
             except Exception:
                 continue
+        self._base_dir_identities: Dict[str, tuple[int, int, int]] = {}
+        for key, value in getattr(base_dir_mtimes, "identities", {}).items():
+            try:
+                identity = tuple(int(part) for part in value)
+                if len(identity) == 3:
+                    self._base_dir_identities[self._norm_path(key)] = identity  # type: ignore[assignment]
+            except Exception:
+                continue
         self._roots_by_origin: Dict[str, List[str]] = {"varac": [], "flmsg": [], "flamp": [], "bbs": []}
         for entry in self._watch_dirs:
+            self._check_cancelled()
             origin = str(entry.get("origin", "") or "").strip().lower()
             path = str(entry.get("path", "") or "").strip()
             if origin in self._roots_by_origin and path:
                 norm = self._norm_path(path)
                 if norm not in self._roots_by_origin[origin]:
                     self._roots_by_origin[origin].append(norm)
+
+        # Build one-pass indexes for unchanged-directory reconciliation.  The
+        # walk can then stat known entries and recurse through cached children
+        # without enumerating every unchanged directory on every refresh.
+        self._cached_children_by_parent: Dict[str, set[str]] = {}
+        for child_norm in self._base_dir_mtimes:
+            parent_norm = self._norm_path(Path(child_norm).parent)
+            self._cached_children_by_parent.setdefault(parent_norm, set()).add(child_norm)
+        self._cached_files_by_parent_origin: Dict[tuple[str, str], List[FileRecord]] = {}
+        for origin, rows in (self._base_records or {}).items():
+            origin_norm = str(origin or "").strip().lower()
+            if origin_norm not in self._roots_by_origin:
+                continue
+            for rec in rows or ():
+                if not isinstance(rec, FileRecord):
+                    continue
+                path = Path(rec.path)
+                parent_norm = self._norm_path(path.parent)
+                self._cached_files_by_parent_origin.setdefault(
+                    (origin_norm, parent_norm), []
+                ).append(
+                    FileRecord(
+                        path=path,
+                        origin=origin_norm,
+                        size=int(rec.size or 0),
+                        mtime=float(rec.mtime or 0.0),
+                        source_id=str(rec.source_id or ""),
+                        source_label=str(rec.source_label or ""),
+                    )
+                )
+
+    def _check_cancelled(self) -> None:
+        if self._cancel_event is not None and self._cancel_event.is_set():
+            raise OperationCancelled("message file scan cancelled")
 
     @staticmethod
     def _norm_path(path: str | Path) -> str:
@@ -205,18 +298,20 @@ class MessageFileScanner:
         origin: str,
         allowed_exts: Optional[set[str]],
         out_map: Dict[str, Dict[str, FileRecord]],
-        dir_mtimes: Dict[str, float],
+        dir_mtimes: DirectoryMtimeSnapshot,
         *,
         source_id: str = "",
         source_label: str = "",
     ) -> None:
         try:
-            dir_mtimes[self._norm_path(base)] = float(base.stat().st_mtime)
+            directory_stat = base.stat()
+            dir_mtimes.record(self._norm_path(base), directory_stat)
         except OSError:
             return
         try:
             with os.scandir(base) as entries:
                 for dent in entries:
+                    self._check_cancelled()
                     try:
                         if dent.is_dir(follow_symlinks=False):
                             self._full_scan_recursive(
@@ -257,18 +352,20 @@ class MessageFileScanner:
         self,
         base: Path,
         out_map: Dict[str, Dict[str, FileRecord]],
-        dir_mtimes: Dict[str, float],
+        dir_mtimes: DirectoryMtimeSnapshot,
         *,
         source_id: str = "",
         source_label: str = "",
     ) -> None:
         try:
-            dir_mtimes[self._norm_path(base)] = float(base.stat().st_mtime)
+            directory_stat = base.stat()
+            dir_mtimes.record(self._norm_path(base), directory_stat)
         except OSError:
             return
         try:
             with os.scandir(base) as entries:
                 for dent in entries:
+                    self._check_cancelled()
                     try:
                         if not dent.is_file(follow_symlinks=False):
                             continue
@@ -298,53 +395,107 @@ class MessageFileScanner:
         origin: str,
         allowed_exts: Optional[set[str]],
         out_map: Dict[str, Dict[str, FileRecord]],
-        dir_mtimes: Dict[str, float],
+        dir_mtimes: DirectoryMtimeSnapshot,
         seen_files: Dict[str, set[str]],
         changed_dirs: Dict[str, set[str]],
         reused_dirs: Dict[str, set[str]],
         *,
         source_id: str = "",
         source_label: str = "",
+        is_watch_root: bool = False,
     ) -> None:
         base_norm = self._norm_path(base)
         try:
-            current_mtime = float(base.stat().st_mtime)
+            # Explicit watched roots retain the legacy behavior of following a
+            # root symlink.  Descendant links are never followed, including a
+            # cached directory replaced by a symlink between scans.
+            directory_stat = base.stat() if is_watch_root else base.stat(follow_symlinks=False)
+            if not is_watch_root and not stat_module.S_ISDIR(directory_stat.st_mode):
+                return
+            current_mtime = float(directory_stat.st_mtime)
         except OSError:
             return
-        dir_mtimes[base_norm] = current_mtime
+        dir_mtimes.record(base_norm, directory_stat)
         previous_mtime = self._base_dir_mtimes.get(base_norm)
-        if previous_mtime is not None and abs(previous_mtime - current_mtime) < 1e-6:
+        current_identity = (
+            int(directory_stat.st_dev),
+            int(directory_stat.st_ino),
+            int(directory_stat.st_mtime_ns),
+        )
+        previous_identity = self._base_dir_identities.get(base_norm)
+        if (
+            previous_mtime is not None
+            and previous_identity is not None
+            and previous_identity == current_identity
+            and previous_mtime == current_mtime
+        ):
             reused_dirs[origin].add(base_norm)
-            # A file created inside an existing child directory does not update
-            # every ancestor directory's mtime. Walk directory entries (but not
-            # files) so a changed descendant can still be discovered without a
-            # full recursive file scan.
-            try:
-                with os.scandir(base) as entries:
-                    for dent in entries:
-                        try:
-                            if dent.is_dir(follow_symlinks=False):
-                                self._scan_changed_recursive(
-                                    Path(dent.path),
-                                    origin,
-                                    allowed_exts,
-                                    out_map,
-                                    dir_mtimes,
-                                    seen_files,
-                                    changed_dirs,
-                                    reused_dirs,
-                                    source_id=source_id,
-                                    source_label=source_label,
-                                )
-                        except OSError:
-                            continue
-            except OSError:
-                pass
+            # A cached file can be modified in place without changing its
+            # parent directory mtime. Reconcile known regular files by stat;
+            # this detects size/mtime changes without opening or hashing them.
+            changed_dirs[origin].add(base_norm)
+            for cached in self._cached_files_by_parent_origin.get((origin, base_norm), ()):
+                self._check_cancelled()
+                suffix = cached.path.suffix.lower()
+                if suffix not in SUPPORTED_EXT or (allowed_exts and suffix not in allowed_exts):
+                    continue
+                key = self._norm_path(cached.path)
+                try:
+                    file_stat = cached.path.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    # A transient permission/readability failure must not turn
+                    # a retained source into a false deletion. Keep the prior
+                    # metadata and current source attribution until a later
+                    # readable reconciliation can establish a change.
+                    out_map[origin][key] = FileRecord(
+                        path=cached.path,
+                        origin=origin,
+                        size=cached.size,
+                        mtime=cached.mtime,
+                        source_id=source_id,
+                        source_label=source_label,
+                    )
+                    seen_files[origin].add(key)
+                    continue
+                if not stat_module.S_ISREG(file_stat.st_mode):
+                    continue
+                record = FileRecord(
+                    path=cached.path,
+                    origin=origin,
+                    size=file_stat.st_size,
+                    mtime=file_stat.st_mtime,
+                    source_id=source_id,
+                    source_label=source_label,
+                )
+                out_map[origin][key] = record
+                seen_files[origin].add(key)
+
+            # The unchanged tree is represented by the cached directory index.
+            # stat each child without following links so disappearance or a
+            # directory-to-symlink replacement prunes its old subtree.
+            for child_norm in self._cached_children_by_parent.get(base_norm, ()):
+                self._check_cancelled()
+                child = Path(child_norm)
+                self._scan_changed_recursive(
+                    child,
+                    origin,
+                    allowed_exts,
+                    out_map,
+                    dir_mtimes,
+                    seen_files,
+                    changed_dirs,
+                    reused_dirs,
+                    source_id=source_id,
+                    source_label=source_label,
+                )
             return
         changed_dirs[origin].add(base_norm)
         try:
             with os.scandir(base) as entries:
                 for dent in entries:
+                    self._check_cancelled()
                     try:
                         if dent.is_dir(follow_symlinks=False):
                             self._scan_changed_recursive(
@@ -390,7 +541,7 @@ class MessageFileScanner:
         self,
         base: Path,
         out_map: Dict[str, Dict[str, FileRecord]],
-        dir_mtimes: Dict[str, float],
+        dir_mtimes: DirectoryMtimeSnapshot,
         seen_files: Dict[str, set[str]],
         changed_dirs: Dict[str, set[str]],
         reused_dirs: Dict[str, set[str]],
@@ -400,18 +551,29 @@ class MessageFileScanner:
     ) -> None:
         base_norm = self._norm_path(base)
         try:
-            current_mtime = float(base.stat().st_mtime)
+            directory_stat = base.stat()
+            current_mtime = float(directory_stat.st_mtime)
         except OSError:
             return
-        dir_mtimes[base_norm] = current_mtime
+        dir_mtimes.record(base_norm, directory_stat)
         previous_mtime = self._base_dir_mtimes.get(base_norm)
-        if previous_mtime is not None and abs(previous_mtime - current_mtime) < 1e-6:
+        current_identity = (
+            int(directory_stat.st_dev),
+            int(directory_stat.st_ino),
+            int(directory_stat.st_mtime_ns),
+        )
+        if (
+            previous_mtime is not None
+            and self._base_dir_identities.get(base_norm) == current_identity
+            and previous_mtime == current_mtime
+        ):
             reused_dirs["bbs"].add(base_norm)
             return
         changed_dirs["bbs"].add(base_norm)
         try:
             with os.scandir(base) as entries:
                 for dent in entries:
+                    self._check_cancelled()
                     try:
                         if not dent.is_file(follow_symlinks=False):
                             continue
@@ -446,8 +608,9 @@ class MessageFileScanner:
 
     def _run_full(self) -> tuple[Dict[str, List[FileRecord]], Dict[str, float]]:
         records_map = self._empty_result()
-        dir_mtimes: Dict[str, float] = {}
+        dir_mtimes: DirectoryMtimeSnapshot = DirectoryMtimeSnapshot()
         for entry in self._watch_dirs:
+            self._check_cancelled()
             origin = str(entry.get("origin", "") or "").strip().lower()
             if origin not in records_map:
                 continue
@@ -472,28 +635,23 @@ class MessageFileScanner:
 
     def _run_incremental(self) -> tuple[Dict[str, List[FileRecord]], Dict[str, float]]:
         records_map = self._empty_result()
-        for origin, rows in (self._base_records or {}).items():
-            origin_norm = str(origin or "").strip().lower()
-            if origin_norm not in records_map:
-                continue
+        # The per-scanner indexes own defensive FileRecord copies, so the
+        # initial result map can reuse those immutable-for-this-scan values
+        # without copying the inventory a second time or borrowing caller rows.
+        for (origin_norm, _parent_norm), rows in self._cached_files_by_parent_origin.items():
             for rec in rows or []:
+                self._check_cancelled()
                 key = self._norm_path(rec.path)
-                records_map[origin_norm][key] = FileRecord(
-                    path=Path(rec.path),
-                    origin=origin_norm,
-                    size=int(rec.size or 0),
-                    mtime=float(rec.mtime or 0.0),
-                    source_id=str(getattr(rec, "source_id", "") or ""),
-                    source_label=str(getattr(rec, "source_label", "") or ""),
-                )
+                records_map[origin_norm][key] = rec
 
-        dir_mtimes: Dict[str, float] = {}
+        dir_mtimes: DirectoryMtimeSnapshot = DirectoryMtimeSnapshot()
         seen_files: Dict[str, set[str]] = {"varac": set(), "flmsg": set(), "flamp": set(), "bbs": set()}
         changed_dirs: Dict[str, set[str]] = {"varac": set(), "flmsg": set(), "flamp": set(), "bbs": set()}
         reused_dirs: Dict[str, set[str]] = {"varac": set(), "flmsg": set(), "flamp": set(), "bbs": set()}
         missing_roots: Dict[str, set[str]] = {"varac": set(), "flmsg": set(), "flamp": set(), "bbs": set()}
 
         for entry in self._watch_dirs:
+            self._check_cancelled()
             origin = str(entry.get("origin", "") or "").strip().lower()
             if origin not in records_map:
                 continue
@@ -518,6 +676,7 @@ class MessageFileScanner:
                 reused_dirs,
                 source_id=source_id,
                 source_label=source_label,
+                is_watch_root=True,
             )
 
         for origin, path_map in records_map.items():
@@ -555,23 +714,66 @@ class MessageFileScanner:
     def scan_with_delta(self) -> tuple[Dict[str, List[FileRecord]], Dict[str, float], str, FileScanDelta]:
         """Scan once and return the legacy result plus a snapshot delta.
 
-        The incremental walk intentionally does not stat files below unchanged
-        directories.  Delta comparison is against the retained snapshots, not
-        another filesystem pass, so callers can safely use it on the UI's scan
-        completion boundary without reintroducing a second file walk.
+        Unchanged directories use cached entry indexes and stat only known
+        supported files, without rescanning directory entries or reading file
+        contents. Delta comparison is against retained snapshots, not a second
+        filesystem walk, so this remains safe on the UI scan completion boundary.
         """
+        self._check_cancelled()
         have_base = bool(self._base_dir_mtimes) or any(
             bool(value) for value in (self._base_records or {}).values()
         )
+        mode = "full" if self._force or not have_base else "incremental"
+        walk_started = time.perf_counter()
         try:
-            if self._force or not have_base:
+            if mode == "full":
                 records, dir_mtimes = self._run_full()
-                return records, dir_mtimes, "full", FileScanDelta.compare(self._base_records, records)
-            records, dir_mtimes = self._run_incremental()
-            return records, dir_mtimes, "incremental", FileScanDelta.compare(self._base_records, records)
+            else:
+                records, dir_mtimes = self._run_incremental()
+        except OperationCancelled:
+            raise
         except Exception:
+            mode = "fallback"
             records, dir_mtimes = self._run_full()
-            return records, dir_mtimes, "fallback", FileScanDelta.compare(self._base_records, records)
+        finally:
+            # Metadata only: paths, message contents, and station data are not
+            # emitted in diagnostics.
+            emit_span(
+                "messages.file_walk",
+                (time.perf_counter() - walk_started) * 1000.0,
+                meta={"force": self._force, "mode": mode},
+                min_ms=5.0,
+            )
+
+        delta_started = time.perf_counter()
+        try:
+            self._check_cancelled()
+            delta = FileScanDelta.compare(self._base_records, records)
+            self._check_cancelled()
+        except OperationCancelled:
+            raise
+        except Exception:
+            if mode == "fallback":
+                raise
+            mode = "fallback"
+            walk_started = time.perf_counter()
+            records, dir_mtimes = self._run_full()
+            emit_span(
+                "messages.file_walk",
+                (time.perf_counter() - walk_started) * 1000.0,
+                meta={"force": self._force, "mode": mode},
+                min_ms=5.0,
+            )
+            delta_started = time.perf_counter()
+            delta = FileScanDelta.compare(self._base_records, records)
+        finally:
+            emit_span(
+                "messages.file_delta",
+                (time.perf_counter() - delta_started) * 1000.0,
+                meta={"mode": mode, "records": sum(len(values) for values in records.values())},
+                min_ms=5.0,
+            )
+        return records, dir_mtimes, mode, delta
 
     def scan(self) -> tuple[Dict[str, List[FileRecord]], Dict[str, float], str]:
         """Legacy scan API retained for all existing callers."""

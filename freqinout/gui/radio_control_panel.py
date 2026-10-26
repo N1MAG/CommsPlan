@@ -583,11 +583,16 @@ class RadioControlCard(QFrame):
         # narrow Dock; the tighter gap keeps one card inside the viewport.
         actions_layout.setSpacing(4)
         self._actions_layout = actions_layout
-        self.qsy_button = QPushButton(actions)
+        self.qsy_button = QToolButton(actions)
+        self.qsy_button.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        self.qsy_button.setPopupMode(QToolButton.MenuButtonPopup)
+        self.qsy_menu = QMenu(self.qsy_button)
+        self.qsy_menu.aboutToShow.connect(self._sync_qsy_menu)
+        self.qsy_button.setMenu(self.qsy_menu)
         self.qsy_button.setObjectName("radioCardQsy")
         self.qsy_button.setToolTip("Choose a configured destination, then QSY this radio.")
         self.qsy_button.clicked.connect(self._qsy)
-        self.qsy_button.setAccessibleName("QSY to the selected configured destination")
+        self.qsy_button.setAccessibleName("Quick QSY; menu offers QSY with hold")
         self.hold_button = QToolButton(actions)
         self.hold_button.setText("")
         self.hold_button.setToolButtonStyle(Qt.ToolButtonIconOnly)
@@ -613,8 +618,8 @@ class RadioControlCard(QFrame):
         self.sources_button = QToolButton(actions)
         self.sources_button.setObjectName("radioCardSources")
         self.sources_button.setToolButtonStyle(Qt.ToolButtonIconOnly)
-        self.sources_button.setAccessibleName("Schedule sources")
-        self.sources_button.setToolTip("Review schedule sources for this radio.")
+        self.sources_button.setAccessibleName("Schedule calendar and sources")
+        self.sources_button.setToolTip("View this radio's assigned schedule and schedule options.")
         self.sources_button.clicked.connect(self._sources)
         self.policy_button = QToolButton(actions)
         self.policy_button.setObjectName("radioCardPolicy")
@@ -851,6 +856,8 @@ class RadioControlCard(QFrame):
                               if self.property("radioCardHoldRemainingMinutes") is not None else "\nUntil Resume")
         elif self.property("radioCardRoutineScheduleEnabled") is False:
             tooltip_suffix = "\nRoutine schedule destinations are disabled for this radio."
+        if full_text.lower().startswith(("scheduling off", "scheduling paused")):
+            tooltip_suffix += "\nUse the schedule calendar to inspect the assigned plan and current validation. Hold/Resume is the operator pause control."
         set_widget_value(self.authority_label, "toolTip", full_text + tooltip_suffix)
         set_widget_value(self.authority_label, "accessibleName", f"{self._name_full_text}: {text}. {full_text}")
 
@@ -924,7 +931,7 @@ class RadioControlCard(QFrame):
                 available = min(available, ancestor.viewport().width())
                 break
             ancestor = ancestor.parentWidget()
-        widths = tuple(icon_button_metrics(button)[2] + (icon_button_metrics(button)[3] if button is self.hold_button else 0)
+        widths = tuple(icon_button_metrics(button)[2] + (icon_button_metrics(button)[3] if button in (self.hold_button, self.qsy_button) else 0)
                        for button in buttons)
         columns = 3 if sum(widths) + 5 * self._actions_layout.horizontalSpacing() > available - 24 else 6
         action_signature = (columns, widths)
@@ -1024,7 +1031,7 @@ class RadioControlCard(QFrame):
                 button.setMinimumHeight(extent)
                 # A split-menu button needs the same icon hit target PLUS its
                 # independent arrow area; a square would clip the main icon.
-                button.setFixedWidth(extent + (menu if button is self.hold_button else 0))
+                button.setFixedWidth(extent + (menu if button in (self.hold_button, self.qsy_button) else 0))
         for combo in (self.frequency_combo, self.duration_combo):
             fit_combo_box_to_contents(combo)
             # The card owns responsive closed-control width. Preserve the
@@ -1090,9 +1097,24 @@ class RadioControlCard(QFrame):
         except (TypeError, ValueError):
             return None
 
+    def _sync_qsy_menu(self) -> None:
+        self.qsy_menu.clear()
+        quick = self.qsy_menu.addAction("Quick QSY — until next schedule change")
+        quick.triggered.connect(self._qsy)
+        self.qsy_menu.addSeparator()
+        for index in range(self.duration_combo.count()):
+            raw = self.duration_combo.itemData(index)
+            duration = int(raw) if raw else None
+            label = "QSY until Resume" if duration is None else f"QSY and hold {self.duration_combo.itemText(index)}"
+            action = self.qsy_menu.addAction(label)
+            action.triggered.connect(lambda _checked=False, choice=duration: self._qsy_with_duration(choice))
+
     def _qsy(self) -> None:
+        self._qsy_with_duration(-1)
+
+    def _qsy_with_duration(self, duration: int | None) -> None:
         if self.callbacks.qsy:
-            self.callbacks.qsy(self.radio_id, self._selected_meta(), self._duration())
+            self.callbacks.qsy(self.radio_id, self._selected_meta(), duration)
 
     def _hold_or_resume(self) -> None:
         if self.hold_button.property("radioCardHeld"):
@@ -1152,7 +1174,7 @@ class RadioControlCard(QFrame):
         controls_available = bool(self.property("radioCardFrequencyControlsAvailable"))
         qsy_enabled = qsy_enabled and controls_available
         set_widget_value(self.qsy_button, "enabled", qsy_enabled)
-        set_widget_value(self.qsy_button, "toolTip", f"QSY {self._name_full_text} to the selected configured destination." if qsy_enabled else "Choose a different configured destination before QSY." if controls_available else "QSY is unavailable for this radio.")
+        set_widget_value(self.qsy_button, "toolTip", f"Quick QSY {self._name_full_text} to the selected configured destination until the next active schedule change. Menu: QSY until Resume or for a duration." if qsy_enabled else "Choose a different configured destination before QSY." if controls_available else "QSY is unavailable for this radio.")
         set_widget_value(self.hold_button, "accessibleName", f"{'Resume' if held else 'Hold'} schedule for {self._name_full_text}")
         set_widget_value(self.hold_button, "toolTip", "Resume scheduled changes." if held else "Pause scheduled changes until Resume. The menu offers optional durations.")
         set_widget_value(self.hold_button, "enabled", controls_available)
@@ -1545,7 +1567,12 @@ class RadioControlCard(QFrame):
             self.sop_button.setChecked(bool(evidence.sop_tuning_enabled))
             policy_text = ", ".join(f"{key}: {value}" for key, value in (evidence.timer_policy or {}).items())
             set_widget_value(self.policy_button, "toolTip", "Review quick schedule policy for this radio." + (f"\n{policy_text}" if policy_text else ""))
-            set_widget_value(self.sources_button, "toolTip", "Review schedule sources for this radio." + ("\nRoutine schedule enabled." if evidence.routine_schedule_enabled else "\nRoutine schedule disabled."))
+            set_widget_value(self.sources_button, "toolTip",
+                "View this radio's assigned schedule and schedule options."
+                + ("\nDaily / Net source: included." if evidence.routine_schedule_enabled else "\nDaily / Net source: excluded.")
+                + f"\nCurrent scheduling status: {evidence.authority}"
+                + "\nAssignment follows automatically when current validation and safety checks permit."
+                + " Hold/Resume pauses the assigned schedule for this radio.")
             self.authority_label.setProperty("radioCardAuthorityRole", evidence.authority_role or "info")
             self.setProperty("selected", bool(selected))
             self.name_button.setChecked(bool(selected))

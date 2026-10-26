@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Set, Tuple
+from uuid import uuid4
 
 from PySide6.QtCore import QCoreApplication, QObject, QTimer, Signal
 
@@ -54,6 +55,7 @@ from freqinout.core.scheduler_events import AsyncSchedulerEventWriter, record_sc
 from freqinout.core.scheduler_command_safety import CommandSafetyGate, checked_ptt
 from freqinout.core.daily_schedule_resolution import resolve_active_daily_entry, next_effective_daily_boundary
 from freqinout.core.schedule_source_sets import refresh_source_backed_frequency_plans
+from freqinout.core.schedule_recurrence import biweekly_week_is_eligible
 from freqinout.core.schedule_targeting import (
     normalize_schedule_target_fields,
     schedule_row_matches_target_context,
@@ -625,6 +627,8 @@ class SchedulerEngine(QObject, NetTuningMixin):
         self._manual_qsy_active: bool = False
         self._manual_qsy_entry_key: Optional[Tuple] = None
         self._manual_qsy_radio_id: Optional[int] = None
+        self._quick_qsy_baselines: Dict[int, object] = {}
+        self._quick_qsy_release_jobs: Dict[int, object] = {}
         self._manual_net_sessions: Dict[Tuple[int, str], str] = {}
         self._manual_net_fldigi_active: bool = False
         self._manual_net_js8_active: bool = False
@@ -809,6 +813,21 @@ class SchedulerEngine(QObject, NetTuningMixin):
             pending.add(int(radio_id))
             self._operator_sources_pending = pending
             self._request_active_schedule_lane_rows_refresh(force=True)
+
+    def resume_legacy_schedule_pause(self, radio_id: int) -> bool:
+        """Explicit Resume intent only; database validation stays on the worker."""
+        review = next((lane.get("schedule_review") or {} for lane in self._cached_active_schedule_lane_rows()
+                       if int(lane.get("device_profile_id") or 0) == int(radio_id)), {})
+        token = review.get("operator_pause_token") if review.get("operator_paused") else None
+        if not token or getattr(self, "_shutdown_requested", False):
+            return False
+        requests = getattr(self, "_legacy_schedule_resume_requests", None)
+        if requests is None:
+            requests = self._legacy_schedule_resume_requests = {}
+        requests[int(radio_id)] = str(token)
+        self._invalidate_command_authority(int(radio_id))
+        self._request_active_schedule_lane_rows_refresh(force=True)
+        return True
 
     def configuration_review_pending(self, radio_id: int) -> None:
         """Immediately fence a Disable click while its durable save is queued."""
@@ -1447,6 +1466,9 @@ class SchedulerEngine(QObject, NetTuningMixin):
         self._latest_intent = None
         self._latest_intents_by_radio = {}
         self._command_results_by_radio = {}
+        self._receiver_pending_by_profile = {}
+        self._legacy_schedule_resume_requests = {}
+        self._receiver_settled_by_profile = {}
         self._latest_intent_ts = 0.0
         self._retry_scheduled = False
         self._force_retry_after_control = False
@@ -1596,6 +1618,8 @@ class SchedulerEngine(QObject, NetTuningMixin):
         if not isinstance(revisions, dict):
             revisions = self._manual_state_revisions = {}
         radio_id = int(radio_id)
+        if state.reason_code != "operator_quick_qsy":
+            getattr(self, "_quick_qsy_baselines", {}).pop(radio_id, None)
         revisions[radio_id] = revisions.get(radio_id, 0) + 1
         unpersisted = getattr(self, "_manual_state_unpersisted_radio_ids", None)
         if not isinstance(unpersisted, set):
@@ -1811,6 +1835,7 @@ class SchedulerEngine(QObject, NetTuningMixin):
                              getattr(self, "_endpoint_config_epochs", {}).get(
                                  key.canonical if isinstance(key, EndpointKey) else "", 0))
         self._launch_schedule_handoffs = pending
+        getattr(self, "_launch_schedule_handoff_blocks", {}).pop(radio_id, None)
         if isinstance(key, EndpointKey):
             self._last_applied_by_endpoint.pop(key.canonical, None)
             self._expected_state_by_endpoint.pop(key.canonical, None)
@@ -1832,12 +1857,27 @@ class SchedulerEngine(QObject, NetTuningMixin):
 
     def end_launch_schedule_apply(self) -> None:
         self._launch_schedule_handoffs = {}
+        self._launch_schedule_handoff_blocks = {}
 
     def launch_schedule_apply_status(self, radio_id: int) -> str:
         """Read worker-published evidence only; never contact a radio or database."""
         request = getattr(self, "_launch_schedule_handoffs", {}).get(radio_id)
-        if request is None or getattr(self, "_shutdown_requested", False):
+        def blocked(reason: str) -> str:
+            # Diagnostics only: never re-arm an obsolete command/launch token.
+            seen = getattr(self, "_launch_schedule_handoff_blocks", {})
+            marker = (request, reason)
+            if seen.get(radio_id) != marker:
+                if len(seen) >= 128 and radio_id not in seen:
+                    seen.pop(next(iter(seen)))
+                seen[radio_id] = marker
+                self._launch_schedule_handoff_blocks = seen
+                emit = log.debug if reason in {"no_active_request", "shutdown"} else log.warning
+                emit("LAUNCH_SCHEDULE_HANDOFF|blocked radio_id=%s reason=%s", radio_id, reason)
             return "blocked"
+        if request is None:
+            return blocked("no_active_request")
+        if getattr(self, "_shutdown_requested", False):
+            return blocked("shutdown")
         if (getattr(self, "_schedule_projection_future", None) is not None
                 or getattr(self, "_schedule_projection_pending_force", False)
                 or getattr(self, "_schedule_config_refresh_pending", False)):
@@ -1849,7 +1889,7 @@ class SchedulerEngine(QObject, NetTuningMixin):
         lane = next((row for row in self.active_schedule_lanes(request_refresh=False)
                      if int(row.get("device_profile_id") or 0) == radio_id), None)
         if lane is None:
-            return "blocked"
+            return blocked("radio_lane_unavailable")
         if not self._scheduler_enabled_for_radio(radio_id):
             return "not_required"
         suspended, _ = self._scheduling_suspended_for_radio(
@@ -1860,11 +1900,11 @@ class SchedulerEngine(QObject, NetTuningMixin):
         if not entry:
             return "not_required"
         if key != getattr(self, "_endpoint_keys_by_profile", {}).get(radio_id):
-            return "blocked"
+            return blocked("endpoint_changed")
         if not isinstance(key, EndpointKey):
-            return "blocked"
+            return blocked("endpoint_unavailable")
         if epoch != getattr(self, "_endpoint_config_epochs", {}).get(key.canonical, 0):
-            return "blocked"
+            return blocked("configuration_changed")
         registry = getattr(self, "_endpoint_status", None)
         if not isinstance(registry, EndpointStatusRegistry):
             return "pending"
@@ -1877,7 +1917,7 @@ class SchedulerEngine(QObject, NetTuningMixin):
         snapshot = registry.latest(key, stale_after_s=2.0)
         frequency = self._parse_freq_hz(str(entry.get("frequency") or ""))
         if not frequency:
-            return "blocked"
+            return blocked("schedule_frequency_invalid")
         desired_vfo = str(entry.get("vfo") or "").strip().upper()[:1]
         if (not snapshot.stale and snapshot.ptt_known and not snapshot.ptt_active
                 and (desired_vfo not in {"A", "B"} or snapshot.vfo == desired_vfo)
@@ -2014,6 +2054,8 @@ class SchedulerEngine(QObject, NetTuningMixin):
             self._invalidate_command_authority(int(profile_id))
             getattr(self, "_command_results_by_radio", {}).pop(int(profile_id), None)
             self._receiver_desired_by_profile.pop(int(profile_id), None)
+            getattr(self, "_receiver_pending_by_profile", {}).pop(int(profile_id), None)
+            getattr(self, "_receiver_settled_by_profile", {}).pop(int(profile_id), None)
             cache = getattr(self, "_profile_control_context_cache", None)
             if isinstance(cache, dict):
                 cache.pop(int(profile_id), None)
@@ -2150,7 +2192,8 @@ class SchedulerEngine(QObject, NetTuningMixin):
         if monotonic_gap < 0.0:
             reason = "monotonic_clock_reset"
         elif monotonic_gap > max(15.0, interval_s * 3.0):
-            reason = "sleep_wake"
+            reason = ("heartbeat_gap" if abs(wall_drift) <= max(5.0, interval_s * 2.0)
+                      else "sleep_wake")
         elif abs(wall_drift) > max(5.0, interval_s * 2.0):
             reason = "clock_jump_forward" if wall_drift > 0.0 else "clock_jump_backward"
         else:
@@ -2790,6 +2833,8 @@ class SchedulerEngine(QObject, NetTuningMixin):
 
     def _shutdown_schedule_projection_executor(self, reason: str) -> None:
         self._schedule_projection_generation += 1
+        getattr(self, "_quick_qsy_release_jobs", {}).clear()
+        getattr(self, "_quick_qsy_baselines", {}).clear()
         self._active_schedule_lane_rows_cache = None
         future = self._schedule_projection_future
         if future is not None and not future.done():
@@ -3170,6 +3215,8 @@ class SchedulerEngine(QObject, NetTuningMixin):
             "endpoint_lanes": rows,
             "endpoint_lanes_omitted": max(0, len(lane_snapshots) - len(rows)),
             "schedule_projection": {
+                "failed": bool(getattr(self, "_schedule_projection_failed", False)),
+                "refresh_pending": bool(getattr(self, "_schedule_config_refresh_pending", False)),
                 "inflight": bool(
                     projection_future is not None and not projection_future.done()
                 ),
@@ -3627,6 +3674,7 @@ class SchedulerEngine(QObject, NetTuningMixin):
         verify_js8_offset: bool = False,
         verification_data: Optional[Mapping[str, object]] = None,
         launch_handoff_token: Optional[Tuple] = None,
+        on_frequency_verified: Optional[Callable[[], None]] = None,
     ) -> None:
         verify_entry = {
             "band": band,
@@ -3771,6 +3819,12 @@ class SchedulerEngine(QObject, NetTuningMixin):
                         actual_frequency_source=verify_state.actual_frequency_source,
                     )
                 else:
+                    if (on_frequency_verified is not None
+                            and isinstance(data.get("checked_ts"), (int, float))
+                            and 0.0 <= time.time() - now_ts <= 2.0
+                            and actual.actual_frequency_hz is not None
+                            and abs(actual.actual_frequency_hz - freq_hz) <= 10):
+                        on_frequency_verified()
                     self._record_scheduler_event(
                         "verified",
                         "post_apply_on_schedule",
@@ -3860,7 +3914,9 @@ class SchedulerEngine(QObject, NetTuningMixin):
         # The manager's cached evaluators accept caller-owned evidence and never
         # poll peers. Detach their profile/policy inputs from Qt-owned state.
         guard = None
-        resources: Set[str] = set()
+        # Forwarding and tuning share the endpoint's command boundary. Existing
+        # per-lane ordering alone cannot serialize a manual API submission.
+        resources: Set[str] = {"endpoint:" + endpoint_key.canonical}
         varac = None
         if isinstance(manager, StationRuntimeManager):
             guard = copy.copy(manager)
@@ -3891,11 +3947,15 @@ class SchedulerEngine(QObject, NetTuningMixin):
         keys = dict(getattr(self, "_endpoint_keys_by_profile", {}) or {})
         statuses = getattr(self, "_endpoint_status", None)
 
+        launch_held = bool(source in {"HF", "NET", "SOP"}
+                           and radio_id in getattr(self, "_launch_initializing_radio_ids", set()))
         approval_required = bool(getattr(self, '_require_operator_schedule_approval', False) and source in {'HF','NET','SOP'})
         approval_token = str(((lane_rows[0].get('schedule_review') or {}).get('approval_token') if lane_rows else '') or '')
         approval_db_path = getattr(getattr(self, 'settings', None), 'db_path', None)
 
         def _authority() -> Optional[str]:
+            if launch_held:
+                return "launch_initializing"
             if not gate.current(radio_id, stamp):
                 return "command_authority_changed"
             if control_mode == 'JS8CALL':
@@ -4295,7 +4355,22 @@ class SchedulerEngine(QObject, NetTuningMixin):
                         endpoint_key=endpoint_key.canonical,
                         generation=result.generation,
                     )
+                    command_outcome = outcomes.get(int(device_profile_id)) if device_profile_id is not None else None
+
+                    def _frequency_verified() -> None:
+                        # Verification may complete after a newer command or
+                        # manual action. Upgrade only this still-current result.
+                        if (source == "QSY" and command_outcome is not None
+                                and outcomes.get(int(device_profile_id)) is command_outcome
+                                and gate.current(device_profile_id, completion_stamp)
+                                and self._endpoint_callback_is_current(
+                                    endpoint_key=endpoint_key,
+                                    device_profile_id=device_profile_id,
+                                    config_epoch=config_epoch)):
+                            command_outcome["status"] = "applied_and_verified"
+
                     self._queue_post_apply_verification(
+                        on_frequency_verified=_frequency_verified,
                         control_future_token=result.generation,
                         endpoint_key=endpoint_key,
                         rig_client=target_rig,
@@ -5581,12 +5656,17 @@ class SchedulerEngine(QObject, NetTuningMixin):
         if radio_id is None or target is None:
             return
         until_resume = (entry or {}).get("manual_hold_policy") == "until_resume"
+        quick = (entry or {}).get("manual_hold_policy") == "until_transition"
+        reason = "operator_quick_qsy" if quick else "operator_qsy"
+        intent_token = str(uuid4()) if quick else None
         try:
-            hold_policy = {"hold_until_utc": ""} if until_resume else {}
+            hold_policy = {"hold_until_utc": ""} if until_resume or quick else {}
+            if quick:
+                hold_policy["latest_event_id"] = intent_token
             state = self._manual_control_service.set_manual_qsy(
                 radio_id,
                 target,
-                reason_code="operator_qsy",
+                reason_code=reason,
                 operator_source=operator_source,
                 **hold_policy,
             )
@@ -5599,11 +5679,100 @@ class SchedulerEngine(QObject, NetTuningMixin):
             now = getattr(self, "_utc_now", lambda: datetime.datetime.now(datetime.timezone.utc))()
             self._publish_manual_state(radio_id, SchedulerManualControlState(
                 radio_profile_id=f"radio_{radio_id}", state="manual_qsy", manual_target=target,
-                hold_until_utc=(existing.hold_until_utc if not until_resume and deadline and deadline > now
+                hold_until_utc=(existing.hold_until_utc if not (until_resume or quick) and deadline and deadline > now
                                 and existing.state in {"manual_qsy", "manual_hold"} else None),
-                reason_code="operator_qsy", operator_source=operator_source,
+                reason_code=reason, operator_source=operator_source, latest_event_id=intent_token,
             ), persisted=False)
             log.warning("SchedulerEngine: retaining local radio %s QSY after persistence failure: %s", radio_id, exc)
+        if quick:
+            baselines = getattr(self, "_quick_qsy_baselines", {})
+            baselines[radio_id] = None
+            self._quick_qsy_baselines = baselines
+            try:
+                now = self._utc_now()
+                for lane in self.active_schedule_lanes(now_utc=now, request_refresh=False):
+                    if int(lane.get("device_profile_id") or 0) == radio_id:
+                        baselines[radio_id] = self._quick_qsy_lane_identity(lane, now)
+                        break
+            except Exception as exc:
+                log.debug("SchedulerEngine: Quick QSY baseline unavailable for radio %s: %s", radio_id, exc)
+
+    def _quick_qsy_lane_identity(self, lane: Mapping, now_utc: datetime.datetime):
+        """Identify an actual active occurrence, independent of refresh/force flags."""
+        entry = lane.get("current_entry")
+        source = str(lane.get("current_source") or "NONE")
+        if (lane.get("schedule_gap") and lane.get("has_assigned_plan")
+                and not lane.get("schedule_projection_pending") and (lane.get("schedule_review") or {}).get("enabled")):
+            return (int(lane.get("frequency_plan_id") or 0), "GAP", (), None)
+        if (lane.get("has_assigned_plan") is False or source not in {"HF", "NET", "SOP"}
+                or not isinstance(entry, dict) or not entry):
+            return None
+        try:
+            occurrence = self._active_row_occurrence_start(now_utc, entry)
+            return (int(lane.get("frequency_plan_id") or 0), source,
+                    self._entry_transition_signature(entry), occurrence)
+        except Exception:
+            return None
+
+    def _maybe_release_quick_qsy(self, lane: Mapping, now_utc: datetime.datetime) -> None:
+        """Request exact-state release on a new entry; publish only on the owner."""
+        radio_id = int(lane.get("device_profile_id") or 0)
+        state = self._manual_state_for_radio(radio_id)
+        if (not state or state.state != "manual_qsy" or state.reason_code != "operator_quick_qsy"
+                or lane.get("schedule_projection_pending") or getattr(self, "_shutdown_requested", False)):
+            return
+        source = str(lane.get("current_source") or "NONE")
+        if (not self._automatic_source_enabled(radio_id, source)
+                or not self._scheduler_enabled_for_radio(radio_id)
+                or self._manual_net_active_for_radio(radio_id)):
+            return
+        identity = self._quick_qsy_lane_identity(lane, now_utc)
+        if identity is None:
+            return
+        baselines = getattr(self, "_quick_qsy_baselines", {})
+        if baselines.get(radio_id) is None:
+            baselines[radio_id] = identity
+            self._quick_qsy_baselines = baselines
+            return
+        if identity[1] == "GAP":
+            return
+        if identity == baselines[radio_id]:
+            return
+        jobs = getattr(self, "_quick_qsy_release_jobs", {})
+        if radio_id in jobs:
+            return
+        revision = getattr(self, "_manual_state_revisions", {}).get(radio_id, 0)
+        generation = getattr(self, "_schedule_projection_generation", 0)
+        try:
+            future = self._schedule_projection_executor.submit(self._manual_control_service.resume_quick_qsy, state)
+        except RuntimeError:
+            return
+        jobs[radio_id] = future
+        self._quick_qsy_release_jobs = jobs
+
+        def done(result):
+            def publish():
+                if jobs.get(radio_id) is not future:
+                    return
+                jobs.pop(radio_id, None)
+                if (getattr(self, "_shutdown_requested", False)
+                        or generation != getattr(self, "_schedule_projection_generation", 0)
+                        or revision != getattr(self, "_manual_state_revisions", {}).get(radio_id, 0)
+                        or self._manual_state_for_radio(radio_id) != state):
+                    return
+                try:
+                    released = result.result()
+                except Exception as exc:
+                    log.warning("SchedulerEngine: quick QSY release failed for radio %s: %s", radio_id, exc)
+                    return
+                if released:
+                    self._invalidate_command_authority(radio_id)
+                    self._publish_manual_state(radio_id, SchedulerManualControlState(
+                        radio_profile_id=state.radio_profile_id,
+                        reason_code="quick_qsy_transition",
+                    ))
+            self._queue_scheduler_thread_call(publish)
+        future.add_done_callback(done)
 
     def _record_manual_hold_state(
         self,
@@ -6103,6 +6272,8 @@ class SchedulerEngine(QObject, NetTuningMixin):
             weekday_name = _python_weekday_to_day_name(day_date.weekday())
             weekday_upper = weekday_name.upper()
             prev_day = _prev_day_name(weekday_name).upper()
+            if recurrence == "Bi-Weekly" and not biweekly_week_is_eligible(row, day_date):
+                continue
             effective_day = row_day
             if recurrence == "Daily":
                 effective_day = "ALL"
@@ -6182,7 +6353,12 @@ class SchedulerEngine(QObject, NetTuningMixin):
                 sop_entry=sop_next,
                 policy_rows=policy_rows,
             )
-            if next_source != current_source or command_identity(next_entry) != command_identity(current_entry):
+            if not next_entry:
+                continue  # Entering a gap does not command a new destination.
+            current_occurrence = self._active_row_occurrence_start(now_utc, current_entry) if current_entry else None
+            next_occurrence = self._active_row_occurrence_start(candidate, next_entry)
+            if (next_source != current_source or command_identity(next_entry) != command_identity(current_entry)
+                    or next_occurrence != current_occurrence):
                 return candidate, next_source, next_entry
         return None, "NONE", None
 
@@ -8403,6 +8579,8 @@ class SchedulerEngine(QObject, NetTuningMixin):
         *,
         force: bool = False,
         settings_snapshot: Optional[Mapping[str, Any]] = None,
+        source_errors: Optional[Mapping[int, str]] = None,
+        prepared_reviews: Optional[Mapping[int, Dict[str, Any]]] = None,
     ) -> List[Dict[str, object]]:
         """
         Build schedule-row lanes for every active radio without touching any
@@ -8413,6 +8591,7 @@ class SchedulerEngine(QObject, NetTuningMixin):
         view of each active radio's assigned plan while keeping polling bounded
         to the existing status coordinators.
         """
+        source_errors = dict(source_errors or {})
         if force:
             worker_settings: Optional[SettingsManager] = None
             try:
@@ -8420,7 +8599,7 @@ class SchedulerEngine(QObject, NetTuningMixin):
                 # a short-lived instance when a forced source refresh is needed;
                 # it must never borrow the Qt thread's SettingsManager.
                 worker_settings = SettingsManager(runtime_worker=True)
-                refreshed = refresh_source_backed_frequency_plans(worker_settings)
+                refreshed = refresh_source_backed_frequency_plans(worker_settings, source_errors=source_errors)
                 if refreshed:
                     log.info("SchedulerEngine refreshed %d source-backed Frequency Plan(s) before schedule evaluation.", len(refreshed))
             except Exception as exc:
@@ -8526,7 +8705,7 @@ class SchedulerEngine(QObject, NetTuningMixin):
         sop_rows = [normalize_schedule_target_fields(row) for row in sop_layer if isinstance(row, dict)]
         policy_rows = [dict(row) for row in policies if isinstance(row, dict)]
 
-        from freqinout.core.operator_schedule_authorization import review_schedule
+        from freqinout.core.operator_schedule_authorization import review_schedule, ensure_assigned_schedule_authority
         lanes: List[Dict[str, object]] = []
         for profile in active_profiles:
             try:
@@ -8540,7 +8719,10 @@ class SchedulerEngine(QObject, NetTuningMixin):
                 if summary_device_id == device_id:
                     operating_id = summary_operating_id
                     break
-            if device_id in assignment_by_device:
+            plan_source_error = source_errors.get(int(assignment_by_device.get(device_id, {}).get("frequency_plan_id") or 0), "")
+            if plan_source_error:
+                assigned_hf, assigned_net, has_assigned_plan = [], [], True
+            elif device_id in assignment_by_device:
                 plan_snapshot = plan_by_device.get(device_id)
                 assigned_hf, assigned_net, has_assigned_plan = (
                     self._decode_assigned_frequency_plan_rows(device_id, plan_snapshot)
@@ -8570,16 +8752,31 @@ class SchedulerEngine(QObject, NetTuningMixin):
             plan = plan_by_device.get(device_id, {})
             try:
                 source_dependencies = json.loads(str(plan.get("source_refs_json") or "[]"))
-            except (TypeError, ValueError) as exc:
-                raise ScheduleSourceError(f"Invalid source dependencies for radio {device_id}") from exc
-            declared_sop_ids = {int(ref.split(":", 1)[1]) for ref in source_dependencies
-                                if isinstance(ref, str) and ref.startswith("sop_schedule_layer:")}
+                if not isinstance(source_dependencies, list) or any(not isinstance(ref, str) for ref in source_dependencies):
+                    raise ValueError("source dependencies must be a list of identities")
+                declared_sop_ids = {int(ref.split(":", 1)[1]) for ref in source_dependencies
+                                    if ref.startswith("sop_schedule_layer:")}
+            except (TypeError, ValueError):
+                plan_source_error = plan_source_error or f"Invalid source dependencies for radio {device_id}"
+                source_dependencies, declared_sop_ids = [], set()
             if declared_sop_ids:
                 lane_sop_rows = [row for row in lane_sop_rows
                                  if int(row.get("sop_profile_id") or 0) in declared_sop_ids]
+            if plan_source_error:
+                hf_rows, net_rows, lane_sop_rows = [], [], []
+            if plan_source_error:
+                lane_review = {"enabled": False, "valid": False, "issues": [plan_source_error],
+                               "label": "Schedule blocked — " + plan_source_error}
+            elif prepared_reviews is not None and device_id in prepared_reviews:
+                lane_review = dict(prepared_reviews[device_id])
+            elif force:
+                lane_review, _delta = ensure_assigned_schedule_authority(store, device_id)
+            else:
+                lane_review = review_schedule(store, device_id)
             lanes.append(
                 {
-                    "schedule_review": review_schedule(store, device_id),
+                    "schedule_source_error": plan_source_error,
+                    "schedule_review": lane_review,
                     "device_profile": dict(profile),
                     "device_profile_id": device_id,
                     "device_name": str(profile.get("name") or ""),
@@ -8600,12 +8797,17 @@ class SchedulerEngine(QObject, NetTuningMixin):
 
         return [filter_lane_sources(lane, radio_choices(settings_snapshot or {}, int(lane["device_profile_id"]))) for lane in lanes]
 
-    def _load_revisioned_schedule_lane_rows(self, cache, *, force, settings_snapshot):
+    def _load_revisioned_schedule_lane_rows(self, cache, *, force, settings_snapshot, resume_requests=None):
         """Worker-only configuration replacement; clock evaluation reuses rows."""
         if cache is None:  # Compatibility for isolated/legacy callers.
             return self._load_active_schedule_lane_rows(force=force, settings_snapshot=settings_snapshot)
         if cache.tracker is None:
+            # Preparation installs source triggers before its validated baseline;
+            # do not repeat that schema walk merely to create this tracker.
             cache.tracker = ScheduleRevisionTracker(self._config_dir())
+
+        source_errors: Dict[int, str] = {}
+        prepared_reviews: Dict[int, Dict[str, Any]] = {}
 
         def key():
             now = self._utc_now()
@@ -8615,19 +8817,39 @@ class SchedulerEngine(QObject, NetTuningMixin):
         def prepare():
             now = self._utc_now()
             week = now.date() - datetime.timedelta(days=(now.weekday() + 1) % 7)
+            from freqinout.core.schedule_approval_sources import ensure_source_database
+            for filename in ("freqinout.db", "freqinout_nets.db"):
+                ensure_source_database(self._config_dir() / filename)
             before = cache.tracker.key()
+            owned_writes: List[int] = []
+            from freqinout.core.operator_schedule_authorization import ensure_assigned_schedule_authority, clear_legacy_schedule_pause
+            store = getattr(self, "_schedule_projection_store", None)
+            if store is None:
+                store = self._schedule_projection_store = MultiRadioStore(self._config_dir() / "freqinout.db")
+            for radio_id, token in dict(resume_requests or {}).items():
+                owned_writes.append(clear_legacy_schedule_pause(store, radio_id, token))
             worker_settings = SettingsManager(runtime_worker=True)
             try:
-                updated = refresh_source_backed_frequency_plans(worker_settings)
+                updated = refresh_source_backed_frequency_plans(worker_settings, source_errors=source_errors, revision_writes=owned_writes, store=store)
             finally:
                 worker_settings.close()
+            for profile in store.list_runtime_active_device_profiles():
+                radio_id = int(profile["id"])
+                assignment = store.get_effective_assigned_plan_for_device(radio_id) or {}
+                if int(assignment.get("frequency_plan_id") or 0) in source_errors:
+                    continue
+                prepared_reviews[radio_id], delta = ensure_assigned_schedule_authority(store, radio_id, sources_prepared=True)
+                owned_writes.append(delta)
             after = cache.tracker.key()
-            # Our own derived-plan saves each advance the settings counter once.
-            # Any other edit (including in the nets database) supersedes this
+            # Count owned writes inside their transactions, including authority
+            # revocation triggers and automatic validation. Any other edit
+            # (including in the nets database) supersedes this
             # materialization. Never stamp stale derived rows with a newer key.
             if (after[0][:-1] != before[0][:-1]
-                    or after[0][-1] != before[0][-1] + len(updated)
+                    or after[0][-1] != before[0][-1] + sum(owned_writes)
                     or after[1] != before[1]):
+                log.warning("Scheduler configuration superseded during materialization: before=%s after=%s owned_delta=%d",
+                            before, after, sum(owned_writes))
                 raise ScheduleSourceError("Configuration changed during source materialization")
             return after, week
 
@@ -8639,7 +8861,7 @@ class SchedulerEngine(QObject, NetTuningMixin):
                 data = copy.deepcopy(worker_settings.all())
             finally:
                 worker_settings.close()
-            return self._load_active_schedule_lane_rows(force=False, settings_snapshot=data)
+            return self._load_active_schedule_lane_rows(force=False, settings_snapshot=data, source_errors=source_errors, prepared_reviews=prepared_reviews)
 
         return cache.read(key, load, force=force, prepare=prepare)
 
@@ -8677,6 +8899,7 @@ class SchedulerEngine(QObject, NetTuningMixin):
         self._schedule_projection_started_at = now_ts
         generation = self._schedule_projection_generation
         manual_revisions = dict(getattr(self, "_manual_state_revisions", {}))
+        resume_requests = dict(getattr(self, "_legacy_schedule_resume_requests", {}))
         # Copy the in-memory compatibility settings on their owning Qt thread.
         # The worker receives immutable plain data and performs no calls against
         # the UI-owned SettingsManager.
@@ -8707,7 +8930,7 @@ class SchedulerEngine(QObject, NetTuningMixin):
             finish_phase("startup_manual_clear")
             lanes = self._load_revisioned_schedule_lane_rows(
                 configuration_cache, force=force,
-                settings_snapshot=settings_snapshot,
+                settings_snapshot=settings_snapshot, resume_requests=resume_requests,
             )
             finish_phase("source_load")
             evaluated_at = self._utc_now()
@@ -8817,6 +9040,10 @@ class SchedulerEngine(QObject, NetTuningMixin):
                         states, manual_revisions,
                         clear_startup_manual_qsy=clear_startup_manual_qsy,
                     )
+                pending_resumes = getattr(self, "_legacy_schedule_resume_requests", {})
+                for radio_id, token in resume_requests.items():
+                    if pending_resumes.get(radio_id) == token:
+                        pending_resumes.pop(radio_id, None)
                 self._operator_sources_pending = set()
                 self._schedule_config_refresh_pending = False
                 self._schedule_projection_failed = False
@@ -8885,11 +9112,17 @@ class SchedulerEngine(QObject, NetTuningMixin):
         if request_refresh:
             self._request_active_schedule_lane_rows_refresh(force=force)
         current_utc = now_utc or self._utc_now()
-        cache = self._active_schedule_lane_rows_cache or {}
+        cache = getattr(self, "_active_schedule_lane_rows_cache", None) or {}
         if not self._schedule_lane_projection_is_current(current_utc):
             return []
         return [dict(lane) for lane in cache.get("evaluated", ())
                 if int(lane.get("device_profile_id") or 0) not in getattr(self, "_operator_sources_pending", set())]
+
+    def schedule_projection_status(self) -> str:
+        """Cache-only presentation; a failed load is distinct from pending work."""
+        if getattr(self, "_schedule_projection_failed", False):
+            return "unavailable"
+        return "ready" if self._schedule_lane_projection_is_current(self._utc_now()) else "updating"
 
     def schedule_display_cache_key(self):
         """Memory-only publication and temporal-validity key for UI readers."""
@@ -8904,7 +9137,7 @@ class SchedulerEngine(QObject, NetTuningMixin):
         its validity fence, never this retained view.
         """
         current = self._schedule_lane_projection_is_current(self._utc_now())
-        cache = self._active_schedule_lane_rows_cache or {}
+        cache = getattr(self, "_active_schedule_lane_rows_cache", None) or {}
         return [{**dict(lane), "schedule_projection_pending": not current or int(lane.get("device_profile_id") or 0) in getattr(self, "_operator_sources_pending", set())}
                 for lane in cache.get("evaluated", ()) if isinstance(lane, Mapping)]
 
@@ -8912,7 +9145,7 @@ class SchedulerEngine(QObject, NetTuningMixin):
         if (getattr(self, "_schedule_projection_failed", False)
                 or getattr(self, "_schedule_config_refresh_pending", False)):
             return False
-        cache = self._active_schedule_lane_rows_cache or {}
+        cache = getattr(self, "_active_schedule_lane_rows_cache", None) or {}
         evaluated_at = cache.get("evaluated_at_utc")
         valid_until = cache.get("valid_until_utc")
         return (isinstance(evaluated_at, datetime.datetime)
@@ -8980,6 +9213,7 @@ class SchedulerEngine(QObject, NetTuningMixin):
             out.update(
                 {
                     "current_source": source,
+                    "schedule_gap": bool(lane.get("has_assigned_plan") and not lane.get("schedule_source_error") and not active_entry),
                     "current_entry": dict(active_entry) if isinstance(active_entry, dict) else {},
                     "hf_entry": dict(hf_active) if isinstance(hf_active, dict) else {},
                     "net_entry": dict(net_active) if isinstance(net_active, dict) else {},
@@ -9110,7 +9344,23 @@ class SchedulerEngine(QObject, NetTuningMixin):
         rows = getattr(self, "_receiver_desired_by_profile", {})
         if not isinstance(rows, dict):
             return {}
-        return {int(profile_id): dict(row) for profile_id, row in rows.items()}
+        result = {int(profile_id): dict(row) for profile_id, row in rows.items()}
+        # Suspended lanes are skipped before receiver dispatch. Project their
+        # current owner here too, using only the already-published manual cache.
+        states = getattr(self, "_manual_states_by_radio", {})
+        for profile_id, row in result.items():
+            state = states.get(profile_id)
+            if state is not None and state.state in {"manual_qsy", "manual_hold", "manual_suspend"}:
+                row.update(state=state.state, reason_code=state.reason_code or state.state,
+                           detail="Operator override is holding receiver scheduling.")
+                row.pop("actual", None)
+                row.pop("result_status", None)
+            elif profile_id in getattr(self, "_launch_initializing_radio_ids", set()):
+                row.update(state="safety_hold", reason_code="launch_initializing",
+                           detail="Receiver automatic tuning is held while Launch Control initializes this radio.")
+                row.pop("actual", None)
+                row.pop("result_status", None)
+        return result
 
     def _receiver_context_for_profile(
         self,
@@ -9156,6 +9406,11 @@ class SchedulerEngine(QObject, NetTuningMixin):
             "detail": state.detail,
         }
 
+    def _receiver_request_token(self, radio_id: int, endpoint_key: EndpointKey, entry_key: Tuple) -> Tuple:
+        return (endpoint_key.canonical,
+                int(getattr(self, "_endpoint_config_epochs", {}).get(endpoint_key.canonical, 0)),
+                self._command_safety_gate().stamp(radio_id), entry_key)
+
     def _queue_receiver_control_action(
         self,
         *,
@@ -9186,6 +9441,14 @@ class SchedulerEngine(QObject, NetTuningMixin):
                 endpoint_key=endpoint_key.canonical,
             )
             return False
+        request_token = self._receiver_request_token(device_profile_id, endpoint_key, entry_key)
+        request_ticket = (request_token, object())
+        pending = getattr(self, "_receiver_pending_by_profile", None)
+        if pending is None:
+            pending = self._receiver_pending_by_profile = {}
+        settled = getattr(self, "_receiver_settled_by_profile", None)
+        if settled is None:
+            settled = self._receiver_settled_by_profile = {}
         registry = self._ensure_endpoint_lane_registry()
         config_epoch = int(getattr(self, "_endpoint_config_epochs", {}).get(endpoint_key.canonical, 0))
         if force_attempt:
@@ -9324,6 +9587,9 @@ class SchedulerEngine(QObject, NetTuningMixin):
 
         def _on_done(result: EndpointResult) -> None:
             def _apply_result() -> None:
+                if pending.get(device_profile_id) != request_ticket:
+                    return
+                pending.pop(device_profile_id, None)
                 if self._shutdown_requested or not gate.current(device_profile_id, completion_stamp):
                     return
                 if not self._endpoint_callback_is_current(
@@ -9331,6 +9597,8 @@ class SchedulerEngine(QObject, NetTuningMixin):
                     device_profile_id=device_profile_id,
                     config_epoch=config_epoch,
                 ):
+                    return
+                if self._receiver_request_token(device_profile_id, endpoint_key, entry_key) != request_token:
                     return
                 if result.status == "rejected":
                     self._receiver_desired_by_profile.setdefault(device_profile_id, {}).update(
@@ -9384,6 +9652,10 @@ class SchedulerEngine(QObject, NetTuningMixin):
                     source="receiver_command_verification",
                 )
                 if verified_success:
+                    settled[device_profile_id] = request_token
+                else:
+                    settled.pop(device_profile_id, None)
+                if verified_success:
                     self._clear_scheduler_health_issue(
                         "receiver-control",
                         device_profile_id=device_profile_id,
@@ -9424,6 +9696,8 @@ class SchedulerEngine(QObject, NetTuningMixin):
 
             self._queue_scheduler_thread_call(_apply_result)
 
+        pending[device_profile_id] = request_ticket
+        settled.pop(device_profile_id, None)
         submission = registry.submit(
             endpoint_key,
             occurrence_id=repr(entry_key),
@@ -9432,6 +9706,8 @@ class SchedulerEngine(QObject, NetTuningMixin):
             timeout_s=timeout_s,
         )
         if not submission.accepted:
+            if pending.get(device_profile_id) == request_ticket:
+                pending.pop(device_profile_id, None)
             row = dict(self._receiver_desired_by_profile.get(device_profile_id, {}))
             row.update(
                 {
@@ -9471,12 +9747,28 @@ class SchedulerEngine(QObject, NetTuningMixin):
             self._receiver_desired_by_profile = {}
         device_profile_id = int(lane.get("device_profile_id") or 0)
         if source != "QSY" and self._radio_manual_qsy_active(device_profile_id):
+            self._receiver_desired_by_profile[device_profile_id] = {
+                "state": "manual_qsy", "source": source,
+                "reason_code": "manual_qsy_active",
+                "detail": "Manual QSY is holding this receiver; automatic tuning is held.",
+                "device_name": str(lane.get("device_name") or ""),
+            }
+            getattr(self, "_receiver_settled_by_profile", {}).pop(device_profile_id, None)
             self._record_scheduler_event(
                 "skip", "manual_qsy_active", source=source, entry=entry,
                 action="Manual QSY holding receiver frequency",
                 detail="Resume Schedule clears manual QSY; timed holds release at their deadline.",
                 device_profile_id=device_profile_id, throttle_sec=30.0,
             )
+            return
+        if (source in {"HF", "NET", "SOP"}
+                and device_profile_id in getattr(self, "_launch_initializing_radio_ids", set())):
+            self._receiver_desired_by_profile[device_profile_id] = {
+                "state": "safety_hold", "source": source,
+                "reason_code": "launch_initializing",
+                "detail": "Receiver automatic tuning is held while Launch Control initializes this radio.",
+                "device_name": str(lane.get("device_name") or ""),
+            }
             return
         endpoint_key = getattr(binding, "endpoint_key")
         automated = bool(getattr(binding, "automated", False))
@@ -9507,14 +9799,30 @@ class SchedulerEngine(QObject, NetTuningMixin):
                 else "Test receiver control to enable automatic retuning, or continue with manual tuning."
             ),
         }
-        self._receiver_desired_by_profile[device_profile_id] = desired
         entry_key = (
             device_profile_id,
             str(source or ""),
             int(frequency_hz or 0),
             str(entry.get("mode") or ""),
             str(desired.get("bandwidth_hz") or ""),
+            int(lane.get("frequency_plan_id") or 0),
+            self._entry_transition_signature(entry),
+            str(entry.get("occurrence_start_utc") or self._active_row_occurrence_start(self._utc_now(), entry) or ""),
         )
+        token = self._receiver_request_token(device_profile_id, endpoint_key, entry_key)
+        if automated and source in {"HF", "NET", "SOP"} and not force:
+            pending_ticket = getattr(self, "_receiver_pending_by_profile", {}).get(device_profile_id)
+            if pending_ticket is not None and pending_ticket[0] == token:
+                return
+            if getattr(self, "_receiver_settled_by_profile", {}).get(device_profile_id) == token:
+                statuses = getattr(self, "_endpoint_status", None)
+                observed = statuses.latest(endpoint_key, stale_after_s=2.0) if isinstance(statuses, EndpointStatusRegistry) else None
+                if (observed is None or observed.stale or observed.frequency_hz is None
+                        or abs(observed.frequency_hz - int(frequency_hz or 0)) <= 20):
+                    return
+                # Fresh, contradictory readback requests normal recovery.
+                self._receiver_settled_by_profile.pop(device_profile_id, None)
+        self._receiver_desired_by_profile[device_profile_id] = desired
         if frequency_hz is None or frequency_hz <= 0:
             self._receiver_desired_by_profile[device_profile_id].update(
                 {
@@ -9697,6 +10005,20 @@ class SchedulerEngine(QObject, NetTuningMixin):
                 # A compatible alias is represented by the deterministic
                 # lowest-profile writer for its shared route.
                 continue
+            source_error = str(lane.get("schedule_source_error") or "")
+            if source_error:
+                self._record_scheduler_health_issue(
+                    f"schedule-source:{radio_id}", source_error, cooldown_sec=30.0,
+                    device_profile_id=radio_id, active_hold=True,
+                    frequency_plan_name=str(lane.get("frequency_plan_name") or ""),
+                )
+                self._record_scheduler_event(
+                    "hold", "schedule_source_unavailable", source="NONE",
+                    action="Automatic control held for this radio's assigned plan",
+                    detail=source_error, device_profile_id=radio_id, throttle_sec=30.0,
+                )
+                continue
+            self._clear_scheduler_health_issue(f"schedule-source:{radio_id}", device_profile_id=radio_id)
             source = str(lane.get("current_source") or "NONE")
             entry = lane.get("current_entry")
             if not isinstance(entry, dict) or not entry:
@@ -9726,6 +10048,17 @@ class SchedulerEngine(QObject, NetTuningMixin):
                     + "."
                     + next_detail
                 )
+                if lane.get("schedule_gap") and (lane.get("schedule_review") or {}).get("valid"):
+                    self._maybe_release_quick_qsy(lane, now_utc)
+                    self._clear_scheduler_health_issue(self._radio_no_active_schedule_health_key(radio_id),
+                        scope=radio_name, radio_profile_id=f"radio_{radio_id}")
+                    self._record_scheduler_event(
+                        "info", "schedule_gap", source="NONE",
+                        action="Keeping current frequency and mode until the next scheduled change",
+                        detail=detail, device_profile_id=radio_id, frequency_plan_name=plan_name,
+                        throttle_sec=60.0,
+                    )
+                    continue
                 log.warning("SchedulerEngine: %s", detail)
                 self._record_scheduler_health_issue(
                     self._radio_no_active_schedule_health_key(radio_id),
@@ -9756,6 +10089,7 @@ class SchedulerEngine(QObject, NetTuningMixin):
                 scope=str(lane.get("device_name") or f"radio {radio_id}"),
                 radio_profile_id=f"radio_{radio_id}",
             )
+            self._maybe_release_quick_qsy(lane, now_utc)
             suspended, _until = self._scheduling_suspended_for_radio(radio_id, now_utc)
             if suspended:
                 continue
@@ -10054,7 +10388,12 @@ class SchedulerEngine(QObject, NetTuningMixin):
     def _find_active_hf_entry(
         self, now_utc: datetime.datetime, hf_sched: List[Dict],
     ) -> Optional[Dict]:
-        return resolve_active_daily_entry(now_utc, hf_sched)
+        entry = resolve_active_daily_entry(now_utc, hf_sched)
+        if entry and (entry.get("_resolution_implicit_continuation") or entry.get("implicit_continuation")):
+            # A gap retains current tuning, including startup/manual QSY. The
+            # previous Daily destination is display provenance, not a command.
+            return None
+        return entry
 
     def _active_row_occurrence_start(self, now_utc: datetime.datetime, row: Dict) -> Optional[datetime.datetime]:
         """Match recurrence on the occurrence's start date, including early check-in."""
@@ -10074,6 +10413,8 @@ class SchedulerEngine(QObject, NetTuningMixin):
             if day != "ALL" and day != _python_weekday_to_day_name(occurrence_day.weekday()).upper():
                 continue
             if recurrence in {"Periodic", "Monthly"} and self._month_week_index(occurrence_day.date()) not in weeks:
+                continue
+            if recurrence == "Bi-Weekly" and not biweekly_week_is_eligible(row, occurrence_day.date()):
                 continue
             start = occurrence_day + datetime.timedelta(minutes=start_min)
             end = occurrence_day + datetime.timedelta(minutes=end_min, days=1 if end_min <= start_min else 0)

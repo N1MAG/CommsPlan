@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+from copy import deepcopy
 import hashlib
 import json
 import math
@@ -442,10 +443,12 @@ from freqinout.core.message_file_scanner import (
     ORIGIN_EXTS,
     SUPPORTED_EXT,
     FileRecord,
+    DirectoryMtimeSnapshot,
     MessageFileScanner,
     is_fio_bbs_helper_file_name,
 )
 from freqinout.core.message_file_projection_pipeline import MessageFileProjectionPipeline
+from freqinout.core.worker_lifecycle import OperationCancelled
 from freqinout.core.observation_backfill import backfill_observations, project_message_file_observations
 from freqinout.core.message_intelligence import (
     MessageIntelligence,
@@ -944,6 +947,7 @@ class _FileScanWorker(QObject):
     ):
         super().__init__()
         self._force = bool(force)
+        self._cancel_event = threading.Event()
         self._db_path = str(db_path or "")
         self._watch_signature = str(watch_signature or "")
         self._bbs_db_path = str(bbs_db_path or "")
@@ -955,9 +959,26 @@ class _FileScanWorker(QObject):
             force=force,
             base_records=base_records,
             base_dir_mtimes=base_dir_mtimes,
+            cancel_event=self._cancel_event,
         )
 
+    def cancel(self) -> None:
+        # Called directly from shutdown; Event.set is thread-safe and performs
+        # no QObject or SQLite access on the GUI thread.
+        self._cancel_event.set()
+
     def run(self) -> None:
+        try:
+            self._run_scan()
+        except OperationCancelled:
+            self.finished.emit({"records": {}, "mode": "cancelled",
+                                "projection": {"state": "cancelled", "error": "cancelled"}}, self._force)
+        except Exception as exc:
+            log.exception("MessageViewer: file scan worker failed")
+            self.finished.emit({"records": {}, "mode": "failed",
+                                "projection": {"state": "failed", "error": str(exc)}}, self._force)
+
+    def _run_scan(self) -> None:
         records, dir_mtimes, mode, delta = self._scanner.scan_with_delta()
         projection: Dict[str, object] = {}
         if self._db_path:
@@ -966,6 +987,7 @@ class _FileScanWorker(QObject):
                 dir_mtimes,
                 self._watch_signature,
                 delta,
+                cancel_event=self._cancel_event,
             )
             projection = {
                 "state": result.state,
@@ -981,7 +1003,11 @@ class _FileScanWorker(QObject):
                 "error": result.error,
             }
         automation: Dict[str, object] = {}
-        if self._bbs_db_path and delta.added_or_changed:
+        # Once projection has checkpointed this delta, finish its existing
+        # automation handoff even if shutdown arrives between these phases.
+        # Before that boundary, cancellation leaves the delta available to retry.
+        checkpointed = str(projection.get("state", "")) in {"updated", "cached", "unchanged"}
+        if (not self._cancel_event.is_set() or checkpointed) and self._bbs_db_path and delta.added_or_changed:
             sweep = apply_station_bbs_automation(
                 self._bbs_db_path,
                 delta.added_or_changed,
@@ -2466,6 +2492,13 @@ class _ProjectedMessageQueryWorker(QObject):
 
     def run(self) -> None:
         started = time.perf_counter()
+        phase_started = started
+        def finish_phase(name):
+            nonlocal phase_started
+            now = time.perf_counter()
+            emit_span("messages.query." + name, (now - phase_started) * 1000.0,
+                      meta={"request_id": self._request_id}, min_ms=5.0)
+            phase_started = now
         error = ""
         rows: list[dict[str, object]] = []
         refs: dict[str, list[dict[str, object]]] = {}
@@ -2495,10 +2528,12 @@ class _ProjectedMessageQueryWorker(QObject):
                     configured_operating_groups=hf_groups,
                     configured_local_groups=local_groups,
                 )
+            finish_phase("context")
             page = query_projected_message_page(
                 self._db_path,
                 page_size=200,
                 include_total=True,
+                strict_errors=True,
                 **self._query,
             )
             rows = [dict(row) for row in page.rows]
@@ -2506,8 +2541,9 @@ class _ProjectedMessageQueryWorker(QObject):
                 traffic_summary = build_traffic_action_summary(rows, traffic_context or OperatorTrafficContext())
             total_count = int(page.total_count or 0)
             generation = int(getattr(page, "generation", 0) or 0)
+            finish_phase("page_and_count")
             message_ids = [str(row.get("message_id") or "") for row in rows]
-            loaded_refs = load_projected_external_refs_for_messages(self._db_path, message_ids)
+            loaded_refs = load_projected_external_refs_for_messages(self._db_path, message_ids, strict_errors=True)
             refs = {
                 message_id: [dict(ref) for ref in message_refs]
                 for message_id, message_refs in loaded_refs.items()
@@ -2567,9 +2603,11 @@ class _ProjectedMessageQueryWorker(QObject):
                 )
                 if key in self._query
             }
+            finish_phase("refs_and_actions")
             if "message_ids" not in self._query:
                 focus_snapshot = query_projected_inbox_focus_counts(
                     self._db_path,
+                    strict_errors=True,
                     **count_query,
                 )
                 focus_counts = {
@@ -2579,6 +2617,7 @@ class _ProjectedMessageQueryWorker(QObject):
                 focus_counts_generation = int(focus_snapshot.generation or 0)
             else:
                 focus_counts = None
+            finish_phase("focus_counts")
         except Exception as exc:
             error = str(exc)
         self.finished.emit(
@@ -2632,6 +2671,24 @@ class FileSignatureState:
     verified_ts: float = 0.0
 
 
+class _SignaturePolicyWorker(QObject):
+    finished = Signal(object)
+
+    def __init__(self, db_path, request_id):
+        super().__init__()
+        self.db_path, self.request_id = db_path, request_id
+
+    def run(self):
+        from freqinout.core.signature_policy_snapshot import load_signature_policy_snapshot
+        data = {"request_id": self.request_id}
+        try:
+            with perf_span("messages.signature_policy_snapshot", min_ms=5.0):
+                data["snapshot"] = load_signature_policy_snapshot(self.db_path)
+        except Exception as exc:
+            data["error"] = str(exc)
+        self.finished.emit(data)
+
+
 class _SignatureVerifyWorker(QObject):
     finished = Signal(object)
 
@@ -2647,6 +2704,8 @@ class _SignatureVerifyWorker(QObject):
         gpg_path: str,
         trusted_signers: set[str],
         generation: int,
+        policy_db_path=None,
+        policy_token=None,
     ):
         super().__init__()
         self._records = list(records)
@@ -2658,12 +2717,19 @@ class _SignatureVerifyWorker(QObject):
         self._gpg_path = str(gpg_path or "").strip()
         self._trusted_signers = set(trusted_signers)
         self._generation = int(generation)
+        self._policy_db_path, self._policy_token = policy_db_path, policy_token
 
     @staticmethod
     def _cache_key(rec: FileRecord) -> tuple:
         return (str(rec.origin or "").strip().lower(), str(rec.path), float(rec.mtime or 0.0), int(rec.size or 0))
 
     def run(self) -> None:
+        try:
+            self._run_verification()
+        except Exception as exc:
+            self.finished.emit({"generation": self._generation, "error": str(exc), "results": {}})
+
+    def _run_verification(self) -> None:
         start = time.perf_counter()
         out: Dict[tuple, dict] = {}
         for rec in self._records:
@@ -2739,12 +2805,17 @@ class _SignatureVerifyWorker(QObject):
                 "local_hash_set_sig": str(self._trusted_hash_sig or ""),
                 "verified_ts": float(time.time()),
             }
+        policy_current = True
+        if self._policy_db_path is not None:
+            from freqinout.core.signature_policy_snapshot import signature_policy_current
+            policy_current = signature_policy_current(self._policy_db_path, self._policy_token)
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         self.finished.emit(
             {
                 "generation": self._generation,
                 "elapsed_ms": elapsed_ms,
-                "results": out,
+                "results": out if policy_current else {},
+                "policy_stale": not policy_current,
             }
         )
 
@@ -3896,10 +3967,16 @@ class MessageViewerTab(QWidget):
     - Scan interval selectable (1 / 15 / 30 / 60 minutes)
     """
 
-    def __init__(self, parent=None, *, plan_context_service: Optional[PlanContextService] = None):
+    def __init__(self, parent=None, *, plan_context_service: Optional[PlanContextService] = None,
+                 settings_manager: Optional[SettingsManager] = None, defer_compose: bool = False):
         super().__init__(parent)
-        self.settings = SettingsManager()
-        self._multi_radio_store = MultiRadioStore()
+        started = time.perf_counter()
+        self.settings = settings_manager if settings_manager is not None else SettingsManager()
+        emit_span("messages.construct.settings", (time.perf_counter() - started) * 1000.0,
+                  settings=self.settings, min_ms=0.0)
+        self._defer_compose = bool(defer_compose)
+        self._compose_page_building = False
+        self._multi_radio_store = MultiRadioStore(getattr(self.settings, "db_path", None))
         self.plan_context_service = plan_context_service or PlanContextService()
         default_mode = (self.settings.get("display_time_mode", "LOCAL") or "LOCAL").upper()
         self._time_mode_override: str | None = None
@@ -4151,6 +4228,12 @@ class MessageViewerTab(QWidget):
         self._projected_query_timer = QTimer(self)
         self._projected_query_timer.setSingleShot(True)
         self._projected_query_timer.timeout.connect(self._start_projected_message_query)
+        self._inbox_filter_pending = False
+        self._inbox_filter_visible = False
+        self._inbox_filter_request_id = 0
+        self._inbox_filter_timer = QTimer(self)
+        self._inbox_filter_timer.setSingleShot(True)
+        self._inbox_filter_timer.timeout.connect(self._show_inbox_filter_feedback)
         self._messages_busy_state: bool = False
         self._open_external_path: Path | None = None
         self._loading_timer: QTimer | None = None
@@ -4205,6 +4288,15 @@ class MessageViewerTab(QWidget):
         self._signature_verify_thread: QThread | None = None
         self._signature_verify_worker: _SignatureVerifyWorker | None = None
         self._signature_verify_generation: int = 0
+        self._signature_policy_thread = None
+        self._signature_policy_worker = None
+        self._signature_policy_request_id = 0
+        self._signature_policy_pending = False
+        self._signature_policy_pending_force = False
+        self._signature_policy_result = None
+        self._signature_policy_settings = None
+        self._signature_verified_policy_tokens = {}
+        self._signature_verify_more_batches = False
         self._signature_verify_pending: bool = False
         self._signature_verify_pending_records: List[FileRecord] = []
         self._signature_verify_deferred_until_active: bool = False
@@ -4225,31 +4317,32 @@ class MessageViewerTab(QWidget):
 
         # merge DB paths if present
         self._load_watch_dirs_from_db()
-        self._clear_backlog_on_upgrade()
-        self._ensure_read_state_table()
-        self._ensure_message_delete_audit_table()
-        self._ensure_spotter_table()
-        self._ensure_fldigi_sender_table()
-        self._ensure_file_scan_cache_table()
-        self._ensure_signature_cache_table()
-        self._read_state_map = self._load_read_state_map()
-        self._signature_state_map = self._load_signature_state_map()
-
+        with perf_span("messages.construct.legacy_state", settings=self.settings, min_ms=0.0):
+            self._clear_backlog_on_upgrade()
+            self._ensure_read_state_table()
+            self._ensure_message_delete_audit_table()
+            self._ensure_spotter_table()
+            self._ensure_fldigi_sender_table()
+            self._ensure_file_scan_cache_table()
+            self._ensure_signature_cache_table()
+            self._read_state_map = self._load_read_state_map()
+            self._signature_state_map = self._load_signature_state_map()
         self.files: Dict[str, List[FileRecord]] = {"varac": [], "flmsg": [], "flamp": [], "bbs": []}
         self.current_record: FileRecord | None = None
-        self._scan_cache_loaded = self._load_file_scan_cache()
-        if self._scan_cache_loaded:
-            try:
-                self._update_fldigi_senders(self.files)
-            except Exception:
-                pass
-            self._files_snapshot_fp = self._files_records_fingerprint(self.files)
-            self._last_file_refresh_ts = time.time()
-
+        with perf_span("messages.construct.file_cache", settings=self.settings, min_ms=0.0):
+            self._scan_cache_loaded = self._load_file_scan_cache()
+            if self._scan_cache_loaded:
+                try:
+                    self._update_fldigi_senders(self.files)
+                except Exception:
+                    pass
+                self._files_snapshot_fp = self._files_records_fingerprint(self.files)
+                self._last_file_refresh_ts = time.time()
         self._timer: QTimer | None = None
         self.paths_labels: Dict[str, QLabel] = {}
 
-        self._build_ui()
+        with perf_span("messages.construct.ui", settings=self.settings, min_ms=0.0):
+            self._build_ui()
         QTimer.singleShot(0, self._initial_refresh)
         self._setup_clock_timer()
         self._setup_timer()
@@ -4292,6 +4385,7 @@ class MessageViewerTab(QWidget):
             or self._qt_thread_running(getattr(self, "_file_scan_thread", None))
             or self._qt_thread_running(getattr(self, "_rows_build_thread", None))
             or self._qt_thread_running(getattr(self, "_signature_verify_thread", None))
+            or self._qt_thread_running(getattr(self, "_signature_policy_thread", None))
             or self._qt_thread_running(getattr(self, "_compose_stage_thread", None))
         )
 
@@ -4405,37 +4499,38 @@ class MessageViewerTab(QWidget):
         db_path = self._backlog_db_path()
         if not db_path:
             return
+        conn = None
         try:
+            resolved = str(Path(db_path).resolve())
+            try:
+                stat = Path(db_path).stat()
+                path_key = (resolved, stat.st_dev, stat.st_ino)
+            except FileNotFoundError:
+                path_key = (resolved, None, None)
+            if path_key[1] is not None and getattr(self, "_backlog_schema_ready_path", None) == path_key:
+                return
             conn = sqlite3.connect(db_path)
-            cur = conn.cursor()
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS autoquery_backlog (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    callsign TEXT NOT NULL,
-                    msg_id TEXT,
-                    kind TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'PENDING',
-                    attempts INTEGER DEFAULT 0,
-                    last_attempt_ts REAL,
-                    created_ts REAL
-                )
-                """
-            )
-            for column, col_type in (
-                ("source_key", "TEXT"),
-                ("source_radio_id", "TEXT"),
-                ("js8_instance_id", "TEXT"),
-                ("source_path", "TEXT"),
-            ):
-                try:
-                    cur.execute(f"ALTER TABLE autoquery_backlog ADD COLUMN {column} {col_type}")
-                except Exception:
-                    pass
+            columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(autoquery_backlog)")}
+            if not columns:
+                conn.execute("""CREATE TABLE IF NOT EXISTS autoquery_backlog (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, callsign TEXT NOT NULL,
+                    msg_id TEXT, kind TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'PENDING',
+                    attempts INTEGER DEFAULT 0, last_attempt_ts REAL, created_ts REAL
+                )""")
+            for column in ("source_key", "source_radio_id", "js8_instance_id", "source_path"):
+                if column not in columns:
+                    conn.execute(f"ALTER TABLE autoquery_backlog ADD COLUMN {column} TEXT")
             conn.commit()
-            conn.close()
+            stat = Path(db_path).stat()
+            after_key = (resolved, stat.st_dev, stat.st_ino)
+            # Never stamp the new path's inode with assurance of an old open
+            # connection. Fresh creation also gets one confirming next probe.
+            self._backlog_schema_ready_path = after_key if after_key == path_key else None
         except Exception as e:
             log.debug("MessageViewer: failed to ensure backlog table: %s", e)
+        finally:
+            if conn is not None:
+                conn.close()
 
     def _ensure_read_state_table(self) -> None:
         db_path = self._db_path()
@@ -5222,17 +5317,21 @@ class MessageViewerTab(QWidget):
     def _is_flamp_auth_file(rec: FileRecord) -> bool:
         return MessageViewerTab._is_auth_verifiable_file(rec)
 
+    def _auth_settings(self):
+        policy = getattr(self, "_signature_policy_settings", None)
+        return policy if policy is not None else self.settings
+
     def _is_signature_verification_enabled(self) -> bool:
-        return bool(self.settings.get("gpg_verify_flamp_k2s_enabled", False))
+        return bool(self._auth_settings().get("gpg_verify_flamp_k2s_enabled", False))
 
     def _is_hash_verification_enabled(self) -> bool:
-        return bool(self.settings.get("hash_verify_flamp_k2s_enabled", True))
+        return bool(self._auth_settings().get("hash_verify_flamp_k2s_enabled", True))
 
     def _is_any_auth_verification_enabled(self) -> bool:
         return bool(self._is_signature_verification_enabled() or self._is_hash_verification_enabled())
 
     def _trusted_hash_entries(self) -> List[dict]:
-        raw = self.settings.get("trusted_file_hashes", []) or []
+        raw = self._auth_settings().get("trusted_file_hashes", []) or []
         if not isinstance(raw, list):
             raw = []
         return normalize_trusted_hash_entries(raw)
@@ -5253,13 +5352,13 @@ class MessageViewerTab(QWidget):
             return ""
 
     def _trusted_signer_fingerprints(self) -> set[str]:
-        raw = self.settings.get("gpg_trusted_signers", []) or []
+        raw = self._auth_settings().get("gpg_trusted_signers", []) or []
         if not isinstance(raw, list):
             raw = []
         return normalize_fingerprints(str(v) for v in raw)
 
     def _inline_signature_name_suffixes(self) -> List[str]:
-        raw = self.settings.get("gpg_inline_signed_filename_suffixes", list(DEFAULT_INLINE_SIGNED_SUFFIXES))
+        raw = self._auth_settings().get("gpg_inline_signed_filename_suffixes", list(DEFAULT_INLINE_SIGNED_SUFFIXES))
         values: List[str]
         if isinstance(raw, str):
             values = [v.strip() for v in raw.split(",")]
@@ -5376,6 +5475,7 @@ class MessageViewerTab(QWidget):
                 if (
                     force
                     or state is None
+                    or getattr(self, "_signature_verified_policy_tokens", {}).get(key) != getattr(self, "_signature_last_policy_token", None)
                     or not self._signature_cache_fresh(rec, state, inline_sig_name_suffixes)
                     or not self._hash_cache_fresh(rec, state, hash_set_sig)
                 ):
@@ -5383,38 +5483,85 @@ class MessageViewerTab(QWidget):
         return out
 
     def _start_signature_verification(self, *, force: bool = False) -> None:
-        if getattr(self, "_is_shutting_down", False):
+        if self._is_shutting_down:
             return
-        try:
-            self.settings.reload()
-        except Exception:
-            pass
+        self._signature_policy_request_id += 1
+        self._signature_policy_pending_force |= bool(force)
+        self._signature_policy_result = None
+        # A finished thread remains occupied until its queued finish slot drains;
+        # otherwise that old slot could clear a newer live worker's references.
+        if self._signature_verify_thread is not None:
+            self._signature_verify_pending = True
+            return
+        if self._signature_policy_thread is not None:
+            self._signature_policy_pending = True
+            return
+        self._signature_policy_pending = False
+        self._signature_policy_result = None
+        self._signature_policy_thread = QThread(self)
+        self._signature_policy_worker = _SignaturePolicyWorker(self.settings.db_path, self._signature_policy_request_id)
+        self._signature_policy_worker.moveToThread(self._signature_policy_thread)
+        self._signature_policy_thread.started.connect(self._signature_policy_worker.run)
+        self._signature_policy_worker.finished.connect(self._on_signature_policy_loaded)
+        self._signature_policy_worker.finished.connect(self._signature_policy_thread.quit)
+        self._signature_policy_worker.finished.connect(self._signature_policy_worker.deleteLater)
+        self._signature_policy_thread.finished.connect(self._on_signature_policy_thread_finished)
+        self._signature_policy_thread.finished.connect(self._signature_policy_thread.deleteLater)
+        self._signature_policy_thread.start()
+        self._emit_message_refresh_busy()
+
+    def _on_signature_policy_loaded(self, data):
+        if self._is_shutting_down or data.get("request_id") != self._signature_policy_request_id:
+            return
+        if data.get("error"):
+            log.warning("Message verification settings unavailable; previous status retained: %s", data["error"])
+            return
+        self._signature_policy_result = data.get("snapshot")
+
+    def _on_signature_policy_thread_finished(self):
+        self._retain_finished_worker_refs(self._signature_policy_thread, self._signature_policy_worker)
+        self._signature_policy_thread = self._signature_policy_worker = None
+        snapshot = self._signature_policy_result
+        self._signature_policy_result = None
+        if self._is_shutting_down:
+            return
+        if self._signature_policy_pending:
+            self._signature_policy_pending = False
+            self._start_signature_verification(force=self._signature_policy_pending_force)
+        elif snapshot is not None:
+            force = self._signature_policy_pending_force
+            self._signature_policy_pending_force = False
+            self._start_signature_verification_from_policy(snapshot, force=force)
+        self._emit_message_refresh_busy()
+
+    def _start_signature_verification_from_policy(self, snapshot, *, force=False):
+        if self._is_shutting_down:
+            return
+        if self._signature_verify_thread is not None:
+            self._signature_verify_pending = True
+            self._signature_policy_pending_force |= bool(force)
+            return
+        force = bool(force or snapshot.token != getattr(self, "_signature_last_policy_token", None))
+        self._signature_last_policy_token = snapshot.token
+        self._signature_policy_settings = dict(snapshot.values)
         if not self._is_any_auth_verification_enabled():
             return
         records = self._signature_candidates_to_verify(force=force)
         if not records:
             return
         try:
-            batch_limit = int(self.settings.get("message_signature_verify_batch_limit", 50) or 50)
+            batch_limit = int(self._auth_settings().get("message_signature_verify_batch_limit", 50) or 50)
         except Exception:
             batch_limit = 50
         batch_limit = max(10, min(500, batch_limit))
-        if len(records) > batch_limit:
+        self._signature_verify_more_batches = len(records) > batch_limit
+        if self._signature_verify_more_batches:
             records = records[:batch_limit]
-        if self._signature_verify_thread:
-            try:
-                if self._signature_verify_thread.isRunning():
-                    self._signature_verify_pending = True
-                    self._signature_verify_pending_records = records
-                    return
-            except RuntimeError:
-                self._signature_verify_thread = None
-                self._signature_verify_worker = None
         self._signature_verify_generation += 1
         generation = int(self._signature_verify_generation)
         self._signature_verify_pending = False
         self._signature_verify_pending_records = []
-        gpg_path = str(self.settings.get("gpg_executable_path", "") or "").strip()
+        gpg_path = str(self._auth_settings().get("gpg_executable_path", "") or "").strip()
         trusted_signers = self._trusted_signer_fingerprints()
         verify_signature = self._is_signature_verification_enabled()
         verify_hash = self._is_hash_verification_enabled()
@@ -5432,6 +5579,8 @@ class MessageViewerTab(QWidget):
             gpg_path=gpg_path,
             trusted_signers=trusted_signers,
             generation=generation,
+            policy_db_path=self.settings.db_path,
+            policy_token=snapshot.token,
         )
         self._signature_verify_worker.moveToThread(self._signature_verify_thread)
         self._signature_verify_thread.started.connect(self._signature_verify_worker.run)
@@ -5461,6 +5610,10 @@ class MessageViewerTab(QWidget):
         except Exception:
             generation = 0
         if generation and generation != self._signature_verify_generation:
+            return
+        if data.get("policy_stale"):
+            self._signature_verify_pending = True
+            self._signature_policy_pending_force = True
             return
         raw_results = data.get("results", {})
         if not isinstance(raw_results, dict) or not raw_results:
@@ -5500,6 +5653,11 @@ class MessageViewerTab(QWidget):
         if not updates:
             return
         self._signature_state_map.update(updates)
+        tokens = getattr(self, "_signature_verified_policy_tokens", {})
+        tokens.update({key: getattr(self, "_signature_last_policy_token", None) for key in updates})
+        self._signature_verified_policy_tokens = tokens
+        if getattr(self, "_signature_verify_more_batches", False):
+            self._signature_verify_pending = True
         self._save_signature_state_batch(updates)
         self._apply_signature_updates_to_rows(updates)
         try:
@@ -5828,6 +5986,8 @@ class MessageViewerTab(QWidget):
         self.more_actions_menu = QMenu(self.more_actions_btn)
         self.more_traffic_summary_action = self.more_actions_menu.addAction("Create Traffic Summary…")
         self.more_traffic_summary_action.triggered.connect(self._open_traffic_summary)
+        self.more_forward_activity_action = self.more_actions_menu.addAction("Forwarding activity…")
+        self.more_forward_activity_action.triggered.connect(self._open_forward_activity)
         self.more_actions_menu.addSeparator()
         self.more_export_pdf_action = self.more_actions_menu.addAction("Export to PDF")
         self.more_export_pdf_action.triggered.connect(self._export_pdf)
@@ -6177,6 +6337,10 @@ class MessageViewerTab(QWidget):
         self.reader_reply_btn = QPushButton("Reply")
         self.reader_reply_btn.setAccessibleName("Reply to message sender")
         self.reader_reply_btn.clicked.connect(self._reply_to_reader_message)
+        self.reader_forward_btn = QPushButton("Forward…")
+        self.reader_forward_btn.setAccessibleName("Forward this message to another transport")
+        self.reader_forward_btn.clicked.connect(self._forward_reader_message)
+        self.reader_forward_btn.setVisible(False)
         self.reader_watch_btn = QPushButton("Add to Watch…")
         self.reader_watch_btn.setAccessibleName("Stage a watch from this message")
         self.reader_watch_btn.clicked.connect(self._add_reader_message_to_watch)
@@ -6214,15 +6378,27 @@ class MessageViewerTab(QWidget):
         reader_layout.addLayout(reader_toolbar)
         self.reader_context_actions_widget = QWidget()
         reader_context_actions = QHBoxLayout(self.reader_context_actions_widget)
+        self._reader_context_actions_layout = reader_context_actions
         reader_context_actions.setContentsMargins(0, 0, 0, 0)
         reader_context_actions.setSpacing(6)
         reader_context_actions.addWidget(self.reader_map_btn)
         reader_context_actions.addWidget(self.reader_operator_btn)
         reader_context_actions.addWidget(self.reader_reply_btn)
+        reader_context_actions.addWidget(self.reader_forward_btn)
         reader_context_actions.addWidget(self.reader_watch_btn)
         reader_context_actions.addStretch(1)
         self.reader_context_actions_widget.setVisible(False)
         reader_layout.addWidget(self.reader_context_actions_widget)
+        self.reader_forward_result = QLabel("")
+        self.reader_forward_result.setWordWrap(True)
+        self.reader_forward_result.setVisible(False)
+        self.reader_forward_details = QPushButton("Forwarding details…")
+        self.reader_forward_details.clicked.connect(self._open_reader_forward_activity)
+        self.reader_forward_details.setVisible(False)
+        forwarding_result_row = QHBoxLayout()
+        forwarding_result_row.addWidget(self.reader_forward_result, 1)
+        forwarding_result_row.addWidget(self.reader_forward_details)
+        reader_layout.addLayout(forwarding_result_row)
         self._reader_back_escape_shortcut = QShortcut(QKeySequence("Escape"), self.reader_page)
         self._reader_back_escape_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self._reader_back_escape_shortcut.activated.connect(self._close_message_reader)
@@ -6401,8 +6577,8 @@ class MessageViewerTab(QWidget):
         fit_child_combo_boxes(self)
         QTimer.singleShot(0, self._set_initial_splitter_sizes)
         self._messages_model.dataChanged.connect(self._update_bulk_delete_buttons)
-        self.compose_page = self._build_compose_page()
-        self.messages_mode_stack.addWidget(self.compose_page)
+        if not self._defer_compose:
+            self._ensure_compose_page()
         self._messages_text_size_guard_signature = None
         self._apply_accessibility_width_guards()
         self._set_messages_mode(self._messages_mode, save=False)
@@ -6412,6 +6588,7 @@ class MessageViewerTab(QWidget):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._update_messages_responsive_layout()
+        self._reflow_reader_context_actions()
 
     def changeEvent(self, event) -> None:
         super().changeEvent(event)
@@ -6419,6 +6596,7 @@ class MessageViewerTab(QWidget):
             self._message_table_fit_signature = None
             self._queue_message_table_column_fit()
             self._refresh_compose_layout_geometry_if_needed(force=True)
+            self._reflow_reader_context_actions()
 
     def _messages_responsive_mode_for_width(self, width: int) -> str:
         try:
@@ -6631,15 +6809,23 @@ class MessageViewerTab(QWidget):
             active = key == self._inbox_focus
             count = int(getattr(self, "_inbox_focus_unread_counts", {}).get(key, 0))
             button_text = f"{labels.get(key, key.title())} {count}"
-            btn.setText(button_text)
+            if btn.text() != button_text:
+                btn.setText(button_text)
             try:
-                btn.setMinimumWidth(max(100, int(btn.fontMetrics().horizontalAdvance(button_text) + 34)))
+                width_key = (button_text, btn.font().toString(), float(btn.devicePixelRatioF()),
+                             btn.logicalDpiX(), btn.logicalDpiY())
+                if getattr(btn, "_focus_width_key", None) != width_key:
+                    btn.setMinimumWidth(max(100, int(btn.fontMetrics().horizontalAdvance(button_text) + 34)))
+                    btn._focus_width_key = width_key
             except Exception:
                 pass
-            btn.blockSignals(True)
-            btn.setChecked(active)
-            btn.blockSignals(False)
-            btn.setStyleSheet(button_style("primary" if active else "muted", theme))
+            if btn.isChecked() != active:
+                blocked = btn.blockSignals(True)
+                btn.setChecked(active)
+                btn.blockSignals(blocked)
+            style = button_style("primary" if active else "muted", theme)
+            if btn.styleSheet() != style:
+                btn.setStyleSheet(style)
 
     @staticmethod
     def _row_is_unread_for_focus_count(row: UnifiedMessage) -> bool:
@@ -6761,7 +6947,8 @@ class MessageViewerTab(QWidget):
     def _reload_projected_messages_for_scope_change(self) -> bool:
         if not self._projection_primary_enabled:
             return False
-        if self._projected_scope_key() == getattr(self, "_projected_scope_load_key", None):
+        if (self._projected_scope_key() == getattr(self, "_projected_scope_load_key", None)
+                and not self._qt_thread_running(getattr(self, "_projected_query_thread", None))):
             return False
         self._unfreeze_table()
         return self._load_projected_messages_into_table(force=False)
@@ -6861,6 +7048,21 @@ class MessageViewerTab(QWidget):
         self.local_label.setText(now_local.strftime(f"<b>Local ({local_day}):</b> %y%m%d %H:%M:%S {local_abbr}"))
         if hasattr(self, "time_toggle_btn"):
             self.time_toggle_btn.setText("Time Display: Local" if self._show_local_time else "Time Display: UTC")
+
+    def _ensure_compose_page(self) -> None:
+        if getattr(self, "compose_page", None) is not None or getattr(self, "_compose_page_building", False):
+            return
+        if getattr(self, "_is_shutting_down", False):
+            return
+        self._compose_page_building = True
+        try:
+            with perf_span("messages.construct.compose_ui", settings=self.settings, min_ms=0.0):
+                page = self._build_compose_page()
+            self.compose_page = page
+            self.messages_mode_stack.addWidget(page)
+            self._apply_accessibility_width_guards()
+        finally:
+            self._compose_page_building = False
 
     def _build_compose_page(self) -> QWidget:
         page = QWidget()
@@ -8443,6 +8645,8 @@ class MessageViewerTab(QWidget):
         btn.setToolTip("Open the same draft in a separate, larger composing window.")
 
     def _refresh_compose_layout_geometry_if_needed(self, *, force: bool = False) -> None:
+        if not hasattr(self, "compose_output_options_btn"):
+            return
         mode = str(getattr(self, "_compose_mode", "nbems") or "nbems")
         in_workbench = bool(getattr(self, "_compose_in_workbench", False))
         viewport = self._compose_layout_viewport()
@@ -9909,6 +10113,9 @@ class MessageViewerTab(QWidget):
         self.meshSendRequested.emit(request)
 
     def on_mesh_send_result(self, result: object) -> None:
+        controller = getattr(self, "_manual_forward_controller", None)
+        if controller is not None and controller.receive_mesh_result(result):
+            return
         if not isinstance(result, MeshSendResult):
             return
         if self._compose_mesh_request_id and result.request_id != self._compose_mesh_request_id:
@@ -12964,6 +13171,10 @@ class MessageViewerTab(QWidget):
         mode_txt = str(mode or "Inbox").strip().title()
         if mode_txt not in {"Inbox", "Compose"}:
             mode_txt = "Inbox"
+        if mode_txt == "Compose" and bool(getattr(self, "_defer_compose", False)):
+            if getattr(self, "_is_shutting_down", False):
+                return
+            self._ensure_compose_page()
         self._messages_mode = mode_txt
         self._update_messages_mode_ui()
         if mode_txt == "Compose" and reset_compose:
@@ -15837,6 +16048,7 @@ class MessageViewerTab(QWidget):
             or self._qt_thread_running(getattr(self, "_file_scan_thread", None))
             or self._qt_thread_running(getattr(self, "_rows_build_thread", None))
             or self._qt_thread_running(getattr(self, "_signature_verify_thread", None))
+            or self._qt_thread_running(getattr(self, "_signature_policy_thread", None))
         ):
             self._message_check_status_text = "Still checking..."
             self._update_message_check_status()
@@ -15998,13 +16210,63 @@ class MessageViewerTab(QWidget):
         self._refresh_pending_backlog()
         self._last_activation_refresh_ts = time.time()
 
-    def _set_loading(self, active: bool, text: str = "Indexing messages...") -> None:
+    def _begin_inbox_filter_feedback(self) -> None:
+        timer = getattr(self, "_inbox_filter_timer", None)
+        if timer is None or getattr(self, "_traffic_navigation_pending", False):
+            return
+        if (not getattr(self, "_inbox_filter_pending", False)
+                and self._projected_scope_key() == getattr(self, "_projected_scope_load_key", None)):
+            return
+        self._inbox_filter_pending = True
+        self._inbox_filter_request_id = self._projected_query_request_id
+        if not self._inbox_filter_visible and not timer.isActive():
+            timer.start(350)
+
+    def _show_inbox_filter_feedback(self) -> None:
+        if (not self._inbox_filter_pending or self._is_shutting_down
+                or not self._has_active_view or not self._app_active):
+            return
+        self._inbox_filter_visible = True
+        self._set_loading(True, _filter_feedback=True)
+
+    def _pause_inbox_filter_feedback(self) -> None:
+        timer = getattr(self, "_inbox_filter_timer", None)
+        if timer is None:
+            return
+        timer.stop()
+        self._inbox_filter_visible = False
+        self._set_loading(False, _filter_feedback=True)
+
+    def _finish_inbox_filter_feedback(self, error: str = "") -> None:
+        if (not getattr(self, "_inbox_filter_pending", False)
+                or self._inbox_filter_request_id != self._projected_query_request_id):
+            return
+        self._inbox_filter_pending = False
+        self._inbox_filter_visible = False
+        self._inbox_filter_timer.stop()
+        self._set_loading(bool(error), error, _filter_feedback=True)
+        if error and self._loading_progress is not None:
+            self._loading_progress.hide()
+
+    def _set_loading(
+        self, active: bool, text: str = "Indexing messages...", *, _filter_feedback: bool = False
+    ) -> None:
+        # Filtering temporarily owns presentation, not the indexing lifecycle.
+        # Restore the latest background status when filtering completes/pauses.
+        if _filter_feedback:
+            if not active:
+                active, text = getattr(self, "_background_loading_state", (False, ""))
+        else:
+            self._background_loading_state = (active, text)
         if bool(getattr(self, "_traffic_navigation_pending", False)):
             active = True
             text = f"Loading {self._traffic_loading_bucket.title()} traffic…"
+        elif getattr(self, "_inbox_filter_visible", False):
+            active = True
+            text = "Applying filters… Previous results remain visible." if self._message_rows else "Applying filters…"
         if not getattr(self, "loading_label", None):
             return
-        if self._loading_timer and self._loading_timer.isActive():
+        if not _filter_feedback and self._loading_timer and self._loading_timer.isActive():
             self._loading_timer.stop()
         self.loading_label.setText(text)
         self.loading_label.setVisible(bool(active))
@@ -16028,6 +16290,14 @@ class MessageViewerTab(QWidget):
     def show_loading_toast(self) -> None:
         self._set_loading(True)
 
+    def on_background_refresh_complete(self) -> None:
+        """Drain a genuine dirty read model, without re-entering source ingest."""
+        if (self._is_shutting_down or not self._has_active_view or not self._app_active
+                or not self._deferred_refresh):
+            return
+        self._deferred_refresh = False
+        self._populate_messages_table(force=False)
+
     def on_tab_activated(self) -> None:
         with perf_span(
             "messages.on_tab_activated",
@@ -16046,7 +16316,9 @@ class MessageViewerTab(QWidget):
             else:
                 self._queue_bbs_auto_archive_check("tab_activated", delay_ms=250)
             now = time.time()
-            stale = (not self._message_rows) or (
+            # A successful empty scope is still loaded; only first activation
+            # or expiration requests source work, not every completion callback.
+            stale = (not self._last_activation_refresh_ts) or (
                 now - float(self._last_activation_refresh_ts) >= self._activation_refresh_interval_sec
             )
             if not stale:
@@ -16127,6 +16399,7 @@ class MessageViewerTab(QWidget):
     def set_tab_active(self, active: bool) -> None:
         self._has_active_view = bool(active)
         if not active:
+            self._pause_inbox_filter_feedback()
             self._invalidate_compose_mesh_contact()
             self._cancel_compose_js8_selected_target_worker()
             self._compose_js8_selected_target_generation += 1
@@ -16177,6 +16450,7 @@ class MessageViewerTab(QWidget):
     def set_app_active(self, active: bool) -> None:
         self._app_active = bool(active)
         if not self._app_active:
+            self._pause_inbox_filter_feedback()
             self._deferred_refresh = True
             for timer in (
                 self._clock_timer,
@@ -16732,7 +17006,7 @@ class MessageViewerTab(QWidget):
             self._refresh_files_inflight = False
             return
         records: Dict[str, List[FileRecord]]
-        dir_mtimes: Dict[str, float] = {}
+        dir_mtimes = DirectoryMtimeSnapshot()
         mode = "legacy"
         projection: Dict[str, object] = {}
         automation: Dict[str, object] = {}
@@ -16749,6 +17023,15 @@ class MessageViewerTab(QWidget):
                         dir_mtimes[os.path.normcase(os.path.normpath(str(k)))] = float(v or 0.0)
                     except Exception:
                         continue
+            # Preserve in-memory inode/nanosecond proof through the GUI swap.
+            # Legacy persisted float-only caches deliberately enumerate once.
+            for path, identity in getattr(maybe_dirs, "identities", {}).items():
+                norm = os.path.normcase(os.path.normpath(str(path)))
+                if norm in dir_mtimes and isinstance(identity, (tuple, list)) and len(identity) == 3:
+                    try:
+                        dir_mtimes.identities[norm] = tuple(int(value) for value in identity)
+                    except (ValueError, TypeError):
+                        pass
             mode = str(payload.get("mode", "unknown") or "unknown")
             maybe_projection = payload.get("projection")
             if isinstance(maybe_projection, dict):
@@ -16764,6 +17047,9 @@ class MessageViewerTab(QWidget):
         changed_count = int(projection.get("added_or_changed", 0) or 0)
         removed_count = int(projection.get("removed", 0) or 0)
         unchanged_records = not force and changed_count == 0 and removed_count == 0
+        projection_state = str(projection.get("state", "") or "")
+        projection_error = str(projection.get("error", "") or "")
+        projection_complete = not projection_error and projection_state in {"", "updated", "cached", "unchanged"}
         try:
             with perf_span(
                 "messages.file_scan_finished_handler",
@@ -16780,15 +17066,20 @@ class MessageViewerTab(QWidget):
                 # normalized projection have already completed on the worker.
                 # The Qt callback only swaps immutable snapshot state and marks
                 # the read model stale for the next coalesced refresh.
-                self.files = records
-                self._scan_dir_mtime_cache = dir_mtimes
-                self._scan_cache_loaded = True
-                self._files_snapshot_fp = None
-                projection_state = str(projection.get("state", "") or "")
-                projection_error = str(projection.get("error", "") or "")
-                if projection_error:
-                    log.warning("MessageViewer: file projection pipeline failed: %s", projection_error)
+                if projection_complete:
+                    self.files = records
+                    self._scan_dir_mtime_cache = dir_mtimes
+                    self._scan_cache_loaded = True
+                    self._files_snapshot_fp = None
+                if not projection_complete:
+                    # Discovery is not an acknowledgement of durable projection.
+                    # Retain the comparison baseline so the next scan includes
+                    # every uncommitted delta, even if new files arrive meanwhile.
+                    log.warning("MessageViewer: file projection pipeline deferred: %s",
+                                projection_error or projection_state)
                     self._message_check_status_text = "Message file update deferred"
+                    if int(projection.get("projected", 0) or 0) or int(projection.get("tombstoned", 0) or 0):
+                        self._deferred_refresh = True
                 elif changed_count or removed_count or force:
                     self._message_check_status_text = "Messages updated"
                     self._deferred_refresh = True
@@ -16808,7 +17099,7 @@ class MessageViewerTab(QWidget):
                     )
         finally:
             self._refresh_files_inflight = False
-            self._last_file_refresh_ts = time.time()
+            self._last_file_refresh_ts = time.time() if projection_complete else 0.0
             self._emit_message_refresh_busy()
             elapsed = time.time() - self._file_scan_start_ts
             emit_span(
@@ -17773,6 +18064,9 @@ class MessageViewerTab(QWidget):
 
     def shutdown(self) -> None:
         self._is_shutting_down = True
+        controller = getattr(self, "_manual_forward_controller", None)
+        if controller is not None:
+            controller.shutdown()
         lane = getattr(self, "_compose_mesh_contact_lane", None)
         if lane is not None:
             lane.shutdown()
@@ -17838,6 +18132,7 @@ class MessageViewerTab(QWidget):
         try:
             if self._projected_query_timer:
                 self._projected_query_timer.stop()
+            self._pause_inbox_filter_feedback()
         except Exception:
             pass
         try:
@@ -17845,12 +18140,16 @@ class MessageViewerTab(QWidget):
                 self._file_watch_debounce_timer.stop()
         except Exception:
             pass
+        file_worker = getattr(self, "_file_scan_worker", None)
+        if file_worker is not None:
+            file_worker.cancel()
         self._request_worker_thread_stop(self._file_scan_thread)
         self._request_worker_thread_stop(self._rows_build_thread)
         self._request_worker_thread_stop(self._projection_write_thread)
         self._request_worker_thread_stop(self._native_file_projection_thread)
         self._request_worker_thread_stop(self._projected_query_thread)
         self._request_worker_thread_stop(self._signature_verify_thread)
+        self._request_worker_thread_stop(self._signature_policy_thread)
         self._request_worker_thread_stop(self._bbs_auto_archive_thread)
         # Compose discovery workers touch the filesystem, external GPG state,
         # local databases, or one bounded JS8 socket request. Give these
@@ -17907,6 +18206,11 @@ class MessageViewerTab(QWidget):
             pass
 
     def on_settings_saved(self) -> None:
+        # Fence in-flight verification immediately; policy is re-read on worker.
+        self._signature_verify_generation = getattr(self, "_signature_verify_generation", 0) + 1
+        self._signature_policy_request_id = getattr(self, "_signature_policy_request_id", 0) + 1
+        self._signature_policy_settings = None
+        self._signature_policy_result = None
         try:
             self.plan_context_label.invalidate_context()
             self.plan_context_label.refresh_context(refresh=True)
@@ -17947,9 +18251,11 @@ class MessageViewerTab(QWidget):
                     self._refresh_varac_messages(force=True)
                 except Exception:
                     pass
-        if auth_sig_changed:
+        # Selective worker snapshot is cheap even for unrelated saves; a policy
+        # edit must never be missed because another SettingsManager was stale.
+        if auth_sig_changed or self._has_active_view:
             try:
-                self._start_signature_verification(force=True)
+                self._start_signature_verification(force=auth_sig_changed)
             except Exception:
                 pass
         try:
@@ -18689,6 +18995,7 @@ class MessageViewerTab(QWidget):
             self._projected_query_pending_force = bool(self._projected_query_pending_force or force)
             self._deferred_refresh = True
             return
+        self._begin_inbox_filter_feedback()
         if self._qt_thread_running(self._projected_query_thread):
             self._projected_query_pending = True
             self._projected_query_pending_force = bool(self._projected_query_pending_force or force)
@@ -18714,6 +19021,7 @@ class MessageViewerTab(QWidget):
             return
         db_path = self._db_path()
         if db_path is None or not db_path.exists():
+            self._finish_inbox_filter_feedback("Messages database is unavailable. Refresh to retry.")
             self._finish_traffic_navigation("Messages database is unavailable.")
             return
         request_id = int(self._projected_query_request_id)
@@ -18749,6 +19057,7 @@ class MessageViewerTab(QWidget):
         error = str(data.get("error", "") or "")
         if error:
             log.warning("MessageViewer: projection query failed: %s", error)
+            self._finish_inbox_filter_feedback("Could not apply filters. Previous results retained. Refresh to retry.")
             self._finish_traffic_navigation("Could not load traffic. Refresh to retry.")
             return
         if not self._has_active_view or not self._app_active or self._is_shutting_down:
@@ -18758,6 +19067,7 @@ class MessageViewerTab(QWidget):
         generation = int(data.get("generation", 0) or 0)
         if generation and generation < int(self._active_projection_generation or 0):
             log.debug("MessageViewer: discarded projection generation %d", generation)
+            self._finish_inbox_filter_feedback("Messages changed while filtering. Previous results retained. Refresh to retry.")
             self._finish_traffic_navigation("Traffic changed while loading. Refresh to retry.")
             return
         try:
@@ -18774,6 +19084,10 @@ class MessageViewerTab(QWidget):
                 self._projected_commstat_groups = data["commstat_groups"]
             if isinstance(data.get("group_families"), dict):
                 self._projected_group_families = data["group_families"]
+            if "scope_key" in data and tuple(data["scope_key"]) != self._projected_scope_key():
+                log.info("MESSAGES|discarded_scope_result request_id=%d", request_id)
+                self._request_projected_message_query(force=True)
+                return
             context = data.get("traffic_context")
             if isinstance(context, OperatorTrafficContext):
                 self._projected_traffic_context = context
@@ -18808,21 +19122,25 @@ class MessageViewerTab(QWidget):
                     self._sync_inbox_focus_buttons()
             self._projected_table_loading = True
             try:
-                self._message_rows = rows
                 summary = data.get("traffic_summary")
                 if isinstance(summary, TrafficActionSummary):
                     available_ids = {str(getattr(row.payload, "message_id", "")) for row in rows}
                     summary = replace(summary, items=tuple(item for item in summary.items if item.stable_id in available_ids))
+                with perf_span("messages.refresh_filters.projected", settings=self.settings, min_ms=5.0):
+                    if getattr(self, "_ops_traffic_message_ids", None) is None:
+                        self._refresh_message_filters(rows)
+                if "scope_key" in data and tuple(data["scope_key"]) != self._projected_scope_key():
+                    log.info("MESSAGES|filter_scope_normalized request_id=%d; requerying", request_id)
+                    self._request_projected_message_query(force=True)
+                    return
                 self._ops_traffic_summary = summary
                 self._last_projection_render_ts = time.time()
                 self._projected_scope_load_key = tuple(data.get("scope_key", ()) or ())
                 self._projected_total_count = int(data.get("total_count", len(rows)) or 0)
                 self._active_projection_generation = generation
-                with perf_span("messages.refresh_filters.projected", settings=self.settings, min_ms=5.0):
-                    if getattr(self, "_ops_traffic_message_ids", None) is None:
-                        self._refresh_message_filters(rows)
+                self._message_rows = rows
                 with perf_span("messages.apply_filters.projected", settings=self.settings, min_ms=5.0):
-                    self._apply_message_filters(recover_empty_stale_scope=True)
+                    self._apply_message_filters(refresh_options=False, recover_empty_stale_scope=True)
             finally:
                 self._projected_table_loading = False
             elapsed_ms = float(data.get("elapsed_ms", 0.0) or 0.0)
@@ -18844,16 +19162,19 @@ class MessageViewerTab(QWidget):
                 },
                 level="debug",
             )
+            self._finish_inbox_filter_feedback()
             self._finish_traffic_navigation()
             log.info(
-                "MESSAGES|projected_table_loaded rows=%d total=%d generation=%d scope=%s",
+                "MESSAGES|projected_table_loaded rows=%d total=%d generation=%d scope=%s age=%s",
                 len(rows),
                 self._projected_total_count,
                 generation,
                 self._active_message_scope_summary(),
+                self.received_filter.currentText(),
             )
         except Exception:
             log.exception("MessageViewer: could not apply projected traffic")
+            self._finish_inbox_filter_feedback("Could not display filtered messages. Previous results retained. Refresh to retry.")
             self._finish_traffic_navigation("Could not display traffic. Refresh to retry.")
 
     def _finish_traffic_navigation(self, error: str = "") -> None:
@@ -19930,6 +20251,7 @@ class MessageViewerTab(QWidget):
             and rows
             and self._recover_empty_message_filter_state(rows, criteria, selected_sources, selected_groups)
         ):
+            refresh_options = True  # Recovery changed the selections/options.
             criteria = self._current_inbox_filter_criteria(now_ts=now_ts)
             type_sel = criteria.type_sel
             selected_sources = self._selected_message_sources()
@@ -20195,6 +20517,21 @@ class MessageViewerTab(QWidget):
         if table is None or model is None:
             return
         font_metrics = table.fontMetrics()
+        metric_key = (table.font().toString(), float(table.devicePixelRatioF()),
+                      table.logicalDpiX(), table.logicalDpiY(), font_metrics.height(),
+                      str(table.style().metaObject().className()))
+        if metric_key != getattr(self, "_message_width_metric_key", None):
+            self._message_width_metric_key = metric_key
+            self._message_text_widths = {}
+        widths = self._message_text_widths
+        def text_width(text: str) -> int:
+            cached = widths.get(text)
+            if cached is None:
+                cached = int(font_metrics.horizontalAdvance(text))
+                if len(widths) >= 4096:
+                    widths.clear()
+                widths[text] = cached
+            return cached
         _chip_padding, _chip_gap, chip_margin, chip_height, _chip_radius = action_chip_metrics(font_metrics)
         action_row_height = chip_height + (2 * chip_margin)
         vertical_header = table.verticalHeader()
@@ -20236,11 +20573,11 @@ class MessageViewerTab(QWidget):
                 minimum, cap = 78, 220
             else:
                 minimum, cap = 78, 300
-            widest = font_metrics.horizontalAdvance(header_text) + padding
+            widest = text_width(header_text) + padding
             for row_index in range(model.rowCount()):
                 value = model.data(model.index(row_index, column), Qt.DisplayRole)
                 if value is not None:
-                    widest = max(widest, font_metrics.horizontalAdvance(str(value)) + padding)
+                    widest = max(widest, text_width(str(value)) + padding)
             measured.append(max(minimum, min(cap, int(widest))))
 
         signature = (
@@ -20993,7 +21330,6 @@ class MessageViewerTab(QWidget):
             self.current_sitrep = None
             self.current_commstat = None
         self.messages_table.setUpdatesEnabled(True)
-        self._message_table_fit_signature = None
         self._queue_message_table_column_fit()
         self._update_bulk_delete_buttons()
         self._update_mark_all_read_style()
@@ -22555,10 +22891,116 @@ class MessageViewerTab(QWidget):
         row.summary = summary
         return summary
 
+    def _manual_forward_source_for_row(self, row):
+        """Snapshot only retained identity. Full source loads in a worker on Forward."""
+        if row is None:
+            return None
+        payload = getattr(row, "payload", None)
+        summary = self._reader_summary(row)
+        if summary is None:
+            return None
+        source = dict(source_id=summary.stable_id, family=summary.source_family,
+                      sender=summary.from_call, body="", source_label=summary.source_label)
+        if isinstance(payload, ProjectedMessagePayload):
+            families = {"meshcore", "meshtastic", "js8"}
+            refs = tuple(payload.external_refs or ())
+            if payload.source_family not in families and not any(r.get("external_kind") == "js8_message" for r in refs):
+                return None
+            source["message_id"] = payload.message_id
+            source["family"] = payload.source_family
+            if any(r.get("external_kind") == "js8_message" for r in refs):
+                source["family"] = "js8"
+            return source
+        if isinstance(payload, JS8Message):
+            source.update(family="js8", native_kind="js8", native_id=payload.msg_id)
+            return source
+        return None
+
+    def _reflow_reader_context_actions(self):
+        layout = getattr(self, "_reader_context_actions_layout", None)
+        host = getattr(self, "reader_context_actions_widget", None)
+        if layout is None or host is None:
+            return
+        buttons = [layout.itemAt(i).widget() for i in range(layout.count()) if layout.itemAt(i).widget() is not None]
+        visible = [b for b in buttons if not b.isHidden()]
+        needed = sum(b.sizeHint().width() for b in visible) + max(0, len(visible) - 1) * layout.spacing()
+        layout.setDirection(QBoxLayout.TopToBottom if needed > max(1, self.reader_page.width()) else QBoxLayout.LeftToRight)
+
+    def _forward_controller(self):
+        controller = getattr(self, "_manual_forward_controller", None)
+        if controller is None:
+            from freqinout.gui.manual_forward_controller import ManualForwardController
+            window = self.window()
+            controller = ManualForwardController(self, window)
+            self._manual_forward_controller = controller
+        return controller
+
+    def _forward_reader_message(self):
+        source = getattr(self, "_reader_forward_source", None)
+        if source is not None:
+            self._open_manual_forward_dialog(dict(source))
+
+    def _open_manual_forward_dialog(self, source):
+        from freqinout.gui.manual_forward_dialog import ManualForwardDialog
+        controller = self._forward_controller()
+        dialog = ManualForwardDialog(source, controller.submit, self)
+        dialog.setWindowModality(Qt.WindowModal)
+        source_id = source.get("source_id", "")
+        def completed(result):
+            results = dict(getattr(self, "_manual_forward_results", {}) or {})
+            results[source_id] = dict(result)
+            self._manual_forward_results = results
+            self._sync_forwarding_result()
+        dialog.completed.connect(completed)
+        self._manual_forward_dialog = dialog
+        dialog.open()
+
+    def _sync_forwarding_result(self):
+        label = getattr(self, "reader_forward_result", None)
+        details = getattr(self, "reader_forward_details", None)
+        if label is None or details is None:
+            return
+        source = getattr(self, "_reader_forward_source", None)
+        result = (getattr(self, "_manual_forward_results", {}) or {}).get((source or {}).get("source_id", ""))
+        label.setVisible(bool(source and result))
+        details.setVisible(source is not None)
+        if result:
+            state = {"draft": "Draft saved", "submitted": "Submitted · completion unknown",
+                     "unknown": "Result unknown", "sent": "Mesh transport completed", "acked": "Destination node acknowledged"}.get(result.get("state"), result.get("state", ""))
+            label.setText(f"Forwarding: {state}. {result.get('detail') or ''}")
+
+    def _open_reader_forward_activity(self):
+        source = getattr(self, "_reader_forward_source", None)
+        self._open_forward_activity(source_id=(source or {}).get("source_id", ""))
+
+    def _open_forward_activity(self, checked=False, *, source_id=""):
+        from freqinout.gui.manual_forward_dialog import ForwardActivityDialog
+        dialog = ForwardActivityDialog(self._forward_controller().submit, self, source_id=source_id)
+        dialog.setWindowModality(Qt.WindowModal)
+        def resume(record):
+            request = dict(record.get("request") or {})
+            source = dict(request.get("source") or record.get("source") or {})
+            source.update(draft_destination=deepcopy(request.get("destination") or {}), relay_id=record.get("relay_id"), draft_destination_id=(request.get("destination") or {}).get("id", ""),
+                          draft_recipient=request.get("recipient", ""))
+            dialog.close()
+            self._open_manual_forward_dialog(source)
+        dialog.resumeRequested.connect(resume)
+        self._manual_forward_activity_dialog = dialog
+        dialog.open()
+
     def _sync_reader_context_actions(self, row: UnifiedMessage | None) -> None:
         """Update source-neutral reader actions from the retained row only."""
 
         summary = self._reader_summary(row)
+        forward_source = self._manual_forward_source_for_row(row)
+        self._reader_forward_source = forward_source
+        forward_button = getattr(self, "reader_forward_btn", None)
+        if isinstance(forward_button, QPushButton):
+            forward_button.setVisible(forward_source is not None)
+            forward_button.setEnabled(forward_source is not None and not getattr(self, "_reader_transitioning", False))
+            forward_button.setText("Forward to JS8Call…" if forward_source and forward_source.get("family") in {"meshcore", "meshtastic"} else "Forward to Mesh…")
+            forward_button.setToolTip("Review the exact destination and complete payload before forwarding. Nothing sends until Send now.")
+        self._sync_forwarding_result()
         transitioning = bool(getattr(self, "_reader_transitioning", False))
         family = normalize_message_source_family(summary.source_family if summary else "")
         map_ready = bool(
@@ -22609,6 +23051,7 @@ class MessageViewerTab(QWidget):
             self.reader_reply_btn.setToolTip(f"Compose a JS8 reply to {summary.from_call}.")
         if watch_ready:
             self.reader_watch_btn.setToolTip("Stage an unsaved shared watch from this message for review.")
+        self._reflow_reader_context_actions()
 
     def _open_reader_map(self) -> None:
         summary = self._reader_summary(self._reader_current_row())

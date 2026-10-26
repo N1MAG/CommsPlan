@@ -295,6 +295,27 @@ class SchedulerManualControlService:
             conn.commit()
             return bool(cur.rowcount)
 
+    def resume_quick_qsy(self, expected: SchedulerManualControlState) -> bool:
+        """Release only this accepted quick override, never a replacement hold."""
+        if expected.state != "manual_qsy" or expected.reason_code != "operator_quick_qsy":
+            return False
+        with self.store.connect() as conn:
+            cur = conn.execute(
+                """UPDATE scheduler_manual_control_states
+                      SET state='on_schedule', manual_target_json='{}', hold_until_utc=NULL,
+                          reason_code='quick_qsy_transition', operator_source='scheduler',
+                          latest_event_id=NULL, updated_utc=?
+                    WHERE radio_profile_id=? AND state=? AND COALESCE(hold_until_utc,'')=COALESCE(?,'')
+                      AND manual_target_json=? AND updated_utc=?
+                      AND reason_code=? AND operator_source=? AND latest_event_id IS ?""",
+                (_utc_now_iso(), _radio_device_id(expected.radio_profile_id), expected.state,
+                 expected.hold_until_utc, _manual_target_to_json(expected.manual_target),
+                 expected.updated_at_utc, expected.reason_code, expected.operator_source,
+                 expected.latest_event_id),
+            )
+            conn.commit()
+            return bool(cur.rowcount)
+
     def save_state(self, state: SchedulerManualControlState) -> SchedulerManualControlState:
         device_id = _radio_device_id(state.radio_profile_id)
         now = _utc_now_iso()

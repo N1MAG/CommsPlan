@@ -159,11 +159,23 @@ def ensure_operator_identity_schema(
     # portable/variant call which intentionally resolve to one stable operator
     # identity.  Older builds briefly made this index UNIQUE; remove that
     # migration artifact before backfilling so existing rosters self-heal.
-    conn.execute("DROP INDEX IF EXISTS idx_operator_checkins_identity")
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_operator_checkins_identity "
-        "ON operator_checkins(operator_id) WHERE operator_id IS NOT NULL AND operator_id <> ''"
-    )
+    index_name = "idx_operator_checkins_identity"
+    index = next((row for row in conn.execute("PRAGMA index_list(operator_checkins)")
+                  if row[1] == index_name), None)
+    definition = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name=?", (index_name,)
+    ).fetchone()
+    sql = re.sub(r"\s+", "", str(definition[0] or "").lower()) if definition else ""
+    columns = [row[2] for row in conn.execute(f"PRAGMA index_info({index_name})")]
+    valid = (index is not None and not index[2] and bool(index[4])
+             and columns == ["operator_id"]
+             and sql.partition("where")[2] == "operator_idisnotnullandoperator_id<>''")
+    if not valid:
+        conn.execute(f"DROP INDEX IF EXISTS {index_name}")
+        conn.execute(
+            f"CREATE INDEX {index_name} ON operator_checkins(operator_id) "
+            "WHERE operator_id IS NOT NULL AND operator_id <> ''"
+        )
 
     now_iso = _utc_now_iso()
     rows = conn.execute(

@@ -146,6 +146,9 @@ class MeshtasticLocalAdapter:
         want_ack = bool(kind == "direct" and request.require_ack)
         response_handlers = getattr(interface, "responseHandlers", None)
         handler_keys_before = set(response_handlers) if isinstance(response_handlers, dict) else set()
+        if request.expected_connection_fingerprint:
+            from freqinout.core.manual_forward_runtime import validate_mesh_forward_at_io
+            validate_mesh_forward_at_io(request, self.config)
         try:
             packet = send_data(
                 text.encode("utf-8"),

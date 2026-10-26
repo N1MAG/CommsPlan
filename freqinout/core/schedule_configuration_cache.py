@@ -74,6 +74,17 @@ class _DatabaseRevision:
                             keys = ','.join("'" + key + "'" for key in CONFIGURATION_KEYS)
                             references = ('NEW',) if operation == 'INSERT' else ('OLD',) if operation == 'DELETE' else ('OLD', 'NEW')
                             condition = ' WHEN ' + ' OR '.join(f'{ref}.key IN ({keys})' for ref in references)
+                        if operation == 'UPDATE':
+                            columns = [str(row[1]) for row in conn.execute(f'PRAGMA table_info("{table}")')]
+                            # Settings timestamps are bookkeeping, not command
+                            # inputs. Keep every other column (including unknown
+                            # future fields) and all nets fields fail-conservative.
+                            fields = [column for column in columns
+                                      if not (table in SETTINGS_TABLES and column in {'updated_utc', 'created_utc'})]
+                            changed = ' OR '.join(f'OLD."{column}" IS NOT NEW."{column}"' for column in fields)
+                            if changed:
+                                condition = (' WHEN (' + condition[6:] + ') AND (' + changed + ')'
+                                             if condition else ' WHEN ' + changed)
                         name = f'_fio_schedule_{table}_{operation}'
                         definition = (f'CREATE TRIGGER {name} '
                                       f'AFTER {operation} ON "{table}"{condition} BEGIN '

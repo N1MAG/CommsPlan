@@ -7,10 +7,12 @@ It never deletes, moves, or opens source files for writing.
 
 from __future__ import annotations
 
+from concurrent.futures import CancelledError, Future, TimeoutError
 from dataclasses import dataclass
 import json
 from pathlib import Path
 import sqlite3
+import threading
 import time
 from typing import Mapping, Sequence
 
@@ -24,6 +26,7 @@ from freqinout.core.message_projection_writer import (
 )
 from freqinout.core.message_source_projectors import prepare_file_projection_bundles
 from freqinout.core.sqlite_utils import connect_sqlite_readonly, connect_sqlite_runtime_write
+from freqinout.core.perf_metrics import span as perf_span
 
 
 _CACHE_KEY = "file_scanner:v1"
@@ -85,6 +88,8 @@ def _record_identity(record: FileRecord) -> tuple[str, str]:
 
 
 def _record_fingerprint(records: Sequence[FileRecord]) -> str:
+    # Encode each filesystem identity once, then reuse it for ordering and wire.
+    indexed = sorted(((_record_identity(record), record) for record in records), key=lambda item:item[0])
     return content_hash(
         "mip3-file-inventory-v1",
         "\n".join(
@@ -98,8 +103,7 @@ def _record_fingerprint(records: Sequence[FileRecord]) -> str:
                     _text(record.source_label),
                 )
             )
-            for record in sorted(records, key=lambda value: _record_identity(value))
-            for origin, path_key in (_record_identity(record),)
+            for (origin, path_key), record in indexed
         ),
     )
 
@@ -143,9 +147,14 @@ class MessageFileProjectionPipeline:
         dir_mtimes: Mapping[str, float],
         watch_signature: str,
         delta: FileScanDelta,
+        *,
+        cancel_event: threading.Event | None = None,
     ) -> FileProjectionPipelineResult:
         start = time.monotonic()
-        current = _normalize_records(records)
+        if cancel_event is not None and cancel_event.is_set():
+            return self._result("cancelled", delta, error="cancelled", elapsed_ms=self._elapsed(start))
+        with perf_span("messages.file_inventory_normalize", min_ms=5.0):
+            current = _normalize_records(records)
         changed = _normalize_records({"_": delta.added_or_changed})
         removed = _normalize_records({"_": delta.removed})
         replaced = tuple(
@@ -155,11 +164,13 @@ class MessageFileProjectionPipeline:
         )
         signature = _text(watch_signature)
         mtimes_json = _dir_mtime_json(dir_mtimes)
-        fingerprint = _record_fingerprint(current)
+        with perf_span("messages.file_inventory_fingerprint", min_ms=5.0, meta={"records":len(current)}):
+            fingerprint = _record_fingerprint(current)
 
         # This read-only test is the hot unchanged path: no transaction, no
         # write connection, no projection preparation and no writer submission.
-        cache = self._load_cache()
+        with perf_span("messages.file_inventory_cache_read", min_ms=5.0):
+            cache = self._load_cache()
         if (
             delta.is_empty
             and cache is not None
@@ -180,16 +191,22 @@ class MessageFileProjectionPipeline:
         writer = get_projection_writer(self._db_path)
         try:
             for batch_start in range(0, len(projection_records), MAX_BUNDLES_PER_TRANSACTION):
+                if cancel_event is not None and cancel_event.is_set():
+                    return self._result("cancelled", delta, projected=projected, tombstoned=tombstoned,
+                                        transactions=transactions, error="cancelled", elapsed_ms=self._elapsed(start))
                 batch = projection_records[batch_start : batch_start + MAX_BUNDLES_PER_TRANSACTION]
-                bundles = self._prepare_bundles(batch)
-                outcome = writer.submit(bundles).result()
+                with perf_span("messages.file_prepare", min_ms=5.0, meta={"records":len(batch)}):
+                    bundles = self._prepare_bundles(batch)
+                with perf_span("messages.file_writer_wait", min_ms=5.0):
+                    future = writer.submit(bundles, cancel_event=cancel_event) if cancel_event is not None else writer.submit(bundles)
+                    outcome = self._await_write(future, cancel_event, len(bundles))
                 projected += int(outcome.committed_bundles)
                 deferred += int(outcome.deferred_bundles)
                 transactions += int(outcome.transactions)
                 if outcome.state != "committed":
                     error = outcome.error or outcome.state
                     return self._result(
-                        "deferred" if outcome.deferred_bundles else "failed",
+                        "cancelled" if outcome.state == "cancelled" else "deferred" if outcome.deferred_bundles else "failed",
                         delta,
                         projected=projected,
                         tombstoned=tombstoned,
@@ -205,14 +222,17 @@ class MessageFileProjectionPipeline:
                     ProjectionDeleteRequest(_source_id(record), _external_kind(record), _external_key(record))
                     for record in prior_versions[batch_start : batch_start + MAX_BUNDLES_PER_TRANSACTION]
                 )
-                outcome = writer.submit_deletions(requests).result()
+                with perf_span("messages.file_delete_writer_wait", min_ms=5.0):
+                    future = (writer.submit_deletions(requests, cancel_event=cancel_event)
+                              if cancel_event is not None else writer.submit_deletions(requests))
+                    outcome = self._await_write(future, cancel_event, len(requests))
                 tombstoned += int(outcome.message_upserts)
                 deferred += int(outcome.deferred_bundles)
                 transactions += int(outcome.transactions)
                 if outcome.state != "committed":
                     error = outcome.error or outcome.state
                     return self._result(
-                        "deferred" if outcome.deferred_bundles else "failed",
+                        "cancelled" if outcome.state == "cancelled" else "deferred" if outcome.deferred_bundles else "failed",
                         delta,
                         projected=projected,
                         tombstoned=tombstoned,
@@ -222,6 +242,9 @@ class MessageFileProjectionPipeline:
                         error=error,
                     )
 
+            if cancel_event is not None and cancel_event.is_set():
+                return self._result("cancelled", delta, projected=projected, tombstoned=tombstoned,
+                                    transactions=transactions, error="cancelled", elapsed_ms=self._elapsed(start))
             inventory_writes = self._persist_inventory(
                 current,
                 current if seed_inventory else changed,
@@ -244,6 +267,26 @@ class MessageFileProjectionPipeline:
                 "failed", delta, projected=projected, tombstoned=tombstoned,
                 deferred=deferred, transactions=transactions, elapsed_ms=self._elapsed(start), error=_text(exc)
             )
+
+    @staticmethod
+    def _await_write(future: Future, cancel_event: threading.Event | None, count: int) -> ProjectionWriteResult:
+        if cancel_event is None:
+            return future.result()
+        while True:
+            if cancel_event.is_set():
+                # A running writer may finish its current complete bundle.
+                # Never advance the scan checkpoint: the next scan safely
+                # reconciles committed and deferred work through the same writer.
+                future.cancel()
+                return ProjectionWriteResult(state="cancelled", attempted_bundles=count,
+                                             deferred_bundles=count, error="cancelled")
+            try:
+                return future.result(timeout=0.1)
+            except TimeoutError:
+                continue
+            except CancelledError:
+                return ProjectionWriteResult(state="cancelled", attempted_bundles=count,
+                                             deferred_bundles=count, error="cancelled")
 
     def _prepare_bundles(self, records: Sequence[FileRecord]):
         conn = connect_sqlite_readonly(self._db_path, timeout=5.0, row_factory=sqlite3.Row, busy_timeout_ms=5000)

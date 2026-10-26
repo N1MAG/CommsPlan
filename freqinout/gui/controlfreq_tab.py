@@ -601,6 +601,8 @@ class ControlFreqTab(QWidget):
         *,
         plan_context_service: Optional[PlanContextService] = None,
         defer_initial_refresh: bool = False,
+        settings_manager: SettingsManager | None = None,
+        startup_gated: bool = False,
     ):
         super().__init__(parent)
         # The main shell creates Ops Center before it can paint.  Keep the
@@ -608,9 +610,10 @@ class ControlFreqTab(QWidget):
         # active-tab tick owns DB-backed projections and index maintenance.
         # Standalone/test callers retain the historical eager behaviour.
         self._defer_initial_refresh = bool(defer_initial_refresh)
-        self.settings = SettingsManager()
+        self._startup_shell_ready = not startup_gated
+        self.settings = settings_manager if settings_manager is not None else SettingsManager()
         self.plan_context_service = plan_context_service
-        self._sop_manager = SOPManager()
+        self._sop_manager = SOPManager(settings=SettingsManager(initialized_source=self.settings))
         self._timer: Optional[QTimer] = None
         self._active = False
         self._brief_cache = LatestReadCache("fio-ops-brief")
@@ -2928,6 +2931,18 @@ class ControlFreqTab(QWidget):
         self._invalidate_theme_cache()
         self._apply_theme()
 
+    def set_startup_shell_ready(self) -> None:
+        """Release optional dashboard reads after main records first usable shell."""
+        if self._startup_shell_ready or getattr(self, "_closing", False):
+            return
+        self._startup_shell_ready = True
+        if self._active:
+            self._reload_sop_manager_settings()
+            self._ensure_operator_roster_read()
+            self._refresh_status_widgets()
+            QTimer.singleShot(2500, self._schedule_focus_index_backfill)
+            self.on_tab_activated()
+
     def set_tab_active(self, active: bool) -> None:
         self._active = bool(active)
         if not self._active:
@@ -2979,6 +2994,8 @@ class ControlFreqTab(QWidget):
             self._clock_timer.stop()
 
     def on_tab_activated(self) -> None:
+        if not getattr(self, "_startup_shell_ready", True) or getattr(self, "_closing", False):
+            return
         with perf_span("controlfreq.on_tab_activated", settings=self.settings, min_ms=5.0):
             self._schedule_focus_index_backfill()
             now = time.time()
@@ -2990,14 +3007,21 @@ class ControlFreqTab(QWidget):
                 QTimer.singleShot(0, self._run_activation_refresh)
 
     def _refresh_frequency_control_tick(self) -> None:
+        if not getattr(self, "_startup_shell_ready", True) or getattr(self, "_closing", False):
+            return
         self._refresh_frequency_control(include_intersections=False)
 
     def _on_periodic_refresh_tick(self) -> None:
+        if not getattr(self, "_startup_shell_ready", True) or getattr(self, "_closing", False):
+            return
         # Keep periodic refresh non-blocking; defer heavy sections.
         self._refresh_all(include_secondary=False, include_heavy=False, include_status=False)
         self._schedule_deferred_secondary_refresh(force=False)
 
     def _run_activation_refresh(self) -> None:
+        if not getattr(self, "_startup_shell_ready", True) or getattr(self, "_closing", False):
+            self._activation_refresh_pending = False
+            return
         try:
             with perf_span("controlfreq.activation_refresh", settings=self.settings, min_ms=10.0):
                 # Status updates run on the dedicated status timer path.
@@ -3007,6 +3031,8 @@ class ControlFreqTab(QWidget):
             self._activation_refresh_pending = False
 
     def _schedule_deferred_secondary_refresh(self, force: bool = False) -> None:
+        if not getattr(self, "_startup_shell_ready", True) or getattr(self, "_closing", False):
+            return
         if self._secondary_refresh_pending:
             return
         now = time.time()
@@ -3016,6 +3042,9 @@ class ControlFreqTab(QWidget):
         QTimer.singleShot(25, self._run_deferred_secondary_refresh)
 
     def _run_deferred_secondary_refresh(self) -> None:
+        if not getattr(self, "_startup_shell_ready", True) or getattr(self, "_closing", False):
+            self._secondary_refresh_pending = False
+            return
         try:
             with perf_span("controlfreq.secondary_refresh", settings=self.settings, min_ms=10.0):
                 self._load_group_combo()
@@ -3033,6 +3062,8 @@ class ControlFreqTab(QWidget):
             self._secondary_refresh_pending = False
 
     def _schedule_deferred_heavy_refresh(self, force: bool = False) -> None:
+        if not getattr(self, "_startup_shell_ready", True) or getattr(self, "_closing", False):
+            return
         if self._heavy_refresh_pending:
             return
         now = time.time()
@@ -3042,6 +3073,9 @@ class ControlFreqTab(QWidget):
         QTimer.singleShot(50, self._run_deferred_heavy_refresh)
 
     def _run_deferred_heavy_refresh(self) -> None:
+        if not getattr(self, "_startup_shell_ready", True) or getattr(self, "_closing", False):
+            self._heavy_refresh_pending = False
+            return
         try:
             with perf_span("controlfreq.heavy_refresh", settings=self.settings, min_ms=10.0):
                 self._refresh_message_summary()
@@ -3315,6 +3349,8 @@ class ControlFreqTab(QWidget):
             QTimer.singleShot(0, self._refresh_scheduler_strip)
 
     def _reload_sop_manager_settings(self) -> None:
+        if not getattr(self, "_startup_shell_ready", True) or getattr(self, "_closing", False):
+            return
         try:
             mgr_settings = getattr(self._sop_manager, "settings", None)
             if mgr_settings is not None and hasattr(mgr_settings, "reload"):
@@ -3705,6 +3741,8 @@ class ControlFreqTab(QWidget):
             log.debug("ControlFreq: focus executor shutdown failed: %s", exc)
 
     def _schedule_focus_index_backfill(self) -> None:
+        if not getattr(self, "_startup_shell_ready", True) or getattr(self, "_closing", False):
+            return
         if self._focus_backfill_pending or self._focus_backfill_complete:
             return
         db_path = self._db_path()
@@ -4275,6 +4313,10 @@ class ControlFreqTab(QWidget):
         include_heavy: bool = True,
         include_status: bool = True,
     ) -> None:
+        if getattr(self, "_closing", False):
+            return
+        if not getattr(self, "_startup_shell_ready", True):
+            include_secondary = include_heavy = False
         with perf_span("controlfreq.refresh_all", settings=self.settings, min_ms=10.0):
             if include_secondary or include_heavy:
                 self._reload_settings_if_changed()
@@ -4303,6 +4345,8 @@ class ControlFreqTab(QWidget):
             self._update_clear_filters_style()
 
     def _refresh_status_widgets(self) -> None:
+        if not getattr(self, "_startup_shell_ready", True) or getattr(self, "_closing", False):
+            return
         self._refresh_running_status()
         self._refresh_scheduler_strip()
 
@@ -4312,6 +4356,8 @@ class ControlFreqTab(QWidget):
         self._refresh_running_status()
 
     def _refresh_running_status(self) -> None:
+        if not getattr(self, "_startup_shell_ready", True) or getattr(self, "_closing", False):
+            return
         theme = self._theme()
         visible_keys = [key for key, _label in self._current_visible_status_items()]
         if visible_keys != list(self.status_labels.keys()):
@@ -4340,6 +4386,8 @@ class ControlFreqTab(QWidget):
         self._update_readiness_review_banner()
 
     def _refresh_scheduler_strip(self, status: Optional[Dict[str, Any]] = None) -> None:
+        if not getattr(self, "_startup_shell_ready", True) or getattr(self, "_closing", False):
+            return
         try:
             theme = self._theme()
             muted = str(theme.get("text_muted", "#888"))
@@ -4643,10 +4691,12 @@ class ControlFreqTab(QWidget):
             options = sorted(self._prop_operator_geo.keys())
         else:
             options = ["ALL"] + sorted(FEMA_REGIONS.keys())
-        self.prop_target_value_combo.blockSignals(True)
-        self.prop_target_value_combo.clear()
-        for value in options:
-            self.prop_target_value_combo.addItem(value)
+        blocked = self.prop_target_value_combo.blockSignals(True)
+        existing = tuple(self.prop_target_value_combo.itemText(i)
+                         for i in range(self.prop_target_value_combo.count()))
+        if existing != tuple(options):
+            self.prop_target_value_combo.clear()
+            self.prop_target_value_combo.addItems(options)
         if selected_value:
             idx = self.prop_target_value_combo.findText(selected_value, Qt.MatchFixedString)
             if idx >= 0:
@@ -4663,9 +4713,11 @@ class ControlFreqTab(QWidget):
         self.prop_target_value_combo.setEditable(True)
         if self.prop_target_value_combo.lineEdit():
             self.prop_target_value_combo.lineEdit().setPlaceholderText("Type to search...")
-        self.prop_target_value_combo.blockSignals(False)
+        self.prop_target_value_combo.blockSignals(blocked)
 
     def _refresh_prop_target_controls(self) -> None:
+        if not getattr(self, "_startup_shell_ready", True) or getattr(self, "_closing", False):
+            return
         self._prop_target_syncing = True
         try:
             self._ensure_operator_roster_read()
@@ -4937,6 +4989,8 @@ class ControlFreqTab(QWidget):
         return rows
 
     def _load_group_combo(self) -> None:
+        if not getattr(self, "_startup_shell_ready", True) or getattr(self, "_closing", False):
+            return
         groups = self._get_operating_groups()
         current = self.group_combo.currentData()
         self.group_combo.blockSignals(True)
@@ -4996,7 +5050,7 @@ class ControlFreqTab(QWidget):
 
     def _ensure_operator_roster_read(self, *, force: bool = False) -> None:
         """Start one detached roster/schedule read when the active UI needs it."""
-        if getattr(self, "_closing", False):
+        if not getattr(self, "_startup_shell_ready", True) or getattr(self, "_closing", False):
             return
         now = time.monotonic()
         snapshot = getattr(self, "_operator_roster_snapshot", None)
@@ -5406,6 +5460,8 @@ class ControlFreqTab(QWidget):
         return rows_out
 
     def _refresh_activity(self) -> None:
+        if not getattr(self, "_startup_shell_ready", True) or getattr(self, "_closing", False):
+            return
         window_minutes = int(self.activity_window_combo.currentData() or 120)
         search = (self.search_edit.text() or "").strip().upper()
         group_filter = self.group_combo.currentData() or ""
@@ -7193,6 +7249,8 @@ class ControlFreqTab(QWidget):
         self._update_clear_filters_style()
 
     def _refresh_intersections(self) -> None:
+        if not getattr(self, "_startup_shell_ready", True) or getattr(self, "_closing", False):
+            return
         if not self._dashboard_card_enabled("intersections"):
             return
         self._ensure_operator_roster_read()
@@ -8724,6 +8782,8 @@ class ControlFreqTab(QWidget):
         return frame
 
     def _refresh_schedule_outlook(self) -> None:
+        if not getattr(self, "_startup_shell_ready", True) or getattr(self, "_closing", False):
+            return
         if not self._dashboard_card_enabled("schedule"):
             return
         self._reload_sop_manager_settings()
@@ -9716,6 +9776,8 @@ class ControlFreqTab(QWidget):
         return self._format_display_time(dt_utc, include_day, tz)
 
     def _refresh_message_summary(self) -> None:
+        if not getattr(self, "_startup_shell_ready", True) or getattr(self, "_closing", False):
+            return
         self._schedule_message_summary_refresh()
 
     def _toggle_traffic_source_detail(self, visible: bool) -> None:
@@ -10550,6 +10612,8 @@ class ControlFreqTab(QWidget):
         )
 
     def _refresh_propagation_snapshot(self) -> None:
+        if not getattr(self, "_startup_shell_ready", True) or getattr(self, "_closing", False):
+            return
         if not self._dashboard_card_enabled("propagation"):
             return
         try:
