@@ -87,8 +87,7 @@ confirmed, keep the current entries open until that problem is resolved.
 
 On compact displays, actions and band choices wrap. Full validation and recovery
 guidance scroll with the selected section; scroll within it to reach the fields.
-The save/close actions stay outside that field scroll. These accumulated changes
-are covered in the [2.0.7 update](/guide/whats-new#commsplan-2-0-7-and-setup-fixes).
+The save/close actions stay outside that field scroll. These accumulated setup changes are covered in the [2.0.7 update](/guide/whats-new#commsplan-2-0-7-and-setup-fixes).
 
 ## Cancel or recover unfinished setup
 
@@ -138,18 +137,17 @@ and review again.
   setup items.
 </div>
 
-## Scheduling requires an explicit review
+## Assign a plan to follow its schedule
 
-Scheduling remains disabled until you choose to enable it. From the selected
-radio's schedule actions, use **Review & enable scheduling…** and check the
-radio, assigned plan and sources, applications, readiness, and safety state.
-Enable only after that summary matches the station you intend to operate. Choose
-**Disable scheduling** to stop automatic schedule commands for that radio.
-These controls do not bypass transmit/busy protection, endpoint checks, or RF
-Guard.
+Assign a valid Frequency Plan to the selected radio when you are ready for it to
+follow that schedule. CommsPlan validates the saved radio, application identity,
+plan, enabled sources, and readiness before issuing automatic commands; a
+separate enable action is not required. Use the radio card calendar to inspect
+or change the assignment. Pause holds schedule changes until you resume. RF
+Guard, endpoint checks, and transmit/busy protection still apply.
 
 ## Continue
 
 - [Understand the operating picture](/guide/operating-picture)
-- [See what's new in CommsPlan 2.0.7](/guide/whats-new)
+- [See what's new in CommsPlan 2.0.8](/guide/whats-new)
 - [Install or upgrade](/install/)

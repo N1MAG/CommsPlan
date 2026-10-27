@@ -1,12 +1,12 @@
 ---
 title: What's New in CommsPlan
-description: CommsPlan 2.0.7 workflows, accumulated setup fixes, and the earlier 2.0.6 feature overview.
+description: CommsPlan 2.0.8 workflows, CommsPlan 2.0.7 history, and the earlier 2.0.6 feature overview.
 ---
 
 # What's new in CommsPlan
 
 <div class="doc-badge-row">
-  <span class="doc-badge">CommsPlan 2.0.7</span>
+  <span class="doc-badge">CommsPlan 2.0.8</span>
   <span class="doc-badge">Operator overview</span>
 </div>
 
@@ -15,21 +15,68 @@ lists currently available packages, checksums, and release notes. Package
 availability can vary by platform, so use that page to confirm which native
 installers have been published.
 
-For the current update, jump to [CommsPlan 2.0.7 and setup fixes](#commsplan-2-0-7-and-setup-fixes). The earlier 2.0.6 overview is retained below.
+For the current update, jump to [CommsPlan 2.0.8](#commsplan-2-0-8). The 2.0.7 and 2.0.6 feature history remains below.
 
-## Saved Station Setup checklist
+## CommsPlan 2.0.8
 
-Station Setup now gives the operator a saved checklist for station-wide setup
-and a review of the selected radio. Use the checklist to see what is configured
-and what needs attention. Radio-scoped editors keep application, connection,
-operating behavior, schedule, launch, readiness, and RF Guard changes tied to
-the radio being reviewed.
+These instructions cover CommsPlan 2.0.8. Check [GitHub Releases](https://github.com/N1MAG/CommsPlan/releases/latest)
+for available packages and their release notes.
 
-Scheduling requires an explicit operator decision. **Review & enable
-scheduling…** presents the saved radio and schedule state for review before
-enabling automatic schedule actions. **Disable scheduling** stops automatic
-schedule actions for that radio. Neither control bypasses readiness, endpoint,
-busy, or RF Guard checks.
+### Assignment-driven schedules and Plan Builder
+
+Assigning a valid Frequency Plan means the radio should follow it after
+CommsPlan validates the saved radio, application identity, plan, enabled sources,
+and readiness. There is no separate **Enable scheduling** action. Use Pause for
+a deliberate hold and Resume to request the current eligible schedule. Quick
+QSY remains in effect until that radio reaches its next eligible transition; a
+valid schedule gap retains current tuning. RF Guard, endpoint, transmit/busy, and
+receive-only checks still apply.
+
+Plan Builder now makes radio assignments visible and supports review and swaps
+with RF Guard. It shows cautions for configured conflicting radios, including
+inactive ones, so review shared-resource and physical antenna concerns before
+starting equipment. A caution acknowledgement does not prove physical isolation.
+
+### Reviewed manual Mesh ↔ JS8Call forwarding
+
+Open a retained message in the Inbox reader, choose **Forward to JS8Call…** or
+**Forward to Mesh…**, select the exact connection and recipient, and review the
+addressed payload and complete wire-byte count. Sending requires an explicit
+**Send now** action after current source, destination, permission, readiness, and
+safety checks. Saved drafts are inert and expire; they do not create an automatic
+bridge or background relay. Mesh-to-JS8 forwarding is restricted to reviewed
+public feeds. Forwarding does not guarantee delivery or that a person read the
+message. JS8 sender/body cleanup preserves the original source for review.
+
+### Responsiveness and Bluetooth lifecycle
+
+CommsPlan 2.0.8 reduces repeated background and presentation work, bounds file
+scans and projection writes, and defers hidden Compose and optional startup work.
+Responsiveness improved in reported use, while high process CPU remains under
+investigation; no fixed timing or CPU reduction is promised. Linux MeshCore helper
+cleanup now retains exclusive device ownership until the helper stops and pauses
+uncertain reconnects for operator action. Bluetooth worked well in limited operator checks; broader Linux hardware, device-contention, package-helper,
+and long-duration soak qualification is not claimed.
+
+### Qualification limits
+
+Linux two-radio scheduler restart, readback, and soak qualification remains
+limited. Physical RF, filter, transfer, installed JS8Call variant, and display/DPI
+checks are separate from automated source tests. The complete worker-published
+Plan Builder input catalog remains deferred. The previously reported
+macOS/PySide Compose comments crash is unresolved. High process CPU is still
+under investigation, and no software workflow can guarantee that a sent message
+is received or read.
+
+
+## Earlier Station Setup workflow: CommsPlan 2.0.7
+
+In CommsPlan 2.0.7, Station Setup provided a saved checklist for station-wide
+setup and a review of the selected radio. The separate **Review & enable
+scheduling…** action described in the 2.0.7 release is historical; CommsPlan
+2.0.8 uses assignment-driven scheduling, described above. Radio-scoped editors
+keep application, connection, operating behavior, schedule, launch, readiness,
+and RF Guard changes tied to the radio being reviewed.
 
 ## Shared forms library
 
@@ -208,9 +255,11 @@ not configure another instance in the native application.
 
 ### Release scope and testing
 
-This update does not add outbound PIN broadcasts, active peer-query automation
-or cross-transport forwarding. Platform/DPI, installed JS8Call variants, physical Mesh and
-live-radio/filter/transfer checks remain separate from automated source tests.
+CommsPlan 2.0.7 did not add outbound PIN broadcasts, active peer-query
+automation, or cross-transport forwarding. Platform/DPI, installed JS8Call
+variants, physical Mesh, and live-radio/filter/transfer checks remain separate
+from automated source tests. See the 2.0.7 release notes for its qualification
+limits.
 
 ## Continue
 

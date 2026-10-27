@@ -11,7 +11,7 @@ description: Connect MeshCore or Meshtastic to CommsPlan and deliberately enable
   <span class="doc-badge">Receive and optional send</span>
 </div>
 
-Local Mesh connects station-level MeshCore or Meshtastic services to CommsPlan. Received text and position evidence can join the Inbox and Map without treating the mesh device as an HF radio profile. Mesh is a supported station transport; this guide does not promise future cross-transport relay or automatic forwarding.
+Local Mesh connects station-level MeshCore or Meshtastic services to CommsPlan. Received text and position evidence can join the Inbox and Map without treating the mesh device as an HF radio profile. CommsPlan 2.0.8 also supports explicit, reviewed forwarding between an Inbox message and JS8Call or Mesh. Saved drafts never send automatically, and forwarding does not guarantee delivery.
 
 ## Add a saved device
 
@@ -36,6 +36,16 @@ CommsPlan does not store the Bluetooth PIN. Scanning never replaces a saved iden
 ::: tip If Linux pauses reconnects
 If Bluetooth is powered off, the pairing is cancelled, or the device stops advertising, CommsPlan pauses automatic reconnect attempts. Restore Bluetooth and device availability, wait for advertising, then select **Connect** once.
 :::
+
+## Manually forward an Inbox message
+
+Open a received message in the Inbox reader and choose its forwarding action.
+Select the exact JS8Call or Mesh connection and recipient, review the addressed
+payload and byte count, then explicitly choose **Send now**. You can save an
+inert draft for later review. There is no automatic cross-transport bridge or
+background relay. A submitted message is not proof that its recipient received
+or read it. See [What’s new in CommsPlan 2.0.8](/guide/whats-new#commsplan-2-0-8)
+for the workflow, privacy rules, and qualification limits.
 
 ## Enable outbound messages
 

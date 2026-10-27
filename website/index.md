@@ -63,7 +63,7 @@ hero:
     <p class="section-link"><a href="./guide/operating-picture#plans-and-scheduling">Explore plans and scheduling →</a></p>
     <div class="home-assurance">
       <h3>You stay in control.</h3>
-      <p>Review and enable scheduling when you’re ready. Holds, busy checks, and manual controls help you manage changes while you operate.</p>
+      <p>Assign a frequency plan when you’re ready; CommsPlan validates the saved radio, application, and plan before following it automatically. Pause and Resume keep operator holds explicit, while readiness, busy checks, and RF Guard still apply.</p>
     </div>
   </section>
   <section aria-labelledby="message-intelligence" class="home-section">
@@ -123,7 +123,7 @@ hero:
         <p>See how plans, messages, and the map help you work through a typical operating session.</p>
       </a>
     </div>
-    <p class="section-link"><a href="./guide/whats-new">See what’s new in CommsPlan 2.0.7 →</a></p>
+    <p class="section-link"><a href="./guide/whats-new">See what’s new in CommsPlan 2.0.8 →</a></p>
   </section>
   <div class="home-callout">
     <div>

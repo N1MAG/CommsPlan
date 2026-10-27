@@ -6,7 +6,7 @@ description: Choose the right CommsPlan setup path for a new station, an upgrade
 # Start here
 
 <div class="doc-badge-row">
-  <span class="doc-badge">CommsPlan 2.0.7</span>
+  <span class="doc-badge">CommsPlan 2.0.8</span>
   <span class="doc-badge">Windows · Linux · macOS</span>
   <span class="doc-badge">Choose the right path</span>
 </div>
@@ -30,13 +30,13 @@ Message Intelligence helps you find useful information in the traffic, with the
 original messages available when you need the details.
 
 The Station Setup checklist and workflow described below are part of CommsPlan
-2.0.7. Use the [CommsPlan 2.0.7 release page](https://github.com/N1MAG/CommsPlan/releases/tag/v2.0.7)
+2.0.8. Use the [CommsPlan 2.0.8 release page](https://github.com/N1MAG/CommsPlan/releases/tag/v2.0.8)
 and the installation and upgrade guide to select a package or source
 installation.
 
-The latest release adds Station Traffic Summaries, reviewable message
-enrichment, per-net FLDigi tuning, and clearer radio setup recovery. [Read the
-2.0.7 feature notes →](/guide/whats-new)
+CommsPlan 2.0.8 adds assignment-driven scheduling, a more spacious Plan Builder,
+reviewed manual Mesh ↔ JS8Call forwarding, and responsiveness improvements. [Read
+the 2.0.8 feature notes →](/guide/whats-new#commsplan-2-0-8)
 
 ## Which path fits your station?
 
@@ -76,7 +76,7 @@ The recommended order is:
 1. Open **Configuration → Main → Station setup** and review the saved checklist.
 2. Enter your operator details and the groups you work with.
 3. Choose a radio and review its software, connections, operating choices, and schedule.
-4. Review the saved setup summary. Scheduling stays off until you explicitly review and enable it.
+4. Review the saved setup summary. Assign a plan when you are ready; CommsPlan validates it before following schedules automatically. Pause remains available for a deliberate hold.
 5. Open Ops Center, Messages, and Map to get to know your station’s workspace.
 
 <div class="expectation">
