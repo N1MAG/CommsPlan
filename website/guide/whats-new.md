@@ -1,12 +1,12 @@
 ---
 title: What's New in CommsPlan
-description: CommsPlan 2.0.8 workflows, CommsPlan 2.0.7 history, and the earlier 2.0.6 feature overview.
+description: CommsPlan 2.0.8.1 folder-save hotfix, CommsPlan 2.0.8 workflows, CommsPlan 2.0.7 history, and the earlier 2.0.6 feature overview.
 ---
 
 # What's new in CommsPlan
 
 <div class="doc-badge-row">
-  <span class="doc-badge">CommsPlan 2.0.8</span>
+  <span class="doc-badge">CommsPlan 2.0.8.1</span>
   <span class="doc-badge">Operator overview</span>
 </div>
 
@@ -15,7 +15,19 @@ lists currently available packages, checksums, and release notes. Package
 availability can vary by platform, so use that page to confirm which native
 installers have been published.
 
-For the current update, jump to [CommsPlan 2.0.8](#commsplan-2-0-8). The 2.0.7 and 2.0.6 feature history remains below.
+For the current update, jump to [CommsPlan 2.0.8.1](#commsplan-2-0-8-1). The 2.0.8, 2.0.7 and 2.0.6 feature history remains below.
+
+## CommsPlan 2.0.8.1
+
+This patch fixes Fast Light folder-save readback errors after enabling FLMsg or
+FLAmp. It also keeps all four component settings folders and FLDigi log/check-in
+folders consistent through changes, intentional clearing and reopening existing
+configurations. Failed verification still rolls back the save.
+
+Native Linux operator qualification of this hotfix remains unperformed. Existing
+2.0.8 hardware, transport and macOS limitations remain unchanged. See the
+[2.0.8.1 release notes](https://github.com/N1MAG/CommsPlan/releases/tag/v2.0.8.1)
+for the published packages and checksums.
 
 ## CommsPlan 2.0.8
 

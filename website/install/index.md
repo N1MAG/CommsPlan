@@ -6,24 +6,24 @@ description: Install CommsPlan from the latest published release or update an es
 # Install or upgrade CommsPlan
 
 <div class="doc-badge-row">
-  <span class="doc-badge">CommsPlan 2.0.8</span>
+  <span class="doc-badge">CommsPlan 2.0.8.1</span>
   <span class="doc-badge">Windows · Linux · macOS</span>
   <span class="doc-badge">Back up before upgrade</span>
 </div>
 
-CommsPlan 2.0.8 is the documented release version. The
-[CommsPlan 2.0.8 release page](https://github.com/N1MAG/CommsPlan/releases/tag/v2.0.8)
+CommsPlan 2.0.8.1 is the documented release version. The
+[CommsPlan 2.0.8.1 release page](https://github.com/N1MAG/CommsPlan/releases/tag/v2.0.8.1)
 is the authority for currently available packages, checksums, and release
 notes. Download a native package only when it is listed there.
 
-The four 2.0.8 package filenames are:
+The four 2.0.8.1 package filenames are:
 
-- Windows 10/11 x86-64: `CommsPlan-2.0.8-windows-x86_64-setup-unsigned.exe`
-- Debian/Ubuntu-family Linux amd64: `CommsPlan-2.0.8-linux-amd64.deb`
-- Apple Silicon macOS: `CommsPlan-2.0.8-macos-arm64-unsigned.dmg`
-- Intel macOS: `CommsPlan-2.0.8-macos-x86_64-unsigned.dmg`
+- Windows 10/11 x86-64: `CommsPlan-2.0.8.1-windows-x86_64-setup-unsigned.exe`
+- Debian/Ubuntu-family Linux amd64: `CommsPlan-2.0.8.1-linux-amd64.deb`
+- Apple Silicon macOS: `CommsPlan-2.0.8.1-macos-arm64-unsigned.dmg`
+- Intel macOS: `CommsPlan-2.0.8.1-macos-x86_64-unsigned.dmg`
 
-Verify the downloaded package against [`SHA256SUMS.txt`](https://github.com/N1MAG/CommsPlan/releases/download/v2.0.8/SHA256SUMS.txt)
+Verify the downloaded package against [`SHA256SUMS.txt`](https://github.com/N1MAG/CommsPlan/releases/download/v2.0.8.1/SHA256SUMS.txt)
 before opening it.
 
 ## Choose an installation method
@@ -38,20 +38,22 @@ When using a source checkout,
 install Git and Python 3.11 (3.10–3.13 are accepted; 3.11 is recommended).
 Close CommsPlan and companion applications before installing or updating.
 
-### Windows source installation — CommsPlan 2.0.8
+### Windows source installation — CommsPlan 2.0.8.1
 
 ```powershell
 git clone https://github.com/N1MAG/CommsPlan.git "$HOME\CommsPlan"
 Set-Location "$HOME\CommsPlan"
+git checkout v2.0.8.1
 py -3.11 install-commsplan.py
 .\start-commsplan.cmd
 ```
 
-### macOS source installation — CommsPlan 2.0.8
+### macOS source installation — CommsPlan 2.0.8.1
 
 ```bash
 git clone https://github.com/N1MAG/CommsPlan.git "$HOME/CommsPlan"
 cd "$HOME/CommsPlan"
+git checkout v2.0.8.1
 python3.11 install-commsplan.py
 ./start-commsplan.sh
 ```
@@ -61,7 +63,7 @@ python3.11 install-commsplan.py
 Install the Debian package offered by the release page, then launch CommsPlan
 from your applications menu or with the `commsplan` command when available.
 
-### Linux source installation and maintenance — CommsPlan 2.0.8
+### Linux source installation and maintenance — CommsPlan 2.0.8.1
 
 The guided installer supports setup, update, repair, and desktop launcher
 refresh. With no action supplied, it runs setup.
@@ -69,6 +71,7 @@ refresh. With no action supplied, it runs setup.
 ```bash
 git clone https://github.com/N1MAG/CommsPlan.git "$HOME/CommsPlan"
 cd "$HOME/CommsPlan"
+git checkout v2.0.8.1
 bash install-commsplan.sh setup
 ```
 
