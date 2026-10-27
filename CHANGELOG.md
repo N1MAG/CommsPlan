@@ -1,5 +1,10 @@
 # Changelog
 
+## [2.0.8.1]
+- Fixed: Saving Fast Light application folders now keeps the reviewed folder, saved resource claims and radio settings consistent. This fixes FLMsg and FLAmp message-folder readback errors after enabling an application.
+- Fixed: The same save correction covers all four Fast Light settings folders and FLDigi log/check-in folders, including changes, intentional clearing and reopening existing configurations. Failed readback still rolls back the save.
+- Qualification: Automated configuration and package checks do not establish a native Linux operator pass or live radio readiness. Existing 2.0.8 hardware, transport and macOS limitations remain unchanged.
+
 ## [2.0.8]
 - Fixed: Assigned schedules follow automatically after validation, without a separate enablement step. Schedule reads remain isolated to the assigned radio and source; Quick QSY stays until its next eligible transition, and gaps retain current tuning.
 - Fixed: Scheduler and QSY feedback clears after verified completion. Schedule refreshes retain their last display, and schema reads no longer repeatedly rebuild valid indexes or invalidate schedule snapshots. Incorrect legacy identity indexes still repair automatically without deleting roster data.

@@ -42,6 +42,21 @@ FIELDS = {
 }
 VARAC_PROFILE_PATHS = (('outbox_path', 'varac_outbox_dir'), ('bbs_path', 'varac_bbs_dir'),
                        ('bbs_archive_path', 'varac_bbs_archive_dir'))
+# Operator fields and the claims consumed by Fast Light adoption/inventory.
+# Keep explicit clears distinct from omitted fields in a component-scoped edit.
+FAST_LIGHT_PATH_CLAIMS = (
+    ('flrig_configuration_path', 'flrig_configuration', True),
+    ('fldigi_configuration_path', 'fldigi_configuration', True),
+    ('flmsg_configuration_path', 'flmsg_root', True),
+    ('flamp_configuration_path', 'flamp_root', False),
+    ('storage_path', 'fldigi_logs', True),
+    ('secondary_storage_path', 'fldigi_checkins', True),
+    ('flmsg_message_path', 'flmsg_messages', True),
+    ('flmsg_templates_path', 'flmsg_templates', True),
+    ('flmsg_auto_path', 'flmsg_auto', True),
+    ('flamp_receive_path', 'flamp_receive', False),
+    ('flamp_outgoing_path', 'flamp_outgoing', False),
+)
 
 def application_manifest(store, family, row):
     """Find an application's saved manifest by owner, including guided keys."""
@@ -91,6 +106,17 @@ def application_editor_values(family: str, row: Mapping[str, Any], manifest=None
         # or historical manifest editor evidence. Load what Save reads back.
         for field, column in VARAC_PROFILE_PATHS:
             values[field] = str(profile.get(column) or '')
+    if family == 'fast_light':
+        claims = {claim.get('kind'): claim.get('value') for claim in
+                  (manifest or {}).get('resource_claims', ()) or ()}
+        for field, kind, _exclusive in FAST_LIGHT_PATH_CLAIMS:
+            # FLDigi logs/check-ins already come from typed application columns.
+            if field not in FIELDS[family] and kind in claims:
+                values[field] = str(claims[kind] or '')
+        if profile is not None:
+            for field, column in (('flmsg_message_path', 'flmsg_message_path'),
+                                  ('flamp_receive_path', 'flamp_message_path')):
+                values[field] = str(profile.get(column) or '')
     return values
 
 
@@ -559,14 +585,20 @@ def save_operator_application(store, payload: Mapping[str, Any]):
                     'verification_state':'configured','verification_summary':'Saved in CommsPlan; connection not checked.',
                     'evidence':evidence}
         if family == 'fast_light':
-            # These executables project to radio-owned columns via resource
-            # claims. Replace prior path claims on explicit review, otherwise
-            # adoption's legacy fallback can replay an old executable.
+            # Adoption projects these claims into radio-owned paths. Replace
+            # reviewed folders as well as executables; otherwise canonical
+            # identity paths change while adoption replays old/empty folders.
+            reviewed_claims = [
+                (field, kind, exclusive) for field, kind, exclusive in FAST_LIGHT_PATH_CLAIMS
+                if field in values
+            ] + [(f'{name}_application_path', f'{name}_application', False)
+                 for name in ('flmsg', 'flamp')]
+            replaced_kinds = {kind for _field, kind, _exclusive in reviewed_claims}
             manifest['resource_claims'] = [
                 claim for claim in manifest.get('resource_claims', ()) or ()
-                if claim.get('kind') not in {'flmsg_application', 'flamp_application'}
-            ] + [dict(kind=f'{name}_application', value=values[f'{name}_application_path'], exclusive=False)
-                 for name in ('flmsg', 'flamp') if values.get(f'{name}_application_path')]
+                if claim.get('kind') not in replaced_kinds
+            ] + [dict(kind=kind, value=values[field], exclusive=exclusive)
+                 for field, kind, exclusive in reviewed_claims if values.get(field)]
         cluster_context = {}
         if family == 'varac' and expected_id and source_id in (None, expected_id):
             # Editing this member does not select a new VarAC arrangement.
@@ -645,6 +677,17 @@ def save_operator_application(store, payload: Mapping[str, Any]):
             for field,column in (('outbox_path','varac_outbox_dir'),('bbs_path','varac_bbs_dir'),('bbs_archive_path','varac_bbs_archive_dir')):
                 if field in values and str(current_profile.get(column) or '') != str(values[field] or ''):
                     mismatches.append(field)
+        if family == 'fast_light':
+            current_profile = store.get_device_profile(radio_id)
+            for field, column in (('flmsg_message_path', 'flmsg_message_path'),
+                                  ('flamp_receive_path', 'flamp_message_path')):
+                if field in values and str(current_profile.get(column) or '') != str(values[field] or ''):
+                    mismatches.append(field)
+            saved_claims = {claim.get('kind'): str(claim.get('value') or '') for claim in
+                            store.get_software_instance_manifest(manifest['instance_key']).get('resource_claims', ())}
+            for field, kind, _exclusive in FAST_LIGHT_PATH_CLAIMS:
+                if field in values and saved_claims.get(kind, '') != str(values[field] or ''):
+                    mismatches.append(kind)
         if mismatches:
             raise ValueError('Application settings readback did not match: ' + ', '.join(mismatches))
         # An unselected application may intentionally retain editable settings.

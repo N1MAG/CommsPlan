@@ -2,9 +2,9 @@
   <img src="assets/CommsPlan_logo.png" alt="CommsPlan logo" width="150">
 </p>
 
-# CommsPlan 2.0.8
+# CommsPlan 2.0.8.1
 
-See the CommsPlan 2.0.8 release page for available platform packages, source
+See the CommsPlan 2.0.8.1 release page for available platform packages, source
 archives, checksums, and release notes.
 
 ### CommsPlan makes your comms plan work.
@@ -30,13 +30,12 @@ exercise messages. Radio readbacks and green Mesh connection status are simulate
 for illustration; no live radio or Mesh connection was used. Detail images show
 the individual workspaces.*
 
-## What is new in 2.0.8
+## What is new in 2.0.8.1
 
-- More reliable and responsive assigned scheduling, clear Quick QSY behavior and schedule swapping with RF Guard review.
-- A compact Plan Builder with visible radio assignments and more room for schedule rows.
-- Reviewed manual Mesh ↔ JS8Call forwarding with searchable recipients, exact payload previews, byte limits and explicit send controls.
-- Inbox filtering/progress fixes, reduced startup and background work, safer Bluetooth helper cleanup and clearer diagnostics.
-- Updated Help and startup guidance. See the [guide](docs/guide.html) and [changelog](CHANGELOG.md) for workflow details and qualification limits.
+- Fixes Fast Light folder-save readback errors affecting FLMsg, FLAmp, FLDigi and component settings folders.
+- Keeps folder changes, intentional clears and reopened configurations consistent while preserving atomic rollback on failed verification.
+- Retains the scheduling, Plan Builder, forwarding and responsiveness improvements introduced in 2.0.8.
+- Native Linux operator qualification of this hotfix remains unperformed. Existing hardware, transport and macOS limitations remain; see the [changelog](CHANGELOG.md).
 
 ## One operating picture for the station
 
@@ -167,7 +166,7 @@ decision support rather than a guarantee of current propagation or delivery.
 
 ![Offline operational map with station and regional context](docs/images/readme-2.0/operational-map.png)
 
-## Hotfixes in 2.0.8
+## Accumulated setup fixes
 
 This release fixes fresh FLRig-only radio saves, supports independent Fast Light
 application choices, and keeps Save and Cancel reachable when application setup
@@ -237,10 +236,10 @@ storage and compatibility identities so companion applications and saved
 stations continue to work. Follow the installation guide when upgrading, and
 make a verified backup before the first upgrade.
 
-## Download CommsPlan 2.0.8
+## Download CommsPlan 2.0.8.1
 
 Use the [CommsPlan release page](https://github.com/N1MAG/CommsPlan/releases/latest)
-for available 2.0.8 installers, source archives, checksums, and release notes.
+for available 2.0.8.1 installers, source archives, checksums, and release notes.
 Use only the artifacts actually listed there. Unsigned Windows/macOS packages
 are identified in their filenames and release notes.
 
@@ -248,7 +247,7 @@ Verify downloaded files against the checksums published on the release page.
 
 ## Install or update from the public source release
 
-Clone the public repository and select the 2.0.8 release tag. For an existing
+Clone the public repository and select the 2.0.8.1 release tag. For an existing
 checkout, fetch the public tag and select it before running the installer.
 Close CommsPlan and its companion applications, use the same application folder
 as the existing installation, and require the final `Installation verified`
@@ -257,14 +256,14 @@ line before launching CommsPlan. A Git pull by itself is not a complete update.
 ```bash
 git clone https://github.com/N1MAG/CommsPlan.git
 cd CommsPlan
-git checkout v2.0.8
+git checkout v2.0.8.1
 ```
 
 For an existing checkout:
 
 ```bash
 git fetch origin --tags
-git checkout v2.0.8
+git checkout v2.0.8.1
 ```
 
 ### Windows PowerShell
@@ -291,7 +290,7 @@ The guided installer installs required system packages where supported,
 creates CommsPlan's virtual environment, and prepares the desktop launcher.
 Use `setup` for first setup, `update` for a source update, and `desktop` to
 refresh desktop integration after an update, including when an older package
-launcher is still installed. Run these commands from the checked-out 2.0.8
+launcher is still installed. Run these commands from the checked-out 2.0.8.1
 release:
 
 ```bash
