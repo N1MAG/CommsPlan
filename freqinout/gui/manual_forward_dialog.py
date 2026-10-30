@@ -10,6 +10,8 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime, timezone
 import uuid
+import math
+import time
 import re
 import weakref
 from typing import Any, Callable, Mapping
@@ -120,6 +122,17 @@ class ManualForwardDialog(QDialog):
         self._requested_source_id = _text(self.source.get("source_id")).strip()
         source_relay = _text(self.source.get("relay_id") or self.source.get("draft_relay_id")).strip()
         self.relay_id = source_relay or uuid.uuid4().hex[:12]
+        self._resumed = bool(source_relay)
+        try:
+            expiry = float(self.source.get("draft_expiry"))
+            self._draft_expiry = expiry if math.isfinite(expiry) and expiry > 0 else None
+        except (TypeError, ValueError, OverflowError):
+            self._draft_expiry = None
+        try:
+            saved_ttl = float(self.source.get("draft_expires_seconds"))
+            self._draft_ttl = saved_ttl if math.isfinite(saved_ttl) and 60 <= saved_ttl <= 86400 else None
+        except (TypeError, ValueError, OverflowError):
+            self._draft_ttl = None
         self._context_busy = True
         self._busy = False
         self._context_reason = ""
@@ -326,7 +339,27 @@ class ManualForwardDialog(QDialog):
         self.expiry_combo.addItem("1 hour", 3600)
         self.expiry_combo.addItem("4 hours", 4 * 3600)
         self.expiry_combo.addItem("24 hours", 24 * 3600)
+        if self._resumed and self._draft_ttl is not None:
+            index = self.expiry_combo.findData(self._draft_ttl)
+            if index < 0:
+                self.expiry_combo.addItem("Keep saved duration", self._draft_ttl)
+                index = self.expiry_combo.count() - 1
+            self.expiry_combo.setCurrentIndex(index)
+        self.expiry_deadline_label = QLabel(self)
+        self.expiry_deadline_label.setWordWrap(True)
+        if self._resumed:
+            if self._draft_expiry is None:
+                self.expiry_deadline_label.setText("Saved deadline unavailable; reopen activity to review.")
+            else:
+                try:
+                    deadline = datetime.fromtimestamp(self._draft_expiry, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                except (ValueError, OverflowError, OSError):
+                    self._draft_expiry = None
+                    deadline = "unavailable"
+                remaining = max(0, int((self._draft_expiry or 0) - time.time()))
+                self.expiry_deadline_label.setText(f"Saved deadline: {deadline} ({remaining // 60} min remaining at review)")
         expiry_row.addWidget(self.expiry_combo)
+        expiry_row.addWidget(self.expiry_deadline_label)
         self.footer_layout.addWidget(self.expiry_host)
         self.footer_action_layout = QBoxLayout(QBoxLayout.LeftToRight)
         self.footer_action_layout.setSpacing(6)
@@ -787,9 +820,10 @@ class ManualForwardDialog(QDialog):
         self.clear_js8_button.setEnabled(not busy and bool(self._observed_js8_target))
         self.find_button.setEnabled(not busy and not self._lookup_busy)
         self.more_button.setEnabled(not busy and not self._lookup_busy and self._has_more)
-        self.save_button.setEnabled(not busy and selected)
+        expiry_ok = not self._resumed or (self._draft_expiry is not None and self._draft_ttl is not None and self._draft_expiry > time.time())
+        self.save_button.setEnabled(not busy and selected and expiry_ok)
         js8_ready = not self._selected_destination or _transport(self._selected_destination) != "js8" or (self._selection_key == (self._connection_key(self._route), self.recipient_edit.text().strip().upper()) and self._selection_available and not self._observed_js8_target)
-        self.send_button.setEnabled(not busy and selected and preview_ok and qualified and js8_ready)
+        self.send_button.setEnabled(not busy and selected and preview_ok and qualified and js8_ready and expiry_ok)
         self.cancel_button.setEnabled(not busy)
         if busy:
             self.send_button.setEnabled(False)
@@ -801,15 +835,17 @@ class ManualForwardDialog(QDialog):
             "destination": deepcopy(self._selected_destination or {}),
             "recipient_type": self.type_combo.currentData(),
             "recipient": self.recipient_edit.text().strip() if self._selected_destination and _transport(self._selected_destination) == "js8" else "",
-            "expires_seconds": int(self.expiry_combo.currentData() or 3600),
+            "expires_seconds": self.expiry_combo.currentData() or 3600,
         }
 
     def _save(self) -> None:
-        if self._busy or self._selected_destination is None:
+        self._update_action_state()
+        if self._busy or not self.save_button.isEnabled():
             return
         self._start_commit("save")
 
     def _send(self) -> None:
+        self._update_action_state()
         if self._busy or not self.send_button.isEnabled():
             return
         self._start_commit("send")

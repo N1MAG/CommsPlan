@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from freqinout.core.resource_catalog_models import FrequencyResource, NetDirectorySession
+from freqinout.core.frequency_reference import frequency_mhz_text, frequency_programming_text
 from freqinout.core.resource_catalog_store import (
     MAX_RESULTS,
     STATION_MANUAL_SOURCE_KEY,
@@ -40,13 +41,6 @@ from freqinout.gui.theme import (
     label_style,
 )
 
-
-def frequency_mhz_text(value_hz: int | None) -> str:
-    """Format a stored Hz value for operators without locale thousands separators."""
-    if value_hz is None:
-        return "Frequency unavailable"
-    mhz = int(value_hz) / 1_000_000
-    return f"{mhz:.6f}".rstrip("0").rstrip(".") + " MHz"
 
 
 def source_display_labels(
@@ -139,6 +133,7 @@ def frequency_where_text(resource: FrequencyResource) -> str:
     if transmit is not None and transmit != receive:
         return f"RX {frequency_mhz_text(receive)} · TX {frequency_mhz_text(transmit)}"
     return frequency_mhz_text(receive)
+
 
 
 def resource_status_text(resource: FrequencyResource) -> str:
@@ -270,6 +265,7 @@ __all__ = [
     "ResourcePicker",
     "choose_frequency_resource",
     "frequency_mhz_text",
+    "frequency_programming_text",
     "frequency_where_text",
     "populate_frequency_combo",
     "populate_source_combo",

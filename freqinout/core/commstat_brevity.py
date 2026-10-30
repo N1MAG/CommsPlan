@@ -109,11 +109,11 @@ def field_section(catalog: dict, field: dict, values: dict) -> dict:
     return catalog.get(field["section"], {})
 
 
-def load_catalogs(asset_dir: Path | str) -> dict[str, dict]:
-    """Worker-side bounded load; fingerprint includes content, not just folder."""
-    out = {}
+def load_catalog_choices(asset_dir: Path | str) -> list[dict]:
+    """Load each numbered JSON definition on a worker, retaining its source."""
+    out = []
     try:
-        paths = sorted(Path(asset_dir).glob("[0-9]-*.json"))[:32]
+        paths = sorted(Path(asset_dir).expanduser().glob("[0-9]-*.json"))[:32]
     except OSError:
         return out
     for path in paths:
@@ -124,13 +124,23 @@ def load_catalogs(asset_dir: Path | str) -> dict[str, dict]:
             if len(blob) > 2_000_000:
                 continue
             data = json.loads(blob)
-            if not isinstance(data, dict) or path.name[0] in out:
+            if not isinstance(data, dict):
                 continue
             data["_fio_fingerprint"] = hashlib.sha256(blob).hexdigest()
             data["_fio_filename"] = path.name
-            out[path.name[0]] = data
+            data["_fio_source"] = str(path.parent)
+            data["_fio_prefix"] = path.name[0]
+            out.append(data)
         except (OSError, ValueError, RecursionError):
             continue
+    return out
+
+
+def load_catalogs(asset_dir: Path | str) -> dict[str, dict]:
+    """Load the first definition per prefix for existing ingest consumers."""
+    out = {}
+    for data in load_catalog_choices(asset_dir):
+        out.setdefault(data["_fio_prefix"], data)
     return out
 
 

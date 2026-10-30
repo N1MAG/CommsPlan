@@ -30,7 +30,10 @@ FIELDS = {
     'js8call': {'application_path':'install_path','configuration_path':'profile_path',
                 'storage_path':'application_data_root','rig_name':'rig_name','host':'host','port':'port',
                 'instance_name':'name','offset_hz':'offset_hz','directed_path':'directed_path','all_path':'all_path',
-                'inbox_path':'inbox_path','forms_path':'forms_path'},
+                'inbox_path':'inbox_path','forms_path':'forms_path',
+                'received_files_enabled':'received_files_enabled',
+                'received_files_path':'received_files_path',
+                'received_files_existing':'received_files_existing'},
     'fast_light': {'application_path':'flrig_path','flrig_application_path':'flrig_path',
                    'fldigi_application_path':'fldigi_path','secondary_application_path':'fldigi_path',
                    'host':'flrig_host','port':'flrig_port','secondary_port':'fldigi_port',
@@ -49,11 +52,11 @@ FAST_LIGHT_PATH_CLAIMS = (
     ('fldigi_configuration_path', 'fldigi_configuration', True),
     ('flmsg_configuration_path', 'flmsg_root', True),
     ('flamp_configuration_path', 'flamp_root', False),
-    ('storage_path', 'fldigi_logs', True),
-    ('secondary_storage_path', 'fldigi_checkins', True),
-    ('flmsg_message_path', 'flmsg_messages', True),
-    ('flmsg_templates_path', 'flmsg_templates', True),
-    ('flmsg_auto_path', 'flmsg_auto', True),
+    ('storage_path', 'fldigi_logs', False),
+    ('secondary_storage_path', 'fldigi_checkins', False),
+    ('flmsg_message_path', 'flmsg_messages', False),
+    ('flmsg_templates_path', 'flmsg_templates', False),
+    ('flmsg_auto_path', 'flmsg_auto', False),
     ('flamp_receive_path', 'flamp_receive', False),
     ('flamp_outgoing_path', 'flamp_outgoing', False),
 )
@@ -329,6 +332,8 @@ def load_operator_application_context(store, payload):
         metadata = dict(expected_current_instance_id=instance_id,replacement_instance_id=instance_id,
                         expected_identity_generation=store.radio_software_identity_generation(radio_id),
                         operator_launch_snapshot=launch_configuration_token(launch))
+        metadata['operator_draft_revision'] = load_unfinished_configuration(
+            store, f'application:{radio_id}:{family}')['revision']
     return {'current_values':values,'context':metadata}
 
 
@@ -482,12 +487,22 @@ def save_operator_application(store, payload: Mapping[str, Any]):
     # The host must resolve retained unfinished work explicitly. Never silently
     # replace it on a fresh edit or restore it over a manual selection.
     session = ConfigEditSession(base, draft_revision=envelope['revision'])
-    if envelope.get('payload') and envelope['payload'].get('session_id') not in {payload.get('operator_session_id'), payload.get('operator_recovered_from')}:
+    replacement = payload.get('replace_saved_draft')
+    if replacement:
+        previous = envelope.get('payload') or {}
+        if (not isinstance(replacement, Mapping) or replacement.get('revision') != envelope['revision']
+                or replacement.get('session_id') != previous.get('session_id')):
+            raise ConfigurationConflict('The previous application draft changed. Review it before replacing it.')
+        session.recovered_from = previous.get('session_id')
+    if payload.get('operator_draft_revision') is not None and not replacement:
+        session.draft_revision = payload['operator_draft_revision']
+    if envelope.get('payload') and not replacement and envelope['payload'].get('session_id') not in {payload.get('operator_session_id'), payload.get('operator_recovered_from')}:
         raise ConfigurationConflict('Saved unfinished work exists. Recover or discard it before another save.')
     session.values = proposed
     if payload.get('operator_session_id'):
         session.session_id = str(payload['operator_session_id'])
-    session.recovered_from = payload.get('operator_recovered_from')
+    if not replacement:
+        session.recovered_from = payload.get('operator_recovered_from')
     key = str(payload.get('initial_application_system_key') or payload.get('operator_system_key') or payload.get('system_key') or '')
     if not key:
         key = f'operator_{uuid4().hex}'
@@ -706,5 +721,15 @@ def save_operator_application(store, payload: Mapping[str, Any]):
                 and values.get('profile_paths_acknowledged') != js8_profile_path_review_token(values)):
             issues += ('The native JS8Call profile changed while previous message/readback paths remain. Review the paths and acknowledge that CommsPlan should use them.',)
         return issues
-    return save_configuration_edit(store,scope,request,read_current=read,
-                                   validate=validate,publish=publish)
+    original_id = expected_id
+    try:
+        return save_configuration_edit(store,scope,request,read_current=read,
+                                       validate=validate,publish=publish)
+    except ConfigurationConflict:
+        raise
+    except ValueError as exc:
+        # The failed publication has rolled back. Preserve the reviewed raw
+        # entries without calling mismatched typed configuration Saved.
+        expected_id, published = original_id, False
+        return save_configuration_edit(store,scope,request,read_current=read,
+                                       validate=lambda _values: (str(exc),),publish=publish)

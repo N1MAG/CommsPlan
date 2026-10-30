@@ -14,6 +14,39 @@ class ScheduleSourceError(RuntimeError):
     """A required schedule input could not be read completely."""
 
 
+class MissingScheduleSourceError(ScheduleSourceError):
+    """Successful inspection proved a selected source no longer exists."""
+
+
+def read_plan_schedule_table(path: Path, tables: tuple[str, ...]) -> tuple[str, list[dict]] | None:
+    """Read the first existing legacy input table; absence is not a read error.
+
+    Names come from application constants, never user input. A successful empty
+    preferred table is authoritative; it cannot resurrect a legacy table.
+    """
+    conn = None
+    try:
+        try:
+            path.stat()
+        except FileNotFoundError:
+            return None
+        conn = connect_sqlite_readonly(path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN")
+        existing = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        table = next((name for name in tables if name in existing), None)
+        if table is None:
+            return None
+        if not table.replace("_", "").isalnum():
+            raise ValueError("Invalid internal schedule table")
+        return table, [dict(row) for row in conn.execute(f'SELECT * FROM "{table}"')]
+    except Exception as exc:
+        raise ScheduleSourceError(f"Cannot read Plan Builder input {path.name}: {exc}") from exc
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 def load_sop_projection_sources(settings: Any, profile_ids: set[int]) -> tuple[list[dict], list[dict]]:
     """Return canonical rows and arbitration policies for declared SOP profiles.
 

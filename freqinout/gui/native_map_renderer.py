@@ -18,6 +18,7 @@ from PySide6.QtQml import QJSValue
 from PySide6.QtQuickWidgets import QQuickWidget
 from PySide6.QtWidgets import QLabel, QSizePolicy, QStackedLayout, QWidget
 
+from freqinout.core.logger import log
 from freqinout.gui.map_marker_presentation import marker_tooltip_text
 from freqinout.gui.theme import active_app_theme
 
@@ -438,6 +439,7 @@ class NativeMapRenderer(QWidget):
         super().__init__(parent)
         self._closed = False
         self._ready_emitted = False
+        self._graphics_failed = False
         self._projection_applied = False
         self.renderer_state = "loading"
         self.failure_reason = "Preparing native map…"
@@ -472,6 +474,7 @@ class NativeMapRenderer(QWidget):
             self._bridge.setParent(quick)
             quick.rootContext().setContextProperty("mapBridge", self._bridge)
             quick.statusChanged.connect(self._on_status_changed)
+            quick.sceneGraphError.connect(self._on_scene_graph_error)
             self._surface_stack.addWidget(quick)
             self.quick_widget = quick
             # Both children remain visible. The status label covers the scene
@@ -517,7 +520,7 @@ class NativeMapRenderer(QWidget):
 
     def set_map_visible(self, visible: bool) -> None:
         """Pause visual work while the owner is hidden without rebuilding QML."""
-        if self._closed:
+        if self._closed or self._graphics_failed:
             return
         self._bridge.set_map_visible(visible)
         if self.quick_widget is not None:
@@ -525,7 +528,7 @@ class NativeMapRenderer(QWidget):
 
     def apply_projection(self, projection: Mapping[str, object] | None) -> None:
         """Apply one normalized station/path snapshot without side effects."""
-        if self._closed:
+        if self._closed or self._graphics_failed:
             return
         payload = projection if isinstance(projection, Mapping) else {}
         markers = self._normalise_markers(payload.get("markers"))
@@ -701,8 +704,18 @@ class NativeMapRenderer(QWidget):
         self.renderer_state = "unavailable"
         self.failure_reason = "Native map renderer is closed."
 
-    def _on_status_changed(self, status: QQuickWidget.Status) -> None:
+    def _on_scene_graph_error(self, error: object, message: str) -> None:
         if self._closed:
+            return
+        self._graphics_failed = True
+        if self.quick_widget is not None:
+            self.quick_widget.setUpdatesEnabled(False)
+        detail = str(message or "Graphics initialization failed.").strip()
+        log.error("Native Map graphics initialization failed (%s): %s", error, detail)
+        self._set_unavailable("Map unavailable: graphics could not be initialized. Review Log Viewer for details. " + detail)
+
+    def _on_status_changed(self, status: QQuickWidget.Status) -> None:
+        if self._closed or self._graphics_failed:
             return
         if status == QQuickWidget.Ready:
             self.renderer_state = "ready"
@@ -731,6 +744,7 @@ class NativeMapRenderer(QWidget):
         quick = self.quick_widget
         if (
             self._closed
+            or self._graphics_failed
             or not self._projection_applied
             or quick is None
             or quick.status() != QQuickWidget.Ready

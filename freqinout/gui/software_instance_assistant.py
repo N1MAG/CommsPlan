@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFormLayout,
+    QFileDialog,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -52,6 +53,7 @@ from freqinout.core.guided_launch_recipes import (
     settings_identity_mode_from_mapping,
 )
 from freqinout.core.varac_native_preparation import native_draft_fingerprint
+from freqinout.gui.received_files_config import ReceivedFilesCounter
 from freqinout.gui.current_page_stack import CurrentPageStack
 from freqinout.gui.theme import active_app_theme, button_height_for_font, button_style, label_style
 
@@ -82,8 +84,8 @@ _FAMILY_FIELDS = {
 _FAMILY_FIELD_LABELS = {
     "js8call": {
         "settings_identity_mode": "How should this radio use JS8Call settings?",
-        "variant": "JS8Call variant",
-        "version": "Verified application version",
+        "variant": "Configured JS8Call variant",
+        "version": "Configured application version",
         "rig_name": "JS8Call rig name",
         "host": "JS8Call API host",
         "port": "JS8Call TCP API port",
@@ -303,6 +305,9 @@ class SoftwareInstanceDraft:
     configuration_path: str = ""
     secondary_configuration_path: str = ""
     storage_path: str = ""
+    received_files_enabled: bool = False
+    received_files_path: str = ""
+    received_files_existing: str = "review"
     secondary_storage_path: str = ""
     outbox_path: str = ""
     launch_command: str = ""
@@ -468,6 +473,9 @@ class SoftwareInstanceDraft:
             "configuration_root": self.configuration_path,
             "secondary_configuration_path": self.secondary_configuration_path,
             "storage_path": self.storage_path,
+            "received_files_enabled": self.received_files_enabled,
+            "received_files_path": self.received_files_path,
+            "received_files_existing": self.received_files_existing,
             "data_root": self.storage_path,
             "secondary_storage_path": self.secondary_storage_path,
             "outbox_path": self.outbox_path,
@@ -645,6 +653,9 @@ def normalize_instance_draft(value: Mapping[str, Any] | SoftwareInstanceDraft) -
         configuration_path=_text(row.get("configuration_path") or row.get("ini_path") or row.get("profile_path") or row.get("js8_profile_path") or row.get("flrig_config_path") or row.get("varac_ini_path")),
         secondary_configuration_path=_text(row.get("secondary_configuration_path") or row.get("fldigi_config_path")),
         storage_path=_text(row.get("storage_path") or family_storage),
+        received_files_enabled=_bool(row.get("received_files_enabled", row.get("js8_received_files_enabled", False))),
+        received_files_path=_text(row.get("received_files_path") or row.get("js8_received_files_path")),
+        received_files_existing=_text(row.get("received_files_existing") or row.get("js8_received_files_existing") or "review"),
         secondary_storage_path=_text(row.get("secondary_storage_path") or family_secondary_storage),
         outbox_path=_text(row.get("outbox_path") or row.get("outbox_dir") or row.get("varac_outbox_dir")),
         launch_command=_text(row.get("launch_command") or row.get("launch_cmd")),
@@ -1062,6 +1073,7 @@ class SoftwareInstanceAssistant(QWidget):
 
     completed = Signal(object)
     cancelled = Signal()
+    review_subspace_files_requested = Signal()
     remove_family_requested = Signal(str)
     discover_requested = Signal(str)
     create_radio_requested = Signal()
@@ -1973,8 +1985,8 @@ class SoftwareInstanceAssistant(QWidget):
             (
                 ("instance_name", "Instance name", "A distinct name for this application instance"),
                 ("settings_identity_mode", "Settings use", "Choose existing default or separate settings"),
-                ("variant", "JS8Call variant", "Choose the exact installed JS8Call family"),
-                ("version", "Verified application version", "Exact version, for example 2.2.0"),
+                ("variant", "Configured JS8Call variant", "Choose the expected JS8Call family"),
+                ("version", "Configured application version", "Expected version, for example 2.2.0"),
             ),
         )
         ownership = QComboBox()
@@ -2032,6 +2044,52 @@ class SoftwareInstanceAssistant(QWidget):
                 ("cluster_instance_number", "VarAC cluster instance", "Optional positive instance number"),
             ),
         )
+        self.received_files_group = QGroupBox("Received files")
+        received = QVBoxLayout(self.received_files_group)
+        self.received_enabled = QCheckBox("Monitor received files")
+        self.received_enabled.setAccessibleName("Monitor received files")
+        received.addWidget(self.received_enabled)
+        path_row = QHBoxLayout()
+        self.received_path = QLineEdit()
+        self.received_path.setAccessibleName("Received files directory")
+        self.received_path.setPlaceholderText("Choose an accessible directory")
+        path_row.addWidget(self.received_path, 1)
+        browse = QPushButton("Browse")
+        browse.setAccessibleName("Browse for received files directory")
+        browse.clicked.connect(self._browse_received_files)
+        path_row.addWidget(browse)
+        received.addLayout(path_row)
+        self.received_choice = QComboBox()
+        self.received_choice.setAccessibleName("Existing files choice")
+        self.received_choice.addItem("Review existing files", "review")
+        self.received_choice.addItem("Monitor new files", "new")
+        received.addWidget(self.received_choice)
+        self.received_status = QLabel("Monitoring off")
+        self.received_status.setAccessibleName("Received files status")
+        self.received_status.setWordWrap(True)
+        received.addWidget(self.received_status)
+        hint = QLabel("Files may be shared by instances; sender and receiving radio remain unverified.")
+        hint.setWordWrap(True)
+        received.addWidget(hint)
+        review = QPushButton("Review files")
+        review.clicked.connect(self.review_subspace_files_requested.emit)
+        received_actions = QHBoxLayout()
+        received_actions.addWidget(review)
+        self.received_check_again = QPushButton("Check directory")
+        self.received_check_again.clicked.connect(self._received_changed)
+        received_actions.addWidget(self.received_check_again)
+        received_actions.addStretch()
+        received.addLayout(received_actions)
+        self._active_form.addRow(self.received_files_group)
+        self._received_counter = ReceivedFilesCounter(self)
+        self._received_counter.finished.connect(self._received_count_finished)
+        self._received_generation = 0
+        self._received_accessible = False
+        self._received_count_timer = QTimer(self)
+        self._received_count_timer.setSingleShot(True)
+        self._received_count_timer.timeout.connect(self._count_received_files)
+        self.received_path.textChanged.connect(self._received_changed)
+        self.received_enabled.toggled.connect(self._received_changed)
         self.varac_cluster_why_label = QLabel(
             "Standalone is the safe default even when another VarAC node or cluster is detected. "
             "Choose Create cluster or Join cluster only when coordinated cluster routing and shared BBS behavior are intentional."
@@ -2334,10 +2392,10 @@ class SoftwareInstanceAssistant(QWidget):
         if key == "variant":
             combo = QComboBox()
             combo.setAccessibleName(label)
-            combo.addItem("Choose the verified JS8Call variant", "")
+            combo.addItem("Choose the expected JS8Call variant", "")
             combo.addItem("JS8Call 2.2", "js8call_2_2")
             combo.addItem("JS8Call Improved 3.0.3", "js8call_improved_3_0_3")
-            combo.addItem("JS8Call Subspace 4.1", "js8call_subspace_4_1")
+            combo.addItem("JS8Call · Subspace Edition 4.1", "js8call_subspace_4_1")
             combo.currentIndexChanged.connect(lambda _index: self._refresh_review_if_needed())
             self._field_widgets[key] = combo
             label_widget = QLabel(label)
@@ -2719,7 +2777,41 @@ class SoftwareInstanceAssistant(QWidget):
                 "Radio selected: Available for this software family."
             )
 
+    def _browse_received_files(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Choose received files directory", self.received_path.text())
+        if path:
+            self.received_path.setText(path)
+
+    def _received_changed(self, *_args) -> None:
+        self._received_generation += 1
+        self._received_accessible = False
+        self._received_count_timer.stop()
+        if not self.received_enabled.isChecked():
+            self.received_status.setText("Monitoring off")
+        elif not self.received_path.text().strip():
+            self.received_status.setText("Choose an accessible directory")
+        else:
+            self.received_status.setText("Checking directory…")
+            self._received_count_timer.start(300)
+
+    def _count_received_files(self) -> None:
+        self._received_counter.request(self._received_generation, self.received_path.text().strip())
+
+    def _received_count_finished(self, generation, path, count, more, error) -> None:
+        if generation != self._received_generation or path != self.received_path.text().strip():
+            return
+        self._received_accessible = not bool(error)
+        if error:
+            self.received_status.setText("Directory unavailable: " + error)
+        elif more and count == 100:
+            self.received_status.setText("100 or more existing files; monitoring uses saved settings")
+        elif more:
+            self.received_status.setText(f"First 100 entries: {count} files; more entries may exist")
+        else:
+            self.received_status.setText(f"{count} existing files; monitoring uses saved settings")
+
     def _sync_family_fields(self) -> None:
+        self.received_files_group.setVisible(self._family_key == "js8call")
         visible = _FAMILY_FIELDS.get(self._family_key, frozenset())
         labels = _FAMILY_FIELD_LABELS.get(self._family_key, {})
         observer_mode = self._radio_role == "observer"
@@ -3088,6 +3180,9 @@ class SoftwareInstanceAssistant(QWidget):
             self._launch_recipe_resolution = None
         self._loading_draft = True
         try:
+            self.received_enabled.setChecked(draft.received_files_enabled)
+            self.received_path.setText(draft.received_files_path)
+            self.received_choice.setCurrentIndex(max(0, self.received_choice.findData(draft.received_files_existing)))
             source_button = self.source_buttons.get(draft.mode)
             if source_button is not None:
                 source_button.setChecked(True)
@@ -3198,6 +3293,9 @@ class SoftwareInstanceAssistant(QWidget):
             configuration_path=value("configuration_path"),
             secondary_configuration_path=value("secondary_configuration_path"),
             storage_path=value("storage_path"),
+            received_files_enabled=self.received_enabled.isChecked() if self._family_key == "js8call" else False,
+            received_files_path=self.received_path.text().strip() if self._family_key == "js8call" else "",
+            received_files_existing=str(self.received_choice.currentData() or "review"),
             secondary_storage_path=value("secondary_storage_path"),
             outbox_path=value("outbox_path"),
             launch_command=value("launch_command"),
@@ -3254,6 +3352,8 @@ class SoftwareInstanceAssistant(QWidget):
     def validation(self) -> tuple[InstanceConflict, ...]:
         draft = self.draft()
         findings = list(instance_conflicts(draft, self._existing_instances))
+        if draft.family_key == "js8call" and draft.received_files_enabled and not self._received_accessible:
+            findings.append(InstanceConflict("received_files_unavailable", "error", "Received files directory unavailable", "Choose an accessible directory and wait for its check before saving."))
         if self._native_varac_apply_required(draft):
             native = self._varac_native_presentation
             native_state = native.state.replace("_", " ").strip().lower()
@@ -3347,10 +3447,12 @@ class SoftwareInstanceAssistant(QWidget):
                 )
             )
         if draft.family_key == "js8call":
+            variant_widget = self._field_widgets["variant"]
+            variant_label = variant_widget.currentText() if draft.variant else "Not set"
             lines.extend(
                 (
                     "Settings: Existing default JS8Call setup" if draft.settings_identity_mode == "default" else "Settings: Separate JS8Call setup for this radio",
-                    f"Variant/version: {draft.variant or 'Not verified'} · {draft.version or 'Not verified'}",
+                    f"Configured variant/version (not live verified): {variant_label} · {draft.version or 'Not set'}",
                     f"Rig name: {draft.rig_name}" if draft.settings_identity_mode == "isolated" and draft.rig_name else "Rig name: Not used (default JS8Call settings)" if draft.settings_identity_mode == "default" else "Rig name: Not set",
                     f"TCP API: {endpoint}",
                     f"UDP: {draft.host}:{draft.udp_port}" if draft.udp_port else "UDP: Not configured",

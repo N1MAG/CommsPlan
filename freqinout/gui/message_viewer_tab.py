@@ -467,7 +467,7 @@ from freqinout.core.sitrep_metadata import (
 )
 from freqinout.core.latest_read_cache import LatestReadCache
 from freqinout.core.commstat_brevity import (
-    load_catalogs, model_fields, field_section, section_entries,
+    load_catalog_choices, model_fields, field_section, section_entries,
     encode_brevity_code, analyze_brevity_codes, code_candidates,
 )
 from freqinout.core.commstat_sitrep import (
@@ -1083,8 +1083,12 @@ class _ComposeJs8SendWorker(QObject):
         command: str,
         generation: int,
         allow_uncertain_target_state: bool,
+        ncs_context: dict | None = None,
+        runtime_manager=None,
     ):
         super().__init__()
+        self._ncs_context = ncs_context
+        self._runtime_manager = runtime_manager
         self._endpoint = endpoint
         self._command = command
         self._generation = int(generation)
@@ -1092,14 +1096,27 @@ class _ComposeJs8SendWorker(QObject):
 
     def run(self) -> None:
         try:
-            client = JS8ApiClientRegistry.get(self._endpoint, timeout_s=1.0, auto_reconnect=True)
-            result = send_js8_message_guarded(
-                client,
-                self._command,
-                timeout_s=0.6,
-                allow_uncertain_target_state=self._allow_uncertain,
-                clear_selected_target=True,
-            )
+            if self._ncs_context:
+                from freqinout.core.ncs_net_messages import send_ncs_command
+                from freqinout.core.ncs_workbench_store import NcsWorkbenchStore
+                context = self._ncs_context
+                outcome = send_ncs_command(NcsWorkbenchStore(context['traffic_db_path']),
+                    run_id=context['run_id'], intent_id=context['intent_id'],
+                    action={**context, 'content': self._command}, runtime_manager=self._runtime_manager)
+                result = outcome.result
+                if result is None:
+                    from freqinout.core.js8_send_service import JS8SendResult, JS8SendPreflight, JS8SendIssue
+                    result = JS8SendResult(False, JS8SendPreflight(self._endpoint, False,
+                        (JS8SendIssue('ncs_guard', outcome.detail),)), outcome.detail)
+            else:
+                client = JS8ApiClientRegistry.get(self._endpoint, timeout_s=1.0, auto_reconnect=True)
+                result = send_js8_message_guarded(
+                    client,
+                    self._command,
+                    timeout_s=0.6,
+                    allow_uncertain_target_state=self._allow_uncertain,
+                    clear_selected_target=True,
+                )
             payload = {
                 "generation": self._generation,
                 "endpoint": self._endpoint,
@@ -2037,7 +2054,21 @@ class _RowsBuildWorker(QObject):
             "civil_unrest": _RowsBuildWorker._canonicalize_value(msg.civil_unrest),
             "political": _RowsBuildWorker._canonicalize_value(msg.political),
         }
-        return _RowsBuildWorker._semantic_report_key(
+        # The one-second key collapses retained display copies. Keep the
+        # broader cross-source correlation key unchanged, but distinguish
+        # substantive report text when choosing which retained rows to show.
+        if bucket_seconds == 1:
+            for name in ("remarks_text", "brevity_code", "brevity_summary"):
+                fields[name] = str(getattr(msg, name, "") or "").strip().casefold()
+            try:
+                payload = json.loads(getattr(msg, "raw_payload_json", "") or "{}")
+            except (TypeError, ValueError):
+                payload = {}
+            if isinstance(payload, dict):
+                for name in ("body", "text", "message", "responses"):
+                    if payload.get(name):
+                        fields["content_" + name] = str(payload[name]).strip().casefold()
+        key = _RowsBuildWorker._semantic_report_key(
             subtype=str(msg.subtype or "").strip().upper(),
             from_call=(msg.from_call or "").strip().upper(),
             target=(msg.target or "").strip().upper(),
@@ -2047,6 +2078,11 @@ class _RowsBuildWorker(QObject):
             fields=fields,
             bucket_seconds=int(bucket_seconds or 60),
         )
+        if key and bucket_seconds == 1:
+            content = {name: value for name, value in fields.items()
+                       if name in {"remarks_text", "brevity_code", "brevity_summary"} or name.startswith("content_")}
+            key += ":" + json.dumps(content, sort_keys=True, ensure_ascii=False)
+        return key
 
     @staticmethod
     def _read_file_head(path: Path, limit: int = 4096) -> str:
@@ -3524,7 +3560,7 @@ class MessageActionDelegate(QStyledItemDelegate):
 
         parent_widget = self.parent()
         items: list[MessageRowAction] = [
-            MessageRowAction("view", "", "View message", "view")
+            MessageRowAction("view", "", "Review file" if str(getattr(row, "origin", "")).lower() == "subspace" else "View message", "view")
         ]
         rec = None
         if hasattr(parent_widget, "_file_record_for_message_row"):
@@ -3755,6 +3791,11 @@ class MessageActionDelegate(QStyledItemDelegate):
             painter.drawLine(body.right() - side // 7, body.top() + side // 6, body.right() - side // 7, body.bottom() - side // 8)
 
     def eventFilter(self, watched, event):
+        # The filter outlives parts of the table during native destruction.
+        # Never query its viewport (or request another paint) for teardown,
+        # layout or paint events; only hover events belong to this filter.
+        if event.type() not in (QEvent.MouseMove, QEvent.Leave):
+            return super().eventFilter(watched, event)
         view = self._view
         if not isinstance(view, QTableView) or watched is not view.viewport():
             return super().eventFilter(watched, event)
@@ -3889,7 +3930,7 @@ class MessageHeaderWithCheckbox(QHeaderView):
         self.setMinimumHeight(button_height_for_font(self._select_all_button) + 4)
         self.sectionResized.connect(lambda *_args: self._position_select_all_button())
         self.sectionMoved.connect(lambda *_args: self._position_select_all_button())
-        QTimer.singleShot(0, self._position_select_all_button)
+        QTimer.singleShot(0, self, self._position_select_all_button)
 
     def select_button_width_hint(self) -> int:
         metrics = self._select_all_button.fontMetrics()
@@ -6318,6 +6359,13 @@ class MessageViewerTab(QWidget):
         self.reader_back_btn.setAccessibleName("Back to Inbox")
         self.reader_back_btn.setToolTip("Return to the message list and restore its position.")
         self.reader_back_btn.clicked.connect(self._close_message_reader)
+        self.reader_ncs_return_btn = QPushButton('Return to NCS')
+        self.reader_ncs_return_btn.setAccessibleName('Return to the originating JS8 net')
+        self.reader_ncs_return_btn.setToolTip('Return to the retained JS8 NCS working view; does not start a net.')
+        self.reader_ncs_return_btn.setVisible(bool(getattr(self, '_ncs_reader_context', None)))
+        self.reader_ncs_return_btn.clicked.connect(self._return_to_ncs_reader_context)
+        reader_toolbar.addWidget(self.reader_ncs_return_btn)
+
         self.reader_previous_btn = QPushButton("Previous")
         self.reader_previous_btn.setAccessibleName("Previous message")
         self.reader_previous_btn.setToolTip("Show the previous message in the current list order.")
@@ -6423,6 +6471,11 @@ class MessageViewerTab(QWidget):
         self.viewer.setReadOnly(True)
         self.viewer.setAcceptRichText(False)
         viewer_layout.addWidget(self.viewer)
+        from freqinout.gui.subspace_files_ui import SubspaceFileReview
+        self.subspace_file_review = SubspaceFileReview(self, self.viewer, self.info_label)
+        viewer_layout.addWidget(self.subspace_file_review)
+        self.subspace_file_review.occurrence_changed.connect(self._on_subspace_occurrence_changed)
+        self.subspace_file_review.manage_source_requested.connect(self._manage_subspace_source)
         reader_layout.addWidget(viewer_container, 1)
         self.inbox_workspace_stack.addWidget(self.reader_page)
         self.inbox_workspace_stack.setCurrentWidget(self.inbox_list_page)
@@ -6575,7 +6628,7 @@ class MessageViewerTab(QWidget):
         self._build_messages_header()
         self._apply_accessibility_width_guards()
         fit_child_combo_boxes(self)
-        QTimer.singleShot(0, self._set_initial_splitter_sizes)
+        QTimer.singleShot(0, self, self._set_initial_splitter_sizes)
         self._messages_model.dataChanged.connect(self._update_bulk_delete_buttons)
         if not self._defer_compose:
             self._ensure_compose_page()
@@ -6583,7 +6636,7 @@ class MessageViewerTab(QWidget):
         self._apply_accessibility_width_guards()
         self._set_messages_mode(self._messages_mode, save=False)
         self._setup_clock_timer()
-        QTimer.singleShot(0, self._update_messages_responsive_layout)
+        QTimer.singleShot(0, self, self._update_messages_responsive_layout)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -6605,6 +6658,8 @@ class MessageViewerTab(QWidget):
             return "wide"
 
     def _update_messages_responsive_layout(self) -> None:
+        if getattr(self, "_is_shutting_down", False):
+            return
         layout = getattr(self, "_inbox_actions_layout", None)
         if layout is None:
             return
@@ -7203,6 +7258,9 @@ class MessageViewerTab(QWidget):
         setup_layout.addWidget(self.compose_guidance_row_widget)
 
         self.compose_context_row_widget = QWidget()
+        self._compose_hearing_context_timer = QTimer(self.compose_context_row_widget)
+        self._compose_hearing_context_timer.setInterval(5000)
+        self._compose_hearing_context_timer.timeout.connect(self._refresh_visible_hearing_context)
         self.compose_context_row_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.compose_context_row_widget.setMaximumHeight(control_height_for_font(self.compose_context_row_widget, vertical_padding=16, floor=44))
         context_row = QHBoxLayout(self.compose_context_row_widget)
@@ -7218,6 +7276,10 @@ class MessageViewerTab(QWidget):
         self.compose_clear_context_btn = QPushButton("Clear Map Context")
         self.compose_clear_context_btn.clicked.connect(self._clear_compose_intent)
         context_row.addWidget(self.compose_clear_context_btn)
+        self.compose_return_reader_btn = QPushButton("Inspect source")
+        self.compose_return_reader_btn.clicked.connect(self._return_to_reply_source)
+        self.compose_return_reader_btn.setVisible(False)
+        context_row.addWidget(self.compose_return_reader_btn)
         self.compose_return_expect_btn = QPushButton("Back to Expect")
         self.compose_return_expect_btn.setToolTip(
             "Return to Expect and reselect the saved entry. Compose changes remain a working copy until saved explicitly."
@@ -7544,7 +7606,23 @@ class MessageViewerTab(QWidget):
         self.compose_commstat_brevity_list_combo.setMinimumWidth(180)
         self.compose_commstat_brevity_list_combo.currentIndexChanged.connect(self._on_compose_commstat_brevity_list_changed)
         brevity_builder_layout.addWidget(QLabel("Event List"), 0, 0)
-        brevity_builder_layout.addWidget(self.compose_commstat_brevity_list_combo, 0, 1, 1, 3)
+        self.compose_commstat_brevity_list_combo.setMinimumWidth(0)
+        self.compose_commstat_brevity_list_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.compose_commstat_brevity_list_combo.setMinimumContentsLength(14)
+        self.compose_commstat_brevity_list_combo.setAccessibleName('CommStat definition and source')
+        source_row = QWidget()
+        source_layout = QHBoxLayout(source_row)
+        source_layout.setContentsMargins(0, 0, 0, 0)
+        source_layout.addWidget(self.compose_commstat_brevity_list_combo, 1)
+        self.compose_commstat_definition_browse = QPushButton('Browse…')
+        self.compose_commstat_definition_browse.setAccessibleName('Choose CommStat definitions folder')
+        self.compose_commstat_definition_browse.clicked.connect(self._browse_compose_commstat_definitions)
+        source_layout.addWidget(self.compose_commstat_definition_browse)
+        brevity_builder_layout.addWidget(source_row, 0, 1, 1, 3)
+        self.compose_commstat_definition_hint = QLabel('Choose definitions; other installations are suggestions.')
+        self.compose_commstat_definition_hint.setWordWrap(True)
+        self.compose_commstat_definition_hint.setTextFormat(Qt.PlainText)
+        brevity_builder_layout.addWidget(self.compose_commstat_definition_hint, 17, 0, 1, 4)
         self._compose_brevity_field_layout = brevity_builder_layout
         self._compose_brevity_field_combos = {}
         self._compose_brevity_field_widgets = []
@@ -8645,6 +8723,9 @@ class MessageViewerTab(QWidget):
         btn.setToolTip("Open the same draft in a separate, larger composing window.")
 
     def _refresh_compose_layout_geometry_if_needed(self, *, force: bool = False) -> None:
+        if getattr(self, "_is_shutting_down", False):
+            self._compose_layout_refresh_pending = False
+            return
         if not hasattr(self, "compose_output_options_btn"):
             return
         mode = str(getattr(self, "_compose_mode", "nbems") or "nbems")
@@ -8678,12 +8759,16 @@ class MessageViewerTab(QWidget):
         if getattr(self, "_compose_layout_refresh_pending", False):
             return
         self._compose_layout_refresh_pending = True
-        QTimer.singleShot(0, self._run_pending_compose_layout_geometry_refresh)
+        # Cancel queued geometry work with its native owner, including callbacks
+        # posted immediately before deleteLater() is processed.
+        QTimer.singleShot(0, self, self._run_pending_compose_layout_geometry_refresh)
 
     def _run_pending_compose_layout_geometry_refresh(self) -> None:
         if not getattr(self, "_compose_layout_refresh_pending", False):
             return
         self._compose_layout_refresh_pending = False
+        if getattr(self, "_is_shutting_down", False):
+            return
         if getattr(self, "_compose_layout_refresh_running", False):
             return
         requested_signature = getattr(self, "_compose_layout_signature", None)
@@ -8699,10 +8784,13 @@ class MessageViewerTab(QWidget):
         # If a real viewport bucket or mode change arrived while the pass was
         # running, honor it once on the next event turn. Same-signature native
         # resize feedback is intentionally discarded.
-        if requested_signature != getattr(self, "_compose_layout_signature", None):
+        if (
+            not getattr(self, "_is_shutting_down", False)
+            and requested_signature != getattr(self, "_compose_layout_signature", None)
+        ):
             if not getattr(self, "_compose_layout_refresh_pending", False):
                 self._compose_layout_refresh_pending = True
-                QTimer.singleShot(0, self._run_pending_compose_layout_geometry_refresh)
+                QTimer.singleShot(0, self, self._run_pending_compose_layout_geometry_refresh)
 
     def _open_compose_workbench_dialog(self) -> None:
         existing = getattr(self, "_compose_workbench_dialog", None)
@@ -8776,8 +8864,8 @@ class MessageViewerTab(QWidget):
             if hasattr(self, "compose_page"):
                 self.compose_page.updateGeometry()
                 self.compose_page.update()
-            QTimer.singleShot(0, lambda: self._refresh_compose_layout_geometry_if_needed(force=True))
-            QTimer.singleShot(0, self._update_messages_responsive_layout)
+            QTimer.singleShot(0, self, lambda: self._refresh_compose_layout_geometry_if_needed(force=True))
+            QTimer.singleShot(0, self, self._update_messages_responsive_layout)
 
         dialog.finished.connect(lambda _result: restore_compose_widgets())
         self._refresh_compose_layout_geometry_if_needed(force=True)
@@ -8797,35 +8885,78 @@ class MessageViewerTab(QWidget):
     def _compose_zulu_text(self) -> str:
         return format_compose_zulu(self._compose_timestamp_utc)
 
+    @staticmethod
+    def _commstat_definition_folder(raw) -> str:
+        text = str(raw or "").strip()
+        if not text:
+            return ""
+        path = Path(text).expanduser()
+        if path.suffix.lower() in {".py", ".exe", ".ini", ".db", ".db3", ".sh", ".cmd", ".bat"}:
+            path = path.parent
+        return str(path)
+
+    def _compose_commstat_catalog_scope(self):
+        selected = self._selected_compose_radio_target() if getattr(self, '_compose_radio_targets_loaded', False) else None
+        return getattr(selected, 'radio_id', 'station')
+
+    def _compose_commstat_preferred_catalog_dir(self) -> str:
+        selected = self._selected_compose_radio_target() if getattr(self, '_compose_radio_targets_loaded', False) else None
+        if getattr(self, '_compose_radio_targets_loaded', False):
+            return self._commstat_definition_folder(selected.profile.get('commstat_launch_path', '') if selected else '')
+        for key in ('commstat_path', 'commstat_app_path', 'commstat_config_path', 'path_commstat',
+                    'commstat_launch_path', 'commstat3_db_path', 'commstat_db_path'):
+            value = self.settings.get(key, '')
+            if value:
+                return self._commstat_definition_folder(value)
+        return ''
+
     def _compose_commstat_brevity_catalog_dirs(self) -> List[Path]:
-        paths: List[Path] = []
-        selected = self._selected_compose_radio_target() if getattr(self, "_compose_radio_targets_loaded", False) else None
-        selected_path = selected.profile.get("commstat_launch_path", "") if selected else ""
-        configured = [selected_path] if selected_path else [self.settings.get(key, "") for key in (
-            "commstat_path", "commstat_app_path", "commstat_config_path", "path_commstat",
-            "commstat_launch_path", "commstat3_db_path", "commstat_db_path")]
-        base_raw = str(self.settings.get("radio_apps_base_folder", "") or "").strip()
-        base_roots = [Path(base_raw).expanduser()] if base_raw else []
-        base_roots.append(Path.home() / "RadioTools" / "Programs")
-        candidates: List[str | Path] = list(configured)
-        if not any(str(value or "").strip() for value in configured):
-            for root in base_roots:
-                candidates.extend((root / "commstat-5.0", root / "commstat-4.7", root / "CommStat"))
-            candidates.append(Path.home() / "RadioTools" / "commstat-5.0")
+        # Candidate awareness only. Selection below owns the actual definition;
+        # another installation can never silently replace a selected source.
+        paths = []
+        selected = self._selected_compose_radio_target() if getattr(self, '_compose_radio_targets_loaded', False) else None
+        configured = [selected.profile.get('commstat_launch_path', '')] if selected else []
+        configured += [self.settings.get(key, '') for key in (
+            'commstat_path', 'commstat_app_path', 'commstat_config_path', 'path_commstat',
+            'commstat_launch_path', 'commstat3_db_path', 'commstat_db_path')]
+        chosen = getattr(self, '_compose_brevity_browsed_sources', {}).get(self._compose_commstat_catalog_scope(), '')
+        if chosen:
+            configured.insert(0, chosen)
+        base_raw = str(self.settings.get('radio_apps_base_folder', '') or '').strip()
+        roots = ([Path(base_raw).expanduser()] if base_raw else []) + [Path.home() / 'RadioTools' / 'Programs']
+        candidates = configured + [root / name for root in roots for name in ('commstat-5.0', 'commstat-4.7', 'CommStat')]
+        candidates.append(Path.home() / 'RadioTools' / 'commstat-5.0')
         for raw in candidates:
-            text = str(raw or "").strip()
-            if not text:
-                continue
-            path = Path(text).expanduser()
-            if path.suffix.lower() in {".py", ".exe", ".ini", ".db", ".db3", ".sh", ".cmd"}:
-                path = path.parent
-            if path not in paths:
-                paths.append(path)
-        return paths
+            folder = self._commstat_definition_folder(raw)
+            if folder and Path(folder) not in paths:
+                paths.append(Path(folder))
+        return paths[:24]
+
+    def _browse_compose_commstat_definitions(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, 'Choose CommStat definitions folder')
+        if not folder:
+            return
+        sources = getattr(self, '_compose_brevity_browsed_sources', {})
+        sources[self._compose_commstat_catalog_scope()] = folder
+        self._compose_brevity_browsed_sources = sources
+        choices = getattr(self, '_compose_brevity_selected_definitions', {})
+        choices.pop(self._compose_commstat_catalog_scope(), None)
+        self._compose_brevity_selected_definitions = choices
+        self._populate_compose_commstat_brevity_builder()
+        self._update_compose_preview()
+
+    @staticmethod
+    def _commstat_catalog_choice_key(entry):
+        prefix, name, data = entry
+        return (str(data.get('_fio_source', '')), name, prefix)
 
     def _compose_commstat_brevity_options(self) -> List[str]:
         options = []
-        for prefix, name, data in self._compose_commstat_brevity_catalogs():
+        catalogs = getattr(self, '_compose_commstat_brevity_catalog_cache', ())
+        picker = getattr(self, 'compose_commstat_brevity_list_combo', None)
+        idx = picker.currentData() if isinstance(picker, QComboBox) else None
+        selected = [catalogs[idx]] if isinstance(idx, int) and 0 <= idx < len(catalogs) else []
+        for prefix, name, data in selected:
             values = {}
             for field in model_fields(data):
                 entries = section_entries(field_section(data, field, values))
@@ -8864,17 +8995,17 @@ class MessageViewerTab(QWidget):
             cache = self._compose_brevity_read_cache = LatestReadCache("fio-compose-brevity")
         def reader_factory():
             def read():
-                catalogs, seen = [], set()
+                catalogs = []
                 for folder in folders:
-                    for prefix, data in load_catalogs(folder).items():
-                        version_key = (prefix, len(model_fields(data)))
-                        if version_key in seen:
-                            continue
-                        seen.add(version_key)
-                        catalogs.append((prefix, data["_fio_filename"], data))
+                    for data in load_catalog_choices(folder):
+                        catalogs.append((data['_fio_prefix'], data['_fio_filename'], data))
+                        if len(catalogs) >= 64:
+                            break
+                    if len(catalogs) >= 64:
+                        break
                 return catalogs
             return read
-        result = cache.read(folders, reader_factory, refresh_after_s=10.0)
+        result = cache.read((self._compose_commstat_catalog_scope(), folders), reader_factory, refresh_after_s=10.0)
         timer = getattr(self, "_compose_brevity_poll", None)
         if timer is None:
             timer = self._compose_brevity_poll = QTimer(self)
@@ -8890,13 +9021,14 @@ class MessageViewerTab(QWidget):
 
     def _on_compose_brevity_catalog_ready(self) -> None:
         catalogs = self._compose_commstat_brevity_catalogs()
-        signature = (tuple(str(path) for path in self._compose_commstat_brevity_catalog_dirs()),
+        signature = (self._compose_commstat_catalog_scope(), self._compose_commstat_preferred_catalog_dir(),
+                     tuple(str(path) for path in self._compose_commstat_brevity_catalog_dirs()),
                      tuple((prefix, name, data.get("_fio_fingerprint")) for prefix, name, data in catalogs))
         if signature == getattr(self, "_compose_brevity_published_signature", None):
             return
         self._compose_brevity_published_signature = signature
-        self._populate_compose_commstat_brevity_options()
         self._populate_compose_commstat_brevity_builder()
+        self._populate_compose_commstat_brevity_options()
         self._update_compose_preview()
 
     @staticmethod
@@ -8918,24 +9050,36 @@ class MessageViewerTab(QWidget):
         list_combo = getattr(self, "compose_commstat_brevity_list_combo", None)
         if not isinstance(list_combo, QComboBox):
             return
-        previous = list_combo.currentData()
-        old_catalogs = getattr(self, "_compose_commstat_brevity_catalog_cache", ())
-        old_key = None
-        if isinstance(previous, int) and 0 <= previous < len(old_catalogs):
-            old_key = (old_catalogs[previous][0], old_catalogs[previous][1])
+        scope = self._compose_commstat_catalog_scope()
+        choices = getattr(self, '_compose_brevity_selected_definitions', {})
+        old_key = choices.get(scope)
+        preferred = getattr(self, '_compose_brevity_browsed_sources', {}).get(scope) or self._compose_commstat_preferred_catalog_dir()
         catalogs = self._compose_commstat_brevity_catalogs()
         self._compose_commstat_brevity_catalog_cache = catalogs
+        self._compose_brevity_catalog_scope = scope
         list_combo.blockSignals(True)
         try:
             list_combo.clear()
             list_combo.addItem("Select event list" if catalogs else "Definitions unavailable", None)
             selected = 0
-            for idx, (prefix, name, data) in enumerate(catalogs):
+            preferred_entries = [entry for entry in catalogs if entry[2].get('_fio_source') == preferred and model_fields(entry[2])]
+            default_key = None
+            if preferred_entries and len({entry[0] for entry in preferred_entries}) == len(preferred_entries):
+                default_key = self._commstat_catalog_choice_key(preferred_entries[0])
+            for idx, entry in enumerate(catalogs):
+                prefix, name, data = entry
                 if model_fields(data):
-                    list_combo.addItem(f"{prefix} - {name}", idx)
-                    if (prefix, name) == old_key:
+                    source = str(data.get('_fio_source', ''))
+                    label = f"{prefix} - {name} · {source}"
+                    list_combo.addItem(label, idx)
+                    list_combo.setItemData(list_combo.count()-1, label, Qt.ToolTipRole)
+                    desired = old_key if scope in choices else default_key
+                    if self._commstat_catalog_choice_key(entry) == desired:
                         selected = list_combo.count() - 1
-            list_combo.setCurrentIndex(selected or (1 if list_combo.count() > 1 else 0))
+            list_combo.setCurrentIndex(selected)
+            if selected and scope not in choices:
+                choices[scope] = self._commstat_catalog_choice_key(catalogs[list_combo.currentData()])
+                self._compose_brevity_selected_definitions = choices
         finally:
             list_combo.blockSignals(False)
         self._on_compose_commstat_brevity_list_changed(refresh_preview=False)
@@ -8947,9 +9091,19 @@ class MessageViewerTab(QWidget):
         idx = list_combo.currentData()
         catalogs = getattr(self, "_compose_commstat_brevity_catalog_cache", []) or []
         data: Dict[str, object] = {}
+        if refresh_preview:
+            choices = getattr(self, '_compose_brevity_selected_definitions', {})
+            choices[self._compose_commstat_catalog_scope()] = (
+                self._commstat_catalog_choice_key(catalogs[idx])
+                if isinstance(idx, int) and 0 <= idx < len(catalogs) else None)
+            self._compose_brevity_selected_definitions = choices
         if isinstance(idx, int) and 0 <= idx < len(catalogs):
             _prefix, _name, raw_data = catalogs[idx]
             data = raw_data if isinstance(raw_data, dict) else {}
+        hint = getattr(self, 'compose_commstat_definition_hint', None)
+        if hint is not None:
+            hint.setText('Definitions: ' + str(data.get('_fio_source', '')) if data else
+                         'Choose a definition or Browse its folder. Brevity is optional; your message remains editable.')
         old_values = {key: combo.currentData() for key, combo in getattr(self, "_compose_brevity_field_combos", {}).items()}
         for widget in getattr(self, "_compose_brevity_field_widgets", ()):
             self._compose_brevity_field_layout.removeWidget(widget)
@@ -8974,6 +9128,7 @@ class MessageViewerTab(QWidget):
         self._compose_brevity_field_combos = combos
         self._compose_brevity_field_widgets = widgets
         if refresh_preview:
+            self._populate_compose_commstat_brevity_options()
             self._update_compose_preview()
 
     def _compose_commstat_brevity_builder_code(self) -> str:
@@ -9014,6 +9169,8 @@ class MessageViewerTab(QWidget):
             self._update_compose_preview()
 
     def _compose_commstat_brevity_code(self) -> str:
+        if getattr(self, '_compose_brevity_catalog_scope', None) != self._compose_commstat_catalog_scope():
+            return ''
         combo = getattr(self, "compose_commstat_brevity_edit", None)
         if isinstance(combo, QComboBox):
             text = combo.currentText()
@@ -9025,10 +9182,14 @@ class MessageViewerTab(QWidget):
         if not candidates:
             return ""
         code = candidates[0]
-        for prefix, _, catalog in self._compose_commstat_brevity_catalogs():
+        catalogs = getattr(self, '_compose_commstat_brevity_catalog_cache', ())
+        picker = getattr(self, 'compose_commstat_brevity_list_combo', None)
+        idx = picker.currentData() if isinstance(picker, QComboBox) else None
+        if isinstance(idx, int) and 0 <= idx < len(catalogs):
+            prefix, _, catalog = catalogs[idx]
             if prefix == code[0]:
                 records = analyze_brevity_codes(code, {prefix: catalog})
-                if records and records[0]["status"] == "decoded":
+                if records and records[0]['status'] == 'decoded':
                     return code
         return ""
 
@@ -9039,7 +9200,33 @@ class MessageViewerTab(QWidget):
                 self._populate_compose_commstat_brevity_builder()
         self._update_compose_preview()
 
+    def set_ncs_reader_context(self, context=None):
+        self._ncs_reader_context = dict(context or {})
+        self._ncs_reader_pending = str(self._ncs_reader_context.get('message_id') or '')
+        button = getattr(self, 'reader_ncs_return_btn', None)
+        if button is not None:
+            button.setVisible(bool(self._ncs_reader_context))
+
+    def _try_open_ncs_reader(self):
+        ident = str(getattr(self, '_ncs_reader_pending', '') or '')
+        if not ident or self._is_shutting_down or not getattr(self, '_has_active_view', False):
+            return
+        if getattr(self, '_messages_mode', 'Inbox') != 'Inbox':
+            return
+        row = next((row for row in getattr(self, '_message_rows', ())
+                    if str(getattr(row.payload, 'message_id', '')) == ident), None)
+        if row is not None:
+            self._ncs_reader_pending = ''
+            self._open_message_reader(row)
+
+    def _return_to_ncs_reader_context(self):
+        callback = getattr(self.window(), 'return_to_ncs_workbench', None)
+        if self._ncs_reader_context and callable(callback):
+            callback(dict(self._ncs_reader_context))
+
     def _compose_rf_target_text(self, value: object) -> str:
+        if dict(getattr(self, '_compose_intent', {}) or {}).get('source') == 'js8_ncs':
+            return str(value or '').strip().upper()
         return str(value or "").strip().upper().lstrip("@")
 
     @staticmethod
@@ -10272,6 +10459,11 @@ class MessageViewerTab(QWidget):
                 "comment": getattr(getattr(self, "compose_commstat_comment_edit", None), "text", lambda: "")(),
                 "brevity": bool(getattr(getattr(self, "compose_commstat_brevity_chk", None), "isChecked", lambda: False)()),
                 "brevity_code": self._compose_combo_text(getattr(self, "compose_commstat_brevity_edit", None)),
+                "brevity_radio_scope": self._compose_commstat_catalog_scope(),
+                "brevity_definition": getattr(self, '_compose_brevity_selected_definitions', {}).get(self._compose_commstat_catalog_scope()),
+                "brevity_folder": getattr(self, '_compose_brevity_browsed_sources', {}).get(self._compose_commstat_catalog_scope()),
+                "brevity_fields": {key: combo.currentData() for key, combo in
+                                   getattr(self, '_compose_brevity_field_combos', {}).items()},
                 "status": {
                     key: self._compose_combo_text(combo)
                     for key, combo in (getattr(self, "compose_commstat_status_widgets", {}) or {}).items()
@@ -10397,12 +10589,27 @@ class MessageViewerTab(QWidget):
             ):
                 self._compose_set_line_text(getattr(self, widget_name, None), draft.get(key))
             self._compose_set_combo_data(getattr(self, "compose_commstat_scope_combo", None), draft.get("scope"))
+            scope = self._compose_commstat_catalog_scope()
+            if 'brevity_definition' in draft and draft.get('brevity_radio_scope') == scope:
+                choices = getattr(self, '_compose_brevity_selected_definitions', {})
+                choices[scope] = tuple(draft['brevity_definition']) if draft['brevity_definition'] else None
+                self._compose_brevity_selected_definitions = choices
+            if draft.get('brevity_folder') and draft.get('brevity_radio_scope') == scope:
+                sources = getattr(self, '_compose_brevity_browsed_sources', {})
+                sources[scope] = draft['brevity_folder']
+                self._compose_brevity_browsed_sources = sources
+            self._populate_compose_commstat_brevity_builder()
             self._compose_set_checked(getattr(self, "compose_commstat_brevity_chk", None), draft.get("brevity"))
             self._compose_set_combo_text(getattr(self, "compose_commstat_brevity_edit", None), draft.get("brevity_code"))
             for key, value in dict(draft.get("status", {}) or {}).items():
                 self._compose_set_combo_text((getattr(self, "compose_commstat_status_widgets", {}) or {}).get(key), value)
             for name, value in dict(draft.get("brevity_builder", {}) or {}).items():
+                if name == 'compose_commstat_brevity_list_combo':
+                    # Old drafts stored a transient row number, not source identity.
+                    continue
                 self._compose_set_combo_data(getattr(self, name, None), value)
+            for key, value in dict(draft.get('brevity_fields', {}) or {}).items():
+                self._compose_set_combo_data(getattr(self, '_compose_brevity_field_combos', {}).get(key), value)
         elif mode == "mesh":
             source_combo = getattr(self, "compose_mesh_source_combo", None)
             adapter_id = str(draft.get("adapter_id") or "")
@@ -12303,6 +12510,8 @@ class MessageViewerTab(QWidget):
         if str(getattr(self, "_compose_mode", "nbems") or "nbems") == "spotter":
             self._refresh_compose_forms()
         self._start_compose_target_guidance_worker()
+        if str(getattr(self, '_compose_mode', 'nbems')) == 'commstat_rf':
+            self._populate_compose_commstat_brevity_builder()
         self._update_compose_preview()
         self.request_compose_js8_selected_target_refresh()
 
@@ -12559,7 +12768,43 @@ class MessageViewerTab(QWidget):
             "fio_spotter_form_expect",
         }
         map_context = bool(source == "map" and (intent.get("recipient_callsign") or intent.get("title")))
-        visible = bool(expect_context or map_context)
+        hearing = intent.get("subspace_hearing_evidence") if map_context else None
+        hearing_context = isinstance(hearing, Mapping) and bool(hearing)
+        reply_context = source == "message_reader_reply"
+        visible = bool(expect_context or map_context or reply_context)
+        timer = getattr(self, "_compose_hearing_context_timer", None)
+        if timer is not None:
+            previous = getattr(self, "_compose_hearing_timer_context", None)
+            if previous is not hearing and timer.isActive():
+                timer.stop()
+            self._compose_hearing_timer_context = hearing if hearing_context else None
+            if hearing_context and not timer.isActive():
+                timer.start()
+        if hasattr(self, "compose_return_reader_btn"):
+            self.compose_return_reader_btn.setText("Review map" if hearing_context else "Inspect source")
+            self.compose_return_reader_btn.setVisible(reply_context or hearing_context)
+        if source == 'js8_ncs':
+            context = intent.get('ncs_context', {})
+            self.compose_context_label.setText('JS8 net: ' + str(context.get('label') or '') + ' · Saved form working copy · explicit Send')
+            self.compose_context_row_widget.setVisible(True)
+            self.compose_return_reader_btn.setText('Return to NCS')
+            self.compose_return_reader_btn.setVisible(True)
+            self.compose_return_expect_btn.setVisible(False)
+            self.compose_clear_context_btn.setText('Restore previous draft')
+            self.compose_clear_context_btn.setVisible(hasattr(self, '_ncs_previous_compose_draft'))
+            return
+        self.compose_clear_context_btn.setText('Clear context')
+        if reply_context:
+            parts = ["Reply to " + str(intent.get("recipient_callsign") or ""),
+                     str(intent.get("source_family") or ""), str(intent.get("title") or ""),
+                     str(intent.get("source_ref") or "")]
+            self.compose_context_label.setText(" · ".join(part for part in parts if part))
+            self.compose_context_label.setToolTip(self.compose_context_label.text())
+            self.compose_context_row_widget.setVisible(True)
+            self.compose_clear_context_btn.setVisible(False)
+            self.compose_return_expect_btn.setVisible(False)
+            self.compose_edit_expect_copy_btn.setVisible(False)
+            return
         if not visible:
             if hasattr(self, "compose_context_row_widget"):
                 self.compose_context_row_widget.setVisible(False)
@@ -12595,13 +12840,25 @@ class MessageViewerTab(QWidget):
         target = str(intent.get("recipient_callsign") or intent.get("target") or "").strip().upper()
         source = str(intent.get("source_label") or intent.get("last_heard_source") or "").strip()
         bits = [f"Opened from map: {target}" if target else "Opened from map"]
-        if source:
+        if hearing_context:
+            from freqinout.core.subspace_hearing import validate_compose_hearing_context
+            selected = self._selected_compose_radio_target()
+            profile = dict(selected.profile) if selected is not None else None
+            if profile is not None:
+                profile["id"] = selected.radio_id
+            result = validate_compose_hearing_context(hearing, self._compose_intent_target(), radio_profile=profile)
+            bits.append("Subspace hearing" if result.get("state") == "current" else "Hearing needs review")
+            tooltip = " ".join(filter(None, (str(intent.get("source_label") or ""),
+                                              str(result.get("detail") or ""),
+                                              "Receiving evidence is advisory; it does not verify a send path.")))
+        elif source:
             bits.append(source)
         age = str(intent.get("last_heard_age_label") or "").strip()
-        if age:
+        if age and not hearing_context:
             bits.append(age)
         if hasattr(self, "compose_context_label"):
             self.compose_context_label.setText(" | ".join(bits))
+            self.compose_context_label.setToolTip(tooltip if hearing_context else " | ".join(bits))
         if hasattr(self, "compose_context_row_widget"):
             self.compose_context_row_widget.setVisible(True)
         if hasattr(self, "compose_clear_context_btn"):
@@ -12610,6 +12867,42 @@ class MessageViewerTab(QWidget):
             self.compose_return_expect_btn.setVisible(False)
         if hasattr(self, "compose_edit_expect_copy_btn"):
             self.compose_edit_expect_copy_btn.setVisible(False)
+
+    def _refresh_visible_hearing_context(self) -> None:
+        if bool(getattr(self, "_is_shutting_down", False)):
+            return
+        row = getattr(self, "compose_context_row_widget", None)
+        if row is not None and row.isVisible():
+            self._refresh_compose_context_label()
+
+    def _return_to_reply_source(self) -> None:
+        from freqinout.gui.ncs_compose_handoff import is_ncs_intent, retain
+        current = dict(getattr(self, '_compose_intent', {}) or {})
+        if is_ncs_intent(current):
+            retain(self)
+            callback = getattr(self.window(), 'return_to_ncs_workbench', None)
+            if callable(callback):
+                callback(current['ncs_context'])
+            return
+        intent = dict(getattr(self, "_compose_intent", {}) or {})
+        if intent.get("source") == "map" and isinstance(intent.get("subspace_hearing_evidence"), Mapping):
+            callback = getattr(self.window(), "_open_map_window", None)
+            if callable(callback):
+                callback()
+            else:
+                self._set_compose_status("Map review is unavailable in this window; the draft is retained.", role="info")
+            return
+        callback = getattr(self.window(), "open_messages_section", None)
+        if not callable(callback):
+            return
+        key = getattr(self, "_reply_source_key", None)
+        callback("inbox")
+        rows = self._messages_model.rows() if hasattr(self, "_messages_model") else []
+        row = next((row for row in rows if self._reader_row_key(row) == key), None)
+        if row is not None:
+            self._open_message_reader(row)
+        else:
+            QMessageBox.information(self, "Reply source", "The original message is no longer in the current Inbox view.")
 
     def _return_to_expect(self) -> None:
         """Return to Expect without persisting the Compose working copy."""
@@ -12627,6 +12920,10 @@ class MessageViewerTab(QWidget):
         )
 
     def _clear_compose_intent(self) -> None:
+        from freqinout.gui.ncs_compose_handoff import is_ncs_intent, restore_previous
+        if is_ncs_intent(dict(getattr(self, '_compose_intent', {}) or {})):
+            restore_previous(self)
+            return
         self._compose_intent = {}
         self._update_compose_preview()
 
@@ -12768,10 +13065,15 @@ class MessageViewerTab(QWidget):
     def prefill_compose_intent(self, intent: Mapping[str, object]) -> None:
         """Apply a navigation handoff as one recoverable Compose transaction."""
 
+        from freqinout.gui.ncs_compose_handoff import is_ncs_intent, begin_handoff, restore
+        retained = begin_handoff(self, dict(intent)) if is_ncs_intent(dict(intent)) else None
         MessageViewerTab._begin_compose_update(self)
         completed = False
         try:
-            self._apply_prefill_compose_intent(intent)
+            if retained:
+                restore(self, retained)
+            else:
+                self._apply_prefill_compose_intent(intent)
             completed = True
         finally:
             self._compose_spotter_source_loading = False
@@ -12779,6 +13081,8 @@ class MessageViewerTab(QWidget):
 
     def _apply_prefill_compose_intent(self, intent: Mapping[str, object]) -> None:
         data = compose_intent_from_mapping(intent).as_dict()
+        from freqinout.gui.ncs_compose_handoff import publish_saved_entry_snapshot
+        publish_saved_entry_snapshot(self, data)
         self._compose_intent = data
         self._compose_expect_view_editing = not bool(data.get("expect_view", False))
         mode = str(data.get("transport") or data.get("mode") or "js8").strip().lower()
@@ -12801,12 +13105,14 @@ class MessageViewerTab(QWidget):
             )
             if self.compose_mode_selector.count() > row:
                 self.compose_mode_selector.setCurrentRow(row)
-        target = str(data.get("recipient_callsign") or data.get("target") or "").strip().upper()
+        target = str((data.get('ncs_target') if data.get('source') == 'js8_ncs' else '') or data.get("recipient_callsign") or data.get("target") or "").strip().upper()
         if target:
             if hasattr(self, "compose_js8_target_edit"):
                 self.compose_js8_target_edit.setText(target)
             if hasattr(self, "compose_commstat_target_edit"):
                 self.compose_commstat_target_edit.setText(target)
+        if data.get("source") == "message_reader_reply" and intent.get("replace_reply_body"):
+            self.compose_js8_plain_text_edit.clear()
         body = str(data.get("body") or data.get("message") or "").strip()
         if body and hasattr(self, "compose_js8_plain_text_edit"):
             self.compose_js8_plain_text_edit.setPlainText(body)
@@ -12831,6 +13137,7 @@ class MessageViewerTab(QWidget):
             self._on_compose_mesh_destination_changed()
         expect_entry_id = int(data.get("expect_entry_id", 0) or 0)
         if mode in {"spotter", "js8spotter", "fiospotter"} and expect_entry_id > 0:
+            saved_found = False
             self._refresh_compose_spotter_expect_entries()
             combo = getattr(self, "compose_spotter_source_combo", None)
             if isinstance(combo, QComboBox):
@@ -12838,6 +13145,7 @@ class MessageViewerTab(QWidget):
                     item = combo.itemData(index)
                     entry = item.get("entry", {}) if isinstance(item, dict) else {}
                     if isinstance(entry, dict) and int(entry.get("id", 0) or 0) == expect_entry_id:
+                        saved_found = True
                         if combo.currentIndex() == index:
                             loaded = self._on_compose_spotter_source_changed()
                         else:
@@ -12855,8 +13163,14 @@ class MessageViewerTab(QWidget):
                         if not loaded:
                             raise ValueError("saved CommsPlan Spotter response could not be decoded")
                         break
+            if not saved_found:
+                raise ValueError('The saved Expect response is unavailable; the requested form was not replaced with a blank form')
         if requested_spotter_form:
             self._select_compose_spotter_form_code(requested_spotter_form)
+        if data.get('source') == 'js8_ncs' and data.get('ncs_target'):
+            # Imported saved responses may carry an old destination. The explicit
+            # NCS handoff target owns this working copy; Expect storage is untouched.
+            self.compose_js8_target_edit.setText(str(data['ncs_target']))
         self._apply_compose_expect_view_state()
         # Mode activation already refreshes this cache when required. Reusing
         # it here avoids a second synchronous runtime-store scan during an
@@ -13602,8 +13916,8 @@ class MessageViewerTab(QWidget):
         self._sync_message_check_timer()
         if compose_active:
             self._refresh_compose_layout_geometry_if_needed(force=True)
-            QTimer.singleShot(0, lambda: self._refresh_compose_layout_geometry_if_needed(force=True))
-            QTimer.singleShot(80, lambda: self._refresh_compose_layout_geometry_if_needed(force=True))
+            QTimer.singleShot(0, self, lambda: self._refresh_compose_layout_geometry_if_needed(force=True))
+            QTimer.singleShot(80, self, lambda: self._refresh_compose_layout_geometry_if_needed(force=True))
         self._update_compose_preview()
         if compose_active and str(getattr(self, "_compose_mode", "nbems") or "nbems") == "spotter":
             self._queue_compose_spotter_scroll_reset()
@@ -14639,6 +14953,8 @@ class MessageViewerTab(QWidget):
             self._render_compose_preview()
 
     def _render_compose_preview(self) -> None:
+        from freqinout.gui.ncs_compose_handoff import queue_retention
+        queue_retention(self)
         if int(getattr(self, "_compose_update_depth", 0) or 0) > 0:
             self._compose_preview_update_pending = True
             return
@@ -15345,6 +15661,15 @@ class MessageViewerTab(QWidget):
                 self._set_compose_status("Complete the Spotter response before sending.", role="warning")
                 return
             self._update_compose_preview()
+        ncs_context = dict(getattr(self, '_compose_intent', {}) or {}).get('ncs_context')
+        if ncs_context:
+            if int(ncs_context.get('radio_id') or 0) != int(radio_target.radio_id):
+                self._set_compose_status('Select the radio pinned to this JS8 net; the draft is retained.', role='warning')
+                return
+            pinned = JS8ApiEndpoint(str(ncs_context.get('host') or ''), int(ncs_context.get('port') or 0)).normalized()
+            if js8_endpoint_from_radio_profile(radio_target.profile, fallback_settings=self.settings).normalized() != pinned:
+                self._set_compose_status('JS8 source changed; return to NCS and review setup. Draft retained.', role='warning')
+                return
         endpoint = js8_endpoint_from_radio_profile(radio_target.profile, fallback_settings=self.settings)
         label = "JS8Call" if js8_mode else "CommStat RF" if commstat_mode else "CommsPlan Spotter"
         radio_short_label = self._compose_radio_target_short_label(radio_target) or radio_target.label
@@ -15375,7 +15700,15 @@ class MessageViewerTab(QWidget):
         self._set_compose_status("Checking JS8Call and queueing the message…", role="info")
         self._update_compose_preview()
         self._compose_send_thread = QThread(self)
+        ncs = dict(getattr(self, '_compose_intent', {}) or {}).get('ncs_context')
+        extra = {}
+        if ncs:
+            import uuid
+            extra = {'ncs_context': {**ncs, 'intent_id': uuid.uuid4().hex, 'kind': 'saved_expect',
+                                      'destination': self._compose_intent_target()},
+                     'runtime_manager': getattr(self.window(), 'station_runtime_manager', None)}
         self._compose_send_worker = _ComposeJs8SendWorker(
+            **extra,
             endpoint=endpoint,
             command=command,
             generation=generation,
@@ -15425,7 +15758,7 @@ class MessageViewerTab(QWidget):
         if not bool(getattr(result, "sent", False)):
             issues = list(getattr(getattr(result, "preflight", None), "issues", []) or [])
             issue_codes = [str(getattr(issue, "code", "") or "") for issue in issues]
-            if issue_codes == ["target_state_unknown"] and not bool(data.get("allow_uncertain", False)):
+            if issue_codes == ["target_state_unknown"] and not bool(data.get("allow_uncertain", False)) and not dict(getattr(self, '_compose_intent', {}) or {}).get('ncs_context'):
                 endpoint = data.get("endpoint")
                 detail = str(getattr(issues[0], "detail", "") or "")
                 endpoint_label = (
@@ -18064,6 +18397,14 @@ class MessageViewerTab(QWidget):
 
     def shutdown(self) -> None:
         self._is_shutting_down = True
+        retention_timer = getattr(self, '_ncs_compose_retention_timer', None)
+        if retention_timer is not None:
+            retention_timer.stop()
+        if hasattr(self, "subspace_file_review"):
+            self.subspace_file_review.shutdown()
+        timer = getattr(self, "_compose_hearing_context_timer", None)
+        if timer is not None:
+            timer.stop()
         controller = getattr(self, "_manual_forward_controller", None)
         if controller is not None:
             controller.shutdown()
@@ -19164,6 +19505,7 @@ class MessageViewerTab(QWidget):
             )
             self._finish_inbox_filter_feedback()
             self._finish_traffic_navigation()
+            self._try_open_ncs_reader()
             log.info(
                 "MESSAGES|projected_table_loaded rows=%d total=%d generation=%d scope=%s age=%s",
                 len(rows),
@@ -19845,7 +20187,7 @@ class MessageViewerTab(QWidget):
         self._render_messages_table(_core_filter_rows_excluding_identities(self._messages_model.rows(), keys))
 
     def _refresh_message_filters(self, rows: List[UnifiedMessage]) -> None:
-        type_vals = sorted({r.msg_type for r in rows if r.msg_type})
+        type_vals = sorted({r.msg_type for r in rows if r.msg_type} | {"Subspace file"})
         status_vals = sorted({r.status for r in rows if r.status})
         from_vals = sorted({r.from_call for r in rows if r.from_call})
         to_vals = sorted({r.to_call for r in rows if r.to_call})
@@ -22239,7 +22581,7 @@ class MessageViewerTab(QWidget):
             # Catch first-show geometry recalcs that do not emit sectionResized.
             header.geometriesChanged.connect(self._sync_header_widths)
             self._messages_header_sync_connected = True
-        QTimer.singleShot(0, self._sync_select_all_checkbox)
+        QTimer.singleShot(0, self, self._sync_select_all_checkbox)
 
     def _set_initial_splitter_sizes(self) -> None:
         if not hasattr(self, "messages_splitter"):
@@ -22981,7 +23323,9 @@ class MessageViewerTab(QWidget):
             request = dict(record.get("request") or {})
             source = dict(request.get("source") or record.get("source") or {})
             source.update(draft_destination=deepcopy(request.get("destination") or {}), relay_id=record.get("relay_id"), draft_destination_id=(request.get("destination") or {}).get("id", ""),
-                          draft_recipient=request.get("recipient", ""))
+                          draft_recipient=request.get("recipient", ""),
+                          draft_expiry=record.get("expires"),
+                          draft_expires_seconds=request.get("expires_seconds", 3600))
             dialog.close()
             self._open_manual_forward_dialog(source)
         dialog.resumeRequested.connect(resume)
@@ -23075,14 +23419,33 @@ class MessageViewerTab(QWidget):
             callback(summary.from_call)
 
     def _reply_to_reader_message(self) -> None:
-        summary = self._reader_summary(self._reader_current_row())
+        source_row = self._reader_current_row()
+        summary = self._reader_summary(source_row)
         if summary is None or not summary.from_call:
             return
+        current_mode = str(getattr(self, "_compose_mode", "") or "")
+        editor = getattr(self, "compose_js8_plain_text_edit", None)
+        existing = (editor.toPlainText() if current_mode == "js8" and editor is not None
+                    else str((getattr(self, "_compose_mode_drafts", {}).get("js8") or {}).get("text") or ""))
+        replace = False
+        if existing.strip():
+            decision = QMessageBox(self)
+            decision.setWindowTitle("Reply draft")
+            decision.setText("A JS8 draft already contains text. Choose how to prepare this reply.")
+            keep = decision.addButton("Continue with text", QMessageBox.AcceptRole)
+            clear = decision.addButton("Replace text", QMessageBox.DestructiveRole)
+            decision.addButton(QMessageBox.Cancel)
+            decision.exec()
+            if decision.clickedButton() not in (keep, clear):
+                return
+            replace = decision.clickedButton() is clear
         callback = getattr(self.window(), "open_messages_section", None)
         if callable(callback):
+            self._reply_source_key = self._reader_row_key(source_row)
             callback(
                 "compose",
                 compose_intent={
+                    "replace_reply_body": replace,
                     "mode": "js8",
                     "transport": "js8",
                     "recipient_callsign": summary.from_call,
@@ -23392,6 +23755,8 @@ class MessageViewerTab(QWidget):
     ) -> None:
         was_open = bool(getattr(self, "_reader_open", False))
         self._reader_open = False
+        if hasattr(self, "subspace_file_review"):
+            self.subspace_file_review.clear_selection()
         if hasattr(self, "inbox_workspace_stack") and hasattr(self, "inbox_list_page"):
             self.inbox_workspace_stack.setCurrentWidget(self.inbox_list_page)
         if was_open:
@@ -23436,6 +23801,28 @@ class MessageViewerTab(QWidget):
             return
         self._render_message_content(row)
 
+    def _on_subspace_occurrence_changed(self, _occurrence: str) -> None:
+        if not getattr(self, "_is_shutting_down", False):
+            self._request_projected_message_query(force=True)
+
+    def _manage_subspace_source(self, _source_id: str) -> None:
+        host = resolve_help_host(self)
+        if host is not None and callable(getattr(host, "open_settings_section", None)):
+            host.open_settings_section("software_administration", settings_nav_context="software")
+
+    def show_subspace_files(self) -> None:
+        """Open the existing Inbox with the Subspace file type selected."""
+        self._set_inbox_focus("all")
+        self._clear_filters()
+        all_time = self.received_filter.findData(0)
+        if all_time >= 0:
+            self.received_filter.setCurrentIndex(all_time)
+        label = "Subspace file"
+        if self.type_filter.findText(label) < 0:
+            self.type_filter.addItem(label)
+        self._filters_initialized = True
+        self.type_filter.setCurrentText(label)
+
     def _render_message_content(self, row: UnifiedMessage) -> None:
         with perf_span(
             "messages.view_message",
@@ -23450,6 +23837,20 @@ class MessageViewerTab(QWidget):
                 row.title,
             )
             self._set_open_external_path(None)
+            review = getattr(self, "subspace_file_review", None)
+            if review is not None:
+                review.clear_selection()
+            if (isinstance(row.payload, ProjectedMessagePayload)
+                    and row.payload.source_family == "subspace"):
+                occurrence = row.payload.entities.get("subspace_occurrence_id", "")
+                self.current_record = self.current_js8 = self.current_sitrep = None
+                self.current_commstat = self.current_observation = None
+                if review is not None and occurrence:
+                    review.show_occurrence(occurrence)
+                else:
+                    self.info_label.setText("Subspace file unavailable")
+                    self.viewer.setPlainText("The file reference is unavailable. Manage the source and retry.")
+                return
             if isinstance(row.payload, JS8Message):
                 self.current_record = None
                 self.current_sitrep = None
@@ -24468,6 +24869,8 @@ class MessageViewerTab(QWidget):
         if isinstance(payload, FileRecord):
             return payload
         if isinstance(payload, ProjectedMessagePayload):
+            if payload.source_family == "subspace":
+                return None
             return self._projected_file_record(payload, allow_detail_lookup=allow_detail_lookup)
         return None
 

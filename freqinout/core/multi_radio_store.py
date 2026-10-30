@@ -629,6 +629,9 @@ SETTINGS_TABLE_SPECS: Dict[str, Dict[str, object]] = {
             application_data_root TEXT,
             all_path TEXT,
             save_dir TEXT,
+            received_files_enabled INTEGER NOT NULL DEFAULT 0,
+            received_files_path TEXT NOT NULL DEFAULT '',
+            received_files_existing TEXT NOT NULL DEFAULT 'review',
             storage_mode TEXT NOT NULL DEFAULT 'unverified',
             storage_verified_utc TEXT,
             storage_evidence TEXT,
@@ -657,6 +660,9 @@ SETTINGS_TABLE_SPECS: Dict[str, Dict[str, object]] = {
             "application_data_root": "TEXT",
             "all_path": "TEXT",
             "save_dir": "TEXT",
+            "received_files_enabled": "INTEGER NOT NULL DEFAULT 0",
+            "received_files_path": "TEXT NOT NULL DEFAULT ''",
+            "received_files_existing": "TEXT NOT NULL DEFAULT 'review'",
             "storage_mode": "TEXT NOT NULL DEFAULT 'unverified'",
             "storage_verified_utc": "TEXT",
             "storage_evidence": "TEXT",
@@ -3519,6 +3525,9 @@ def _save_js8_instance_conn(conn: sqlite3.Connection, values: Mapping[str, Any])
     if not existing:
         payload.setdefault("variant_family", "unknown")
         payload.setdefault("storage_mode", "unverified")
+        payload.setdefault("received_files_enabled", 0)
+        payload.setdefault("received_files_path", "")
+        payload.setdefault("received_files_existing", "review")
     if "offset_hz" in payload or not existing:
         payload["offset_hz"] = coerce_js8_offset_hz(payload.get("offset_hz"))
     if "variant_family" in payload or not existing:
@@ -3534,6 +3543,17 @@ def _save_js8_instance_conn(conn: sqlite3.Connection, values: Mapping[str, Any])
         payload["storage_mode"] = storage_mode
     if "application_data_root" in payload:
         payload["application_data_root"] = canonicalize_storage_path(payload.get("application_data_root"))
+    if "received_files_enabled" in payload:
+        payload["received_files_enabled"] = _coerce_bool_int(payload["received_files_enabled"], False)
+    if "received_files_path" in payload:
+        payload["received_files_path"] = _coerce_text(payload["received_files_path"], "").strip()
+    if "received_files_existing" in payload:
+        choice = _coerce_text(payload["received_files_existing"], "review").lower()
+        if choice not in {"review", "new"}:
+            raise ValueError("Choose review existing files or monitor new files.")
+        payload["received_files_existing"] = choice
+    if payload.get("received_files_enabled", (existing or {}).get("received_files_enabled", 0)) and not payload.get("received_files_path", (existing or {}).get("received_files_path", "")):
+        raise ValueError("Choose a received files directory before enabling monitoring.")
     return _save_simple_record(
         conn,
         "js8_instances",
@@ -3556,6 +3576,9 @@ def _save_js8_instance_conn(conn: sqlite3.Connection, values: Mapping[str, Any])
             "application_data_root",
             "all_path",
             "save_dir",
+            "received_files_enabled",
+            "received_files_path",
+            "received_files_existing",
             "storage_mode",
             "storage_verified_utc",
             "storage_evidence",
@@ -4931,6 +4954,9 @@ def _resolve_device_profile_links_conn(conn: sqlite3.Connection, profile: Mappin
             data["js8_message_storage_root"] = _coerce_text(js8_row.get("application_data_root", ""), "")
             data["js8_all_path"] = _coerce_text(js8_row.get("all_path", ""), "")
             data["js8_save_dir"] = _coerce_text(js8_row.get("save_dir", ""), "")
+            data["js8_received_files_enabled"] = bool(js8_row.get("received_files_enabled", 0))
+            data["js8_received_files_path"] = _coerce_text(js8_row.get("received_files_path", ""), "")
+            data["js8_received_files_existing"] = _coerce_text(js8_row.get("received_files_existing", "review"), "review")
             data["js8_storage_mode"] = _coerce_text(js8_row.get("storage_mode", "unverified"), "unverified")
             data["js8_storage_verified_utc"] = _coerce_text(js8_row.get("storage_verified_utc", ""), "")
             data["js8_storage_evidence"] = _coerce_text(js8_row.get("storage_evidence", ""), "")

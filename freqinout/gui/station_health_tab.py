@@ -26,7 +26,8 @@ from PySide6.QtWidgets import (
 )
 
 from freqinout.core.settings_manager import SettingsManager
-from freqinout.core.station_health_summary import ScopeResolver, summarize_station_health
+from freqinout.core.dependency_health import get_dependency_health_registry
+from freqinout.core.station_health_summary import ScopeResolver, attach_hearing_to_runtime_sources, summarize_station_health
 from freqinout.core.support_report import build_support_report
 from freqinout import __version__
 from freqinout.gui.bounded_snapshot_worker import SnapshotWorkerController
@@ -50,6 +51,7 @@ class StationHealthTab(QWidget):
         self._closed = False
         self._last_summary: dict[str, object] = {"issue_count": 0, "severity": "ok", "items": []}
         self._scope_resolver: Optional[ScopeResolver] = None
+        self._identity_resolver: Optional[Callable[[str], Mapping[str, object]]] = None
         self._runtime_item_provider: Optional[Callable[[], Iterable[Mapping[str, object]]]] = None
         self._runtime_source_provider: Optional[Callable[[], Iterable[Mapping[str, object]]]] = None
         self._runtime_source_rows: list[Mapping[str, object]] = []
@@ -329,6 +331,10 @@ class StationHealthTab(QWidget):
         self._scope_resolver = resolver
         self._refresh_registry_seed()
 
+    def set_identity_resolver(self, resolver: Optional[Callable[[str], Mapping[str, object]]]) -> None:
+        self._identity_resolver = resolver
+        self._refresh_registry_seed()
+
     def set_runtime_item_provider(self, provider: Optional[Callable[[], Iterable[Mapping[str, object]]]]) -> None:
         self._runtime_item_provider = provider
         self._refresh_registry_seed()
@@ -380,6 +386,7 @@ class StationHealthTab(QWidget):
             self._scope_resolver,
             self._runtime_item_provider,
             self._runtime_source_provider,
+            self._identity_resolver,
         )
         self._accept_registry_snapshot(generation, (summary, rows))
 
@@ -389,11 +396,12 @@ class StationHealthTab(QWidget):
         self._snapshot_generation += 1
         generation = self._snapshot_generation
         resolver = self._scope_resolver
+        identity_resolver = self._identity_resolver
         item_provider = self._runtime_item_provider
         source_provider = self._runtime_source_provider
 
         def read_snapshot() -> tuple[Mapping[str, object], tuple[Mapping[str, object], ...]]:
-            return StationHealthTab._read_registry_snapshot(resolver, item_provider, source_provider)
+            return StationHealthTab._read_registry_snapshot(resolver, item_provider, source_provider, identity_resolver)
 
         self._ensure_snapshot_worker().request(generation, read_snapshot)
 
@@ -402,6 +410,7 @@ class StationHealthTab(QWidget):
         scope_resolver: Optional[ScopeResolver],
         runtime_item_provider: Optional[Callable[[], Iterable[Mapping[str, object]]]],
         runtime_source_provider: Optional[Callable[[], Iterable[Mapping[str, object]]]],
+        identity_resolver: Optional[Callable[[str], Mapping[str, object]]] = None,
     ) -> tuple[Mapping[str, object], tuple[Mapping[str, object], ...]]:
         runtime_items: list[Mapping[str, object]] = []
         if runtime_item_provider is not None:
@@ -419,9 +428,13 @@ class StationHealthTab(QWidget):
                 )
             except Exception:
                 runtime_source_rows = tuple()
+        registry_snapshot = get_dependency_health_registry().snapshot()
+        runtime_source_rows = attach_hearing_to_runtime_sources(runtime_source_rows, registry_snapshot)
         summary = summarize_station_health(
+            registry_snapshot,
             include_scheduler_events=True,
             scope_resolver=scope_resolver,
+            identity_resolver=identity_resolver,
             extra_items=runtime_items,
         )
         for event in summary.get("recent_scheduler_events", ()):
@@ -729,7 +742,8 @@ class StationHealthTab(QWidget):
         last_activity = str(row.get("last_activity_label", "") or "").strip()
         metadata = row.get("metadata", {})
         freshness = self._runtime_source_freshness_text(metadata if isinstance(metadata, Mapping) else {})
-        for candidate in (cached, last_activity, freshness):
+        hearing = str(metadata.get("hearing_summary", "") or "").strip() if isinstance(metadata, Mapping) else ""
+        for candidate in (hearing, cached, last_activity, freshness):
             if candidate:
                 return candidate
         return ""
@@ -784,6 +798,14 @@ class StationHealthTab(QWidget):
             parts.append(f"Last Source Decision: {last_activity}")
         if freshness:
             parts.append(f"Freshness: {freshness}")
+        if metadata.get("hearing_summary"):
+            parts.append(str(metadata["hearing_summary"]))
+            if metadata.get("hearing_detail"):
+                parts.append(f"Hearing detail: {metadata['hearing_detail']}")
+            if metadata.get("hearing_identity"):
+                parts.append(str(metadata["hearing_identity"]))
+            if metadata.get("hearing_checked"):
+                parts.append(f"Hearing check: {metadata['hearing_checked']}")
         if detail and detail != cached:
             parts.append(f"Detail: {detail}")
         if action:
@@ -942,15 +964,19 @@ class StationHealthTab(QWidget):
                 "health_key": "schedule_assignments",
                 "scope": scope,
                 "dependency": dependency,
+                "radio_id": item.get("radio_id", self._radio_id_from_scope(scope)),
             }
-        payload = self._related_payload_for_text(text)
+        # The dependency key owns routing; a radio label or error may mention
+        # another application without changing which service needs repair.
+        service = str(item.get("key", "") or "").split(":", 1)[0]
+        payload = self._related_payload_for_text(service) or self._related_payload_for_text(text)
         if not payload:
             return {}
         payload.update(
             {
                 "scope": scope,
                 "dependency": dependency,
-                "radio_id": self._radio_id_from_scope(scope),
+                "radio_id": item.get("radio_id", self._radio_id_from_scope(scope)),
             }
         )
         return payload
@@ -976,6 +1002,8 @@ class StationHealthTab(QWidget):
         health_key = "radio_profiles"
         if "schedule assignment" in haystack:
             health_key = "schedule_assignments"
+        elif any(token in haystack for token in ("rigctld", "observer")):
+            health_key = "radio_profiles"
         elif any(token in haystack for token in ("js8", "spotter", "commstat", "directed.txt", "all.txt")):
             health_key = "js8call"
         elif any(token in haystack for token in ("flmsg", "flamp", "fldigi", "flrig", "fast light", "nbems")):

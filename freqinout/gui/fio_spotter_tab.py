@@ -14,9 +14,9 @@ from typing import Any, Callable, Mapping
 from PySide6.QtCore import QEvent, Qt, QTimer, Signal, QStringListModel
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QFormLayout, QGridLayout, QGroupBox,
-    QCompleter, QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QPushButton, QFileDialog, QMessageBox, QMenu,
+    QCompleter, QDialog, QDialogButtonBox, QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QPushButton, QFileDialog, QMessageBox, QMenu,
     QListWidget, QListWidgetItem, QScrollArea, QSizePolicy, QSplitter, QSpinBox, QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit,
-    QVBoxLayout, QWidget,
+    QToolButton, QVBoxLayout, QWidget, QWidgetAction,
 )
 
 from freqinout.core.multi_radio_store import MultiRadioStore
@@ -57,6 +57,8 @@ from freqinout.core.logger import log
 from freqinout.core.settings_manager import SettingsManager
 from freqinout.core.varac_bbs_vault import list_flamp_transfer_index_statuses
 from freqinout.gui.theme import (
+    CellControlDelegate,
+    ThemedCheckBox,
     button_style,
     choice_chip_selector_style,
     control_height_for_font,
@@ -279,6 +281,52 @@ class _TokenListEditor(QWidget):
         self.valuesChanged.emit()
 
 
+
+class _FormGroupSelector(QToolButton):
+    """Inline, cached group relevance; empty selection means shared."""
+    groups_changed = Signal(object)
+
+    def __init__(self, groups, selected, parent=None):
+        super().__init__(parent)
+        self._selected = list(selected)
+        self._names = dict(groups)
+        for key in self._selected:
+            self._names.setdefault(key, 'Missing group: ' + key)
+        self.setPopupMode(QToolButton.InstantPopup)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        menu = QMenu(self)
+        self._checks = {}
+        for key, name in self._names.items():
+            control = ThemedCheckBox(name, menu)
+            control.setAccessibleName('Associate form with ' + name)
+            control.setChecked(key in self._selected)
+            action = QWidgetAction(menu)
+            action.setDefaultWidget(control)
+            menu.addAction(action)
+            self._checks[key] = control
+            control.toggled.connect(lambda checked, ident=key: self._adopt(ident, checked))
+        if not self._names:
+            action = menu.addAction('No operating groups configured')
+            action.setEnabled(False)
+        self.setMenu(menu)
+        self._present()
+
+    def _adopt(self, key, checked):
+        if checked and key not in self._selected:
+            self._selected.append(key)
+        elif not checked and key in self._selected:
+            self._selected.remove(key)
+        self._present()
+        self.groups_changed.emit(list(self._selected))
+
+    def _present(self):
+        names = [self._names[key] for key in self._selected]
+        label = ', '.join(names) if names else 'Shared'
+        self.setText(f'{len(names)} groups' if len(names) > 1 else label)
+        self.setToolTip(label + '\nOptional group relevance; does not restrict incoming check-ins.')
+        self.setAccessibleName('Operating groups: ' + label)
+
+
 class FioSpotterTab(QWidget):
     """A bounded browser for CommsPlan's existing Spotter facilities.
 
@@ -286,6 +334,8 @@ class FioSpotterTab(QWidget):
     first visit or explicit refresh, so changing selection or painting never
     opens a database or walks a forms directory.
     """
+
+    form_mappings_saved = Signal()
 
     def __init__(
         self,
@@ -970,6 +1020,40 @@ class FioSpotterTab(QWidget):
         table.setSizeAdjustPolicy(QAbstractItemView.AdjustIgnored)
         table.horizontalHeader().setStretchLastSection(True)
         return table
+
+    @staticmethod
+    def _install_form_checkbox(table, row, column, item, label):
+        """Use the shared visible check control; item data stays authoritative."""
+        item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+        table.setItem(row, column, item)
+        control = ThemedCheckBox()
+        control.setAccessibleName(label)
+        control.setToolTip(label)
+        control.setChecked(item.checkState() == Qt.Checked)
+        host = QWidget(table)
+        layout = QHBoxLayout(host)
+        padding = max(2, control.fontMetrics().height() // 5)
+        layout.setContentsMargins(padding, padding, padding, padding)
+        layout.setAlignment(Qt.AlignCenter)
+        layout.addWidget(control)
+        host.setMinimumSize(control.sizeHint().width() + padding * 2,
+                            control.sizeHint().height() + padding * 2)
+        def adopt(checked):
+            table.setCurrentCell(item.row(), item.column())
+            item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+        control.toggled.connect(adopt)
+        table.setCellWidget(row, column, host)
+        table.setRowHeight(row, max(table.rowHeight(row), host.minimumHeight()))
+
+    @staticmethod
+    def _sync_form_checkbox(item):
+        table = item.tableWidget()
+        host = table.cellWidget(item.row(), item.column()) if table else None
+        control = host.findChild(QCheckBox) if host else None
+        if control is not None:
+            blocked = control.blockSignals(True)
+            control.setChecked(item.checkState() == Qt.Checked)
+            control.blockSignals(blocked)
 
     @staticmethod
     def _put(table: QTableWidget, row: int, col: int, value: object, *, data: object = None) -> None:
@@ -2723,6 +2807,7 @@ class FioSpotterTab(QWidget):
 
     # Forms / imports ------------------------------------------------------
     def _build_forms(self, page: QWidget) -> None:
+        self._forms_mappings_saved = False
         layout = self._page_layout(page)
         header = QHBoxLayout()
         header.addWidget(QLabel("MCF form catalog"))
@@ -2786,12 +2871,17 @@ class FioSpotterTab(QWidget):
         mapping_row.addWidget(self.forms_save_btn)
         layout.addLayout(mapping_row)
         self.forms_table = self._table(
-            ["Form", "Name", "Purpose", "Inbox", "Map", "Alert", "Net", "Status route", "Expect status"],
+            ["Form", "Name", "Purpose", "Inbox", "Map", "Alert", "Net route", "Status route", "Expect status", "Use for nets", "Operating groups"],
             name="fioSpotterFormsTable",
         )
+        for column in (*range(3, 8), 9):
+            self.forms_table.setItemDelegateForColumn(column, CellControlDelegate(self.forms_table))
+        self.forms_table.itemChanged.connect(self._sync_form_checkbox)
+        self.forms_table.itemChanged.connect(self._mark_form_mappings_dirty)
         forms_header = self.forms_table.horizontalHeader()
         forms_header.setSectionResizeMode(0, QHeaderView.Interactive)
-        forms_header.setSectionResizeMode(1, QHeaderView.Stretch)
+        forms_header.setSectionResizeMode(1, QHeaderView.Interactive)
+        self.forms_table.setColumnWidth(1, self.forms_table.fontMetrics().horizontalAdvance("M") * 24)
         forms_header.setSectionResizeMode(2, QHeaderView.Interactive)
         for column in range(3, 9):
             forms_header.setSectionResizeMode(column, QHeaderView.Interactive)
@@ -2804,6 +2894,12 @@ class FioSpotterTab(QWidget):
         for column in range(3, 8):
             self.forms_table.setColumnWidth(column, 65)
         self.forms_table.setColumnWidth(8, 115)
+        self.forms_table.setColumnWidth(9, 100)
+        for column in (*range(3, 8), 9):
+            forms_header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        forms_header.setStretchLastSection(False)
+        forms_header.setSectionResizeMode(10, QHeaderView.Interactive)
+        self.forms_table.setColumnWidth(10, self.forms_table.fontMetrics().horizontalAdvance('Operating groups') + 60)
         self.forms_table.itemSelectionChanged.connect(self._on_forms_selection_changed)
         layout.addWidget(self.forms_table, 1)
         action_row = QHBoxLayout()
@@ -2985,6 +3081,7 @@ class FioSpotterTab(QWidget):
 
     def refresh_forms(self) -> None:
         if not hasattr(self, "forms_table"): return
+        self._forms_mappings_saved = False
         selected = self._selected_form_row()
         selected_code = _text((selected or {}).get("form_code")).upper()
         configured_path = _text(self.settings.get("js8_forms_path", ""))
@@ -3005,6 +3102,9 @@ class FioSpotterTab(QWidget):
             f"Forms catalog: {path} — {len(mappings)} catalog entries "
             f"(bounded to {_MAX_ROWS}). Select which CommsPlan services receive each form, then Save mappings."
         )
+        from freqinout.core.operating_group_identity import operating_group_options
+        group_choices = [(group.operating_group_key, group.group_name) for group in
+                         operating_group_options(self.settings.get('operating_groups', []) or [])]
         self.forms_table.setUpdatesEnabled(False)
         self.forms_table.blockSignals(True)
         try:
@@ -3021,18 +3121,34 @@ class FioSpotterTab(QWidget):
                 purpose.setCurrentText(_text(row.get("purpose")))
                 self._fit_spotter_combo(purpose, minimum_characters=12)
                 self.forms_table.setCellWidget(row_index, 2, purpose)
+                purpose.currentIndexChanged.connect(self._mark_form_mappings_dirty)
                 for column, key in enumerate(("messages", "map", "alert", "net", "status"), start=3):
                     item = QTableWidgetItem("")
                     item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable)
                     item.setCheckState(Qt.Checked if bool(row.get(key)) else Qt.Unchecked)
                     item.setToolTip(f"Use {_text(row.get('form_code'))} for {key}")
-                    self.forms_table.setItem(row_index, column, item)
+                    self._install_form_checkbox(self.forms_table, row_index, column, item, item.toolTip())
                 expect_entry = expect_by_key.get(_text(row.get("form_code")).upper())
                 if not expect_entry:
                     availability = "Not in Expect"
                 else:
                     availability = self._expect_display_state(expect_entry)
                 self._put(self.forms_table, row_index, 8, availability)
+                item = QTableWidgetItem("")
+                item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable)
+                item.setCheckState(Qt.Checked if row.get("use_for_nets", True) else Qt.Unchecked)
+                item.setToolTip("Available in net tools; Ignore disables it without changing this choice.")
+                self._install_form_checkbox(self.forms_table, row_index, 9, item,
+                    f"Use {_text(row.get('form_code'))} for nets")
+                groups = _FormGroupSelector(group_choices, row.get('operating_group_keys', []))
+                self.forms_table.setCellWidget(row_index, 10, groups)
+                code_item = self.forms_table.item(row_index, 0)
+                def adopt(keys, item=code_item):
+                    source = dict(item.data(Qt.UserRole) or {})
+                    source['operating_group_keys'] = keys
+                    self.forms_table.setCurrentCell(item.row(), 10)
+                    item.setData(Qt.UserRole, source)
+                groups.groups_changed.connect(adopt)
         finally:
             self.forms_table.blockSignals(False)
             self.forms_table.setUpdatesEnabled(True)
@@ -3063,10 +3179,20 @@ class FioSpotterTab(QWidget):
             for column, key in enumerate(("messages", "map", "alert", "net", "status"), start=3):
                 item = self.forms_table.item(row_index, column)
                 values[key] = bool(item is not None and item.checkState() == Qt.Checked)
+            values["use_for_nets"] = self.forms_table.item(row_index, 9).checkState() == Qt.Checked
+            for key in ("operating_group_keys", "preferred_query_for", "preferred_checkin_for"):
+                values[key] = (source or {}).get(key, [])
             rows.append(normalize_mapping_row(values))
         return rows
 
+    def _mark_form_mappings_dirty(self, *_args):
+        self._forms_mappings_saved = False
+        self.forms_state.setText('Changes not saved. Choose Save mappings to apply them.')
+        self._refresh_forms_action_state()
+
     def _save_form_mappings(self) -> None:
+        self._forms_mappings_saved = False
+        self._refresh_forms_action_state()
         if not hasattr(self, "forms_table") or self.forms_table.rowCount() <= 0:
             self.forms_state.setText("No form mappings are available to save.")
             return
@@ -3078,11 +3204,15 @@ class FioSpotterTab(QWidget):
         except Exception as exc:
             self.forms_state.setText(f"Form mappings were not saved: {exc}")
             return
+        self._forms_mappings_saved = True
+        self._refresh_forms_action_state()
         self.forms_state.setText(f"Saved {len(rows)} CommsPlan Spotter form mapping(s).")
+        self.form_mappings_saved.emit()
 
     def _auto_classify_forms(self) -> None:
         if not hasattr(self, "forms_table"):
             return
+        self._mark_form_mappings_dirty()
         for row_index in range(self.forms_table.rowCount()):
             code_item = self.forms_table.item(row_index, 0)
             source = code_item.data(Qt.UserRole) if code_item is not None else {}
@@ -3161,7 +3291,9 @@ class FioSpotterTab(QWidget):
         save = getattr(self, "forms_save_btn", None)
         if isinstance(save, QPushButton):
             save.setEnabled(has_rows)
-            save.setStyleSheet(button_style("primary" if has_rows else "muted", theme))
+            saved = bool(getattr(self, '_forms_mappings_saved', False)) and has_rows
+            save.setText('✓ Saved' if saved else 'Save mappings')
+            save.setStyleSheet(button_style('success' if saved else 'primary' if has_rows else 'muted', theme))
         for button, role in (
             (getattr(self, "forms_preview_btn", None), "secondary"),
             (getattr(self, "forms_compose_btn", None), "primary"),

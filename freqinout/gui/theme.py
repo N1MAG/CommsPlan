@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Dict, Tuple
 from functools import lru_cache
 
-from PySide6.QtCore import QSize, Qt
+from PySide6.QtCore import QEvent, QRectF, QSize, Qt
 from PySide6.QtGui import QColor, QFont, QPalette, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QApplication,
@@ -46,6 +46,77 @@ class CellControlDelegate(QStyledItemDelegate):
         if control is not None:
             size = size.expandedTo(control.minimumSizeHint()).expandedTo(control.minimumSize())
         return size
+
+
+class ThemedItemCheckDelegate(QStyledItemDelegate):
+    """Paint every check state explicitly, avoiding Cocoa's item-indicator cache.
+
+    Items keep Qt's check-state/accessibility model without per-row widgets.
+    The check column accepts a left click or Space and uses shared theme tokens.
+    """
+
+    def paint(self, painter, option, index):
+        state = index.data(Qt.CheckStateRole)
+        content = QStyleOptionViewItem(option)
+        self.initStyleOption(content, index)
+        content.features &= ~QStyleOptionViewItem.HasCheckIndicator
+        style = content.widget.style() if content.widget is not None else QApplication.style()
+        style.drawControl(QStyle.CE_ItemViewItem, content, painter, content.widget)
+        if state is None or not index.flags() & Qt.ItemIsUserCheckable:
+            return
+        theme = active_app_theme()
+        edge = min(option.fontMetrics.height(), option.rect.height() - 4)
+        if edge <= 0:
+            return
+        rect = QRectF(option.rect.center().x() - edge / 2, option.rect.center().y() - edge / 2, edge, edge)
+        value = state.value if hasattr(state, "value") else state
+        checked = value == Qt.Checked.value
+        partial = value == Qt.PartiallyChecked.value
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+        if not index.flags() & Qt.ItemIsEnabled or not option.state & QStyle.State_Enabled:
+            painter.setOpacity(0.55)
+        painter.setPen(QPen(QColor(theme["accent"] if checked or partial else theme["text_muted"]), max(1.0, edge / 14)))
+        painter.setBrush(QColor(theme["accent"] if checked or partial else theme["surface"]))
+        painter.drawRoundedRect(rect, edge / 6, edge / 6)
+        if checked or partial:
+            pen = QPen(QColor(contrast_text_for_background(theme["accent"], theme)))
+            pen.setWidthF(max(1.0, edge / 8))
+            pen.setCapStyle(Qt.RoundCap)
+            pen.setJoinStyle(Qt.RoundJoin)
+            painter.setPen(pen)
+            path = QPainterPath()
+            if partial:
+                path.moveTo(rect.x() + edge * .25, rect.y() + edge * .5)
+                path.lineTo(rect.x() + edge * .75, rect.y() + edge * .5)
+            else:
+                path.moveTo(rect.x() + edge * .22, rect.y() + edge * .52)
+                path.lineTo(rect.x() + edge * .43, rect.y() + edge * .72)
+                path.lineTo(rect.x() + edge * .79, rect.y() + edge * .27)
+            painter.drawPath(path)
+        painter.restore()
+
+    def editorEvent(self, event, model, option, index):
+        if not index.flags() & Qt.ItemIsEnabled or not index.flags() & Qt.ItemIsUserCheckable:
+            return False
+        state = index.data(Qt.CheckStateRole)
+        if state is None:
+            return False
+        if event.type() in (QEvent.MouseButtonPress, QEvent.MouseButtonDblClick, QEvent.MouseButtonRelease):
+            if event.button() != Qt.LeftButton or not option.rect.contains(event.position().toPoint()):
+                return False
+            if event.type() != QEvent.MouseButtonRelease:
+                return True
+        elif event.type() == QEvent.KeyPress:
+            if event.key() not in (Qt.Key_Space, Qt.Key_Select):
+                return False
+        else:
+            return False
+        value = state.value if hasattr(state, "value") else state
+        # Qt's item model expects an integer role value. A Python CheckState
+        # QVariant paints correctly but QTableWidgetItem.checkState() reads it
+        # as Unchecked, leaving consumers unaware of mouse selections.
+        return model.setData(index, Qt.Unchecked.value if value == Qt.Checked.value else Qt.Checked.value, Qt.CheckStateRole)
 
 
 class ThemedCheckBox(QCheckBox):
@@ -1182,6 +1253,9 @@ def app_stylesheet(theme: Dict[str, str]) -> str:
         f" color: {theme['text_muted']};"
         f" border: 1px solid {theme['border']};"
         "}"
+        'QLineEdit[fioRequiredMissing="true"], QComboBox[fioRequiredMissing="true"] {'
+        f" border: 1px solid {theme['warning']};"
+        "}"
         "QTabWidget::pane {"
         f" border: 1px solid {theme['border']};"
         f" background-color: {theme['bg']};"
@@ -1367,7 +1441,43 @@ def _cached_control_icon(name: str, color: str, size: int, dpr: float):
     painter.setPen(QPen(QColor(color), 1.8, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
     def line(x1, y1, x2, y2):
         painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
-    if name in {"pause", "play"}:
+    if name in {"flag", "flag-filled"}:
+        from PySide6.QtGui import QPainterPath
+        flag = QPainterPath(QPointF(5, 4))
+        for x, y in ((19, 4), (16, 8), (19, 12), (5, 12)):
+            flag.lineTo(x, y)
+        flag.closeSubpath()
+        if name == "flag-filled":
+            painter.fillPath(flag, QColor(color))
+        painter.drawPath(flag)
+        line(5, 4, 5, 21)
+    elif name == "topic-power":
+        from PySide6.QtGui import QPainterPath
+        path = QPainterPath(QPointF(13, 2))
+        for x, y in ((5, 13), (11, 13), (10, 22), (20, 10), (14, 10), (13, 2)):
+            path.lineTo(x, y)
+        painter.drawPath(path)
+    elif name == "topic-water":
+        from PySide6.QtGui import QPainterPath
+        path = QPainterPath(QPointF(12, 3))
+        path.cubicTo(8, 9, 5, 12, 5, 15)
+        path.cubicTo(5, 24, 19, 24, 19, 15)
+        path.cubicTo(19, 12, 16, 9, 12, 3)
+        painter.drawPath(path)
+    elif name == "topic-medical":
+        painter.drawRoundedRect(QRectF(3, 3, 18, 18), 2, 2)
+        line(7, 12, 17, 12); line(12, 7, 12, 17)
+    elif name == "topic-communications":
+        painter.drawRoundedRect(QRectF(3, 4, 18, 13), 2, 2)
+        line(6, 17, 6, 21); line(6, 21, 11, 17)
+        line(7, 9, 17, 9); line(7, 13, 14, 13)
+    elif name == "review-check":
+        line(4, 12, 10, 18); line(10, 18, 21, 5)
+    elif name == "document-open":
+        painter.drawRoundedRect(QRectF(4, 4, 13, 17), 1, 1)
+        line(8, 9, 12, 9); line(8, 13, 11, 13)
+        line(13, 11, 21, 3); line(16, 3, 21, 3); line(21, 3, 21, 8)
+    elif name in {"pause", "play"}:
         if name == "play":
             line(7, 4, 19, 12); line(19, 12, 7, 20); line(7, 20, 7, 4)
         else:

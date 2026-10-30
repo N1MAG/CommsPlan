@@ -1055,7 +1055,11 @@ def _project_spotter_traffic(conn: sqlite3.Connection, limit: int, force: bool, 
                 body_preview=body[:1200],
                 topics=tuple(intelligence.topics) or _topics(body),
                 entities={
-                    "relay_via": _upper(row["relay_via"]),
+                    # Older API imports marked direct traffic as relayed by its
+                    # own author. Keep native evidence; normalize the read model.
+                    "relay_via": (_upper(row["relay_via"])
+                                  if _upper(row["relay_via"]) != _upper(row["from_call"])
+                                  else ""),
                     "spotter_token": _text(row["spotter_token"]),
                     "state": _upper(intelligence.state),
                     "grid": _upper(intelligence.grid),

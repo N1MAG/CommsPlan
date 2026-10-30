@@ -813,7 +813,17 @@ class MainWindow(QMainWindow):
 
         self.nav_compact_widget = self._build_compact_navigation_widget()
         self.nav_compact_widget.setVisible(False)
-        nav_main_layout.insertWidget(4, self.nav_compact_widget, 1)
+        self.nav_compact_scroll = QScrollArea(self.nav_widget)
+        self.nav_compact_scroll.setObjectName('mainCompactNavigationScroll')
+        self.nav_compact_scroll.setWidgetResizable(True)
+        self.nav_compact_scroll.setFrameShape(QFrame.NoFrame)
+        self.nav_compact_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.nav_compact_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.nav_compact_scroll.setMinimumHeight(0)
+        self.nav_compact_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Ignored)
+        self.nav_compact_scroll.setWidget(self.nav_compact_widget)
+        self.nav_compact_scroll.hide()
+        nav_main_layout.insertWidget(4, self.nav_compact_scroll, 1)
 
         # Placeholder for map filters (shown only on Map view)
         self.map_filters_container = QWidget()
@@ -3848,6 +3858,8 @@ class MainWindow(QMainWindow):
         """Add currently owned Qt workers to the cooperative shutdown registry."""
         candidates = list(self.findChildren(QThread))
         candidates.extend(entry[0] for entry in tuple(_MESH_RUNTIME_SHUTDOWN_GUARD))
+        from freqinout.gui.operator_configuration_job import live_configuration_jobs
+        candidates.extend(live_configuration_jobs())
         seen: set[int] = set()
         for thread in candidates:
             marker = id(thread)
@@ -3861,7 +3873,7 @@ class MainWindow(QMainWindow):
 
             def _thread_stopped(owned: QThread = thread) -> bool:
                 try:
-                    return not owned.isRunning()
+                    return owned.wait(0)
                 except RuntimeError:
                     return True
 
@@ -4066,6 +4078,8 @@ class MainWindow(QMainWindow):
         live_threads: list[QThread] = []
         candidates = list(self.findChildren(QThread))
         candidates.extend(entry[0] for entry in tuple(_MESH_RUNTIME_SHUTDOWN_GUARD))
+        from freqinout.gui.operator_configuration_job import live_configuration_jobs
+        candidates.extend(live_configuration_jobs())
         seen: set[int] = set()
         for thread in candidates:
             marker = id(thread)
@@ -4073,7 +4087,7 @@ class MainWindow(QMainWindow):
                 continue
             seen.add(marker)
             try:
-                if thread.isRunning():
+                if not thread.wait(0):
                     live_threads.append(thread)
             except RuntimeError:
                 continue
@@ -4365,13 +4379,15 @@ class MainWindow(QMainWindow):
             scale = float(resolve_ui_text_scale(self.settings))
         except Exception:
             scale = 1.0
-        return max(74, min(88, int(round(74 * scale))))
+        reserve = self.style().pixelMetric(QStyle.PM_ScrollBarExtent) + 6 if hasattr(self, 'nav_compact_scroll') else 0
+        return max(74, min(88, int(round(74 * scale)))) + reserve
 
     def _compact_navigation_button_width(self) -> int:
         # The button sits inside both the 4px-per-side main navigation margins
         # and the 3px-per-side compact-widget margins. Subtract both so Qt does
         # not clip the button's right border/icon paint area on macOS or Linux.
-        return max(56, self._compact_navigation_width() - 14)
+        reserve = self.style().pixelMetric(QStyle.PM_ScrollBarExtent) + 6 if hasattr(self, 'nav_compact_scroll') else 0
+        return max(56, self._compact_navigation_width() - reserve - 14)
 
     @staticmethod
     def _compact_navigation_specs() -> tuple[tuple[str, str, str, str], ...]:
@@ -4569,6 +4585,9 @@ class MainWindow(QMainWindow):
         compact = getattr(self, "nav_compact_widget", None)
         if compact is not None:
             compact.setVisible(collapsed)
+        compact_scroll = getattr(self, 'nav_compact_scroll', None)
+        if compact_scroll is not None:
+            compact_scroll.setVisible(collapsed)
         if collapsed:
             compact_width = self._compact_navigation_width()
             self.nav_widget.setMinimumWidth(compact_width)
@@ -5303,6 +5322,7 @@ class MainWindow(QMainWindow):
         traffic_message_ids: Sequence[str] | None = None,
         traffic_count_at_click: int = 0,
         compose_intent: Mapping[str, object] | None = None,
+        ncs_reader_context: Mapping[str, object] | None = None,
     ) -> None:
         idx = self._screen_index_by_label.get("Messages", -1)
         if idx < 0:
@@ -5327,6 +5347,7 @@ class MainWindow(QMainWindow):
             **map_context.as_messages_kwargs(),
             "action_filter": str(action_filter or "").strip().lower(),
             "compose_intent": normalized_intent,
+            "ncs_reader_context": dict(ncs_reader_context or {}),
         }
         if traffic_message_ids is not None:
             self._messages_nav_filter_context.update(
@@ -5334,6 +5355,13 @@ class MainWindow(QMainWindow):
                 traffic_count_at_click=max(0, int(traffic_count_at_click)),
             )
         self._set_screen(idx)
+
+    def open_subspace_files(self) -> None:
+        """Open Messages and select its received-file filter."""
+        self.open_messages_section("inbox")
+        viewer = getattr(self, "message_viewer_tab", None)
+        if viewer is not None and hasattr(viewer, "show_subspace_files"):
+            viewer.show_subspace_files()
 
     def open_hf_operator(self, callsign: str = "") -> None:
         """Open HF Operators and apply an optional cached reader identity."""
@@ -5517,6 +5545,9 @@ class MainWindow(QMainWindow):
         if tab is None:
             return
         mode = str(getattr(self, "_messages_nav_context", "inbox") or "inbox").strip().lower()
+        setter = getattr(tab, 'set_ncs_reader_context', None)
+        if callable(setter):
+            setter(dict(getattr(self, '_messages_nav_filter_context', {}) or {}).get('ncs_reader_context'))
         try:
             if mode == "compose" and hasattr(tab, "show_compose_from_navigation"):
                 tab.show_compose_from_navigation()
@@ -5527,6 +5558,7 @@ class MainWindow(QMainWindow):
             elif hasattr(tab, "show_inbox_with_context"):
                 context = dict(getattr(self, "_messages_nav_filter_context", {}) or {})
                 context.pop("compose_intent", None)
+                context.pop('ncs_reader_context', None)
                 has_context = context.get("traffic_message_ids") is not None
                 for key, value in context.items():
                     if key == "source_family" and str(value or "").strip().lower() in {"", "message"}:
@@ -6443,6 +6475,11 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             log.debug("MainWindow deferred screen signal wiring failed: %s: %s", key, exc)
 
+    def _notify_ops_schedule_sources_changed(self):
+        tab = getattr(self, "controlfreq_tab", None)
+        if tab is not None and hasattr(tab, "on_schedule_sources_changed"):
+            tab.on_schedule_sources_changed()
+
     def _create_hf_schedule_tab(self) -> QWidget:
         with perf_span("main_window.create_hf_schedule_tab", settings=self.settings, min_ms=5.0):
             tab = DailyScheduleTab(self, plan_context_service=self.plan_context_service)
@@ -6456,6 +6493,11 @@ class MainWindow(QMainWindow):
                 "hf_schedule.freq_planner",
                 tab.schedule_saved,
                 self._refresh_freq_planner_if_loaded,
+            )
+            self._connect_lazy_screen_signal(
+                "hf_schedule.ops_outlook",
+                tab.schedule_saved,
+                self._notify_ops_schedule_sources_changed,
             )
             self._connect_lazy_screen_signal(
                 "hf_schedule.scheduler",
@@ -6482,6 +6524,11 @@ class MainWindow(QMainWindow):
                 "net_schedule.freq_planner",
                 tab.schedule_saved,
                 self._refresh_freq_planner_if_loaded,
+            )
+            self._connect_lazy_screen_signal(
+                "net_schedule.ops_outlook",
+                tab.schedule_saved,
+                self._notify_ops_schedule_sources_changed,
             )
             self._connect_lazy_screen_signal(
                 "net_schedule.scheduler",
@@ -6518,8 +6565,9 @@ class MainWindow(QMainWindow):
 
     def _create_fldigi_ncs_tab(self) -> QWidget:
         with perf_span("main_window.create_fldigi_ncs_tab", settings=self.settings, min_ms=5.0):
-            tab = FldigiNetControlTab(self)
+            tab = FldigiNetControlTab(self, preparation_settings=getattr(self, '_ncs_preparation_settings', None))
             self.fldigi_tab = tab
+            MainWindow._attach_ncs_peer_awareness(self, tab)
             self._connect_lazy_screen_signal(
                 "settings_saved.fldigi_ncs",
                 self.settings_tab.settings_saved,
@@ -6539,8 +6587,9 @@ class MainWindow(QMainWindow):
 
     def _create_js8_ncs_tab(self) -> QWidget:
         with perf_span("main_window.create_js8_ncs_tab", settings=self.settings, min_ms=5.0):
-            tab = JS8CallNetControlTab(self)
+            tab = JS8CallNetControlTab(self, preparation_settings=getattr(self, '_ncs_preparation_settings', None))
             self.js8_tab = tab
+            MainWindow._attach_ncs_peer_awareness(self, tab)
             self._connect_lazy_screen_signal(
                 "settings_saved.js8_ncs",
                 self.settings_tab.settings_saved,
@@ -6557,6 +6606,71 @@ class MainWindow(QMainWindow):
                 self._on_ncs_scoped_net_status_changed,
             )
             return tab
+
+    def _attach_ncs_peer_awareness(self, tab):
+        from freqinout.gui.ncs_peer_awareness import NcsPeerAwareness
+        strip = NcsPeerAwareness(tab)
+        tab.layout().insertWidget(0, strip)
+        tab.ncs_peer_awareness = strip
+        strip.open_requested.connect(lambda protocol: MainWindow._open_independent_ncs_net(self, protocol))
+        MainWindow._refresh_ncs_peer_awareness(self)
+
+    def _open_independent_ncs_net(self, protocol):
+        # Navigation only: never select a radio, adopt preparation or start a net.
+        index = getattr(self, '_ncs_nav_indices', {}).get(str(protocol).upper())
+        if index is not None:
+            self._set_screen(index)
+
+    def _refresh_ncs_peer_awareness(self):
+        from freqinout.gui.ncs_peer_awareness import cached_net_activity
+        tabs = {'JS8': getattr(self, 'js8_tab', None), 'FLDIGI': getattr(self, 'fldigi_tab', None)}
+        activity = {key: cached_net_activity(key, tab) for key, tab in tabs.items()}
+        for key, peer in (('JS8', 'FLDIGI'), ('FLDIGI', 'JS8')):
+            strip = getattr(tabs[key], 'ncs_peer_awareness', None)
+            if strip is not None:
+                strip.publish(activity[key], activity[peer])
+
+    def retain_ncs_compose_draft(self, context, key, snapshot):
+        controller = getattr(getattr(self, 'js8_tab', None), 'workbench', None)
+        if controller is None:
+            raise ValueError('NCS working view is unavailable; the composer draft is retained')
+        controller.retain_compose_draft(context, key, snapshot)
+
+    def ncs_compose_draft(self, context, key):
+        controller = getattr(getattr(self, 'js8_tab', None), 'workbench', None)
+        if controller is None or str(context.get('traffic_db_path')) != str(controller.path):
+            return None
+        import copy
+        return copy.deepcopy(controller.drafts.get(str(key)))
+
+    def clear_ncs_compose_draft(self, context, draft_key_value=None):
+        controller = getattr(getattr(self, 'js8_tab', None), 'workbench', None)
+        viewer = getattr(self, 'message_viewer_tab', None)
+        if controller is None or str(context.get('traffic_db_path')) != str(controller.path):
+            return
+        from freqinout.gui.ncs_compose_handoff import draft_key, discard_current
+        intent = dict(getattr(viewer, '_compose_intent', {}) or {})
+        current_key = draft_key(intent) if intent.get('ncs_context', {}).get('run_id') == context.get('run_id') else None
+        key = draft_key_value or current_key
+        if not key or not controller.run or controller.run['run_id'] != context.get('run_id'):
+            return
+        snapshot = controller.drafts.get(str(key)) or getattr(viewer, '_ncs_compose_drafts', {}).get(str(key)) or {}
+        if snapshot.get('intent', {}).get('ncs_context', {}).get('run_id') != context.get('run_id'):
+            return
+        if key == current_key:
+            discard_current(viewer)
+        getattr(viewer, '_ncs_compose_drafts', {}).pop(str(key), None)
+        controller.clear_compose_draft(str(key))
+
+    def return_to_ncs_workbench(self, context):
+        controller = getattr(getattr(self, 'js8_tab', None), 'workbench', None)
+        if controller is None or str(context.get('traffic_db_path')) != str(controller.path):
+            return
+        index = self._screen_index_by_label.get('NCS-JS8', -1)
+        if index >= 0:
+            self._set_screen(index)
+        if not controller.run or controller.run['run_id'] != context.get('run_id'):
+            controller.open_run(context.get('run_id', ''))
 
     def _create_local_ncs_tab(self) -> QWidget:
         with perf_span("main_window.create_local_ncs_tab", settings=self.settings, min_ms=5.0):
@@ -6593,6 +6707,7 @@ class MainWindow(QMainWindow):
         with perf_span("main_window.create_station_health_tab", settings=self.settings, min_ms=5.0):
             tab = StationHealthTab(self)
             tab.set_scope_resolver(self._station_health_scope_resolver)
+            tab.set_identity_resolver(self._station_health_radio_identity_resolver)
             tab.set_runtime_item_provider(self._station_health_runtime_items)
             tab.set_runtime_source_provider(self._station_health_runtime_source_rows)
             self._connect_lazy_screen_signal(
@@ -6665,8 +6780,14 @@ class MainWindow(QMainWindow):
                     str(row.get("from_call") or "")
                 ),
             )
+            tab.form_mappings_saved.connect(self._on_spotter_form_mappings_saved)
             self.fio_spotter_tab = tab
             return tab
+
+    def _on_spotter_form_mappings_saved(self):
+        tab = getattr(self, 'js8_tab', None)
+        if tab is not None:
+            tab.on_form_mappings_saved()
 
     def _create_operator_history_tab(self) -> QWidget:
         with perf_span("main_window.create_operator_history_tab", settings=self.settings, min_ms=5.0):
@@ -7637,6 +7758,9 @@ class MainWindow(QMainWindow):
         self._active_runtime_profile = profile
         self._active_runtime_policy = policy
         self._runtime_profile_signature = signature
+        notify_outlook = getattr(self, "_notify_ops_schedule_sources_changed", None)
+        if callable(notify_outlook):
+            notify_outlook()
         self._suppressed_screen_labels = self._suppressed_screens_for_runtime(profile, policy)
         for label in ("Map", "Messages", "FreqPlanner", "NCS-FLDigi/SSB", "NCS-JS8", "NCS-Local"):
             self._set_nav_visibility_for_screen(label, label not in self._suppressed_screen_labels)
@@ -14472,6 +14596,7 @@ class MainWindow(QMainWindow):
         # context. Their command controls remain unavailable.
         if read_only or self._activate_station_command_radio(ident):
             self._station_command_selected_profile_id = ident
+            self._station_command_explicit_profile_id = ident if not read_only else None
         self._refresh_station_command_bar(force=True)
 
     def _refresh_station_command_bar(self, *, force: bool = False) -> None:
@@ -14748,6 +14873,7 @@ class MainWindow(QMainWindow):
     def _refresh_station_health_scope_map(self) -> None:
         scope_map: dict[str, str] = {}
         endpoint_owners: dict[str, set[str]] = {}
+        endpoint_ids: dict[str, set[int]] = {}
         try:
             profiles = list(self.multi_radio_store.list_runtime_active_device_profiles())
         except Exception:
@@ -14777,6 +14903,12 @@ class MainWindow(QMainWindow):
             key = f"{service.lower()}:{host_text}:{port_text}"
             owners = endpoint_owners.setdefault(key, set())
             owners.add(name)
+            try:
+                ident = int(raw_profile.get("id") or 0)
+            except (TypeError, ValueError):
+                ident = 0
+            if ident > 0:
+                endpoint_ids.setdefault(key, set()).add(ident)
             label = name if len(owners) == 1 else "Shared · " + ", ".join(sorted(owners))
             scope_map[key] = label
             if host_text == "127.0.0.1":
@@ -14801,6 +14933,23 @@ class MainWindow(QMainWindow):
             if str(raw_profile.get("device_class", "") or "").strip().lower() == "observer":
                 _add("OBSERVER", raw_profile.get("sdr_host"), raw_profile.get("sdr_port"), name, default_port=0)
         self._station_health_scope_map = scope_map
+        self._station_health_endpoint_ids = {key: tuple(sorted(values)) for key, values in endpoint_ids.items()}
+
+    def _station_health_radio_identity_resolver(self, key: str) -> dict[str, object]:
+        # Immutable cache published with display scopes; no settings or endpoint
+        # work may be triggered by background health presentation.
+        service, _, endpoint = str(key or "").strip().lower().partition(":")
+        for alias in ("::1:", "[::1]:"):
+            if endpoint.startswith(alias):
+                endpoint = "127.0.0.1:" + endpoint[len(alias):]
+                break
+        parts = (service + ":" + endpoint).split(":")
+        if len(parts) < 3:
+            return {}
+        if parts[1] in {"localhost", "loopback"}:
+            parts[1] = "127.0.0.1"
+        owners = getattr(self, "_station_health_endpoint_ids", {}).get(":".join(parts[:3]), ())
+        return {"radio_ids": owners} if owners else {}
 
     def _station_health_scope_resolver(self, key: str, metadata: dict[str, object]) -> str:
         scope_map = getattr(self, "_station_health_scope_map", {}) or {}
@@ -15222,6 +15371,7 @@ class MainWindow(QMainWindow):
         queue_count = len(queue) if isinstance(queue, list) else 0
         trigger = str(data.get("trigger", "")).strip().capitalize() or "Launch"
         launch_radio_ids = self._launch_sequence_radio_ids(payload)
+        self._launch_apply_radio_ids = set(launch_radio_ids)
         self._launch_initializing_radio_ids = set(launch_radio_ids)
         try:
             self.scheduler.set_launch_initializing_radios(launch_radio_ids)
@@ -15296,11 +15446,14 @@ class MainWindow(QMainWindow):
                 pass
 
     def _on_launch_sequence_finished(self, payload: object) -> None:
+        if isinstance(payload, dict) and payload.get("cancelled"):
+            self.scheduler.cancel_pending_radio_applies(getattr(self, "_launch_apply_radio_ids", ()))
+        self._launch_apply_radio_ids = set()
         self._launch_initializing_radio_ids = set()
         try:
             self.scheduler.set_launch_initializing_radios(())
             self.scheduler.end_launch_schedule_apply()
-            self.scheduler.force_refresh()
+            self.scheduler.refresh_after_launch()
         except Exception:
             log.debug("MainWindow: could not clear launch scheduler hold", exc_info=True)
         try:
@@ -16132,6 +16285,20 @@ class MainWindow(QMainWindow):
             return {"FLDIGI": False, "JS8": False, "LOCAL": False}
 
     def _clear_stale_ncs_activity_on_startup(self) -> None:
+        # Administrative recovery runs once per shell startup, never on tab render.
+        from freqinout.core.ncs_workbench_store import NcsWorkbenchStore
+        from freqinout.core.scheduler_serial_executor import DaemonSerialExecutor
+        recovery = DaemonSerialExecutor(thread_name_prefix='fio-ncs-recovery')
+        self._ncs_recovery_executor = recovery
+        future = recovery.submit(NcsWorkbenchStore(Path(self.settings.db_path).with_name('freqinout_nets.db')).interrupt_active_runs, before_ts=time.time())
+        def recovered(result):
+            try:
+                result.result()
+            except Exception as exc:
+                log.warning('NCS retained-record recovery unavailable: %s', exc)
+            finally:
+                recovery.shutdown(wait=False)
+        future.add_done_callback(recovered)
         try:
             cleared = clear_persisted_active_ncs_sessions(self.settings, timing_state="interrupted")
             if cleared:
@@ -16174,6 +16341,7 @@ class MainWindow(QMainWindow):
         )
 
     def _update_ncs_nav_button_styles(self) -> None:
+        MainWindow._refresh_ncs_peer_awareness(self)
         if not getattr(self, "nav_buttons", None):
             return
         try:

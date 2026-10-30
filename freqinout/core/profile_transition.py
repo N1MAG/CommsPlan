@@ -194,6 +194,57 @@ def _database_files(profile, files):
     return result
 
 
+def _inert_schedule_kv_triggers(conn, database, table, column, columns, values):
+    """Recognize built-in triggers only for an unrelated kv value update.
+
+    Generate canonical definitions on empty schema-only tables, never execute
+    source schema SQL or copy profile data. All other triggered writes remain
+    unsupported. The recognized WHEN conditions are false for these keys, so
+    neither approval state nor revision counters may change during relocation.
+    """
+    if database != 'config/freqinout.db' or table != 'kv' or column != 'value' or 'key' not in columns:
+        return False
+    schema = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='kv'").fetchone()
+    # Trigger equality inherits the column's collation. Only the established
+    # plain-text schema is qualified; NOCASE/custom collations, generated keys
+    # and other altered definitions must not turn an 'unrelated' key into a
+    # watched schedule key.
+    if not schema or re.sub(r'\s+', '', schema[0]).lower() != 'createtablekv(keytextprimarykey,valuetext)':
+        return False
+    from freqinout.core.schedule_configuration_cache import CONFIGURATION_KEYS, SETTINGS_TABLES, _DatabaseRevision
+    from freqinout.core.schedule_approval_sources import install_source_revisions, SOURCE_TABLES
+    from freqinout.core.operator_schedule_authorization import ensure_schedule_authorization_schema
+    sensitive = set(CONFIGURATION_KEYS) | {
+        'radio_operator_controls', 'sop_schedule_layer_enabled',
+        'sop_frequency_variant_references', 'operating_groups',
+        'freqplanner_hf_daily_schedule_sets', 'freqplanner_hf_net_schedule_sets',
+    }
+    if values[columns.index('key')] in sensitive:
+        return False
+    try:
+        with closing(sqlite3.connect(':memory:')) as reference:
+            names = set(SETTINGS_TABLES) | set(SOURCE_TABLES)
+            for name in sorted(names):
+                info = conn.execute(f'PRAGMA table_info({_quote(name)})').fetchall()
+                if info:
+                    fields = ','.join(_quote(row[1]) for row in info)
+                    reference.execute(f'CREATE TABLE {_quote(name)} ({fields})')
+            ensure_schedule_authorization_schema(reference)
+            install_source_revisions(reference)
+            reference.commit()
+            revision = _DatabaseRevision(Path('unused'), SETTINGS_TABLES)
+            revision.connection = reference
+            revision._install()
+            expected = dict(reference.execute(
+                "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name='kv'"))
+            actual = list(conn.execute(
+                "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name='kv'"))
+            return bool(actual) and all(expected.get(name) == sql for name, sql in actual)
+    except sqlite3.Error:
+        # Missing/unsupported schemas remain blocked, never repaired here.
+        return False
+
+
 def _inspect_paths(profile, source, destination, files, *, write=False, ignored_manifest_rows=()):
     changes, blockers, external = [], [], []
     targets = set(files) | set(cold._directories(profile, profile=True))
@@ -242,7 +293,9 @@ def _inspect_paths(profile, source, destination, files, *, write=False, ignored_
                             before = len(changes)
                             new = _transform(value, field, source, destination, targets, changes, blockers, f'{name}:{table}:row:{record[0] if rowid else "key"}:{column}', external, regular_files=files)
                             if len(changes) > before:
-                                if not rowid or any(r[0] for r in conn.execute("SELECT 1 FROM sqlite_master WHERE type='trigger' AND tbl_name=?", (table,))):
+                                triggered = conn.execute("SELECT 1 FROM sqlite_master WHERE type='trigger' AND tbl_name=?", (table,)).fetchone()
+                                if not rowid or (triggered and not _inert_schedule_kv_triggers(
+                                        conn, name, table, column, columns, values)):
                                     blockers.append(f'{name}:{table}: triggers/row identity require review')
                                 elif write:
                                     if blockers:

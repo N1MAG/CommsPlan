@@ -399,6 +399,16 @@ class SettingsManager:
         self._assert_thread_affinity()
         self._station_bbs_catalog = deepcopy(snapshot)
 
+    def publish_committed_values(self, values: Dict[str, Any]) -> None:
+        """Publish another owner's committed values without SQLite I/O.
+
+        This is a memory handoff, not an edit or persistence API. The caller
+        must have committed the values before publishing them on this thread.
+        Keep the detached values independent of the publisher's later edits.
+        """
+        self._assert_thread_affinity()
+        self._data.update(deepcopy(values))
+
     def close(self) -> None:
         conn = self._conn
         self._conn = None

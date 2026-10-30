@@ -343,6 +343,44 @@ class ResourceCatalogStore:
     def create_frequency(self, resource: FrequencyResource, *, group_keys: Iterable[str] | Mapping[str, str] = ()) -> FrequencyResource:
         return self._write_frequency(resource, group_keys=group_keys, create=True)
 
+    def import_radio_frequencies(self, resources: Iterable[FrequencyResource]) -> tuple[int, int]:
+        """Atomically add a reviewed batch, skipping keys without altering saved data."""
+        rows = []
+        for resource in resources:
+            if len(rows) >= MAX_BATCH_KEYS:
+                raise CatalogValidationError("Import is limited to 2000 selected rows")
+            if not isinstance(resource, FrequencyResource) or resource.source_key != "source_station_radio_import":
+                raise CatalogValidationError("Invalid radio import resource")
+            rows.append(resource)
+        if not rows:
+            return (0, 0)
+        added = skipped = 0
+        now = _utc_now()
+        with self._write() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._require_schema(conn)
+            key = "source_station_radio_import"
+            source = conn.execute("SELECT * FROM resource_catalog_sources WHERE source_key=?", (key,)).fetchone()
+            if source is None:
+                conn.execute(
+                    """INSERT INTO resource_catalog_sources
+                    (source_key,label,source_kind,content_hash,read_only,enabled,created_utc,updated_utc)
+                    VALUES (?,?,'station',?,0,1,?,?)""",
+                    (key, "Imported radio channels", _hash({"source_key": key}), now, now),
+                )
+            self._require_mutable_source(conn, key)
+            for resource in rows:
+                if conn.execute("SELECT 1 FROM frequency_resources WHERE frequency_resource_key=?",
+                                (resource.frequency_resource_key,)).fetchone():
+                    skipped += 1
+                    continue
+                content_hash = _hash(self._frequency_payload(resource))
+                version_hash = _hash({"content_hash": content_hash, "revision": "1"})
+                conn.execute(self._frequency_upsert_sql(), self._frequency_values(
+                    resource, "1", content_hash, version_hash, now, now))
+                added += 1
+        return added, skipped
+
     def update_frequency(self, resource: FrequencyResource, *, group_keys: Iterable[str] | Mapping[str, str] | None = None) -> FrequencyResource:
         return self._write_frequency(resource, group_keys=group_keys, create=False)
 
@@ -395,8 +433,10 @@ class ResourceCatalogStore:
         clauses, params = ["1=1"], []
         if search.strip():
             needle = f"%{search.strip().lower()}%"
-            clauses.append("(LOWER(label) LIKE ? OR LOWER(COALESCE(band,'')) LIKE ? OR LOWER(COALESCE(channel,'')) LIKE ? OR LOWER(COALESCE(locality,'')) LIKE ? OR LOWER(COALESCE(coverage,'')) LIKE ? OR LOWER(COALESCE(notes,'')) LIKE ?)")
+            frequency_needle = f"%{search.strip().lower().replace('mhz', '').replace('hz', '').strip()}%"
+            clauses.append("(LOWER(label) LIKE ? OR LOWER(COALESCE(band,'')) LIKE ? OR LOWER(COALESCE(channel,'')) LIKE ? OR LOWER(COALESCE(locality,'')) LIKE ? OR LOWER(COALESCE(coverage,'')) LIKE ? OR LOWER(COALESCE(notes,'')) LIKE ? OR CAST(COALESCE(receive_hz,center_hz) AS TEXT) LIKE ? OR CAST(transmit_hz AS TEXT) LIKE ? OR CAST(COALESCE(receive_hz,center_hz)/1000000.0 AS TEXT) LIKE ? OR CAST(transmit_hz/1000000.0 AS TEXT) LIKE ?)")
             params.extend([needle] * 6)
+            params.extend([frequency_needle] * 4)
         if service:
             clauses.append("service=?")
             params.append(str(service).strip().upper())

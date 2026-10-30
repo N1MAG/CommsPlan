@@ -174,6 +174,7 @@ def preflight_js8_send(
     allow_dirty_tx_text: bool = False,
     allow_selected_target: bool = False,
     allow_uncertain_target_state: bool = False,
+    require_target_id: bool = False,
 ) -> JS8SendPreflight:
     endpoint = client.endpoint.normalized()
     issues: list[JS8SendIssue] = []
@@ -224,8 +225,8 @@ def preflight_js8_send(
         issues.append(JS8SendIssue("tx_text_unknown", f"Could not verify JS8Call transmit text is empty: {exc}", False))
 
     try:
-        response = client.request("RX.GET_CALL_SELECTED", expect_types=("RX.CALL_SELECTED",), timeout_s=timeout_s)
-        selected_call = str(response.value or response.params.get("CALLSIGN") or response.params.get("CALL") or "").strip()
+        response = client.request("RX.GET_CALL_SELECTED", expect_types=("RX.CALL_SELECTED",), timeout_s=timeout_s, **({"require_id": True} if require_target_id else {}))
+        selected_call = _selected_target_value(response)
         if selected_call and not allow_selected_target:
             issues.append(
                 JS8SendIssue(
@@ -427,6 +428,8 @@ def _send_js8_message_guarded_unlocked(
     allow_dirty_tx_text: bool = False,
     allow_selected_target: bool = False,
     allow_uncertain_target_state: bool = False,
+    require_target_id: bool = False,
+    before_send: Callable[[], tuple[bool, str]] | None = None,
     clear_selected_target: bool = False,
     set_selected_target: object = None,
 ) -> JS8SendResult:
@@ -438,6 +441,7 @@ def _send_js8_message_guarded_unlocked(
             set_js8_selected_target(client, "" if clear_selected_target else set_selected_target)
     except Exception:
         pass
+    connection = getattr(client, "last_connected_ts", None)
     preflight = preflight_js8_send(
         client,
         message_text,
@@ -445,9 +449,34 @@ def _send_js8_message_guarded_unlocked(
         allow_dirty_tx_text=allow_dirty_tx_text,
         allow_selected_target=allow_selected_target,
         allow_uncertain_target_state=allow_uncertain_target_state,
+        require_target_id=require_target_id,
     )
     if not preflight.ok:
         return JS8SendResult(False, preflight, preflight.summary)
+    if require_target_id and (not client.is_connected or getattr(client, 'last_connected_ts', None) != connection):
+        changed = JS8SendPreflight(endpoint=preflight.endpoint, ok=False,
+            issues=(JS8SendIssue('connection_changed', 'JS8Call reconnected during preflight; nothing sent.'),))
+        return JS8SendResult(False, changed, changed.summary)
+    if before_send is not None:
+        try:
+            allowed, detail = before_send()
+        except Exception as exc:
+            allowed, detail = False, f'Source/guard unavailable: {exc}'
+        if not allowed:
+            blocked = JS8SendPreflight(endpoint=preflight.endpoint, ok=False,
+                issues=(JS8SendIssue('source_changed', detail),))
+            return JS8SendResult(False, blocked, detail)
+    if require_target_id:
+        try:
+            response = client.request('RX.GET_CALL_SELECTED', expect_types=('RX.CALL_SELECTED',),
+                                      timeout_s=timeout_s, require_id=True)
+            selected = _selected_target_value(response)
+            if selected or not client.is_connected or getattr(client, 'last_connected_ts', None) != connection:
+                raise ValueError('JS8Call selection or connection changed; review before sending.')
+        except Exception as exc:
+            blocked = JS8SendPreflight(endpoint=preflight.endpoint, ok=False,
+                issues=(JS8SendIssue('target_state_changed', str(exc)),))
+            return JS8SendResult(False, blocked, blocked.summary)
     try:
         client.send("TX.SET_TEXT", value="")
         client.send("TX.SEND_MESSAGE", value=message_text)
@@ -473,6 +502,8 @@ def send_js8_message_guarded(
     allow_dirty_tx_text: bool = False,
     allow_selected_target: bool = False,
     allow_uncertain_target_state: bool = False,
+    require_target_id: bool = False,
+    before_send: Callable[[], tuple[bool, str]] | None = None,
     clear_selected_target: bool = False,
     set_selected_target: object = None,
 ) -> JS8SendResult:
@@ -485,6 +516,47 @@ def send_js8_message_guarded(
             allow_dirty_tx_text=allow_dirty_tx_text,
             allow_selected_target=allow_selected_target,
             allow_uncertain_target_state=allow_uncertain_target_state,
+            require_target_id=require_target_id,
+            before_send=before_send,
             clear_selected_target=clear_selected_target,
             set_selected_target=set_selected_target,
         )
+
+
+def send_js8_addressed_message_guarded(
+    client: JS8ApiClient, message: str, *, timeout_s: float = 0.8,
+    source_preflight: Callable[[], tuple[bool, str]],
+) -> JS8SendResult:
+    """NCS addressed text: verified UI deselection, then the normal send guard.
+
+    No permissive target override reaches TX. The shared RLock spans every step;
+    an external GUI change is caught by the final selected-target preflight.
+    A failed clear is blocked rather than retried or speculatively transmitted.
+    """
+    def blocked(code, detail):
+        state = JS8SendPreflight(endpoint=client.endpoint.normalized(), ok=False,
+            issues=(JS8SendIssue(code, detail),))
+        return JS8SendResult(False, state, detail)
+
+    with _endpoint_tx_lock(client):
+        allowed, reason = source_preflight()
+        if not allowed:
+            return blocked('source_changed', reason)
+        # Inspect busy/text state before changing the user's JS8 selection.
+        initial = preflight_js8_send(client, message, timeout_s=timeout_s,
+            allow_selected_target=True, allow_uncertain_target_state=False, require_target_id=True)
+        if not initial.ok:
+            return JS8SendResult(False, initial, initial.summary)
+        connected_ts = getattr(client, 'last_connected_ts', None)
+        if initial.selected_call:
+            cleared = clear_js8_selected_target(client, expected_target=initial.selected_call,
+                                                 timeout_s=timeout_s)
+            if not cleared.cleared:
+                return blocked('target_clear_failed', cleared.detail)
+        allowed, reason = source_preflight()
+        if not allowed:
+            return blocked('source_changed', reason)
+        if not client.is_connected or getattr(client, 'last_connected_ts', None) != connected_ts:
+            return blocked('connection_changed', 'JS8Call reconnected; review and send again explicitly.')
+        return send_js8_message_guarded(client, message, timeout_s=timeout_s,
+            allow_uncertain_target_state=False, require_target_id=True, before_send=source_preflight)

@@ -6,7 +6,6 @@ indexed counters, so source edits in another CP process fence queued work too.
 from pathlib import Path
 import json
 import sqlite3
-from freqinout.core.sqlite_utils import connect_sqlite_readonly
 
 TABLE = '_cp_schedule_source_revision'
 IMPLEMENTATION_VERSION = 4
@@ -98,6 +97,7 @@ def install_source_revisions(conn):
 
 
 def ensure_source_database(path):
+    from freqinout.core.sqlite_utils import connect_sqlite_readonly
     path=Path(path)
     if not path.is_file():
         return
@@ -118,6 +118,7 @@ def ensure_source_database(path):
 
 def source_tokens(db_path,plan,choices=None):
     """Worker-only bounded dependency snapshot, not a UI or tick operation."""
+    from freqinout.core.sqlite_utils import connect_sqlite_readonly
     db_path=Path(db_path)
     refs=json.loads(plan.get('source_refs_json') or '[]')
     groups=json.loads(plan.get('group_refs_json') or '[]')
@@ -175,6 +176,7 @@ def source_tokens(db_path,plan,choices=None):
 
 
 def tokens_current(db_path,tokens):
+    from freqinout.core.sqlite_utils import connect_sqlite_readonly
     for domain,expected in (tokens or {}).items():
         path=Path(db_path) if domain=='settings' else Path(db_path).with_name('freqinout_nets.db')
         if expected.get('missing'):

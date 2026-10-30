@@ -356,6 +356,9 @@ class NetDirectoryView(QWidget):
         if rows:
             selected_index = next((index for index, row in enumerate(rows) if row.net_entry_key == selected_key), 0)
             self.entry_table.selectRow(selected_index)
+            # Selecting the same row need not emit selectionChanged after its
+            # items were replaced. Refresh details from the new snapshot too.
+            self._entry_selection_changed()
         else:
             self._selected_entry = None
             self.session_table.setRowCount(0)

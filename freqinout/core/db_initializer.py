@@ -12,6 +12,8 @@ from typing import Dict, Set
 from freqinout.core.checkins_db import ensure_operator_checkins_schema
 from freqinout.core.commstat_artifacts import ensure_commstat_artifact_tables
 from freqinout.core.logger import log
+from freqinout.core.ncs_workbench_store import ensure_ncs_workbench_schema
+from freqinout.core.ncs_net_messages import ensure_net_messages_schema
 from freqinout.core.config_paths import get_config_dir
 from freqinout.core.group_utils import normalize_group_name
 from freqinout.core.js8_message_schema import ensure_js8_message_cache_schema
@@ -48,6 +50,7 @@ def _ensure_settings_db() -> None:
         ensure_multi_radio_settings_schema(conn)
         conn.commit()
         ensure_bbs_library_schema(conn)
+        ensure_net_messages_schema(conn)
         conn.row_factory = sqlite3.Row
         profile_rows = [
             dict(row)
@@ -2184,6 +2187,8 @@ def _ensure_nets_db() -> None:
             ensure_varac_local_tables(conn)
         with perf_span("startup.database.nets.dirty_triggers", min_ms=10.0):
             ensure_source_dirty_triggers(conn)
+        with perf_span("startup.database.nets.ncs_workbench", min_ms=10.0):
+            ensure_ncs_workbench_schema(conn)
         with perf_span("startup.database.nets.expect", min_ms=10.0):
             _ensure_js8_expect_tables(conn)
         with perf_span("startup.database.nets.ops_indexes", min_ms=10.0):

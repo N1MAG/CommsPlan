@@ -1007,6 +1007,10 @@ def list_expect_entries(
     enabled_only: bool = False,
     expect_key: str = "",
     limit: Optional[int] = None,
+    net_forms_only: bool = False,
+    static_form_codes: Optional[Iterable[str]] = None,
+    after_id: int = 0,
+    entry_id: Optional[int] = None,
 ) -> list[dict[str, Any]]:
     path = Path(db_path) if db_path is not None else default_expect_db_path()
     if not path.exists():
@@ -1023,7 +1027,20 @@ def list_expect_entries(
         if canonical_key:
             clauses.append("e.expect_key=?")
             params.append(canonical_key)
+        if net_forms_only:
+            clauses.extend(["e.expect_key LIKE 'F!%'", "TRIM(COALESCE(e.response_text,''))<>''", "e.id>?"])
+            params.append(max(0, int(after_id)))
+            if static_form_codes is not None:
+                codes = tuple(sorted({str(code).strip().upper() for code in static_form_codes}))
+                if not codes:
+                    return []
+                clauses.append('e.expect_key IN (' + ','.join('?' for _ in codes) + ')')
+                params.extend(codes)
+        if entry_id is not None:
+            clauses.append('e.id=?')
+            params.append(int(entry_id))
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        order = 'e.id ASC' if net_forms_only else 'COALESCE(e.enabled, 0) DESC, e.expect_key ASC, e.id ASC'
         limit_clause = ""
         if limit is not None:
             row_limit = max(1, min(5000, int(limit or 1)))
@@ -1042,7 +1059,7 @@ def list_expect_entries(
             FROM js8_expect_entries e
             LEFT JOIN js8_expect_allow_policies p ON p.id=e.allow_policy_id
             {where}
-            ORDER BY COALESCE(e.enabled, 0) DESC, e.expect_key ASC, e.id ASC
+            ORDER BY {order}
             {limit_clause}
             """,
             tuple(params),

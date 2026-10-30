@@ -13,7 +13,7 @@ import json
 from typing import Any, Iterable, Mapping
 from uuid import uuid4
 
-from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QCompleter,
     QDialog,
+    QFileDialog,
     QFormLayout,
     QGroupBox,
     QHeaderView,
@@ -45,7 +46,8 @@ from PySide6.QtWidgets import (
 
 from freqinout.core.multi_radio_store import COMMON_AMATEUR_BANDS
 from freqinout.core.operator_radio_configuration import normalize_supported_band
-from freqinout.gui.operator_instance_assistant import OperatorInstanceAssistant
+from freqinout.core.receiver_control import receiver_control_verification_matches
+from freqinout.gui.operator_instance_assistant import OperatorInstanceAssistant, _recovered_edited_fields
 from freqinout.gui.responsive_geometry import WrappingControlLayout
 from freqinout.gui.theme import (
     ThemedCheckBox,
@@ -148,6 +150,7 @@ class OperatorRadioEditor(QDialog):
     recover_requested = Signal(object)
     discard_unfinished_requested = Signal(object)
     application_owner_requested = Signal(object)
+    receiver_control_test_requested = Signal(dict)
 
     def __init__(
         self,
@@ -166,6 +169,7 @@ class OperatorRadioEditor(QDialog):
         self.resize(900, 560)
         self._base = deepcopy(dict(profile or {}))
         self._values = deepcopy(self._base)
+        self._review_edited_fields: set[str] = set()
         self._radio_catalog = deepcopy(dict(radio_catalog or {}))
         self._applying_catalog = False
         self._radio_name_edited = bool(_first(self._base, "name", "radio_name"))
@@ -203,7 +207,12 @@ class OperatorRadioEditor(QDialog):
         self._selected_schedule_plan_id: Any = None
         self._nested_dialogs: list[_ApplicationPage] = []
         self._unfinished_envelope: dict[str, Any] | None = None
+        self._conflict_review_context: dict[str, Any] | None = None
         self._allow_close = False
+        self._receiver_test_service_ready = False
+        self._receiver_pending = None
+        self._receiver_closed = False
+        self._receiver_result_detail = ""
 
         self._build_ui()
         self._load_profile()
@@ -240,6 +249,11 @@ class OperatorRadioEditor(QDialog):
             button.setEnabled(not self._busy)
         for button in self._application_configure_buttons.values():
             button.setEnabled(not self._busy)
+        for widget in (self.receiver_launch_enabled, self.receiver_launch_path, self.receiver_launch_command,
+                       self.receiver_launch_browse):
+            widget.setEnabled(not self._busy)
+        self.receiver_launch_startup.setEnabled(not self._busy and self.receiver_launch_enabled.isChecked())
+        self._refresh_receiver_setup()
         self._refresh_recovery_guidance()
 
     def set_status(self, text: str) -> None:
@@ -284,7 +298,8 @@ class OperatorRadioEditor(QDialog):
             family, field = first.get('family'), first.get('field')
             if family == 'radio':
                 self.tabs.setCurrentIndex(0)
-                widget = self.band_selector if field == 'antenna_supported_bands' else self._field_widgets.get(field)
+                widget = (self.band_selector if field == 'antenna_supported_bands' else
+                          self.receiver_launch_path if field == '_receiver_launch' else self._field_widgets.get(field))
                 if widget is not None:
                     self.tabs.widget(0).ensureWidgetVisible(widget)
                     widget.setFocus()
@@ -357,6 +372,7 @@ class OperatorRadioEditor(QDialog):
             return False
         self._base = deepcopy(dict(profile))
         self._values = deepcopy(dict(profile))
+        self._review_edited_fields.clear()
         self.operator_session_id = uuid4().hex
         self._operator_recovered_from = None
         self._operator_draft_revision = None
@@ -401,6 +417,53 @@ class OperatorRadioEditor(QDialog):
         self._unfinished_envelope = deepcopy(dict(envelope or {})) if envelope else None
         self._refresh_recovery_guidance()
 
+    def set_conflict_review(self, context: Mapping[str, Any] | None) -> None:
+        self._conflict_review_context = deepcopy(dict(context)) if isinstance(context, Mapping) else None
+        self.conflict_review_button.setVisible(self._conflict_review_context is not None)
+        self.conflict_review_button.setEnabled(not self._busy)
+
+    def _review_saved_changes(self) -> None:
+        if self._busy or self._conflict_review_context is None:
+            return
+        from freqinout.core.configuration_review import radio_review
+        context = self._conflict_review_context
+        review = radio_review(self._base, {**self.values(), '__edited_fields__': sorted(self._review_edited_fields)}, self._application_drafts, context)
+        box = QMessageBox(self)
+        box.setWindowTitle('Review saved radio changes')
+        box.setTextFormat(Qt.PlainText)
+        box.setText('Review your entries alongside the current saved settings.')
+        summary = review['summary']
+        if len(summary) > 360 or len(summary.splitlines()) > 4:
+            box.setInformativeText('Review the changed fields in Show Details. Unedited fields use the current saved settings. Nothing is saved until you choose Save.')
+            box.setDetailedText(summary)
+        else:
+            box.setInformativeText(summary)
+        apply = box.addButton('Use reviewed entries', QMessageBox.ButtonRole.AcceptRole)
+        keep = box.addButton('Keep editing', QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(keep)
+        box.exec()
+        if box.clickedButton() is not apply:
+            return
+        self._base = deepcopy(dict(review['base']))
+        self._values = deepcopy(dict(review['values']))
+        self._application_drafts = deepcopy(dict(review['application_drafts']))
+        seeds = context.get('application_seeds', {})
+        self._application_seeds = {str(key): deepcopy(dict(value)) for key, value in dict(seeds or {}).items() if isinstance(value, Mapping)}
+        if 'operating_profiles' in context:
+            self._operating_profiles = self._rows(context['operating_profiles'])
+        if 'schedule_plans' in context:
+            self._schedule_plans = self._rows(context['schedule_plans'])
+        unfinished = context.get('unfinished')
+        if isinstance(unfinished, Mapping):
+            self._operator_draft_revision = unfinished.get('revision')
+            self.set_unfinished(unfinished if unfinished.get('payload') else None)
+        self._repopulate_selection_combos()
+        self._load_profile()
+        self._dirty = True
+        self._refresh_dirty_state()
+        self.set_conflict_review(None)
+        self.set_status('Reviewed entries are ready. Choose Save radio to apply them.')
+
     def _has_other_saved_draft(self) -> bool:
         payload = (self._unfinished_envelope or {}).get("payload")
         if not isinstance(payload, Mapping):
@@ -420,6 +483,7 @@ class OperatorRadioEditor(QDialog):
         )
         for button in (self.recover_button, self.discard_unfinished_button):
             button.setEnabled(not self._busy)
+        self.conflict_review_button.setEnabled(not self._busy)
         blocked = self._has_other_saved_draft()
         self.save_button.setEnabled(not self._busy)
         self.save_button.setToolTip(
@@ -462,6 +526,7 @@ class OperatorRadioEditor(QDialog):
         self.recover_requested.emit(deepcopy(envelope))
         self._base = deepcopy(dict(base))
         self._values = deepcopy(dict(values))
+        self._review_edited_fields = _recovered_edited_fields(base, values)
         self.operator_session_id = uuid4().hex
         self._operator_recovered_from = _text(session_id)
         self._operator_draft_revision = envelope.get("revision")
@@ -569,6 +634,11 @@ class OperatorRadioEditor(QDialog):
         self.discard_unfinished_button.clicked.connect(self._discard_unfinished)
         recovery.addWidget(self.recover_button)
         recovery.addWidget(self.discard_unfinished_button)
+        self.conflict_review_button = QPushButton('Review saved changes…')
+        self.conflict_review_button.setObjectName('operatorRadioReviewSavedChanges')
+        self.conflict_review_button.setVisible(False)
+        self.conflict_review_button.clicked.connect(self._review_saved_changes)
+        recovery.addWidget(self.conflict_review_button)
         self._guidance_layout.addLayout(recovery)
 
         footer = WrappingControlLayout()
@@ -640,7 +710,10 @@ class OperatorRadioEditor(QDialog):
         self._add_line(form, "radio_manufacturer", "Manufacturer", "Manufacturer (optional)")
         self._add_line(form, "radio_model", "Model", "Model (optional)")
         self._add_line(form, "name", "Radio name (required)", "Your station label")
-        self._add_combo(form, "device_class", "Role", (("tx_rx", "Transmit and receive"), ("observer", "Observer / receive only"), ("gateway", "Gateway")))
+        roles = [("tx_rx", "Transmit and receive"), ("observer", "Observer / receive only")]
+        if self._base.get('id') and self._base.get('device_class') == 'gateway':
+            roles.append(("gateway", "Gateway"))
+        self._add_combo(form, "device_class", "Role", roles)
         layout.addLayout(form)
         self.radio_model_hint = QLabel()
         self.radio_model_hint.setWordWrap(True)
@@ -672,8 +745,195 @@ class OperatorRadioEditor(QDialog):
         band_hint.setWordWrap(True)
         more_form.addRow(band_hint)
         layout.addWidget(more)
+        self._build_receiver_setup(layout)
         layout.addStretch(1)
         self._backend_changed()
+
+    def _build_receiver_setup(self, layout: QVBoxLayout) -> None:
+        self.receiver_setup = QGroupBox("Receiver setup")
+        self.receiver_setup.setObjectName("operatorReceiverSetup")
+        form = QFormLayout(self.receiver_setup)
+        form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        self._add_combo(form, "sdr_application", "Receiver application", (("Other / manual", "Other / manual"), ("SDR++", "SDR++")))
+        self._add_combo(form, "sdr_adapter", "Control adapter", (("manual", "Manual tuning"), ("sdrpp_rigctl", "SDR++ RigCTL")))
+        self._add_line(form, "sdr_host", "Host", "Receiver application host")
+        self._add_line(form, "sdr_port", "Port", "Receiver application port")
+        self._add_line(form, "sdr_target", "Target", "selected-vfo")
+        self.receiver_test_button = QPushButton("Test control")
+        self.receiver_test_button.setObjectName("operatorReceiverTestControl")
+        self.receiver_test_button.clicked.connect(self._request_receiver_test)
+        form.addRow(self.receiver_test_button)
+        self.receiver_verification_label = QLabel()
+        self.receiver_verification_label.setWordWrap(True)
+        form.addRow(self.receiver_verification_label)
+        enabled = ThemedCheckBox("Enable CommsPlan tuning")
+        enabled.setObjectName("operatorReceiverControlEnabled")
+        enabled.toggled.connect(lambda value: self._set_value("sdr_control_enabled", value))
+        self._field_widgets["sdr_control_enabled"] = enabled
+        form.addRow(enabled)
+        launch_note = QLabel("SDR++ launch is separate from receiver tuning. Choose whether CommsPlan should launch it.")
+        launch_note.setWordWrap(True)
+        form.addRow(launch_note)
+        self.receiver_launch_enabled = ThemedCheckBox("Include SDR++ in Launch Control")
+        self.receiver_launch_enabled.setObjectName("operatorReceiverLaunchEnabled")
+        form.addRow(self.receiver_launch_enabled)
+        self.receiver_launch_path = QLineEdit()
+        self.receiver_launch_path.setObjectName("operatorReceiverLaunchPath")
+        self.receiver_launch_path.setAccessibleName("SDR++ executable path")
+        self.receiver_launch_path.setPlaceholderText("SDR++ executable path")
+        path_row = QWidget()
+        path_layout = QHBoxLayout(path_row)
+        path_layout.setContentsMargins(0, 0, 0, 0)
+        path_layout.addWidget(self.receiver_launch_path)
+        self.receiver_launch_browse = QPushButton("Browse")
+        self.receiver_launch_browse.setObjectName("operatorReceiverLaunchBrowse")
+        self.receiver_launch_browse.setAccessibleName("Browse for SDR++ executable or application")
+        self.receiver_launch_browse.clicked.connect(self._browse_receiver_launch)
+        path_layout.addWidget(self.receiver_launch_browse)
+        form.addRow("Executable path", path_row)
+        self.receiver_launch_command = QLineEdit()
+        self.receiver_launch_command.setObjectName("operatorReceiverLaunchCommand")
+        self.receiver_launch_command.setAccessibleName("SDR++ launch command")
+        self.receiver_launch_command.setPlaceholderText("Optional explicit launch command")
+        form.addRow("Launch command", self.receiver_launch_command)
+        self.receiver_launch_startup = ThemedCheckBox("Start SDR++ when CommsPlan opens")
+        self.receiver_launch_startup.setObjectName("operatorReceiverLaunchStartup")
+        self.receiver_launch_startup.setToolTip("Enables automatic startup for this radio. Other applications checked for startup in Launch Control will also start.")
+        form.addRow(self.receiver_launch_startup)
+        for widget in (self.receiver_launch_enabled, self.receiver_launch_startup):
+            widget.toggled.connect(self._receiver_launch_changed)
+        for widget in (self.receiver_launch_path, self.receiver_launch_command):
+            widget.textChanged.connect(self._receiver_launch_changed)
+        layout.addWidget(self.receiver_setup)
+
+    @staticmethod
+    def _normalize_receiver_launch(value: object) -> dict[str, Any]:
+        value = value if isinstance(value, Mapping) else {}
+        return {"name": "SDR++", "enabled": _bool(value.get("enabled", False)),
+                "startup": _bool(value.get("startup", False)),
+                "launch_path_override": _text(value.get("launch_path_override")).strip(),
+                "launch_command_override": _text(value.get("launch_command_override")).strip()}
+
+    def _receiver_launch_selection(self) -> dict[str, Any]:
+        return {"name": "SDR++", "enabled": self.receiver_launch_enabled.isChecked(),
+                "startup": self.receiver_launch_startup.isChecked(),
+                "launch_path_override": self.receiver_launch_path.text().strip(),
+                "launch_command_override": self.receiver_launch_command.text().strip()}
+
+    def _load_receiver_launch(self) -> None:
+        value = self._normalize_receiver_launch(self._values.get("_receiver_launch"))
+        for widget, selected in ((self.receiver_launch_enabled, value["enabled"]),
+                                 (self.receiver_launch_startup, value["startup"])):
+            widget.blockSignals(True)
+            widget.setChecked(selected)
+            widget.blockSignals(False)
+        for widget, selected in ((self.receiver_launch_path, value["launch_path_override"]),
+                                 (self.receiver_launch_command, value["launch_command_override"])):
+            widget.blockSignals(True)
+            widget.setText(selected)
+            widget.blockSignals(False)
+        self.receiver_launch_startup.setEnabled(value["enabled"] and not self._busy)
+
+    def _receiver_launch_changed(self, *_args) -> None:
+        if self._busy:
+            return
+        if not self.receiver_launch_enabled.isChecked() and self.receiver_launch_startup.isChecked():
+            self.receiver_launch_startup.blockSignals(True)
+            self.receiver_launch_startup.setChecked(False)
+            self.receiver_launch_startup.blockSignals(False)
+        self.receiver_launch_startup.setEnabled(self.receiver_launch_enabled.isChecked())
+        self._set_value("_receiver_launch", self._receiver_launch_selection())
+
+    def _browse_receiver_launch(self) -> None:
+        if self._busy:
+            return
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self, "Choose SDR++ executable or application", self.receiver_launch_path.text()
+        )
+        if path:
+            self.receiver_launch_path.setText(path)
+
+    def set_receiver_control_test_service_ready(self, ready: bool) -> None:
+        self._receiver_test_service_ready = bool(ready)
+        self._refresh_receiver_setup()
+
+    def _receiver_endpoint(self) -> tuple[str, ...]:
+        return tuple(_text(self._values.get(key)).strip() for key in
+                     ("sdr_application", "sdr_adapter", "sdr_host", "sdr_port", "sdr_target"))
+
+    def _refresh_receiver_setup(self) -> None:
+        if not hasattr(self, "receiver_setup"):
+            return
+        observer = _text(self._values.get("device_class") or "tx_rx").lower() == "observer"
+        self.receiver_setup.setVisible(observer)
+        verified = receiver_control_verification_matches(self._values)
+        application, adapter, host, port, target = self._receiver_endpoint()
+        try:
+            valid_port = 1 <= int(port) <= 65535
+        except ValueError:
+            valid_port = False
+        ready = observer and adapter == "sdrpp_rigctl" and bool(host and target and valid_port)
+        self.receiver_test_button.setEnabled(bool(ready and self._receiver_test_service_ready and not self._receiver_pending and not self._busy and not self._receiver_closed))
+        self._field_widgets["sdr_control_enabled"].setEnabled(bool(observer and verified and not self._receiver_pending and not self._busy and not self._receiver_closed))
+        if self._receiver_pending:
+            detail = "Testing receiver control…"
+        elif verified:
+            detail = "CommsPlan tuning ready for this receiver. Enable tuning only if desired."
+        elif self._receiver_result_detail:
+            detail = self._receiver_result_detail
+        elif adapter in {"", "manual"}:
+            detail = "Manual tuning: CommsPlan is not controlling this receiver."
+        else:
+            detail = "Verification required. Test control verifies tuning and restores the original frequency."
+        self.receiver_verification_label.setText(detail)
+        self.receiver_test_button.setToolTip("Select a supported adapter, host, port and target; the receiver test service must be available.")
+
+    def _request_receiver_test(self) -> None:
+        self._refresh_receiver_setup()
+        if not self.receiver_test_button.isEnabled():
+            return
+        self._sync_values()
+        token = uuid4().hex
+        profile_id = int(self._profile_radio_id() or 0)
+        self._receiver_pending = (token, profile_id, self._receiver_endpoint())
+        self._receiver_result_detail = ""
+        snapshot = deepcopy(self._values)
+        snapshot.update(id=profile_id, qualification_request_id=token)
+        self._refresh_receiver_setup()
+        self.receiver_control_test_requested.emit(snapshot)
+
+    def apply_receiver_control_test_result(self, result: object) -> None:
+        pending = self._receiver_pending
+        if self._receiver_closed or not pending or not isinstance(result, Mapping):
+            return
+        token, profile_id, endpoint = pending
+        try:
+            result_id = int(result.get("profile_id", -1))
+        except (TypeError, ValueError):
+            return
+        if (result_id != profile_id or result.get("qualification_request_id") != token
+                or endpoint != self._receiver_endpoint()):
+            return
+        self._receiver_pending = None
+        evidence = result.get("verification")
+        candidate = dict(self._values, sdr_verification_state=result.get("verification_state"),
+                         sdr_verification_json=deepcopy(evidence))
+        candidate.pop("sdr_verification", None)
+        if isinstance(evidence, Mapping) and receiver_control_verification_matches(candidate):
+            self._values["sdr_verification_state"] = "verified"
+            self._values["sdr_verification_json"] = json.dumps(dict(evidence), sort_keys=True)
+            self._values.pop("sdr_verification", None)
+        else:
+            self._values["sdr_verification_state"] = "failed"
+            self._values["sdr_verification_json"] = "{}"
+            self._values.pop("sdr_verification", None)
+            self._field_widgets["sdr_control_enabled"].setChecked(False)
+        self._receiver_result_detail = _text(result.get("detail")) if not receiver_control_verification_matches(self._values) else ""
+        self._dirty = True
+        self._refresh_dirty_state()
+        self._refresh_receiver_setup()
+        if result.get("detail"):
+            self.receiver_verification_label.setToolTip(_text(result["detail"]))
 
     def _add_band_checkbox(self, band: str) -> None:
         label = band if band in COMMON_AMATEUR_BANDS else f"{band[:24]} (saved)"
@@ -943,6 +1203,11 @@ class OperatorRadioEditor(QDialog):
         for value, text in items:
             combo.addItem(text, value)
         combo.currentIndexChanged.connect(lambda _index, field_key=key, widget=combo: self._set_value(field_key, widget.currentData()))
+        if key == "sdr_application":
+            # Choosing the visible default is still an explicit edit when a
+            # legacy value was blank, even though the index does not change.
+            combo.activated.connect(lambda _index, widget=combo: self._set_value(key, widget.currentData())
+                                    if self._values.get(key) in (None, "") else None)
         self._field_widgets[key] = combo
         self._field_labels[key] = QLabel(label)
         form.addRow(self._field_labels[key], combo)
@@ -976,6 +1241,8 @@ class OperatorRadioEditor(QDialog):
                 label.setVisible(visible)
 
     def _load_profile(self) -> None:
+        self._receiver_pending = None
+        self._receiver_result_detail = ""
         aliases = self._field_aliases()
         self._application_raw_values = {
             key: deepcopy(self._values[key]) for key, _label in _APPLICATION_FLAGS if key in self._values
@@ -1044,6 +1311,14 @@ class OperatorRadioEditor(QDialog):
                                        or _first(self._values, "name", "radio_name"))
         self._sync_radio_model_selection()
         self._backend_changed()
+        self._load_receiver_launch()
+        if (_text(self._values.get("device_class") or "tx_rx").lower() != "observer"
+                or not receiver_control_verification_matches(self._values)):
+            enabled = self._field_widgets["sdr_control_enabled"]
+            enabled.blockSignals(True)
+            enabled.setChecked(False)
+            enabled.blockSignals(False)
+        self._refresh_receiver_setup()
         self._refresh_summaries()
         self._refresh_application_identity_labels()
 
@@ -1071,6 +1346,11 @@ class OperatorRadioEditor(QDialog):
                 else:
                     value = widget.isChecked()
             elif isinstance(widget, QComboBox):
+                if (key == "sdr_application" and key not in self._review_edited_fields
+                        and self._values.get(key) in (None, "")):
+                    # The first visible choice is only a presentation default.
+                    # Keep a legacy blank (or missing) value until it is edited.
+                    continue
                 value = widget.currentData()
             else:
                 continue
@@ -1091,7 +1371,20 @@ class OperatorRadioEditor(QDialog):
     def _set_value(self, key: str, value: Any) -> None:
         if self._busy:
             return
+        self._review_edited_fields.add(key)
         self._values[key] = deepcopy(value)
+        if key in {"sdr_application", "sdr_adapter", "sdr_host", "sdr_port", "sdr_target"}:
+            self._receiver_pending = None
+            self._receiver_result_detail = ""
+            self._values["sdr_verification_state"] = "unverified"
+            self._values["sdr_verification_json"] = "{}"
+            self._values.pop("sdr_verification", None)
+            self._field_widgets["sdr_control_enabled"].setChecked(False)
+        if key == "device_class" and value != "observer":
+            self._receiver_pending = None
+            self._field_widgets["sdr_control_enabled"].setChecked(False)
+        if key.startswith("sdr_") or key == "device_class":
+            self._refresh_receiver_setup()
         if key in {'flrig_host', 'flrig_port', 'rig_host', 'rig_port'}:
             self._endpoint_fields_edited.add(key)
         if not self._applying_catalog:
@@ -1103,7 +1396,9 @@ class OperatorRadioEditor(QDialog):
         if key in {'flrig_host', 'flrig_port'}:
             draft = self._application_drafts.get('fast_light')
             if isinstance(draft, Mapping) and draft.get('operator_values', {}).get('flrig_enabled'):
-                draft['operator_values']['host' if key == 'flrig_host' else 'port'] = deepcopy(value)
+                app_key = 'host' if key == 'flrig_host' else 'port'
+                draft['operator_values'][app_key] = deepcopy(value)
+                draft['operator_values']['__edited_fields__'] = sorted(set(draft['operator_values'].get('__edited_fields__', ())) | {app_key})
         if key in self._application_checks:
             self._application_raw_values[key] = deepcopy(value)
             self._application_touched.add(key)
@@ -1161,6 +1456,7 @@ class OperatorRadioEditor(QDialog):
             return
         self._sync_values()
         seed = deepcopy(self._application_seeds.get(family_key, {}))
+        unfinished_application = seed.pop('_unfinished_application', None)
         existing_draft = self._application_drafts.get(family_key)
         if isinstance(existing_draft, Mapping):
             draft_values = existing_draft.get("operator_values")
@@ -1225,6 +1521,7 @@ class OperatorRadioEditor(QDialog):
                 "expected_current_instance_id",
                 "replacement_instance_id",
                 "operator_launch_snapshot",
+                "replace_saved_draft",
             ):
                 if key in existing_draft:
                     assistant._raw_fields[key] = deepcopy(existing_draft[key])
@@ -1233,6 +1530,17 @@ class OperatorRadioEditor(QDialog):
             if existing_draft.get("expected_current_instance_id") not in (None, ""):
                 assistant._replacement_instance_id = existing_draft["expected_current_instance_id"]
         assistant._radio_setup_context = True
+        assistant.discard_unfinished_button.setText("Use current entries instead")
+        assistant.discard_unfinished_button.setAccessibleName("Use current application entries instead of saved draft")
+        previous = unfinished_application.get('payload') if isinstance(unfinished_application, Mapping) else None
+        replacement = existing_draft.get('replace_saved_draft') if isinstance(existing_draft, Mapping) else None
+        resolved = (isinstance(previous, Mapping) and isinstance(existing_draft, Mapping) and
+                    ((existing_draft.get('operator_recovered_from') == previous.get('session_id') and
+                      existing_draft.get('operator_draft_revision') == unfinished_application.get('revision')) or
+                     (isinstance(replacement, Mapping) and replacement.get('session_id') == previous.get('session_id') and
+                      replacement.get('revision') == unfinished_application.get('revision'))))
+        if isinstance(previous, Mapping) and not resolved:
+            assistant.set_unfinished(unfinished_application)
         assistant.cancel_button.setText("Back to radio setup")
         assistant.create_radio_button.hide()
         title = {"flrig": "FLRig", "fldigi": "FLDigi", "flmsg": "FLMsg", "flamp": "FLAmp",
@@ -1423,11 +1731,20 @@ class OperatorRadioEditor(QDialog):
 
     def _select_initial_step(self, step: str) -> None:
         normalized = _text(step).strip().lower()
+        receiver = normalized in {"connection", "receiver"}
+        if receiver:
+            normalized = "radio"
         aliases = {"software": "apps", "model": "behavior", "plans": "schedule"}
         normalized = aliases.get(normalized, normalized)
         index = {"radio": 0, "apps": 1, "applications": 1, "behavior": 2, "schedule": 3, "review": 4}.get(normalized, 0)
         self.tabs.setCurrentIndex(index)
         self._tab_changed(index)
+        if receiver:
+            QTimer.singleShot(0, self._show_receiver_setup)
+
+    def _show_receiver_setup(self) -> None:
+        if not self._receiver_closed and not self.receiver_setup.isHidden():
+            self.tabs.widget(0).ensureWidgetVisible(self.receiver_setup)
 
     def _nav_changed(self, index: int) -> None:
         if self._syncing_navigation or index < 0 or index >= self.tabs.count():
@@ -1482,6 +1799,8 @@ class OperatorRadioEditor(QDialog):
             envelope = self._unfinished_envelope or {}
             replacement = {'revision': envelope.get('revision'),
                            'session_id': (envelope.get('payload') or {}).get('session_id')}
+        self._receiver_pending = None
+        self._refresh_receiver_setup()
         self._sync_values()
         payload = {
             "operator_radio_v1": True,
@@ -1489,10 +1808,16 @@ class OperatorRadioEditor(QDialog):
             "operator_recovered_from": self._operator_recovered_from,
             "operator_draft_revision": self._operator_draft_revision,
             "base": deepcopy(self._base),
-            "values": deepcopy(self._values),
+            "values": {**deepcopy(self._values), '__edited_fields__': sorted(self._review_edited_fields)},
             "application_drafts": deepcopy(self._application_drafts),
             "operating_profile_id": self._selected_operating_profile_id,
             "schedule_plan_id": self._selected_schedule_plan_id,
+            "receiver_launch": (
+                self._receiver_launch_selection()
+                if _text(self._values.get("device_class")).lower() == "observer"
+                and self._receiver_launch_selection() != self._normalize_receiver_launch(self._base.get("_receiver_launch"))
+                else None
+            ),
         }
         if replacement:
             payload['replace_saved_draft'] = replacement
@@ -1542,11 +1867,18 @@ class OperatorRadioEditor(QDialog):
     def reject(self) -> None:
         # Escape uses QDialog.reject directly and bypasses closeEvent.
         if self._allow_close:
+            self._receiver_closed = True
+            self._receiver_pending = None
             super().reject()
         elif self._busy:
             return
         else:
             self._cancel()
+
+    def accept(self) -> None:
+        self._receiver_closed = True
+        self._receiver_pending = None
+        super().accept()
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self._nested_dialogs:
@@ -1554,15 +1886,21 @@ class OperatorRadioEditor(QDialog):
             event.ignore()
             return
         if self._allow_close:
+            self._receiver_closed = True
+            self._receiver_pending = None
             event.accept()
             return
         if self._busy:
             event.ignore()
             return
         if not self.isVisible():
+            self._receiver_closed = True
+            self._receiver_pending = None
             event.accept()
             return
         if not self._dirty:
+            self._receiver_closed = True
+            self._receiver_pending = None
             self.cancelled.emit()
             event.accept()
             return
@@ -1575,6 +1913,8 @@ class OperatorRadioEditor(QDialog):
             event.ignore()
         elif action == "discard":
             self._dirty = False
+            self._receiver_closed = True
+            self._receiver_pending = None
             self.cancelled.emit()
             event.accept()
         else:
@@ -1600,6 +1940,8 @@ class OperatorRadioEditor(QDialog):
         self.save_button.setStyleSheet(button_style("primary", palette))
         self.cancel_button.setStyleSheet(button_style("secondary", palette))
         self.keep_draft_button.setStyleSheet(button_style("secondary", palette))
+        self.receiver_test_button.setStyleSheet(button_style("secondary", palette))
+        self.receiver_launch_browse.setStyleSheet(button_style("secondary", palette))
         for button in (self.back_button, self.next_button):
             button.setStyleSheet(button_style("muted", palette))
         height = control_height_for_font(self, vertical_padding=8, floor=28)
@@ -1607,7 +1949,7 @@ class OperatorRadioEditor(QDialog):
         for widget in self._field_widgets.values():
             if isinstance(widget, (QLineEdit, QComboBox, QCheckBox)):
                 widget.setMinimumHeight(height)
-        for button in (self.back_button, self.next_button, self.cancel_button, self.save_button, self.keep_draft_button, *self._edit_application_buttons.values()):
+        for button in (self.back_button, self.next_button, self.cancel_button, self.save_button, self.keep_draft_button, self.receiver_test_button, self.receiver_launch_browse, *self._edit_application_buttons.values()):
             button.setMinimumHeight(button_height)
         for checkbox in self.band_checks.values():
             self._size_band_checkbox(checkbox)

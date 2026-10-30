@@ -9,7 +9,7 @@ The active page is the only page that can affect the requested geometry here.
 from __future__ import annotations
 
 from PySide6.QtCore import QSize
-from PySide6.QtWidgets import QStackedWidget, QWidget
+from PySide6.QtWidgets import QStackedWidget, QTabWidget, QStyle, QWidget
 
 
 class CurrentPageStack(QStackedWidget):
@@ -80,4 +80,42 @@ class CurrentPageStack(QStackedWidget):
 # as an active-page stack.
 ActivePageStack = CurrentPageStack
 
-__all__ = ["ActivePageStack", "CurrentPageStack"]
+__all__ = ["ActivePageStack", "CurrentPageStack", "CurrentPageTabs"]
+
+
+class CurrentPageTabs(QTabWidget):
+    """Tabbed counterpart of CurrentPageStack; hidden editors cannot grow a list.
+
+    Native tab styling and keyboard navigation remain owned by QTabWidget.
+    Geometry reads only cached widget hints and the current font/style.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.currentChanged.connect(lambda _index: self.updateGeometry())
+
+    def _page_hint(self, method):
+        page = self.currentWidget()
+        size = (getattr(page, method)().expandedTo(page.minimumSize())
+                if page is not None else QSize(0, 0))
+        bar = self.tabBar().sizeHint()
+        frame = 2 * self.style().pixelMetric(QStyle.PixelMetric.PM_DefaultFrameWidth, None, self)
+        return QSize(max(size.width(), bar.width()) + frame,
+                     max(0, size.height()) + bar.height() + frame)
+
+    def sizeHint(self):  # noqa: N802
+        return self._page_hint("sizeHint")
+
+    def minimumSizeHint(self):  # noqa: N802
+        return self._page_hint("minimumSizeHint")
+
+    def hasHeightForWidth(self):  # noqa: N802
+        page = self.currentWidget()
+        return bool(page is not None and page.hasHeightForWidth())
+
+    def heightForWidth(self, width):  # noqa: N802
+        page = self.currentWidget()
+        if page is None or not page.hasHeightForWidth():
+            return -1
+        frame = 2 * self.style().pixelMetric(QStyle.PixelMetric.PM_DefaultFrameWidth, None, self)
+        return page.heightForWidth(max(0, width - frame)) + self.tabBar().sizeHint().height() + frame

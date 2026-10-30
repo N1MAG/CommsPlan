@@ -131,7 +131,7 @@ class FLRigClient:
         self.host = host
         self.port = port
         self._proxy: Optional[ServerProxy] = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         # Multiple FIO services create short-lived clients for status, launch,
         # and scheduler work.  FLRig serves these through one XML-RPC endpoint,
         # so serialize only callers sharing that exact host/port.  Other radios
@@ -350,6 +350,12 @@ class FLRigClient:
             log.warning("Failed to get VFO frequency from FLRig: %s", e)
             return None
 
+    def get_radio_mode(self) -> Optional[str]:
+        try:
+            return str(self._with_proxy(lambda p: p.rig.get_mode(), label="get_mode") or "").strip() or None
+        except Exception:
+            return None
+
     def get_transceiver_name(self) -> Optional[str]:
         """Return FLRig's online transceiver name, or None when it is offline.
 
@@ -460,7 +466,10 @@ class FLRigClient:
             return "DATA-U"
         return txt
 
-    def set_frequency(self, cmd: FrequencyCommand) -> bool:
+    def set_frequency_guarded(self, cmd: FrequencyCommand, guard) -> bool:
+        return self.set_frequency(cmd, mutation_guard=guard)
+
+    def set_frequency(self, cmd: FrequencyCommand, *, mutation_guard=None) -> bool:
         """
         Set rig frequency (and optionally mode/VFO) via FLRig.
         """
@@ -472,52 +481,78 @@ class FLRigClient:
 
                 def _set_vfo(vfo: str) -> None:
                     log.info("Setting FLRig VFO to %s", vfo)
+                    if mutation_guard and mutation_guard():
+                        raise RuntimeError("Radio mutation held by safety/authority check")
                     p.rig.set_AB(vfo)
 
                 def _set_mode(mode_cmd: str, vfo: Optional[str]) -> None:
                     if vfo == "A":
                         try:
+                            if mutation_guard and mutation_guard():
+                                raise RuntimeError("Radio mutation held by safety/authority check")
                             p.rig.set_verify_modeA(mode_cmd)
                             return
                         except Exception:
                             try:
+                                if mutation_guard and mutation_guard():
+                                    raise RuntimeError("Radio mutation held by safety/authority check")
                                 p.rig.set_modeA(mode_cmd)
                                 return
                             except Exception:
                                 pass
                     elif vfo == "B":
                         try:
+                            if mutation_guard and mutation_guard():
+                                raise RuntimeError("Radio mutation held by safety/authority check")
                             p.rig.set_verify_modeB(mode_cmd)
                             return
                         except Exception:
                             try:
+                                if mutation_guard and mutation_guard():
+                                    raise RuntimeError("Radio mutation held by safety/authority check")
                                 p.rig.set_modeB(mode_cmd)
                                 return
                             except Exception:
                                 pass
                     try:
+                        if mutation_guard and mutation_guard():
+                            raise RuntimeError("Radio mutation held by safety/authority check")
                         p.rig.set_verify_mode(mode_cmd)
                     except Exception:
+                        if mutation_guard and mutation_guard():
+                            raise RuntimeError("Radio mutation held by safety/authority check")
                         p.rig.set_mode(mode_cmd)
 
                 def _set_frequency(freq_val: float, vfo: Optional[str]) -> None:
                     if vfo == "A":
                         try:
+                            if mutation_guard and mutation_guard():
+                                raise RuntimeError("Radio mutation held by safety/authority check")
                             p.rig.set_verify_vfoA(freq_val)
                             return
                         except Exception:
+                            if mutation_guard and mutation_guard():
+                                raise RuntimeError("Radio mutation held by safety/authority check")
                             p.rig.set_vfoA(freq_val)
                             return
                     if vfo == "B":
                         try:
+                            if mutation_guard and mutation_guard():
+                                raise RuntimeError("Radio mutation held by safety/authority check")
                             p.rig.set_verify_vfoB(freq_val)
                             return
                         except Exception:
+                            if mutation_guard and mutation_guard():
+                                raise RuntimeError("Radio mutation held by safety/authority check")
                             p.rig.set_vfoB(freq_val)
                             return
                     try:
+                        if mutation_guard and mutation_guard():
+                            raise RuntimeError("Radio mutation held by safety/authority check")
                         p.rig.set_verify_frequency(freq_val)
                     except Exception:
+                        if mutation_guard and mutation_guard():
+                            raise RuntimeError("Radio mutation held by safety/authority check")
                         p.rig.set_frequency(freq_val)
 
                 def _readback_frequency(vfo: Optional[str]) -> int:
@@ -617,11 +652,28 @@ class RigctldClient:
         host: str = "127.0.0.1",
         port: int = 4532,
         timeout: float = 0.8,
+        fldigi_host: Optional[str] = None,
+        fldigi_port: Optional[int] = None,
     ) -> None:
         self.host = host
         self.port = int(port)
         self.timeout = float(timeout)
         self._lock = threading.RLock()
+        self._fldigi_client = (FLRigClient(fldigi_host=fldigi_host or host,
+                                          fldigi_port=fldigi_port, timeout=timeout)
+                               if fldigi_port is not None else None)
+
+    def is_fldigi_available(self) -> bool:
+        return bool(self._fldigi_client and self._fldigi_client.is_fldigi_available())
+
+    def get_fldigi_mode(self) -> Optional[str]:
+        return self._fldigi_client.get_fldigi_mode() if self._fldigi_client else None
+
+    def get_fldigi_offset(self) -> Optional[int]:
+        return self._fldigi_client.get_fldigi_offset() if self._fldigi_client else None
+
+    def set_fldigi_mode_offset(self, mode: Optional[str], offset_hz: Optional[int]) -> bool:
+        return bool(self._fldigi_client and self._fldigi_client.set_fldigi_mode_offset(mode, offset_hz))
 
     @staticmethod
     def _normalize_rig_mode(mode: Optional[str], band: Optional[str]) -> Optional[str]:
@@ -756,6 +808,13 @@ class RigctldClient:
                 log.debug("Failed to get active VFO from rigctld: %s", e)
             return None
 
+    def get_radio_mode(self) -> Optional[str]:
+        with self._lock:
+            try:
+                return self._scalar_response_locked("m", label="get_mode")
+            except Exception:
+                return None
+
     def _set_vfo_locked(self, vfo: Optional[str]) -> bool:
         target = str(vfo or "").strip().upper()
         if target not in {"A", "B"}:
@@ -769,15 +828,24 @@ class RigctldClient:
             return True
         return self._command_ok_locked(f"M {mode_cmd} 0", label="set_mode")
 
-    def set_frequency(self, cmd: FrequencyCommand) -> bool:
+    def set_frequency_guarded(self, cmd: FrequencyCommand, guard) -> bool:
+        return self.set_frequency(cmd, mutation_guard=guard)
+
+    def set_frequency(self, cmd: FrequencyCommand, *, mutation_guard=None) -> bool:
         freq_hz = cmd.hz
         with self._lock:
             try:
+                if mutation_guard and mutation_guard():
+                    return False
                 if not self._set_vfo_locked(cmd.vfo):
                     log.warning("rigctld VFO select failed for target=%s", cmd.vfo)
                     return False
+                if mutation_guard and mutation_guard():
+                    return False
                 if not self._set_mode_locked(cmd.mode, cmd.band):
                     log.warning("rigctld mode apply failed for mode=%s band=%s", cmd.mode, cmd.band)
+                if mutation_guard and mutation_guard():
+                    return False
                 if not self._command_ok_locked(f"F {int(freq_hz)}", label="set_frequency"):
                     return False
                 verify_hz = self._parse_first_int(self._scalar_response_locked("f", label="verify_frequency"))
@@ -811,7 +879,10 @@ def flrig_client_from_settings(settings: object) -> FLRigClient:
 def rigctld_client_from_settings(settings: object) -> RigctldClient:
     host = _settings_text(settings, "rig_host", "127.0.0.1") or "127.0.0.1"
     port = _settings_int(settings, "rig_port", 4532)
-    return RigctldClient(host=host, port=port)
+    return RigctldClient(host=host, port=port,
+                        fldigi_host=_settings_text(settings, "fldigi_host", "127.0.0.1"),
+                        fldigi_port=_settings_int(settings, "fldigi_port", 7362)
+                        if getattr(settings, "get", lambda _key, default: default)("use_fldigi", False) else None)
 
 
 def rig_control_client_from_settings(settings: object) -> Optional[RigControlClient]:

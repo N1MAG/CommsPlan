@@ -745,6 +745,10 @@ def factory_mapping_for_form(form_code: object, title: object = "") -> Dict[str,
         "alert": alert,
         "net": net,
         "status": status,
+        "use_for_nets": True,
+        "operating_group_keys": [],
+        "preferred_query_for": [],
+        "preferred_checkin_for": [],
     }
 
 
@@ -766,6 +770,11 @@ def normalize_mapping_row(row: Mapping[str, object], *, title: str = "") -> Dict
             "status": bool(row.get("status", base["status"])),
         }
     )
+    base["use_for_nets"] = bool(row.get("use_for_nets", True))
+    for key in ("operating_group_keys", "preferred_query_for", "preferred_checkin_for"):
+        values = row.get(key, [])
+        base[key] = list(dict.fromkeys(value.strip() for value in values
+                                       if isinstance(value, str) and value.strip())) if isinstance(values, (list, tuple)) else []
     if purpose == PURPOSE_IGNORE:
         base.update({"messages": False, "map": False, "alert": False, "net": False, "status": False})
     return base
@@ -826,6 +835,42 @@ def effective_mapping_rows(settings, forms_dir: object = None) -> List[Dict[str,
         if code not in seen:
             out.append(normalize_mapping_row(row))
     return out
+
+
+@dataclass(frozen=True)
+class NetFormOptions:
+    options: tuple[tuple[str, str], ...]
+    preferred: str = ""
+    ambiguous: bool = False
+    missing_preferred: tuple[str, ...] = ()
+
+
+def resolve_net_form_options(definitions, mappings, *, group_key="", preference="query") -> NetFormOptions:
+    """Resolve a catalog snapshot without filesystem access or inferred identities."""
+    configured = {row["form_code"]: row for row in normalize_mapping_rows(mappings)}
+    group_key = str(group_key or "").strip()
+    preference_key = "preferred_checkin_for" if preference == "checkin" else "preferred_query_for"
+    available = []
+    present = set()
+    for definition in definitions:
+        code = normalize_form_code(definition.form_code)
+        if not code or code in present:
+            continue
+        present.add(code)
+        row = configured.get(code, factory_mapping_for_form(code, definition.title))
+        if row["purpose"] == PURPOSE_IGNORE or not row["use_for_nets"]:
+            continue
+        label = code + (" - " + definition.title if definition.title else "")
+        associated = row["operating_group_keys"]
+        relevance = 0 if group_key and group_key in associated else 1 if not associated else 2
+        available.append((relevance, code, label, row))
+    available.sort(key=lambda item: (item[0], item[1]))
+    preferred = [code for _, code, _, row in available if group_key and group_key in row[preference_key]]
+    missing = tuple(sorted(code for code, row in configured.items()
+                           if group_key and group_key in row[preference_key] and code not in {item[1] for item in available}))
+    return NetFormOptions(tuple((code, label) for _, code, label, _ in available),
+                          preferred[0] if len(preferred) == 1 and not missing else "",
+                          len(preferred) + len(missing) > 1, missing)
 
 
 def forms_enabled_for(settings, *, purpose: str = "", flag: str = "") -> set[str]:

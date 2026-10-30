@@ -312,3 +312,23 @@ def _count_sort_key(value: str) -> tuple[int, object]:
     if text.isdigit():
         return (0, int(text))
     return (1, text)
+
+
+def load_hf_roster_group_names(db_path: str | Path) -> tuple[str, ...]:
+    """Read explicit HF roster memberships; no operating-group inference or writes."""
+    conn = connect_sqlite_readonly(db_path, timeout=1.0)
+    try:
+        columns = {str(row[1]) for row in conn.execute('PRAGMA table_info(operator_checkins)')}
+        names = [key for key in ('group1', 'group2', 'group3', 'groups_json') if key in columns]
+        if not names:
+            return ()
+        cursor = conn.execute('SELECT ' + ','.join(names) + ' FROM operator_checkins')
+        groups = set()
+        while rows := cursor.fetchmany(200):
+            for row in rows:
+                groups.update(_row_groups(dict(zip(names, row))))
+            if len(groups) > 1000:
+                raise ValueError('Roster group list exceeds 1000 choices')
+        return tuple(sorted(groups))
+    finally:
+        conn.close()

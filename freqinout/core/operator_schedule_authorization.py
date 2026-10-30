@@ -212,9 +212,10 @@ def review_schedule(store, radio_id, *, now=None):
         # Reuse the scheduler's recurrence evaluator without constructing a
         # runtime, timer, SettingsManager or endpoint. All persisted time fields
         # are canonical UTC; unsupported bases are rejected rather than guessed.
-        from freqinout.core.scheduler_engine import SchedulerEngine, _parse_hhmm_to_minutes
-        engine=SchedulerEngine.__new__(SchedulerEngine)
-        engine.settings=SimpleNamespace(all=lambda:settings_data)
+        if enabled:
+            from freqinout.core.scheduler_engine import SchedulerEngine, _parse_hhmm_to_minutes
+            engine=SchedulerEngine.__new__(SchedulerEngine)
+            engine.settings=SimpleNamespace(all=lambda:settings_data)
         for index,row in enumerate(enabled,1):
             prefix=f'Entry {index}: '
             group_issue=engine._operating_group_resolution_error(row)
@@ -434,7 +435,7 @@ def review_station_setup(store):
     from freqinout.core.schedule_source_inputs import ScheduleSourceError
     for profile in store.list_device_profiles():
         try:
-            ensure_assigned_schedule_authority(store,int(profile['id']))
+            ensure_assigned_schedule_authority(store,int(profile['id']),sources_prepared=True)
         except (ValueError, ScheduleSourceError):
             pass  # The read-only per-radio review below publishes its error.
     with store.configuration_read_transaction():

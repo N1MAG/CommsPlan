@@ -32,7 +32,7 @@ include packaging/linux/freqinout.desktop
 include packaging/macos/entitlements.plist
 include packaging/pyinstaller_runtime_qt.py
 include packaging/verify_release_inputs.py
-recursive-include docs/images/readme-2.0 *.jpg
+recursive-include docs/images/readme-2.0 *.jpg *.png
 recursive-include freqinout *.py *.qml
 recursive-include freqinout/resources/spotter_forms *.txt
 recursive-include assets *.png *.ico *.icns *.svg

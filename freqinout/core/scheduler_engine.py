@@ -41,6 +41,7 @@ from freqinout.core.receiver_control import (
 )
 from freqinout.core.scheduler_manual_control_service import SchedulerManualControlService
 from freqinout.core.scheduler_net_tuning import NetTuningMixin
+from freqinout.core.scheduler_radio_apply import RadioApplyOperation
 from freqinout.core.scheduler_coordination import (
     EndpointKey,
     EndpointResult,
@@ -803,7 +804,10 @@ class SchedulerEngine(QObject, NetTuningMixin):
             existing = cache.get(OPERATOR_CONTROLS_KEY, {})
             rows = dict(existing) if isinstance(existing, Mapping) else {}
             rows[str(radio_id)] = copy.deepcopy(dict(choices))
-            cache[OPERATOR_CONTROLS_KEY] = rows
+            if hasattr(settings, "publish_committed_values"):
+                settings.publish_committed_values({OPERATOR_CONTROLS_KEY: rows})
+            else:
+                cache[OPERATOR_CONTROLS_KEY] = rows
         getattr(self, "_latest_intents_by_radio", {}).pop(int(radio_id), None)
         for endpoint, continuation in tuple(getattr(self, "_status_continuations_by_endpoint", {}).items()):
             if self._entry_manual_control_radio_id(continuation.get("entry")) == int(radio_id):
@@ -1805,6 +1809,11 @@ class SchedulerEngine(QObject, NetTuningMixin):
             dt = self._suspend_until_dt()
         return (dt is not None and now_utc < dt), dt
 
+    def refresh_after_launch(self) -> None:
+        """Refresh availability without replacing unrelated command authority."""
+        self._request_active_endpoint_status_refreshes()
+        self._request_active_schedule_lane_rows_refresh(force=False)
+
     def force_refresh(self) -> None:
         """
         Force re-loading schedules from settings and reevaluating
@@ -1903,6 +1912,13 @@ class SchedulerEngine(QObject, NetTuningMixin):
             return blocked("endpoint_changed")
         if not isinstance(key, EndpointKey):
             return blocked("endpoint_unavailable")
+        modem_apply = getattr(self, "_radio_apply_operations", {}).get(key.canonical)
+        if modem_apply:
+            progress = modem_apply["operation"].snapshot()
+            if progress["blocked"]:
+                return blocked("radio_modem_apply_blocked")
+            if not progress["complete"]:
+                return "pending"
         if epoch != getattr(self, "_endpoint_config_epochs", {}).get(key.canonical, 0):
             return blocked("configuration_changed")
         registry = getattr(self, "_endpoint_status", None)
@@ -3019,7 +3035,13 @@ class SchedulerEngine(QObject, NetTuningMixin):
                 and not status.errors
                 and status.age_seconds(now_monotonic=now) <= 30.0
             )
-            if receiver_state == "manual_tuning":
+            apply_record = getattr(self, "_radio_apply_operations", {}).get(endpoint_key.canonical)
+            apply_progress = apply_record["operation"].snapshot() if apply_record else {}
+            if apply_progress and not apply_progress.get("complete"):
+                state_code = "control_stalled" if apply_progress.get("blocked") else "applying_schedule"
+                label = "Radio/modem apply blocked" if apply_progress.get("blocked") else "Radio/modem settings pending"
+                detail = str(apply_progress.get("detail") or "Waiting for verified modem settings")
+            elif receiver_state == "manual_tuning":
                 state_code = "manual_tuning"
                 label = "Manual tuning"
                 detail = receiver_detail or "CommsPlan shows the scheduled receiver frequency but does not control this endpoint."
@@ -3875,6 +3897,45 @@ class SchedulerEngine(QObject, NetTuningMixin):
 
     def _invalidate_command_authority(self, radio_id: Optional[int] = None) -> None:
         self._command_safety_gate().invalidate(radio_id)
+        operations = getattr(self, "_radio_apply_operations", {})
+        for key, record in list(operations.items()):
+            if radio_id is None or record["operation"].radio_id == radio_id:
+                record["operation"].cancel()
+                operations.pop(key, None)
+                if getattr(self, "_pending_entry_keys_by_endpoint", {}).get(key) == record["kwargs"]["entry_key"]:
+                    self._pending_entry_keys_by_endpoint.pop(key, None)
+                self._clear_scheduler_health_issue(f"radio-modem:{key}")
+
+    def _retry_radio_apply_operations(self) -> None:
+        """Resume only captured pending work, never a fresh QSY/antenna tune."""
+        for key, record in list(getattr(self, "_radio_apply_operations", {}).items()):
+            operation = record["operation"]
+            progress = operation.snapshot()
+            if progress["complete"] or progress["blocked"]:
+                continue
+            if key in getattr(self, "_pending_entry_keys_by_endpoint", {}):
+                continue
+            if not self._command_safety_gate().current(operation.radio_id, record["stamp"]):
+                operation.cancel()
+                getattr(self, "_radio_apply_operations", {}).pop(key, None)
+                self._clear_scheduler_health_issue(f"radio-modem:{key}")
+                continue
+            lane = self._ensure_endpoint_lane_registry().lane(record["kwargs"]["endpoint_key"])
+            if lane is not None and lane.future is not None and not lane.future.done():
+                continue
+            self._queue_control_action(**record["kwargs"], radio_apply_operation=operation)
+
+    def cancel_pending_radio_applies(self, radio_ids: Iterable[int]) -> None:
+        """Cancel captured launch work without disabling a configured radio."""
+        ids = {int(value) for value in radio_ids}
+        operations = getattr(self, "_radio_apply_operations", {})
+        for key, record in list(operations.items()):
+            if record["operation"].radio_id in ids:
+                record["operation"].cancel()
+                operations.pop(key, None)
+                if getattr(self, "_pending_entry_keys_by_endpoint", {}).get(key) == record["kwargs"]["entry_key"]:
+                    self._pending_entry_keys_by_endpoint.pop(key, None)
+                self._clear_scheduler_health_issue(f"radio-modem:{key}")
 
     def _resolve_deferred_intent(self, intent: Dict) -> Tuple[Dict, str, datetime.datetime]:
         """Re-evaluate automatic ownership now; a held row is not authority."""
@@ -4064,6 +4125,9 @@ class SchedulerEngine(QObject, NetTuningMixin):
         ignore_varac_busy: bool = False,
         fldigi_mode: Optional[str] = None,
         fldigi_offset: Optional[int] = None,
+        apply_radio: bool = True,
+        radio_apply_operation: Optional[RadioApplyOperation] = None,
+        synchronize_js8: bool = False,
     ) -> bool:
         if self._shutdown_requested:
             log.debug("SchedulerEngine: control action skipped (shutdown requested).")
@@ -4082,6 +4146,11 @@ class SchedulerEngine(QObject, NetTuningMixin):
             return False
         target_js8 = js8_client if not allow_global_fallback else (js8_client or self.js8)
         target_rig = rig_client if not allow_global_fallback else (rig_client or self.rig)
+        if (control_mode in {"FLRIG", "RIGCTLD"} and (fldigi_mode or fldigi_offset is not None)
+                and not synchronize_js8 and js8_offset is None):
+            # A runtime may retain a JS8 client even when the app is disabled.
+            # It is neither required companion work nor valid busy evidence.
+            target_js8 = None
         endpoint_key = endpoint_key or self._control_endpoint_key(
             control_mode,
             rig_client=target_rig,
@@ -4176,8 +4245,93 @@ class SchedulerEngine(QObject, NetTuningMixin):
         gate = self._command_safety_gate()
         completion_stamp = gate.stamp(device_profile_id)
         status_registry = getattr(self, "_endpoint_status", None)
+        operation = radio_apply_operation
+        if target_rig is not None and control_mode in {"FLRIG", "RIGCTLD"} and (fldigi_mode or fldigi_offset is not None):
+            operations = getattr(self, "_radio_apply_operations", None)
+            if operations is None:
+                operations = self._radio_apply_operations = {}
+            identity = (device_profile_id, source, repr(entry_key), config_epoch,
+                        freq_hz, vfo, mode, fldigi_mode, fldigi_offset, synchronize_js8,
+                        json.dumps(schedule_entry or {}, sort_keys=True, default=str))
+            previous = operations.get(endpoint_key.canonical)
+            if operation is None and previous and previous["operation"].identity == identity and previous["stamp"] == completion_stamp:
+                operation = previous["operation"]
+                if operation.snapshot()["complete"]:
+                    # A fresh observed modem mismatch is a new modem-only apply.
+                    operation = None
+            if operation is None:
+                if previous:
+                    previous["operation"].cancel()
+                operation = RadioApplyOperation(
+                    identity, device_profile_id, freq_hz, vfo, mode,
+                    fldigi_mode, fldigi_offset, apply_radio, bool(auto_tune and control_mode == "FLRIG"),
+                    getattr(self, "_monotonic_clock", time.monotonic)(),
+                    frequency_tolerance_hz=self._frequency_tolerance_hz(schedule_entry, control_mode))
+            retry_kwargs = dict(
+                control_mode=control_mode, rig_client=target_rig, js8_client=target_js8,
+                endpoint_key=endpoint_key, device_profile_id=device_profile_id,
+                force_attempt=False, allow_global_fallback=False, entry_key=entry_key,
+                source=source, freq_hz=freq_hz, band=band, mode=mode, vfo=vfo,
+                auto_tune=auto_tune, js8_offset=js8_offset, js8_group=js8_group,
+                schedule_entry=copy.deepcopy(schedule_entry),
+                ignore_coordination_prompt=ignore_coordination_prompt,
+                approved_guard_signature=approved_guard_signature,
+                ignore_js8_busy=ignore_js8_busy, ignore_varac_busy=ignore_varac_busy,
+                fldigi_mode=fldigi_mode, fldigi_offset=fldigi_offset, apply_radio=apply_radio,
+                synchronize_js8=synchronize_js8)
+            operations[endpoint_key.canonical] = dict(operation=operation, stamp=completion_stamp, kwargs=retry_kwargs)
+        elif radio_apply_operation is None:
+            obsolete = getattr(self, "_radio_apply_operations", {}).pop(endpoint_key.canonical, None)
+            if obsolete:
+                obsolete["operation"].cancel()
+                self._clear_scheduler_health_issue(f"radio-modem:{endpoint_key.canonical}")
 
         def _perform() -> Dict[str, object]:
+            if operation is not None:
+                command = FrequencyCommand(band=band, rig_hz=freq_hz, mode=mode, vfo=vfo)
+                outcome = operation.advance(target_rig, command, preflight,
+                                            getattr(self, "_monotonic_clock", time.monotonic))
+                companion_required = bool(synchronize_js8 or js8_offset is not None)
+                if outcome["actual_state"]["radio_apply"]["complete"] and companion_required and target_js8 is None:
+                    return operation.defer_completion("Radio/FLDigi verified; required JS8Call companion unavailable")
+                if outcome["actual_state"]["radio_apply"]["complete"] and target_js8 is not None and companion_required:
+                    # Companion synchronization remains safety-fenced and does
+                    # not turn a pending modem attempt into frequency success.
+                    try:
+                        guard = lambda: operation.check_safety(preflight, getattr(self, "_monotonic_clock", time.monotonic))
+                        if guard() is not None:
+                            return operation.defer_completion("Radio/FLDigi verified; companion synchronization waiting for receive/safety")
+                        offset = js8_offset if js8_offset is not None else target_js8.get_offset()
+                        if guard() is not None or not target_js8.set_frequency(freq_hz, offset_hz=offset):
+                            return operation.defer_completion("Radio/FLDigi verified; companion frequency/offset update pending")
+                        actual_js8 = target_js8.get_frequency()
+                        actual_offset = target_js8.get_offset()
+                        if (guard() is not None or actual_js8 is None or abs(actual_js8 - freq_hz) > operation.frequency_tolerance_hz
+                                or (js8_offset is not None and actual_offset != js8_offset)):
+                            return operation.defer_completion("Radio/FLDigi verified; companion frequency/offset readback pending")
+                        outcome["actual_state"].update(js8_freq_hz=actual_js8, js8_offset_hz=actual_offset)
+                    except Exception as exc:
+                        return operation.defer_completion("Radio/FLDigi verified; companion synchronization pending: " + str(exc))
+                if outcome["actual_state"]["radio_apply"]["complete"] and isinstance(status_coordinator, RadioStatusPollCoordinator):
+                    verification = _collect_endpoint_verification(
+                        rig=target_rig, js8=target_js8, control_mode=control_mode,
+                        observe_js8=companion_required,
+                        verify_js8_offset=js8_offset is not None, status_poll_coordinator=status_coordinator,
+                        status_scope=endpoint_key.canonical, verification_purpose="post_apply")
+                    outcome["actual_state"].update(verification)
+                    if (verification.get("errors") or not verification.get("flrig_ptt_known")
+                            or verification.get("flrig_ptt_active")
+                            or not verification.get("fldigi_available")
+                            or (fldigi_mode and str(verification.get("fldigi_mode") or "").strip().upper() != fldigi_mode.strip().upper())
+                            or (fldigi_offset is not None and verification.get("fldigi_offset_hz") != fldigi_offset)
+                            or verification.get("flrig_freq_hz") is None
+                            or abs(verification["flrig_freq_hz"] - freq_hz) > operation.frequency_tolerance_hz
+                            or (vfo and verification.get("flrig_vfo") != vfo)
+                            or (companion_required and (verification.get("js8_freq_hz") is None
+                                or abs(verification["js8_freq_hz"] - freq_hz) > operation.frequency_tolerance_hz
+                                or (js8_offset is not None and verification.get("js8_offset_hz") != js8_offset)))):
+                        return operation.defer_completion("Radio/modem verification changed during final readback; retry pending")
+                return outcome
             ok = False
             if control_mode == "JS8CALL":
                 try:
@@ -4247,7 +4401,7 @@ class SchedulerEngine(QObject, NetTuningMixin):
             if not gate.acquire(resources):
                 return {"ok": False, "safety_hold": True, "reason_code": "shared_resource_reserved"}
             try:
-                reason = preflight()
+                reason = preflight() if operation is None else None
                 if reason:
                     log.warning("SchedulerEngine: radio=%s endpoint=%s command held at execution: %s",
                                 device_profile_id, endpoint_key.safe_label, reason)
@@ -4257,7 +4411,8 @@ class SchedulerEngine(QObject, NetTuningMixin):
                     # Publish proof before another shared-resource lane can enter.
                     # A failed command/readback makes peer tuning unknown.
                     verification = result.get("actual_state") or {}
-                    if result.get("ok") and verification and not verification.get("errors"):
+                    progress = verification.get("radio_apply") or {}
+                    if result.get("ok") and verification and not verification.get("errors") and (not progress or progress.get("complete")):
                         status_registry.publish(endpoint_key,
                             self._endpoint_status_raw_from_verification(verification), source="command_boundary")
                     else:
@@ -4268,6 +4423,10 @@ class SchedulerEngine(QObject, NetTuningMixin):
 
         def _on_lane_done(result: EndpointResult) -> None:
             def _apply_result():
+                if operation is not None:
+                    current = getattr(self, "_radio_apply_operations", {}).get(endpoint_key.canonical)
+                    if current is None or current["operation"] is not operation:
+                        return
                 if device_profile_id is not None and not self._endpoint_callback_is_current(
                     endpoint_key=endpoint_key,
                     device_profile_id=device_profile_id,
@@ -4298,6 +4457,35 @@ class SchedulerEngine(QObject, NetTuningMixin):
                 outcomes = getattr(self, "_command_results_by_radio", None)
                 if not isinstance(outcomes, dict):
                     outcomes = self._command_results_by_radio = {}
+                progress = result.actual_state().get("radio_apply")
+                if isinstance(progress, dict) and progress.get("phase") == "cancelled":
+                    getattr(self, "_radio_apply_operations", {}).pop(endpoint_key.canonical, None)
+                    self._clear_scheduler_health_issue(f"radio-modem:{endpoint_key.canonical}")
+                    return
+                if isinstance(progress, dict) and not progress.get("complete"):
+                    if device_profile_id is not None:
+                        outcomes[int(device_profile_id)] = dict(
+                            source=source, frequency_hz=freq_hz,
+                            status="blocked" if progress.get("blocked") else "pending",
+                            reason_code="radio_modem_apply_pending", detail=progress.get("detail", ""),
+                            completed_monotonic=time.monotonic())
+                    self._record_scheduler_event(
+                        "hold", "radio_modem_apply_pending", source=source,
+                        entry_key=entry_key, frequency_hz=freq_hz,
+                        action="Radio/modem settings pending", detail=progress.get("detail", ""),
+                        device_profile_id=device_profile_id, throttle_sec=15.0)
+                    self._record_scheduler_health_issue(
+                        f"radio-modem:{endpoint_key.canonical}", str(progress.get("detail", "")),
+                        source=source, frequency_hz=freq_hz, cooldown_sec=15.0)
+                    return
+                if isinstance(progress, dict) and progress.get("complete"):
+                    self._clear_scheduler_health_issue(f"radio-modem:{endpoint_key.canonical}")
+                    if self._entry_is_primary(schedule_entry, device_profile_id):
+                        self._fldigi_apply_token = getattr(self, "_fldigi_apply_token", 0) + 1
+                        self._last_fldigi_apply = (fldigi_mode, fldigi_offset)
+                        self._fldigi_apply_pending = False
+                        self._fldigi_force_apply_once = False
+                        self._fldigi_apply_after_ts = None
                 if device_profile_id is not None:
                     outcomes[int(device_profile_id)] = {
                         "source": source, "frequency_hz": freq_hz,
@@ -7463,6 +7651,7 @@ class SchedulerEngine(QObject, NetTuningMixin):
             force=force,
             request_projection_refresh=request_projection_refresh,
         )
+        self._retry_radio_apply_operations()
         self._maybe_apply_fldigi()
         self._maybe_prompt_enforcement()
 
@@ -7577,6 +7766,15 @@ class SchedulerEngine(QObject, NetTuningMixin):
         if self._control_mode() in ("MANUAL", "NONE"):
             return
         entry = self.current_schedule_entry or {}
+        if any(record["kwargs"]["rig_client"] is self.rig
+               for record in getattr(self, "_radio_apply_operations", {}).values()):
+            return
+        # Radio-scoped FLRig/Rigctld applies now reconcile primary and secondary
+        # modem targets through the same serialized, verified operation.
+        if (entry.get("target_device_profile_id") not in (None, "")
+                and self._control_mode() in {"FLRIG", "RIGCTLD"}
+                and (self._expected_fldigi_mode(entry) or self._expected_fldigi_offset(entry) is not None)):
+            return
         if self._operating_group_resolution_error(entry):
             return
         rig_mode = self._resolve_rig_mode(entry)
@@ -11110,6 +11308,10 @@ class SchedulerEngine(QObject, NetTuningMixin):
             log.warning("SchedulerEngine: %s", resolution_error)
             return resolution_error
         effective_entry, _og = self._entry_with_operating_group_overrides(entry)
+        if source == "QSY" and isinstance(_og, dict):
+            # Retained card metadata can predate an Operating Group save. Manual
+            # QSY uses the current exact variant; scheduled row choices stay intact.
+            effective_entry["auto_tune"] = bool(_og.get("auto_tune", False))
         rig_client, js8_client, _varac_client, control_settings, target_radio_id = self._control_context_for_entry(
             effective_entry
         )
@@ -11127,6 +11329,7 @@ class SchedulerEngine(QObject, NetTuningMixin):
         vfo_raw = (effective_entry.get("vfo") or "A").strip().upper()
         vfo: Optional[str] = vfo_raw if vfo_raw in ("A", "B") else None
         auto_tune = bool(effective_entry.get("auto_tune"))
+        apply_fldigi = bool(apply_fldigi and getattr(control_settings, "get", lambda _key, default: default)("use_fldigi", True))
         rig_mode = self._resolve_rig_mode(effective_entry)
 
         # Update internal state regardless of whether we can actually
@@ -11775,8 +11978,11 @@ class SchedulerEngine(QObject, NetTuningMixin):
         # that case rebuild the read model instead of manufacturing a device
         # write.  PTT is intentionally absent here: it gates a required retune,
         # but it is not evidence for or against an already matching frequency.
+        apply_record = getattr(self, "_radio_apply_operations", {}).get(endpoint_key.canonical)
+        apply_pending = bool(apply_record and not apply_record["operation"].snapshot()["complete"])
         readback_matches_intent = bool(
-            not force
+            not apply_pending
+            and not force
             and not scheduler_transition
             and not actual_state.stale
             and not off_state.status_unknown
@@ -11892,7 +12098,7 @@ class SchedulerEngine(QObject, NetTuningMixin):
             self.active_entry_changed.emit(effective_entry, source)
             return
         already_applied = endpoint_already_applied
-        if not force and already_applied and not off_state.off_schedule:
+        if not force and not apply_pending and already_applied and not off_state.off_schedule:
             self._clear_coordination_prompt()
             log.debug("SchedulerEngine: schedule entry already applied; skipping re-apply.")
             self._record_scheduler_event(
@@ -11941,6 +12147,21 @@ class SchedulerEngine(QObject, NetTuningMixin):
             rig_mode or "-",
             comment,
         )
+        # Modem drift and unverified readback can require another apply without
+        # an RF transition. Repeating antenna tuning on those retries can key
+        # the radio every scheduler tick. Preserve explicit actions and initial
+        # schedule transitions; otherwise tune only for observed dial/VFO drift.
+        tune_for_rf_change = bool(
+            force
+            or scheduler_transition
+            or (
+                not actual_state.stale
+                and (
+                    (current_freq_hz is not None and not freq_matches)
+                    or off_state.flags.get("vfo")
+                )
+            )
+        )
         queued = self._queue_control_action(
             control_mode=control_mode,
             rig_client=rig_client,
@@ -11955,7 +12176,7 @@ class SchedulerEngine(QObject, NetTuningMixin):
             band=band,
             mode=rig_mode,
             vfo=vfo,
-            auto_tune=auto_tune,
+            auto_tune=bool(auto_tune and tune_for_rf_change),
             js8_offset=js8_offset,
             js8_group=js8_group,
             schedule_entry=entry,
@@ -11963,8 +12184,10 @@ class SchedulerEngine(QObject, NetTuningMixin):
             approved_guard_signature=coordination_signature if ignore_coordination_prompt else "",
             ignore_js8_busy=bool(ignore_js8_busy and not want_js8_offset_change),
             ignore_varac_busy=ignore_varac_busy,
-            fldigi_mode=self._expected_fldigi_mode(effective_entry) if apply_fldigi and not self._entry_is_primary(effective_entry, target_radio_id) else None,
-            fldigi_offset=fldigi_center if apply_fldigi and not self._entry_is_primary(effective_entry, target_radio_id) else None,
+            fldigi_mode=self._expected_fldigi_mode(effective_entry) if apply_fldigi else None,
+            fldigi_offset=fldigi_center if apply_fldigi else None,
+            apply_radio=bool(force or scheduler_transition or not freq_matches or off_state.flags.get("vfo")),
+            synchronize_js8=bool(getattr(control_settings, "get", lambda _key, default: default)("use_js8call", False)),
         )
         if not queued:
             log.debug("SchedulerEngine: control action skipped (pending/backoff).")

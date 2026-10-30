@@ -2,10 +2,10 @@
   <img src="assets/CommsPlan_logo.png" alt="CommsPlan logo" width="150">
 </p>
 
-# CommsPlan 2.0.8.1
+# CommsPlan 2.0.9
 
-See the CommsPlan 2.0.8.1 release page for available platform packages, source
-archives, checksums, and release notes.
+See the [CommsPlan release page](https://github.com/N1MAG/CommsPlan/releases/latest)
+for available platform packages, checksums, and release notes.
 
 ### CommsPlan makes your comms plan work.
 
@@ -30,12 +30,73 @@ exercise messages. Radio readbacks and green Mesh connection status are simulate
 for illustration; no live radio or Mesh connection was used. Detail images show
 the individual workspaces.*
 
-## What is new in 2.0.8.1
+## What is new in 2.0.9
 
-- Fixes Fast Light folder-save readback errors affecting FLMsg, FLAmp, FLDigi and component settings folders.
-- Keeps folder changes, intentional clears and reopened configurations consistent while preserving atomic rollback on failed verification.
-- Retains the scheduling, Plan Builder, forwarding and responsiveness improvements introduced in 2.0.8.
-- Native Linux operator qualification of this hotfix remains unperformed. Existing hardware, transport and macOS limitations remain; see the [changelog](CHANGELOG.md).
+- **JS8 net control:** scan a full-width station intelligence table with decoded
+  Spotter/CommStat summaries, topics, state, region and group filters. View the
+  underlying traffic, mark follow-up, or exclude and restore local working items.
+- **Nimble net messaging:** choose Expect forms and group/station targets as the
+  net develops, reuse saved text, compose a saved form, and review Sent activity.
+  Submission to JS8Call is recorded separately from RF transmission or delivery.
+- **Local frequency references:** import CHIRP, RepeaterBook and BTECH CSV/TSV
+  exports into Frequency Catalog, review the programming details, and add selected
+  entries to new or existing Local Comms Groups for Local SOP use.
+- **Prepare from Ops:** open the intended net occurrence on the selected radio
+  and service, check or repair setup, and retain your draft. Start remains an
+  explicit operator action; preparation does not tune or transmit.
+- **Clearer planning:** the assigned-plan outlook separates the current window
+  from the next change. Background loading, recovery actions and stable refreshes
+  keep schedule work and retained edits usable.
+- **Group tuning:** manual QSY uses the exact configuration's saved Auto-Tune
+  setting. Protected configuration edits, clearer save feedback and expanded
+  JS8Call, VarAC, MAGNET and AMRRON frequency choices support setup.
+- **Subspace awareness:** inspect reported-hearing context and safely review
+  captured received files while retaining source and uncertainty information.
+
+## JS8 net control: collect, understand and respond
+
+Keep the information needed to direct a net in one working view. Callsigns can
+belong to multiple groups; state and FEMA-region context use the roster with
+Call Finder fallback. Decoded summaries help identify topics and follow-up work,
+and View keeps the source traffic close at hand. Relevant direct and relayed
+reports remain available with decoded details and relay attribution. RX SNR shows
+what your receiver heard; a reading marked via a relay describes that relay link.
+Generic SNR?, message-query and hearing exchanges stay outside substantive traffic.
+
+![JS8 NCS station intelligence with decoded exercise reports and group, state and region filters](docs/images/readme-2.0/js8-ncs.png)
+
+*Current application UI with fictional demonstration traffic and simulated RX
+SNR values. No live radio, transmission or confirmed delivery is represented.*
+
+Queries and acknowledgements stay inside NCS. Compose switches back to Traffic
+without losing the draft. A separate editable **MSG_NAME | Message content**
+library provides repeatable announcements across nets, and Sent activity shows
+exact destinations and factual submission results. Spotter's **Use for nets**
+checkbox and optional group relevance guide the available form tools without
+restricting incoming participation to a particular response.
+
+## Import local frequencies and use them in a group
+
+Open **Resources → Frequencies → Frequency Catalog → Import radio files…** and choose one or
+more CSV/TSV exports. CommsPlan recognizes CHIRP, RepeaterBook and BTECH layouts
+and common column names. Choose the intended service, review warnings and RX/TX,
+mode and tone details, and uncheck unwanted records; valid records start selected.
+Use **Column mapping…** for unfamiliar generic headers or explicit MHz/Hz units.
+Exact normalized duplicates are skipped; different versions may remain separate.
+Radio programming JSON, Excel workbooks and binary radio images are not supported;
+CommsPlan catalog-exchange JSON uses the separate Import / Export workflow.
+
+In **Local Comms Groups**, choose **Add Configuration**, enter the **Group** name,
+then **Add from catalog…** in the configuration editor. Search, check the desired
+frequencies and add them to that group. This also works for a new unsaved group.
+Each selection becomes a saved programming reference. Use **Review catalog
+changes…** to accept later source changes deliberately.
+
+In a Local SOP action, select the group, then choose **Assigned frequency** on
+**What** and **Insert frequency reference** to put the programming details into
+Procedure. Existing SOP text stays as saved. These references help operators
+program a radio manually; importing or assigning them does not program a radio,
+create a Local Net schedule or activate scheduler control.
 
 ## One operating picture for the station
 
@@ -170,11 +231,15 @@ decision support rather than a guarantee of current propagation or delivery.
 
 This release fixes fresh FLRig-only radio saves, supports independent Fast Light
 application choices, and keeps Save and Cancel reachable when application setup
-shows suggestions or validation messages in a compact window.
+shows suggestions or validation messages in a compact window. Component-specific
+**Find again…** refreshes discovery; installed application choices and native
+profiles remain separate. Fast Light message/ICS and RX/TX data folders can be
+shared intentionally between radios without blocking configuration. Independent
+control endpoints and native configuration identities still require review.
 
-## What's new in 2.0.6
+## Established station tools
 
-CommsPlan 2.0.6 expands the station workflow in several areas:
+CommsPlan includes these established station tools:
 
 - **Call Finder:** search offline FCC amateur and GMRS records and Canadian
   ISED amateur records, with optional U.S. and Canadian postal-reference estimates.
@@ -188,13 +253,13 @@ CommsPlan 2.0.6 expands the station workflow in several areas:
   through radio, application, operating behavior, schedule, and final review.
   Radio and software editors save their own scope, retain the last committed
   view if saving fails, and show Complete, Review, Not checked, Unsaved, or
-  Optional status with a reason. Review scheduling per radio before explicitly
-  enabling it; disable is available from that radio's schedule controls.
+  Optional status with a reason. Assign a valid Frequency Plan to follow it automatically after validation;
+  Pause/Resume and per-radio source choices keep operator control explicit.
 - **Forms Library:** preview selected forms or a folder, then explicitly import
   valid new forms into the station library. Existing duplicates are reported
   and skipped; merely browsing a folder does not copy its files.
-- **Map references:** the map includes bundled worldwide geography for offline
-  use, category and text search, and a saved starting area. Optional license
+- **Map references:** the native map uses Qt Location and includes bundled
+  worldwide geography for offline use, category and text search, and a saved starting area. Optional license
   references can be searched and displayed using postal estimates after their
   source datasets are loaded. A reference is an estimate, not evidence of a
   station's current location or activity.
@@ -209,12 +274,7 @@ results are reported on the release page. Those checks do not establish every
 physical-radio, operating-system or display configuration. Python 3.11 is the
 tested and recommended interpreter; the broader Python 3.10 through 3.13
 compatibility range has not been clean-host qualified in full.
-
-A macOS/PySide test covering Compose comment wrapping and preserving oversized
-saved text reproduced a segmentation fault; no fix is recorded. An earlier
-combined test run omitted world-map grid lines at low zoom. The latest combined
-release check passed all 192 tests, including that grid test; the cause of the
-earlier failure has not been established.
+Production-size Linux Local Nets performance, populated interactive shutdown and the new Plan Builder/Ops two-radio and soak matrix remain unqualified.
 
 ## Supported systems
 
@@ -236,10 +296,11 @@ storage and compatibility identities so companion applications and saved
 stations continue to work. Follow the installation guide when upgrading, and
 make a verified backup before the first upgrade.
 
-## Download CommsPlan 2.0.8.1
+## Download CommsPlan 2.0.9
 
 Use the [CommsPlan release page](https://github.com/N1MAG/CommsPlan/releases/latest)
-for available 2.0.8.1 installers, source archives, checksums, and release notes.
+for published installers, source archives, checksums, and release notes.
+Choose 2.0.9 only when it is listed as a published release.
 Use only the artifacts actually listed there. Unsigned Windows/macOS packages
 are identified in their filenames and release notes.
 
@@ -247,7 +308,7 @@ Verify downloaded files against the checksums published on the release page.
 
 ## Install or update from the public source release
 
-Clone the public repository and select the 2.0.8.1 release tag. For an existing
+After v2.0.9 is published, clone the public repository and select that release tag. For an existing
 checkout, fetch the public tag and select it before running the installer.
 Close CommsPlan and its companion applications, use the same application folder
 as the existing installation, and require the final `Installation verified`
@@ -256,14 +317,14 @@ line before launching CommsPlan. A Git pull by itself is not a complete update.
 ```bash
 git clone https://github.com/N1MAG/CommsPlan.git
 cd CommsPlan
-git checkout v2.0.8.1
+git checkout v2.0.9
 ```
 
 For an existing checkout:
 
 ```bash
 git fetch origin --tags
-git checkout v2.0.8.1
+git checkout v2.0.9
 ```
 
 ### Windows PowerShell
@@ -290,7 +351,7 @@ The guided installer installs required system packages where supported,
 creates CommsPlan's virtual environment, and prepares the desktop launcher.
 Use `setup` for first setup, `update` for a source update, and `desktop` to
 refresh desktop integration after an update, including when an older package
-launcher is still installed. Run these commands from the checked-out 2.0.8.1
+launcher is still installed. Run these commands from the checked-out 2.0.9
 release:
 
 ```bash

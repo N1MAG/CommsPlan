@@ -31,7 +31,7 @@
   </div>
 
   <h1 id="guide-home">CommsPlan User Guide</h1>
-  <p><strong>Current version</strong>: 2.0.8.1. This guide covers assignment-driven scheduling, Plan Builder and reviewed manual forwarding. See release notes for package availability and qualification limits; a submitted message is not proof of delivery.</p>
+  <p><strong>Current version</strong>: 2.0.9. This guide covers assignment-driven scheduling, Plan Builder and reviewed manual forwarding. See release notes for package availability and qualification limits; a submitted message is not proof of delivery.</p>
   <p><strong>2.0.8.1 hotfix</strong>: Fast Light folder saves now keep FLMsg, FLAmp and FLDigi paths consistent through changes, clearing and reopening. A failed consistency check still rolls back the save. Native Linux operator qualification remains unperformed; package checks do not establish live radio readiness.</p>
   <div class="callout">
     <p><strong>Dedication</strong></p>
@@ -116,6 +116,16 @@
     <li><a href="#station-support-report">Support report</a>: preview and copy bounded, redacted cached diagnostics.</li>
     <li><a href="#hf-nets-schedule">FLDigi tuning</a>: optional per-net Center + Narrow presets and explicit restoration.</li>
     <li><a href="#settings-station-setup">Radio setup fixes</a>: independent applications, guided model/band choices, clear save/draft recovery, visible conflict feedback and responsive controls.</li>
+  </ul>
+
+  <h3 id="post-2-0-8-1">Changes after public 2.0.8.1</h3>
+  <p>These features are included in the 2.0.9 release candidate. Check the release page for published package availability; this guide alone does not establish that a package has been released.</p>
+  <ul class="section-list">
+    <li><a href="#settings-hf-groups-tuning">Operating Group antenna tuning</a>: configure the exact frequency variant for manual QSY, and understand tuning, receive verification, and scheduled row choices.</li>
+    <li><a href="#ncs-js8call">JS8 NCS</a>: station intelligence, flexible queries, decoded traffic, reversible exclusions, reusable saved messages and factual submission history.</li>
+    <li><a href="#controlfreq-net-preparation">Prepare a net from Ops</a>: review the source, radio and service, retain drafts, repair setup and start explicitly.</li>
+    <li><a href="#fio-spotter-net-mappings">Spotter net tools</a>: checkbox mappings, optional group relevance and <code>Use for nets</code>.</li>
+    <li><a href="#subspace-awareness">Subspace evidence</a>: reported-hearing paths and protected received-file review.</li>
   </ul>
 
   <h2 id="main-menu">Main Menu and Left Rail</h2>
@@ -341,10 +351,10 @@
       <tr><td><a href="#ncs-fldigi-compare-workspace">FLDigi Compare and Reference</a></td><td>Use this to compare your roster with another list and merge missing entries only when that matches the operator's net picture.</td></tr>
       <tr><td><a href="#ncs-fldigi-macro-mapping">FLDigi Macro Mapping Dialog</a></td><td>This is where you teach CommsPlan what your FLDigi macro buttons mean so generated check-in files and labels line up with your workflow.</td></tr>
       <tr><td><a href="#ncs-fldigi-lifecycle">FLDigi Net Lifecycle</a></td><td>Start, save, and end the net here so the working files and final archive match what actually happened.</td></tr>
-      <tr><td><a href="#ncs-js8-session-controls">JS8 Session, Group, and Expect-Query Controls</a></td><td>This sets the role, group target, refresh timing, and expected follow-up form for JS8 net work.</td></tr>
-      <tr><td><a href="#ncs-js8-checkins">JS8 Check-ins and Status Tracking</a></td><td>This shows who has appeared in the JS8 workflow and which stations still need operator attention.</td></tr>
+      <tr><td><a href="#ncs-js8-session-controls">JS8 Session, Group, and Expect-Query Controls</a></td><td>Choose the net identity and role; select query targets and forms as the net develops. No Set step is required.</td></tr>
+      <tr><td><a href="#ncs-js8-checkins">JS8 Station Intelligence</a></td><td>Filter participants, inspect decoded summaries and topics, review traffic, and exclude or restore local working items.</td></tr>
       <tr><td><a href="#ncs-js8-actions">JS8 ACK and Query Actions</a></td><td>Use these to acknowledge stations or ask for the expected response, either by group or by selected callsign.</td></tr>
-      <tr><td><a href="#ncs-js8-query-notes">JS8 Query Workflow Notes</a></td><td>This explains what CommsPlan does and does not automate so you know when the operator is still in control.</td></tr>
+      <tr><td><a href="#ncs-js8-query-notes">JS8 Compose, Saved Messages and Sent Activity</a></td><td>Prepare an addressed message, reuse saved text or forms, and inspect submission history without assuming RF delivery.</td></tr>
       <tr><td><a href="#ncs-vhf-session-workflow">Local NCS Session Workflow</a></td><td>This opens, joins, or closes the local net session so check-ins belong to the right event.</td></tr>
       <tr><td><a href="#ncs-vhf-entry-management">Local NCS Lookup, Filters, and Entries</a></td><td>This is how you find local operators, add check-ins, narrow the table, refresh, and export the session.</td></tr>
       <tr><td><a href="#ncs-vhf-editor">Local NCS Selected Entry Editor</a></td><td>This is where one operator's current local status and notes are edited safely during the net.</td></tr>
@@ -384,12 +394,12 @@
   </table>
 
   <h3 id="left-rail-status">Station Control Bar and Radio Cards</h3>
-  <p><strong>Purpose</strong>: keep each active radio's current frequency, schedule state, application status, and next change visible while you work in another tab. Select a radio by its name before using shared advanced controls. Actions inside a radio card always apply to that named radio.</p>
+  <p><strong>Purpose</strong>: keep each active radio's current frequency, schedule state, application status, and next change visible while you work in another tab. Use the actions inside the card for the intended radio; they always apply to that named radio.</p>
   <table>
     <thead><tr><th>Control</th><th>What It Does</th></tr></thead>
     <tbody>
       <tr><td>Radio name and schedule state</td><td>Select the radio by name. The state identifies its current source or operator control. Click the schedule state for its explanation and health details.</td></tr>
-      <tr><td>Frequency selector and QSY arrow</td><td>Choose any configured Operating Group frequency, then click the arrow to move this radio. Selecting or typing a destination alone does not tune it. The current observation remains available in the selector and tooltip.</td></tr>
+      <tr><td>Frequency selector and QSY arrow</td><td>Choose any configured Operating Group frequency, then click the arrow to move this radio. Selecting or typing a destination alone does not tune it. The current observation remains available in the selector and tooltip. The exact destination’s saved <a href="#settings-hf-groups-tuning">Auto-Tune on QSY</a> setting also applies to manual QSY.</td></tr>
       <tr><td>Quick QSY and explicit holds</td><td>The primary QSY action keeps the selected frequency until the next eligible schedule transition for this radio, then follows its assigned schedule automatically. It does not disable scheduling. Use the QSY menu for an explicit timed hold or hold until Resume; choosing a timed Pause entry starts a pause immediately.</td></tr>
       <tr><td>Pause / Resume icon and menu</td><td>The main Pause action holds this radio until Resume. Open its menu for a timed pause. Resume requests the current schedule for this radio; it does not end an active net or turn disabled schedule sources back on.</td></tr>
       <tr><td>Net headset icon</td><td>Enter operator net control at the current frequency. CommsPlan does not tune, transmit, start a roster, or change your NCS role. To leave, choose <code>Resume current schedule</code> or <code>Remain paused</code>. End an active NCS session in its NCS workspace.</td></tr>
@@ -397,7 +407,6 @@
       <tr><td>Schedule calendar icon</td><td>Shows this radio's assigned schedule and status. Choose <code>View assigned schedule</code> or <code>Change or swap schedule…</code>. The secondary <code>Schedule options</code> menu controls <code>Daily / Net schedule</code> and <code>SOP tuning</code> participation without editing plan rows.</td></tr>
       <tr><td>Schedule policy icon</td><td>Review frequency, FLDigi mode/offset, JS8 offset, and reminder policies for this radio. <code>Save policy</code> saves the quick choices; <code>Use profile defaults</code> returns to its Configuration policy.</td></tr>
       <tr><td>CAT and application indicators</td><td>CAT verification requires a fresh observed radio frequency. Application indicators describe the named radio's monitored software; a running process alone does not prove radio connectivity. Hover for details.</td></tr>
-      <tr><td><code>Controls</code> and <code>More controls</code></td><td>Show or hide additional operating detail and shared advanced actions for the selected radio. Radio identity and application activity remain visible when detail is collapsed.</td></tr>
       <tr><td><code>Dock view</code> / <code>Full view</code></td><td>Switch between the full workspace and compact radio cards. Dock uses <code>Previous</code>, <code>Next</code>, and <code>Radios</code> to reach additional radios, and <code>Go to</code> to open a workspace.</td></tr>
     </tbody>
   </table>
@@ -431,6 +440,7 @@
   <p><strong>State colors</strong>: green success requires supporting evidence; amber calls attention to a hold, approaching action, or operational issue; red marks stronger attention such as a due SOP action or reported transmit activity. Neutral status means unknown, stale, or not reported as described by the text. Read the tooltip before interpreting the color; a red TX label is activity information, not by itself a fault.</p>
 
   <h2 id="controlfreq">Ops Center</h2>
+  <p><strong>Review or prepare a scheduled net</strong>: eligible net actions offer <code>Prepare net</code>. Use <code>Review schedule</code> in the action’s context menu to focus the exact source row in HF Nets without starting a net or tuning. Changed or missing source rows and unfinished edits are explained rather than silently selecting another net. See <a href="#controlfreq-net-preparation">Net Preparation</a>.</p>
   <p><strong>Purpose</strong>: primary operating dashboard for station state, schedule actions, and near-term decision support.</p>
   <p><strong>Operational use</strong>: Ops Center is the primary tab for monitoring live operation. It shows current activity, upcoming changes, schedule alignment, and software conditions that may make an immediate QSY unsafe.</p>
   <ul class="section-list">
@@ -450,7 +460,7 @@
       <tr><td><code>Filters</code></td><td>Show group, source, age, <code>Clear Filters</code>, and <code>Times: Local/UTC</code> controls. The applied scope remains visible when this section is closed.</td></tr>
       <tr><td>Traffic Intelligence counts</td><td>Open the matching Inbox view for the attention category. Inbox shows the applied traffic scope; review or clear that scope before comparing it with an unfiltered message list.</td></tr>
       <tr><td>SOP attention button</td><td>Open <code>SOP Actions</code> for due, overdue, or upcoming procedure actions. Updating, stale, unavailable, or partial information remains identified even when detailed guidance is hidden.</td></tr>
-      <tr><td><code>Upcoming</code></td><td>Review up to four near-term HF, net, or SOP entries and their available actions. Open the full Schedule view for more detail.</td></tr>
+      <tr><td><code>Upcoming</code></td><td>Review up to four near-term HF, net, or SOP entries and their available actions. Open Schedule Outlook for the full view; its navigation link is not an extra expansion when that view is already open.</td></tr>
       <tr><td>Schedule row action</td><td>Use the action offered for that entry, such as <code>QSY + Hold</code>, net review, or SOP review. Read the radio and source context before applying a frequency action.</td></tr>
       <tr><td>Radio control actions</td><td>Use the always-visible <a href="#left-rail-status">radio cards</a> for QSY, Pause/Resume, Net control, schedule sources, and policy.</td></tr>
     </tbody>
@@ -471,6 +481,15 @@
   </table>
   <p><strong>Schedule confidence</strong>: read the radio card's current source, observed frequency, and next change together. <code>Off Schedule</code> can reflect deliberate tuning, a pending action, busy software, or a protected resource. Use <a href="#station-health">Health Details</a> for the reason; correct the saved plan in Configuration, HF Daily, HF Nets, or SOP Builder.</p>
   <p><strong>Local Nets in Ops Center</strong>: local reminders remain separate from HF commands and traffic. <code>Details</code> opens the reminder, <code>Dismiss</code> applies to a due/active occurrence, and <code>Open SOP</code> reviews linked context manually. These actions do not QSY, start software, or activate an SOP.</p>
+
+  <h3 id="controlfreq-net-preparation">Schedule Outlook and Net Preparation</h3>
+  <p>Schedule Outlook distinguishes the current assigned-plan window from the next change. An overnight window can already be active even though its next transition is hours away. Compare the named radio, current window and next event with Plan Builder; a valid gap keeps current tuning. Upcoming is a short list, while the full outlook includes current and later occurrences. Updating or unavailable inputs retain the previous view with their status identified; actions wait for validation. Repair the named source and use <code>Retry</code> when offered.</p>
+  <ol class="section-list">
+    <li>Choose <code>Prepare net</code> on an eligible net occurrence. To inspect its schedule instead, use the action's context menu (right-click or Shift+F10) and <code>Review schedule</code>.</li>
+    <li>Review the source occurrence, radio and service. If a choice is needed, select them and choose <code>Use selected radio/service</code>. Preparation opens the scoped NCS workspace; it does not start the net, tune the radio or transmit.</li>
+    <li>Use <code>Check setup</code>, <code>Repair setup</code>, <code>Inspect source</code> or <code>Review schedule</code> as needed. Returning from repair retains the draft. <code>Use updated setup</code> explicitly accepts a changed setup identity; <code>Start Net</code> remains a separate action.</li>
+    <li>If another net is active, use <code>Open current net</code>, <code>Keep request for later</code> or <code>Cancel preparation</code>. For an existing draft, review differences or keep the draft before preparing another request. These retained preparation drafts live in the current application session; do not assume restart recovery.</li>
+  </ol>
 
   <h2 id="freqplanner">Plan Builder</h2>
   <p><strong>Purpose</strong>: build, review, edit, and assign named Frequency Plans from HF Daily, HF Nets, and SOP condition layers.</p>
@@ -499,6 +518,7 @@
     </tbody>
   </table>
   <p><strong>Source details and refresh</strong>: HF Daily, HF Nets and SOP selectors share the available width. Hover for additional source and usage details. Selecting a row opens its inline source editor. Refreshing retains the displayed rows while a replacement view is built; changing the selected plan does not change another radio's assignment.</p>
+  <p><strong>Input recovery</strong>: use <code>Retry inputs</code> after an unavailable source is repaired. If inputs change while you have a draft, <code>Review changed inputs</code> reconciles that context without discarding the draft; saving/updating remains explicit. <code>Review retained SOP edit</code> returns to retained source edits. Repair a missing referenced source instead of substituting an unrelated schedule.</p>
   <p><strong>Assignment checks and gaps</strong>: review invalid frequencies, missing referenced sources and RF Guard findings before assignment. Missing optional Net or SOP layers are not defects. Gaps are informational: retain current tuning until the next explicit eligible event. Startup during a gap does not infer a previous row or borrow another plan. A blocked or unavailable source is different from a valid gap.</p>
   <p><strong>Changing or swapping plans</strong>: RF Guard reviews the proposed assignments together. A configured conflicting radio can appear in cautions even when stopped. Review antenna isolation and the named frequencies before starting that radio. Acknowledging a caution does not bypass a blocking conflict or verify physical isolation.</p>
   <p><strong>Effective Windows columns</strong>: <code>Day</code>, <code>Group / Net / SOP</code>, <code>Band/Freq</code>, <code>Time</code>, <code>Mode</code>, <code>Layer</code>, <code>What It Means</code>.</p>
@@ -506,6 +526,7 @@
   <h2 id="messages">Messages</h2>
   <p><strong>Purpose</strong>: unified traffic review, filtering, read state, and file-level actions.</p>
   <p><strong>Operational use</strong>: Messages combines multiple traffic sources into one operational inbox for received traffic, outstanding items, outbound staging, and original-form review.</p>
+  <p><strong>Reply drafts</strong>: replying from the reader keeps the original message identified in Compose. If a JS8 draft already contains text, choose whether to continue with it, replace it, or cancel before the recipient changes. Cancel retains the prior draft. <code>Inspect source</code> returns to the original retained message when it is still in the Inbox view. Preparing a reply does not send it.</p>
   <ul class="section-list">
     <li><strong>Traffic model</strong>: some rows are files, some are software-originated message artifacts, and some are reporting artifacts that also influence Map and operator-history views.</li>
     <li><strong>Cross-tab interaction</strong>: if a report changes Map pins or SitRep rollups, the original artifact is usually visible here. If a BBS or compose workflow seems confusing, pair this section with <a href="#settings-varac-details">VarAC Settings Details</a>.</li>
@@ -567,6 +588,7 @@
   <p><strong>Length and content</strong>: the preview includes the <code>CP &lt;reference&gt; FROM &lt;sender&gt;: &lt;body&gt;</code> attribution, plus the JS8 recipient prefix when applicable. Limits apply to the complete UTF-8 wire payload: MeshCore 160 bytes, Meshtastic 220 bytes, or a lower qualified connection limit. JS8 forwarding uses a CommsPlan ceiling of 512 bytes, not a universal JS8Call application maximum, and sends printable ASCII in uppercase. For JS8, icons and other unsupported non-ASCII/control characters are removed from the outgoing sender name and message body; line breaks, tabs and other whitespace become spaces. The exact preview and notices show the cleanup, while <code>View original</code> retains the source body. If no printable sender name remains, the outgoing attribution says <code>MESH SENDER</code>; the original identity remains in the source record. A message with no printable text after cleanup is blocked. Recipients and forwarding references are never cleaned, and oversized wire text remains blocked without truncation or splitting.</p>
   <p><strong>Privacy and permissions</strong>: Mesh-to-HF forwarding requires a reviewed public source feed. Private, direct and unknown Mesh feeds are blocked by this workflow. Outbound connection and channel permissions still apply in either direction. An accepted channel, contact or source label does not authenticate a sender or establish permission to redistribute sensitive content.</p>
   <p><strong>Review activity</strong>: open <code>Show Inbox Tools &gt; More Actions &gt; Forwarding activity…</code>, or the reader's <code>Forwarding details…</code>. Use <code>Review draft…</code> to reopen an eligible draft or failed attempt, or <code>Cancel saved draft</code> to cancel it. Expired intents cannot send; review current source and destination again before creating a fresh intent. Nothing is sent automatically from a saved draft, and failures are not automatically retried. A submitted or uncertain attempt cannot simply be retried: check the destination application before considering another send. JS8 <code>submitted</code> means API submission only. Mesh submitted, sent or acknowledged states describe their native evidence; none proves that a person read the message.</p>
+  <p><strong>Saved forwarding deadline</strong>: reopening a draft shows its saved deadline and remaining time at review. Saving it without changing the duration retains the original deadline; it does not restart the clock. Choosing a shorter duration can shorten the deadline. An expired draft cannot send, including if it expires while the review remains open.</p>
 
   <h3 id="messages-mesh-intelligence">Mesh Receive Intelligence</h3>
   <p>Policy-approved structured and wrapped Mesh reports can contribute received evidence to Inbox and Map. Source provenance and privacy rules still apply. Reported event locations and node positions are separate evidence; parsing received text does not authorize an automatic response or cross-transport relay. Unknown, malformed, oversized or unapproved payloads remain unstructured.</p>
@@ -703,6 +725,14 @@
     <li><strong>Import forms</strong>: <code>Add forms… &gt; Choose MCF files…</code> or <code>Choose a forms folder…</code> previews existing <code>MCF*.txt</code> files. Confirm the copy to install new forms in the CommsPlan-owned station library; this preserves the effective existing catalog and leaves the source files untouched.</li>
     <li><strong>Review limits and duplicates</strong>: batches are limited to 200 forms and 1 MiB per file. Rejected forms or an over-limit source/catalog stop the import; correct the source and preview again. Duplicate filenames are skipped rather than overwritten. A source changed since preview requires another review. Cancellation or failed publication retains the previous active catalog.</li>
     <li><strong>Routing</strong>: importing a file and assigning its purpose are separate steps. Review Inbox, Map, Alerts, Net, and Status mappings; <code>Auto-classify</code> stages suggestions and <code>Save mappings</code> retains them. Importing forms does not enable watches or Expect replies. External Spotter imports remain separate activity/import awareness data.</li>
+  </ul>
+
+  <h3 id="fio-spotter-net-mappings">Form Mappings and Net Tools</h3>
+  <p>In <code>CommsPlan Spotter &gt; Forms</code>, set the routing checkboxes directly, then choose <code>Save mappings</code>. A successful save shows green confirmation. <code>Auto-classify</code> stages suggestions for review.</p>
+  <ul class="section-list">
+    <li><strong>Use for nets</strong>: makes an eligible catalog form available to NCS form tools. This is separate from the <code>Net route</code> traffic-routing checkbox.</li>
+    <li><strong>Operating groups</strong>: use the row's group checklist to mark optional relevance. No selected group means <code>Shared</code>. These choices guide tools; they do not whitelist incoming check-ins or require a specific form before a station can participate.</li>
+    <li><strong>Expect status</strong>: a form in the catalog is not necessarily a saved response. To send a filled local form, first prepare and save its response in <code>Expect</code>. Enabling a net tool does not enable automatic Expect replies or change access policies.</li>
   </ul>
 
   <h2 id="map">Map</h2>
@@ -881,7 +911,7 @@
   <ul class="section-list">
     <li><strong>Role</strong>: choose <code>NCS</code>, <code>ANCS</code>, or <code>Joiner</code>. NCS and ANCS are the active net-control roles. Joiner is for an operator who is following along and may want to record both leadership callsigns without acting as either one.</li>
     <li><strong>Net Name</strong>: names the session so saved and archived files make sense later. Scheduled nets that are active now or coming up soon appear here, so joining a few minutes late does not force you into an ad hoc name.</li>
-    <li><strong>Start Net</strong>: turns on the live working state. CommsPlan clears the generated macro files, clears the previous working roster, resets traffic progress, and starts writing new roster changes to the live files. Adding check-ins is intentionally blocked until the net is started, so old draft entries do not accidentally become part of a new session.</li>
+    <li><strong>Start Net</strong>: preserves nonempty surviving generated and configured roster files before clearing the working roster and starting a fresh session. The preservation location is shown; if preservation fails, Start is cancelled and the working records remain. Adding check-ins is intentionally blocked until the net is started, so old draft entries do not accidentally become part of a new session.</li>
     <li><strong>Set NCS / Set ANCS</strong>: after the net starts, use these to place the leadership station in the roster. CommsPlan looks up the callsign when it can and fills known name/state details. Leadership rows are pinned at the top.</li>
     <li><strong>Ad Hoc Net</strong>: creates a timestamped net name and starts a session when the net is not on the schedule or you need a quick practice/test session.</li>
     <li><strong>QSY + Hold</strong>: changes frequency using the same station-control helpers used elsewhere in CommsPlan and temporarily holds scheduler control for the chosen time. Use this when the net intentionally moves and you do not want scheduler corrections fighting the move.</li>
@@ -989,64 +1019,56 @@
   <h3 id="ncs-fldigi-lifecycle">Net Lifecycle</h3>
   <ul class="section-list">
     <li><strong>Before Start Net</strong>: choose your role, select the net name, confirm the partner callsign if you have one, and make sure the macro header is acceptable for how you plan to operate. You can run the net with clipboard actions even if no macro is mapped.</li>
-    <li><strong>Start Net</strong>: clears old working files and begins a fresh session. This is the point where roster entry becomes active.</li>
+    <li><strong>Start Net</strong>: preserves surviving nonempty working records, then clears the live files and begins a fresh session. This is the point where roster entry becomes active.</li>
     <li><strong>During the net</strong>: add stations, correct the roster, use ACK Needed and Next TFC as often as needed, and let CommsPlan keep the live files synchronized.</li>
     <li><strong>Save Check-ins</strong>: writes a manual checkpoint of the current roster and clears the unsaved-change highlight. It is useful before a long pause or before ending the net, but it is not required for macro files to stay current.</li>
     <li><strong>End Net</strong>: asks for confirmation, saves the final roster, imports valid check-ins into the operator database, archives the generated files, and ends the live session state.</li>
-    <li><strong>Archive folder</strong>: archived files are stored under <code>&lt;fldigi_checkin_dir&gt;/archive</code>. Live files are working files and are cleared at the next Start Net; the archive is the record you keep after the net.</li>
+    <li><strong>Archive folder</strong>: archived files are stored under <code>&lt;fldigi_checkin_dir&gt;/archive</code>. Pre-start preservation folders include a manifest mapping preserved files to their original paths, including configured roster files outside the normal folder. An interruption does not automatically restore a live radio session.</li>
   </ul>
 
-  <h2 id="ncs-js8call">NCS: JS8Call</h2>
-  <p><strong>Purpose</strong>: JS8Call-directed net control with group-targeted and callsign-targeted acknowledgement/query workflows, live check-in tracking, and structured follow-up support around expected query forms.</p>
-  <p><strong>Operational use</strong>: this tab supports JS8-driven participation where check-ins, acknowledgements, query requests, and follow-up message retrieval occur in a structured directed-message environment.</p>
-  <ul class="section-list">
-    <li><strong>Best use</strong>: use this when the net is operating through JS8Call and you want one place to manage group intent, expected forms, check-in state, and acknowledgement/query actions.</li>
-    <li><strong>Cross-tab interaction</strong>: this tab depends on JS8Call paths and refresh settings from Configuration, shares QSY/hold logic with other operating tabs, and can enrich later Messages/Map interpretation through the operator data it collects.</li>
-    <li><strong>Operational caution</strong>: follow-up query handling is still operator-driven in the visible workflow. Use the acknowledgement and <code>E?</code> actions intentionally instead of assuming every missing detail will be gathered automatically.</li>
-  </ul>
-  <table>
-    <thead>
-      <tr><th>Area</th><th>Actions</th></tr>
-    </thead>
-    <tbody>
-      <tr><td>Session setup</td><td><code>Role</code> (NCS/ANCS), Net Name, refresh interval, Group target, expected query form, QSY dropdown, <code>Hold</code> selector, <code>QSY + Hold</code>, <code>Ad Hoc Net</code>.</td></tr>
-      <tr><td>Check-ins</td><td>Filter selector (<code>F!103 / F!104</code>, <code>Any Spotter</code>, <code>All Callsigns</code>), table actions by row selection.</td></tr>
-      <tr><td>Net lifecycle/actions</td><td><code>Start Net</code>, <code>ACK GROUP</code>, <code>ACK CALLSIGN</code>, <code>E? GROUP</code>, <code>E? Callsign</code>, <code>Save Checkins</code>, <code>End Net</code>.</td></tr>
-    </tbody>
-  </table>
-  <p><strong>Check-in table columns</strong>: <code>CALLSIGN</code>, <code>NAME</code>, <code>ST</code>, <code>GRID</code>, <code>REGION</code>, <code>MODE</code>, <code>SNR</code>, <code>OFFSET</code>, <code>STATUS</code>, action column.</p>
+  <h2 id="ncs-js8call">NCS: JS8Call Net Control</h2>
+  <p><strong>Purpose</strong>: collect and understand traffic during a slow digital net while keeping query, acknowledgement and follow-up decisions with NCS. The net is scoped to its radio and service. A parallel FLDigi net can use another radio; a common net or incident label provides context without merging their sessions.</p>
+  <p>The left action menu groups <code>Start Net</code>, <code>Save check-ins</code> and <code>End Net</code>, then activity review, then <code>Saved messages</code>, <code>Tools…</code> and <code>Edit setup</code>. <code>Compose</code> sits beside the ACK actions inside the working NCS area; <code>Back to traffic</code> returns to station intelligence without losing the outgoing draft.</p>
 
   <h3 id="ncs-js8-session-controls">Session, Group, and Expect-Query Controls</h3>
+  <ol class="section-list">
+    <li>Choose a radio/service, enter a Net Name and select the Group and Role. Before Start also checks your configured callsign and the selected radio’s DIRECTED.TXT source. An ad hoc net name is available when needed. Missing required fields receive inline guidance; a query form is not required to start. Local setup checks do not prove RF readiness.</li>
+    <li>Choose <code>Start Net</code> to listen and maintain this net's working record. <code>Edit setup</code> keeps setup details out of the traffic area. Use the Station Control Bar for QSY or hold changes.</li>
+    <li>Select <code>Query group</code> from groups in <code>Operators &gt; HF Callsigns</code>, or enter the intended group. No leading <code>@</code> and no separate Set click are required. The query destination can change during the net.</li>
+    <li>Select a form when you need it, then use <code>Expect query</code>. The choice is dynamic and does not fix the entire net to one form. Form availability follows <a href="#fio-spotter-net-mappings">Spotter mappings</a>. Reload forms and Topics are in <code>Tools…</code>.</li>
+  </ol>
+
+  <h3 id="ncs-js8-checkins">Station Intelligence and Received Traffic</h3>
+  <p>The table framework remains visible before traffic arrives. Columns include Callsign, RX SNR, State, Region, Groups, Latest traffic, decoded report summary, Topics and attention information. A station may belong to several groups. Search by callsign and filter by group, state or FEMA region; use the traffic selector for <code>Net</code>, <code>Other</code> or <code>Show excluded</code>. Large nets are paged; the counts describe the current view rather than an invitation to scroll through every station.</p>
   <ul class="section-list">
-    <li><strong>Role and Net Name</strong>: establish the current operator role and the net identity the tab should manage.</li>
-    <li><strong>Refresh (sec)</strong>: controls how often the tab polls for updated JS8 activity.</li>
-    <li><strong>Set Group</strong>: sets the group target used for group-oriented actions. This is a core operational step, not just a label field.</li>
-    <li><strong>Set Expect Query</strong>: chooses which expected spotter/query form the tab should use for later <code>E?</code> actions.</li>
-    <li><strong>QSY + Hold</strong> and <code>Ad Hoc Net</code>: use the shared scheduler-hold tools when the net requires moving the station outside the normal schedule flow.</li>
+    <li><strong>Geographic context</strong>: use HF Callsigns roster data, with Call Finder fallback when missing. Region is derived from the available state. A mailing-state fallback is reference data, not a confirmed live operating location.</li>
+    <li><strong>Participant decisions</strong>: received Spotter forms, CommStat reports and substantive net traffic can contribute directly. Relevant relayed reports also appear, with the original author and relay station shown separately in Details. Generic SNR?, QUERY MSGS and HEARING exchanges remain filtered, including relayed versions; meaningful prose mentioning those terms remains available. CommsPlan does not impose an ANCS qualification or require a particular response form.</li>
+    <li><strong>RX SNR</strong>: the station table shows the latest retained local receive signal-to-noise reading in dB. The tooltip identifies the transmitting station and observation time when available. <code>via [relay]</code> describes the relay-to-local-receiver link, not the original author's direct signal. A dash means no valid reading was reported for that link; retained readings are not proof of current reachability.</li>
+    <li><strong>View</strong>: inspect a station's traffic and decoded summary, including report topics, source and time. Latest activity and the latest decoded report can be different events. <code>Open full message</code> opens the corresponding Inbox message when available.</li>
+    <li><strong>Review and follow-up</strong>: mark traffic Reviewed, flag follow-up or save a local note. <code>Add to net</code> explicitly includes useful traffic from Other. New arrivals do not silently change your current selection or outgoing recipient.</li>
+    <li><strong>Exclude / Restore</strong>: exclude a station or one traffic item from this net's working view. Use <code>Show excluded</code> and Restore to bring it back. The received source message is retained; this is a local working decision, not a remote deletion.</li>
   </ul>
 
-  <h3 id="ncs-js8-checkins">Check-ins and Status Tracking</h3>
+  <h3 id="ncs-js8-actions">ACK, Query and Net Actions</h3>
   <ul class="section-list">
-    <li><strong>Check-in Filter</strong>: <code>F!103 / F!104</code> focuses on the standard expected forms, <code>Any Spotter</code> broadens to other spotter-style form activity, and <code>All Callsigns</code> shows the widest received-participation view.</li>
-    <li><strong>Status column</strong>: use it to understand where each station stands in the workflow, such as newly seen, form-tagged, or acknowledged. This is the quickest way to see who still needs attention.</li>
-    <li><strong>Selection matters</strong>: some actions, especially callsign-specific acknowledgement or query operations, depend on a selected table row.</li>
+    <li><strong>Expect query</strong>: sends an <code>E?</code> request for the selected form to the chosen group or selected station. It requests that form from the recipient; it does not send your locally saved form.</li>
+    <li><strong>SNR? / QUERY MSGS</strong>: request signal or message availability from the explicit group/station target. These are utility queries, not check-in rules. Read the target beside the action before sending.</li>
+    <li><strong>ACK group…</strong>: relates to groups for which this net has submitted an Expect query. Select the intended group after its Expect query was accepted for submission to JS8Call. The eligible nonexcluded net roster is considered, not only members of that group or replies to that query; calls already acknowledged for that group are omitted. Table search/filter choices do not silently redefine the ACK list.</li>
+    <li><strong>ACK station…</strong>: acknowledges the selected eligible station. Group membership does not prevent a callsign belonging to several groups.</li>
+    <li><strong>Save check-ins</strong>: saves the net record; narrowing the visible table does not discard participants outside that filter.</li>
+    <li><strong>End Net</strong>: saves the occurrence before ending it or attempting an optional concluding message. A save failure keeps the session available for retry. If submission of a concluding message is uncertain, inspect JS8Call before another attempt.</li>
   </ul>
 
-  <h3 id="ncs-js8-actions">ACK and Query Actions</h3>
-  <ul class="section-list">
-    <li><strong>ACK GROUP</strong>: acknowledges all qualifying new check-ins as a group.</li>
-    <li><strong>ACK CALLSIGN</strong>: acknowledges the selected station individually.</li>
-    <li><strong>E? GROUP</strong>: sends the currently selected expected-query request to the group target.</li>
-    <li><strong>E? Callsign</strong>: sends that expected-query request to the selected station only.</li>
-    <li><strong>Save Checkins</strong>: persists the current net picture.</li>
-    <li><strong>End Net</strong>: closes the active session and performs the end-of-net save/log behavior.</li>
-  </ul>
+  <p><strong>Source and send recovery</strong>: a newly started net uses the selected radio's saved JS8Call application source and retains it for the session. If the source configuration needed repair, save/end the old session and start a new one. The listening status retains the latest send outcome. Review a blocked or uncertain submission in Sent activity and JS8Call before retrying. If a selected target prevents a verified clear, deselect it in JS8Call as directed. CommsPlan does not retry automatically, and API submission does not prove RF transmission or delivery.</p>
 
-  <h3 id="ncs-js8-query-notes">Query Workflow Notes</h3>
+  <h3 id="ncs-js8-query-notes">Compose, Saved Messages and Sent Activity</h3>
+  <p>Choose <code>Compose</code> inside NCS to prepare an outgoing message, then <code>Back to traffic</code> to resume review. Select a saved message using its searchable name/content dropdown, or type freeform text. Choose the query group or a station from the net roster as the explicit recipient. Preview the addressed message, then choose <code>Send</code>; loading or editing a draft does not send it.</p>
   <ul class="section-list">
-    <li><strong>Current operator-facing model</strong>: the supported workflow in this release is the visible manual one built around <code>Set Expect Query</code>, <code>E? GROUP</code>, and <code>E? Callsign</code>.</li>
-    <li><strong>Operational impact</strong>: JS8 nets often need a disciplined way to request a specific form or follow-up response. This release does not expose a user-configurable automatic query workflow in Configuration.</li>
-    <li><strong>Recommended practice</strong>: use this tab to decide when to send follow-up requests; it is not a background recovery engine that silently gathers all missing details.</li>
+    <li><strong>Reusable message administration</strong>: open <code>Saved messages</code> from the left menu. The editable <code>MSG_NAME | Message content</code> table holds reusable text across nets, such as a starting announcement or closing message. Create, edit, save or delete entries here; Compose uses the library without requiring administration during the net. <code>{TARGET GROUP}</code> inserts the chosen group in a text message.</li>
+    <li><strong>Content…</strong>: <code>Text message</code> uses freeform text; <code>Form query</code> builds an Expect request; <code>Saved form</code> uses a locally saved response from CP Expect, with a working copy for review. A catalog form alone is not a filled saved response.</li>
+    <li><strong>JS8Call selection</strong>: the guarded send checks JS8Call’s busy and text state, then clears and verifies any selected callsign/group before proceeding. Clearing selection can resume paused JS8Call heartbeats. If that cannot be verified, the message is not silently sent to another target. Changing the selected table station does not silently retarget an existing draft.</li>
+    <li><strong>Sent activity</strong>: review recorded time, action, exact destination, content and result; View shows read-only details. <code>Submitted to JS8Call</code> means API submission, not confirmed RF transmission or delivery. <code>Not submitted</code>, <code>Submission uncertain</code> and <code>Submission failed</code> describe the recorded attempt. Decide what confirmation you need; uncertain attempts are not automatically resent.</li>
+    <li><strong>Earlier work and separate nets</strong>: retained records and local annotations remain scoped to their net occurrence. Reviewing an ended net does not restart listening or authorize sending. A peer net's status is context, not permission to control its radio.</li>
   </ul>
 
   <h2 id="ncs-vhf-uhf">NCS: VHF/UHF (Local NCS)</h2>
@@ -1123,7 +1145,7 @@
       <tr><td><code>Save HF Schedule</code></td><td>Persists active HF rows.</td></tr>
     </tbody>
   </table>
-  <p><strong>Active Schedule columns</strong>: <code>Selected</code>, <code>Day</code>, <code>Source</code>, <code>Group Name</code>, <code>Mode</code>, <code>Band</code>, <code>Freq (MHz)</code>, <code>Start</code>, <code>End</code>, <code>Auto-Tune</code>.</p>
+  <p><strong>Active Schedule columns</strong>: <code>Selected</code>, <code>Day</code>, <code>Source</code>, <code>Group Name</code>, <code>Mode</code>, <code>Band</code>, <code>Freq (MHz)</code>, <code>Start</code>, <code>End</code>, <a href="#settings-hf-groups-tuning"><code>Auto-Tune</code></a>.</p>
   <p>Rows are shown in time sequence by default to simplify conflict review.</p>
 
   <h3 id="hf-daily-resources">Daily Row Library Section</h3>
@@ -1195,7 +1217,7 @@
       <tr><td><code>Save Schedule</code></td><td>Saves the visible rows as the selected named HF Net schedule, or creates a new named schedule for Plan Manager.</td></tr>
     </tbody>
   </table>
-  <p><strong>Net Schedule columns</strong>: <code>Select</code>, <code>Day</code>, <code>Recurrence</code>, <code>Weeks of Month</code>, <code>Group Name</code>, <code>Mode</code>, <code>Band</code>, <code>Freq (MHz)</code>, <code>Start</code>, <code>End</code>, <code>Early (min)</code>, <code>FLDigi Mode</code>, <code>FLDigi Offset</code>, <code>Net Name</code>, <code>Auto-Tune</code>.</p>
+  <p><strong>Net Schedule columns</strong>: <code>Select</code>, <code>Day</code>, <code>Recurrence</code>, <code>Weeks of Month</code>, <code>Group Name</code>, <code>Mode</code>, <code>Band</code>, <code>Freq (MHz)</code>, <code>Start</code>, <code>End</code>, <code>Early (min)</code>, <code>FLDigi Mode</code>, <code>FLDigi Offset</code>, <code>Net Name</code>, <a href="#settings-hf-groups-tuning"><code>Auto-Tune</code></a>.</p>
   <p><strong>Recurrence values</strong>: <code>Weekly</code>, <code>Daily</code>, <code>Periodic</code>. Periodic rows use <code>Weeks of Month</code>.</p>
   <p><strong>Optional FLDigi tuning</strong>: use a row's <code>FLDigi Tuning…</code> button, enable the preset, and save the schedule. The default <code>Center + Narrow</code> action moves FLDigi audio to 1500 Hz and requests a 500 Hz radio receiver filter. Customize its label, audio offset, optional filter width, signal-preservation behavior, and optional application at net start. A blank width leaves the radio filter unchanged. Preserving the signal compensates the actual dial frequency for the audio change in confirmed USB/LSB; the starting schedule frequency and offset retain their usual meaning.</p>
   <p>During the scheduled net, open the radio card's Net menu or <code>Center + Narrow…</code> in the FLDigi NCS session tools. Review the named radio/net and requested settings, then apply once. Results show observed before/after tuning; success requires readback. <code>Restore previous tuning</code> restores the preceding observation for the same net, radio authority, and VFO. Unknown previous filter width is left unchanged. These actions require the radio's FLRig/FLDigi connections and honor transmit, protected-traffic and RF Guard checks. No transmission is started. Operators remain free to adjust tuning afterward; a failed automatic preset requires an explicit manual retry.</p>
@@ -1258,7 +1280,7 @@
 
   <h2 id="tools-resources">Resources: Frequencies</h2>
   <p><strong>Purpose</strong>: manage reference data that can be selected from planning workspaces without making the catalog itself an active schedule, station configuration page, or radio-control surface.</p>
-  <p><strong>Workspace model</strong>: <code>Resources</code> is one direct main-navigation destination. Inside it, use the browser-style tabs from left to right: <code>Frequency Catalog</code> for channels and frequencies, <code>Net Directory</code> for net identity and published net meetings, and <code>Import / Export</code> for preview-first exchange. Search results are bounded so normal catalog work remains responsive.</p>
+  <p><strong>Workspace model</strong>: <code>Resources &gt; Frequencies</code> opens the frequency/reference workspace. Inside it, use the browser-style tabs from left to right: <code>Frequency Catalog</code> for channels and frequencies, <code>Net Directory</code> for net identity and published net meetings, and <code>Import / Export</code> for preview-first exchange. Search results are bounded so normal catalog work remains responsive.</p>
   <h3 id="tools-resources-frequency-catalog">Frequency Catalog</h3>
   <ul class="section-list">
     <li><strong>Reference versus station resource</strong>: bundled and imported records retain their catalog source internally, while normal screens show its readable name instead of database keys or version hashes. A station-owned record is the right choice for a locally maintained simplex frequency or repeater pair.</li>
@@ -1267,6 +1289,20 @@
     <li><strong>Used by</strong>: inspect this before changing a resource. It shows the saved Local Nets, directory sessions, or other consumers that retain a reference to it.</li>
     <li><strong>Retire instead of delete</strong>: retirement removes a record from normal selection while preserving its identity and history. A referenced record cannot be silently removed. Hard deletion is only available after CommsPlan proves there are no references and asks for confirmation.</li>
   </ul>
+  <h3 id="tools-resources-radio-import">Import radio programming files</h3>
+  <p>Open <code>Resources &gt; Frequencies &gt; Frequency Catalog &gt; Import radio files…</code> to create station-owned frequency references from CHIRP, RepeaterBook native, BTECH or generic CSV/TSV exports. The importer reads programming data for manual reference; it does not program a radio, tune, transmit, create a schedule or activate an SOP.</p>
+  <ol class="section-list">
+    <li>Choose <code>Choose CSV/TSV files…</code> and select one or more exports. Use CSV/TSV from your programming tool first: binary CHIRP images, proprietary radio project files, XLS/XLSX workbooks and arbitrary radio programming JSON are not supported.</li>
+    <li>Choose <code>Service</code> explicitly. Frequency alone does not establish whether an entry is Amateur, GMRS, FRS, MURS or Other. Separate batches when service or generic mappings differ.</li>
+    <li>Review the detected format and records. All valid rows start checked. Uncheck records you do not want, or use <code>Select all</code> and <code>Clear selection</code>. Rows with errors cannot be selected; inspect warnings and the source data before proceeding.</li>
+    <li>For unfamiliar generic headers, open <code>Column mapping…</code>. Map Receive frequency, Transmit frequency, Channel name, Mode or Comment and select MHz or Hz, then choose <code>Review mapping</code>. Recognized layouts and common aliases map automatically; ambiguous or missing required columns need correction. Mapping applies across the selected generic files.</li>
+    <li>Check the channel name in the table, then expand <code>Selected record details</code> for RX/TX, mode, directional tones, bandwidth, diagnostics and original source fields such as offset, location or notes when supplied. Unknown or disabled TX remains absent; do not assume receive-only means simplex.</li>
+    <li>Check the count and choose <code>Import N records</code>. Exact normalized duplicates are skipped without overwriting existing operator edits. Exports with differing content may remain separate entries even when their receive frequencies match.</li>
+  </ol>
+  <p>One batch supports up to 20 files, 10 MiB per file and 2,000 preview records. Split larger exports into smaller batches. The Frequency Catalog retains the selected programming details and source values so an operator can reference them later and enter the channel manually on a radio.</p>
+  <p><strong>JSON distinction</strong>: <code>Import / Export</code> uses CommsPlan's catalog-exchange JSON with preview and explicit apply. That does not add arbitrary JSON support to the radio programming file importer.</p>
+  <p><strong>Next step</strong>: use <a href="#settings-local-comms-details">Local Comms Groups &gt; Add from catalog…</a> to associate selected frequencies with a local group, then insert a saved reference into a Local SOP action.</p>
+
   <h3 id="tools-resources-net-directory">Net Directory and HF subscription</h3>
   <ul class="section-list">
     <li><strong>Directory identity is not a schedule.</strong> A directory entry describes a net; published net meetings describe its reusable timing and frequency context. <code>Listed</code> means an item is available in the catalog—it does not mean the net is happening now or that your station follows it. Neither a listing nor a meeting activates an HF or Local schedule on its own.</li>
@@ -1277,7 +1313,7 @@
   </ul>
   <h3 id="tools-resources-import-export">Import, export, and recovery</h3>
   <ul class="section-list">
-    <li><strong>Preview first.</strong> Import reads a chosen JSON file and shows diagnostics before <code>Apply Preview</code> becomes available. Cancel Preview leaves the catalog unchanged.</li>
+    <li><strong>Catalog exchange preview.</strong> This tab reads CommsPlan-format catalog JSON and shows diagnostics before <code>Apply Preview</code> becomes available. Cancel Preview leaves the catalog unchanged. For radio CSV/TSV exports, use <a href="#tools-resources-radio-import">Frequency Catalog &gt; Import radio files…</a>.</li>
     <li><strong>Source protection.</strong> Imports do not overwrite bundled read-only records. Resolve invalid, duplicate, ambiguous, or conflicting preview items before applying an exchange.</li>
     <li><strong>Export is selective.</strong> Enter the stable frequency or net keys you want to exchange; export does not imply publication, scheduling, or radio action.</li>
     <li><strong>Recovery mindset.</strong> Keep an export before a large catalog change. If a change must be reversed, restore or re-import a reviewed exchange rather than editing an active schedule or deleting a referenced source record.</li>
@@ -1740,6 +1776,8 @@
     <li><strong>Another radio</strong>: an installed executable may be shared, but independently controlled radios require distinct application instance settings and API endpoints. The rigctld control port is separate from FLDigi XML-RPC and JS8Call TCP API ports. Configure matching native settings folders/profiles and endpoints in those applications. A failed Save radio retains a draft; use Resume setup to correct the reported conflict before activating the radio.</li>
     <li><strong>Same identity as Station Setup</strong>: Software Administration edits the exact saved radio and application identity created by <a href="#settings-station-setup">Station Setup</a>. The display name, native rig name, selected profile, and launch arguments remain distinct and are shown separately.</li>
   </ul>
+  <p><strong>Find and folder choices</strong>: component-specific discovery suggests the intended FLRig, FLDigi, FLMsg or FLAmp executable; <code>Find again…</code> explicitly refreshes the search. Review suggestions before applying them. JS8Call executable installations and native profiles remain separate choices, and finding an executable does not require a profile to be discovered. Message Folders offers folder controls rather than an installed-application search.</p>
+  <p><strong>Shared Fast Light data</strong>: operators may intentionally use the same message/ICS, templates, auto, log/check-in or RX/TX data folders across radios. Shared data folders do not block configuration, while control endpoints and native configuration identity checks still apply. Review what will be common to those radios. An unfinished edit must be saved or cancelled before switching components; the task selection remains on the visible editor until that is resolved.</p>
   <p><strong>Fast Light overview</strong> lists FLRig, FLDigi, FLMsg and FLAmp with their explicit Use choices, saved native identities and cached observations. A recorded application path does not mean the application is selected. Each component's <code>Configure</code> or <code>Details</code> action opens that component's owning settings view; it does not open an unrelated full-family form. <code>Check status</code> explicitly refreshes the selected radio; navigation alone does not probe applications or radios.</p>
   <p><strong>Configuration attention:</strong> Settings section buttons show only a status icon beside the section name. The legend explains the icons where configuration evidence is available: ✓ Complete, ⚠ Review, ○ Not checked, ● Unsaved, or — Optional. Blue identifies the selected section. Complete means the section's required saved settings pass local checks; it does not verify files, native application settings, or a running connection. Open a section to read the reason and make a correction. Runtime observations remain separate in Health. Optional signing does not invalidate FLAmp configuration. Navigation does not scan or contact applications.</p>
   <p><strong>VarAC policy and shared folders:</strong> <code>Inbound Guard</code> checks the saved per-radio access choices; its Save updates only that policy even when application identity is managed. Both access sources may be disabled intentionally. The BBS archive is a <em>folder</em>. For a cluster member, Runtime &amp; Paths displays the saved shared BBS and archive folders; change those shared folders in <code>Cluster</code> settings. <code>Cluster</code>, <code>Forms Library</code>, and <code>Open CommsPlan Spotter</code> are navigation destinations with no per-radio configuration check, so they carry no configuration badge.</p>
@@ -1851,6 +1889,11 @@
     <li><strong>Auto-Fill status</strong>: after an auto-fill attempt, CommsPlan reports what it found or what still needs attention. Treat this as setup guidance, not an error unless a feature you need remains missing.</li>
   </ul>
 
+  <h4 id="subspace-awareness">Subspace Hearing and Received Files</h4>
+  <p>Subspace reported-hearing evidence can enrich Map paths and station details. Arrows show who reported hearing whom; signal color describes the reported quality and evidence can age. Context carried from Map into Compose includes <code>Review map</code>. It does not establish a live connection or delivery.</p>
+  <p>In the radio's JS8Call software editor, open <code>Received files</code>, enable <code>Monitor received files</code>, choose an accessible directory and decide whether to <code>Review existing files</code> or <code>Monitor new files</code>. Use <code>Check directory</code>, save the settings and choose <code>Review files</code>. Inbox exposes these as <code>Subspace file</code> items, distinct from ordinary directed-message logs.</p>
+  <p>Review the captured source and warnings before <code>Mark reviewed</code>, <code>Retry</code>, <code>Capture empty file</code> or <code>Export…</code>. <code>Open text file</code> is available for safely captured text; use export for other content, and <code>Manage source</code> for monitoring settings. Finding a file does not verify a completed transfer, sender or receiving radio. Marking it reviewed records a local review, not those missing facts.</p>
+
   <h3 id="settings-fast-light-details">Fast Light Settings Details</h3>
   <p><strong>Where to configure it</strong>: open <a href="#settings-software-administration">Configuration &gt; Software</a>, choose Fast Light, then choose the radio and task. The installed FLMsg and FLAmp executables may be shared, but each managed radio normally has its own NBEMS runtime/data identity and launch arguments.</p>
   <ul class="section-list">
@@ -1870,8 +1913,10 @@
     <li><strong>Purpose</strong>: Operating Groups are the reusable link between a named activity and its expected station behavior. HF schedules use their frequency, mode, VFO, FLDigi mode, and offset; Plan Builder, Ops Center, NCS, and QSY workflows use the same definitions when resolving what the station should do.</li>
     <li><strong>Configuration location</strong>: open <code>Configuration &gt; Main &gt; HF Operating Groups</code>. The section is part of the station-wide configuration rather than a single radio's Software Administration record.</li>
     <li><strong>Group-based scheduling</strong>: configure Operating Groups before creating schedules or actions that refer to group behavior. The group supplies the concrete frequency, mode, and related expectations. No groups is valid for operation that does not depend on group plans; only workflows that require a missing group need correction.</li>
+    <li><strong>Protected editing</strong>: select the exact configuration row, then <code>Edit Configuration</code> to unlock and reveal its fields. <code>Save Changes</code> validates and persists that configuration; <code>Cancel</code> restores saved values and protection. <code>Add Configuration</code> starts a new variant. Global Save Settings does not commit an unfinished configuration editor. After a saved guardrail warning, use <code>Review warnings</code> to inspect the actual issue.</li>
     <li><strong>Minimum useful configuration</strong>: enter a recognizable Group name and select Mode, Band, Frequency, and VFO. For digital operation, also set the expected FLDigi Starting Mode and FLDigi Offset. Use <code>Save Changes</code> to validate and immediately persist the configuration.</li>
     <li><strong>Groups and configurations</strong>: one named group can contain several frequencies in the same band and mode, as well as configurations for different bands or modes. Select the group first, then select a configuration row to review its VFO, FLDigi, auto-tune, condition-level, and Fast Light naming details. <code>Add Configuration</code> adds another frequency configuration without creating a different group identity. Select the exact frequency in schedules, SOP actions, and QSY choices. If a referenced frequency is edited, deleted, or ambiguous, review and select it again; CommsPlan does not silently substitute another configuration.</li>
+    <li><strong>Delivered presets</strong>: review <code>JS8CALL STANDARD</code> and <code>VARAC STANDARD</code> with <code>View Frequencies</code>, then enable the desired group. MAGNET includes 14.115, 7.115, 3.585, 10.115 and 28.115 MHz; AMRRON includes 14.110, 7.110 and 3.588 MHz. Presets are choices to copy and review, not automatic replacements for locally edited groups or immediate schedule assignments.</li>
     <li><strong>Known groups</strong>: <code>Known Groups from Net Resources</code> lists recognized groups supplied by the net-resource catalog. <code>View Frequencies</code> previews the available configurations; <code>Enable Group</code> copies supported configurations into the station's saved Operating Groups for review. Planned or unsupported entries are not silently enabled.</li>
     <li><strong>Mode choices</strong>: choose <code>Digi</code> for digital-mode work such as JS8 or FLDigi workflows, and <code>SSB</code> for voice net work.</li>
     <li><strong>Voice sideband behavior</strong>: when <code>Mode=SSB</code>, <code>FLDigi Starting Mode</code> defaults to band-appropriate sideband (<code>LSB</code> on lower HF bands, <code>USB</code> on upper HF bands), and can be manually overridden.</li>
@@ -1879,7 +1924,7 @@
     <li><strong>Frequency</strong>: enter the operating frequency as decimal MHz, such as <code>7.078</code>, or in the readable <code>MHz.kHz.Hz</code> form shown by the editor, such as <code>7.078.000</code>. CommsPlan validates the value against the selected band and mode and uses it when comparing the active station with the schedule.</li>
     <li><strong>VFO</strong>: choose the radio VFO the plan expects, usually <code>A</code> unless your station has a reason to use another VFO.</li>
     <li><strong>FLDigi Offset meaning</strong>: this is the expected FLDigi audio offset for the group row, such as <code>900</code>. If a schedule row omits FLDigi offset, the matching Operating Group value is used as the expected offset.</li>
-    <li><strong>Auto-Tune on QSY</strong>: allows CommsPlan to tune this group configuration automatically when schedule enforcement calls for it and the radio's control and safety policies also permit the action. Leave it off when operator confirmation is required.</li>
+    <li><strong>Auto-Tune on QSY</strong>: requests the radio's antenna-tuner function through FLRig for this frequency configuration, including manual QSY. It is separate from changing the dial frequency. See <a href="#settings-hf-groups-tuning">Antenna Tuning on QSY</a> before enabling it.</li>
     <li><strong>Drift behavior</strong>: FLDigi offset may move during operation and appear off plan. Whether CommsPlan corrects it immediately or asks first depends on the FLDigi enforcement mode; active net operation can also suppress scheduler corrections.</li>
     <li><strong>Condition levels</strong>: condition-level participation is group-scoped. Changing <code>Use Condition Levels</code> on one configuration applies to every configuration with the same Group name, allowing SOP condition layers to select the appropriate group behavior without redefining the schedule.</li>
     <li><strong>Fast Light naming</strong>: the selected group can define filename delimiter, signed and unsigned suffix, and preferred form-family behavior used by Fast Light message workflows. These naming choices are group-scoped and do not change the scheduler frequency.</li>
@@ -1888,11 +1933,41 @@
     <li><strong>Condition-level concept</strong>: condition levels let you pre-stage several operational postures without rewriting the whole schedule every time conditions change. Instead of editing frequency plans during an event, you can move the station's active level and let CommsPlan reveal only the rows meant for that level.</li>
   </ul>
 
+  <h4 id="settings-hf-groups-tuning">Antenna Tuning on QSY</h4>
+  <p><code>Auto-Tune on QSY</code> means running the radio's supported antenna-tune function through FLRig. This may key the transmitter during tuning. It is not the permission to change frequency and is different from an FLDigi <code>Center + Narrow</code> receive-tuning preset.</p>
+  <ol class="section-list">
+    <li>Open <code>Configuration &gt; Main &gt; HF Operating Groups</code>, select the exact band/frequency/mode configuration and choose <code>Edit Configuration</code>.</li>
+    <li>Check or clear <code>Auto-Tune on QSY</code>, then choose <code>Save Changes</code>. The choice belongs to that configuration; another frequency in the same group can have a different setting.</li>
+    <li>In the named radio's Station Control Bar, select that destination and choose QSY. Manual QSY uses the current saved setting for that exact configuration, including changes made after the card was first displayed. Selecting a destination alone does not QSY or tune.</li>
+  </ol>
+  <table>
+    <thead><tr><th>Situation</th><th>Expected behavior</th></tr></thead>
+    <tbody>
+      <tr><td>Manual QSY, option enabled</td><td>Apply and verify the requested radio frequency/VFO/mode, request antenna tuning through FLRig, then wait for verified receive before applying and checking FLDigi mode/offset when required.</td></tr>
+      <tr><td>Manual QSY, option disabled</td><td>QSY can still change frequency and applicable modem settings; CommsPlan does not request the antenna-tune step for that configuration.</td></tr>
+      <tr><td>Scheduled change</td><td>The schedule row's explicit Auto-Tune choice remains authoritative. Eligible real schedule transitions or RF frequency/VFO corrections can tune; routine modem/offset-only correction does not repeatedly run the antenna tuner.</td></tr>
+      <tr><td>Unsupported or unavailable tuner</td><td>This feature requires FLRig and a radio/FLRig implementation supporting <code>rig.tune</code>. Other control backends do not gain antenna-tune support from the checkbox. Review the connection and radio capability.</td></tr>
+      <tr><td>Busy, safety hold or missing readback</td><td>PTT, protected-traffic, RF Guard, radio ownership and readback checks still apply. Inspect Health Details and the named radio; the setting does not bypass those checks.</td></tr>
+      <tr><td>Uncertain tune result</td><td>Inspect the radio before retrying explicitly. A routine retry of the same pending operation does not repeat an already attempted tune. API acceptance and radio readback do not prove a successful antenna match.</td></tr>
+    </tbody>
+  </table>
+  <p>Quick QSY's return at the next eligible transition and explicit Until Resume/timed holds control schedule ownership; they do not enable or disable this antenna-tune option. If a referenced group configuration is missing or ambiguous, repair the destination rather than assuming another variant's setting.</p>
+
   <h3 id="settings-local-comms-details">Local Comms Groups Details</h3>
+  <p>Use this workspace to save local programming references for SOP reminders. It is separate from <code>Local Nets</code>, which defines timed local reminders. Catalog assignments do not program a radio, create a Local Net schedule or drive HF scheduler automation.</p>
+  <ol class="section-list">
+    <li>Choose <code>Add Configuration</code>, then enter the destination in the editor's <code>Group</code> field. For a new group, you can proceed without saving a dummy manual row or choosing Enable Group first. For an existing group, confirm the editor names the intended group.</li>
+    <li>Choose <code>Add from catalog…</code> in the configuration editor. Type to filter, narrow by Service and check the desired frequencies. Unlike the file importer, this picker starts with none selected. Selections remain across pages and searches; <code>Already added</code> entries cannot be added twice to the same group.</li>
+    <li>Review <code>Frequency details</code> and the count and destination in <code>Add N frequencies to [group]</code>, then add. This saves one configuration per selected catalog entry, including for a newly named group. Cancel leaves the group unchanged. The same catalog entry can belong to several groups; separate entries on the same receive frequency can have different TX, modes or tones.</li>
+    <li>Select the saved group and use <code>Review catalog changes…</code> to compare saved programming references with their current catalog versions. Select the updates to accept explicitly. Missing or retired entries retain their saved details; ordinary loading never replaces them automatically.</li>
+  </ol>
+  <p><strong>Local edits</strong>: changing Group or Notes preserves the catalog association. Editing Resource, Mode or Target makes that configuration a local copy, detached from catalog updates. Removing a group configuration does not delete the catalog resource. Catalog <code>Used by</code> counts do not include Local Comms Group references; the group keeps its saved programming version even if the source is removed.</p>
+  <p><strong>Local SOP insertion</strong>: select the local group in a Local SOP action, then on <code>What</code> choose an <code>Assigned frequency</code> and <code>Insert frequency reference</code>. This appends the saved programming text to Procedure. Review it, choose <code>Use action</code> and save the SOP. Later group/catalog changes do not silently rewrite that Procedure text. The saved name, frequency and tone details remain usable for manual radio programming.</p>
+  <p>For a manual configuration, the existing fields remain available:</p>
   <ul class="section-list">
     <li><strong>Purpose</strong>: local comms groups let you maintain non-HF resource profiles such as VHF/UHF, repeaters, simplex channels, local nets, or nearby coordination channels.</li>
     <li><strong>Group</strong>: the team or local operating group name.</li>
-    <li><strong>Resource</strong>: the practical resource name, such as a repeater, simplex channel, tactical channel, or local net.</li>
+    <li><strong>Resource</strong>: the local resource category, such as VHF simplex or repeater. Catalog-derived configurations also retain the channel's name and programming details in their saved reference.</li>
     <li><strong>Mode</strong>: how operators use the resource, such as voice, packet, FLDigi, or another local mode name your group understands.</li>
     <li><strong>Target</strong>: the frequency, repeater, talkgroup, node, or other destination operators need in order to use that resource.</li>
     <li><strong>Notes</strong>: short local reminders, access details, tone information, role notes, or operating cautions.</li>
@@ -2125,6 +2200,7 @@
   <ul class="section-list">
     <li>If a button appears disabled, confirm required row selection or required fields.</li>
     <li>If startup reports that station data could not be prepared, a startup warning remains after the workspace opens until you acknowledge it. Review Log Viewer for details; opening the workspace does not confirm that station data or radio connections are ready.</li>
+    <li>If manual QSY changes frequency but does not run antenna tuning, check the exact Operating Group configuration's saved <code>Auto-Tune on QSY</code> value, FLRig/radio tune support, safety holds and readback. See <a href="#settings-hf-groups-tuning">Antenna Tuning on QSY</a>. Do not confuse this with frequency enforcement or FLDigi receive-filter tuning.</li>
     <li>If schedule behavior is unexpected, inspect that radio's calendar for its assigned plan and status, then check holds, enabled sources, validation and connection readiness. A valid schedule gap retains tuning; Quick QSY stays until the next eligible transition. CommsPlan 2.0.8 needs no separate Enable scheduling action.</li>
     <li>If a Configuration section stays highlighted, open that section and look for a missing companion field such as <code>DIRECTED.TXT</code>, an endpoint port, an explicit native message source, or <code>Incoming Files</code>. A custom forms folder is optional; CommsPlan uses the station CP Forms Library, a clearly identified legacy fallback, or bundled forms when no station library is selected.</li>
     <li>If FLDigi offset returns unexpectedly, open <code>Configuration &gt; Radios</code>, choose the affected radio, and check <code>Schedule Control</code> for its FLDigi enforcement mode (<code>On Schedule Change</code> vs <code>Prompt</code>). Then confirm whether a new schedule row transition occurred.</li>

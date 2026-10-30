@@ -14,6 +14,7 @@ schema-free runtime helpers; do not add schema assurance to this module.
 from __future__ import annotations
 
 from concurrent.futures import Future
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 import json
 import sqlite3
@@ -1277,7 +1278,12 @@ class ProjectionBundleWriter:
                         (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),),
                     )
                 with perf_span("messages.writer.commit", min_ms=2.0):
-                    conn.commit()
+                    # Optional source lifecycle fence serializes its generation
+                    # invalidation with this final commit. Ordinary producers
+                    # retain the existing finish-started-bundle behavior.
+                    guard=getattr(cancel_event,"commit_guard",None)
+                    with guard() if callable(guard) else nullcontext():
+                        conn.commit()
                 transaction_open = False
             else:
                 conn.rollback()

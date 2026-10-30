@@ -4,9 +4,14 @@ from uuid import uuid4
 from PySide6.QtCore import QThread, Signal
 from freqinout.core.multi_radio_store import MultiRadioStore
 from freqinout.core.operator_application_configuration import save_operator_application, load_operator_application_context
-from freqinout.core.configuration_edit_session import load_unfinished_configuration, discard_unfinished_configuration
+from freqinout.core.configuration_edit_session import ConfigurationConflict, load_unfinished_configuration, discard_unfinished_configuration
 
 _LIVE_JOBS = set()
+
+
+def live_configuration_jobs():
+    """GUI-thread snapshot for application shutdown, including detached saves."""
+    return tuple(_LIVE_JOBS)
 
 class OperatorConfigurationJob(QThread):
     result_ready = Signal(object)
@@ -82,6 +87,15 @@ class OperatorConfigurationJob(QThread):
                 response['unfinished'] = load_unfinished_configuration(store,scope)
         except Exception as exc:
             response['error'] = str(exc) or exc.__class__.__name__
+            if isinstance(exc, ConfigurationConflict) and self.action in {'save', 'radio_save', 'radio_keep_draft'}:
+                try:
+                    if self.action.startswith('radio_'):
+                        response['conflict_context'] = load_operator_radio_context(store, radio_id)
+                    else:
+                        response['conflict_context'] = load_operator_application_context(store, self.payload)
+                except Exception:
+                    # Missing/removed targets retain the original error and draft.
+                    pass
             try:
                 response['unfinished'] = load_unfinished_configuration(store,scope)
             except Exception:

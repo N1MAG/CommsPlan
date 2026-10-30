@@ -1697,15 +1697,6 @@ class RadioControlPanel(QWidget):
         self._toolbar_stacked = None
         self.utility_rail = ResponsiveAwarenessRail(self)
         self.utility_rail.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-        self.controls_button = QPushButton("Controls ▴", self)
-        self.controls_button.setObjectName("radioControlDisclosure")
-        self.controls_button.setCheckable(True)
-        self.controls_button.setChecked(True)
-        self.controls_button.setToolTip("Collapse operational controls; keep radio and application activity visible.")
-        self.controls_button.setAccessibleName("Collapse radio controls")
-        self.controls_button.clicked.connect(lambda: self.set_minimized(not self._minimized))
-        self.utility_rail.addWidget(self.controls_button)
-        self.controls_button.show()
         self.view_button = QPushButton("Dock view", self)
         self.view_button.setAccessibleName("Switch to Dock view")
         self.view_button.clicked.connect(self._toggle_dock)
@@ -1981,7 +1972,7 @@ class RadioControlPanel(QWidget):
 
     def _reflow(self) -> None:
         stacked = self.width() < max(600, self.fontMetrics().horizontalAdvance("M") * 60)
-        utility_width = sum(button.sizeHint().width() for button in (self.controls_button, self.view_button)) + 12
+        utility_width = self.view_button.sizeHint().width() + 6
         if not self.navigation_button.isHidden():
             utility_width += self.navigation_button.sizeHint().width() + 6
         self.utility_rail.setMinimumWidth(0 if stacked else utility_width)
@@ -2080,11 +2071,6 @@ class RadioControlPanel(QWidget):
             return
         self._minimized = minimized
         self._expand_action.setText("Expand controls" if minimized else "Collapse controls")
-        set_widget_value(self.controls_button, "text", "Controls ▾" if minimized else "Controls ▴")
-        self.controls_button.setChecked(not minimized)
-        self.controls_button.setAccessibleName("Expand radio controls" if minimized else "Collapse radio controls")
-        self.controls_button.setToolTip("Show Hold duration, Hold/Resume and SOP actions for each radio." if minimized else
-                                       "Collapse operational controls; keep radio and application activity visible.")
         self.setProperty("minimized", minimized)
         self.minimized_changed.emit(minimized)
         for card in self._cards.values():

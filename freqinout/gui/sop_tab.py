@@ -793,6 +793,8 @@ class _LegacySOPTab(QWidget):
         self._hf_schedule_slots_index = {}
 
     def _load_local_net_profiles_from_data(self, data: Dict[str, Any]) -> None:
+        from freqinout.core.local_group_frequency import normalize_local_profile
+
         local_profiles = data.get("local_net_profiles", [])
         self._local_net_profiles = []
         if isinstance(local_profiles, list):
@@ -802,15 +804,7 @@ class _LegacySOPTab(QWidget):
                 group = str(raw.get("group", raw.get("name", "")) or "").strip()
                 if not group:
                     continue
-                self._local_net_profiles.append(
-                    {
-                        "group": group,
-                        "resource": str(raw.get("resource", raw.get("service", "")) or "").strip(),
-                        "mode": str(raw.get("mode", "") or "").strip(),
-                        "target": str(raw.get("target", "") or "").strip(),
-                        "notes": str(raw.get("notes", "") or "").strip(),
-                    }
-                )
+                self._local_net_profiles.append(normalize_local_profile(raw, default_resource=""))
         self._local_net_profiles = sorted(
             self._local_net_profiles,
             key=lambda x: (
@@ -858,7 +852,11 @@ class _LegacySOPTab(QWidget):
     def _set_save_dirty(self, dirty: bool) -> None:
         self._dirty = bool(dirty)
         self._update_profile_action_styles()
-        self._update_summary_status()
+        # Only the current workbench adds the summary surface; the retained
+        # legacy editor still supports dirty tracking without that surface.
+        update_summary = getattr(self, '_update_summary_status', None)
+        if callable(update_summary):
+            update_summary()
 
     def _mark_dirty(self, *_args) -> None:
         if self._loading_ui:
@@ -5129,9 +5127,18 @@ class SOPTab(_LegacySOPTab):
         if hasattr(self, "sop_delete_action"):
             self.sop_delete_action.setEnabled(bool(self._selected_profile_id))
 
+    def _choose_local_frequency_reference(self, parent):
+        from freqinout.core.known_operating_groups import net_resources_db_path
+        from freqinout.core.resource_catalog_store import ResourceCatalogStore
+        from freqinout.gui.resource_picker import choose_frequency_resource
+        return choose_frequency_resource(ResourceCatalogStore(net_resources_db_path()), parent)
+
     def _summary_editor_options(self, row: int) -> Dict[str, Any]:
         """Copy loaded choices only; opening/editing an action never queries a source."""
         options: Dict[str, Any] = {"category": self._current_category()}
+        if self._current_category() == self.CAT_LOCAL:
+            options["choose_frequency_reference"] = self._choose_local_frequency_reference
+            options["local_frequency_profiles"] = [dict(profile) for profile in self._local_net_profiles]
         for field, column in (("group_name", self.COL_GROUP), ("software", self.COL_RESOURCE),
                               ("mode", self.COL_MODE), ("contact_target", self.COL_CONTACT_TARGET)):
             values = []
@@ -5140,6 +5147,23 @@ class SOPTab(_LegacySOPTab):
                 if isinstance(combo, QComboBox):
                     values.extend(combo.itemText(i) for i in range(combo.count()))
             options[field] = list(dict.fromkeys(values))
+        if self._current_category() == self.CAT_LOCAL:
+            group_resources: Dict[str, List[str]] = {}
+            for profile in self._local_net_profiles:
+                group = str(profile.get("group") or "").strip()
+                resource = str(profile.get("resource") or "").strip()
+                mode = str(profile.get("mode") or "").strip()
+                if group and group not in options["group_name"]:
+                    options["group_name"].append(group)
+                if resource and resource not in options["software"]:
+                    options["software"].append(resource)
+                if mode and mode not in options["mode"]:
+                    options["mode"].append(mode)
+                if group and resource:
+                    resources = group_resources.setdefault(group.upper(), [])
+                    if resource not in resources:
+                        resources.append(resource)
+            options["local_group_resources"] = group_resources
         options["condition_levels"] = ["ALL", "1", "2", "3", "4", "5"]
         options["operating_groups"] = [dict(row) for row in self._operating_groups if isinstance(row, dict)]
         options["band"] = list(self.BAND_CHOICES) if self._current_category() == self.CAT_HF else []

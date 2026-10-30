@@ -229,7 +229,9 @@ def stable_application_system_key(owner_draft_key: object, family_key: object) -
     return f"{family}-instance-{digest}"
 
 
-def _normalized_identity(family_key: object, row: Mapping[str, Any]) -> dict[str, Any]:
+def _normalized_identity(
+    family_key: object, row: Mapping[str, Any], *, supplied_values: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     family = _family(family_key)
     aliases = {
         "host": ("host", "flrig_host", "fldigi_host"),
@@ -258,6 +260,11 @@ def _normalized_identity(family_key: object, row: Mapping[str, Any]) -> dict[str
     result: dict[str, Any] = {"family_key": family}
     for name in _IDENTITY_FIELDS[family]:
         candidates = aliases.get(name, (name,))
+        if supplied_values is not None:
+            for key in candidates:
+                if key in row:
+                    supplied_values[name] = row[key]
+                    break
         value: Any = ""
         for candidate in candidates:
             if row.get(candidate) not in (None, ""):
@@ -292,7 +299,35 @@ def _snapshot_row(
     *,
     linked_ids: frozenset[int] | None = None,
 ) -> dict[str, Any]:
-    normalized = _normalized_identity(family, row)
+    supplied_values: dict[str, Any] = {}
+    normalized = _normalized_identity(family, row, supplied_values=supplied_values)
+    # Normalization defaults are identity evidence, not operator-requested
+    # clears. Preserve which suggestion values were actually supplied.
+    if "_suggestion_values" in row:
+        supplied_values = dict(row["_suggestion_values"])
+    elif "_suggestion_fields" in row:
+        supplied_values = {key: normalized[key] for key in row["_suggestion_fields"] if key in normalized}
+    elif "name" in row or "instance_name" in row:
+        supplied_values["name"] = row.get("name", row.get("instance_name"))
+    for field in ("directed_path", "all_path", "inbox_path", "storage_mode", "suggestion_kind"):
+        if field in row:
+            normalized[field] = _text(row[field])
+            supplied_values[field] = normalized[field]
+    if family == "fast_light":
+        # Executables are shareable discovery evidence, separate from the
+        # existing locked instance identity. Keep them through classification
+        # so component pickers can offer FLMsg/FLAmp as well as FLRig/FLDigi.
+        component_paths = row.get("component_paths")
+        component_paths = component_paths if isinstance(component_paths, Mapping) else {}
+        for component in ("flrig", "fldigi", "flmsg", "flamp"):
+            path = _text(row.get(f"{component}_application_path") or row.get(f"{component}_path")
+                         or component_paths.get(component))
+            if path or f"{component}_application_path" in row or f"{component}_path" in row:
+                normalized[f"{component}_application_path"] = path
+                field = f"{component}_application_path"
+                supplied_values[field] = _text(row[field]) if field in row else path
+    normalized["_suggestion_fields"] = tuple(sorted(supplied_values))
+    normalized["_suggestion_values"] = tuple(sorted(supplied_values.items()))
     complete, completeness_reasons = _complete_identity(family, row, normalized)
     linked = _linked_to_radio(row, linked_ids)
     retained = bool(_text(row.get("owner_draft_key")) or _text(row.get("draft_instance_key")))

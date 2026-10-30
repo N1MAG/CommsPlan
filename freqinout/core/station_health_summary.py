@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 
@@ -115,6 +116,27 @@ def _is_js8_diagnostic_only(key: str, metadata: Mapping[str, object]) -> bool:
 
 def _js8_capability_mode(metadata: Mapping[str, object]) -> str:
     return str(metadata.get("capability_mode", "") or metadata.get("mode", "") or "").strip().lower()
+
+
+def _js8_observed_identity(metadata: Mapping[str, object]) -> str:
+    """Describe API version evidence without inferring an edition from a number."""
+    version = str(metadata.get("version", "") or "").strip()
+    configured = str(metadata.get("configured_family") or "").strip().lower()
+    labels = {"js8call_subspace_4_1": "JS8Call · Subspace Edition",
+              "js8call_improved_3_0_3": "JS8Call Improved", "js8call_2_2": "JS8Call 2.2"}
+    expected = labels.get(configured, "")
+    expectation = f"Configured: {expected} · identity unverified. " if expected else ""
+    if not version:
+        return expectation.strip()
+    observed = ("JS8Call · Subspace Edition" if re.search(r"\bsubspace\b", version, re.IGNORECASE)
+                else "JS8Call Improved" if re.search(r"\bimproved\b", version, re.IGNORECASE)
+                else "JS8Call 2.2" if re.search(r"\bjs8call\s+2\.2\b", version, re.IGNORECASE)
+                else "")
+    if expected and observed and expected != observed:
+        return f"Configured {expected} differs from observed {observed} ({version}). Review this instance's application settings."
+    if observed:
+        return f"Observed: {observed} ({version})."
+    return expectation + f"Observed version: {version} · edition unverified."
 
 
 def _is_ingest_source_health_snapshot(
@@ -240,11 +262,39 @@ def _scope_from_metadata(metadata: Mapping[str, object]) -> str:
     return identity.replace("radio_", "Radio ") if identity else "Station-wide"
 
 
+def _radio_identity_fields(metadata: Mapping[str, object]) -> Dict[str, object]:
+    """Keep repair identity separate from a mutable or shared display scope."""
+    identities: set[int] = set()
+    supplied = False
+    for key in ("device_profile_id", "radio_id", "profile_id", "radio_profile_id", "radio_ids", "device_profile_ids"):
+        raw = metadata.get(key)
+        if raw is None or raw == "":
+            continue
+        supplied = True
+        values = raw if isinstance(raw, (list, tuple, set)) else (raw,)
+        for value in values:
+            if isinstance(value, bool):
+                continue
+            text = str(value or "").strip().removeprefix("radio_")
+            try:
+                ident = int(text)
+            except (TypeError, ValueError):
+                continue
+            if ident > 0:
+                identities.add(ident)
+    if not supplied:
+        return {}
+    return {"radio_id": next(iter(identities)) if len(identities) == 1 else "",
+            "radio_ids": tuple(sorted(identities)),
+            "radio_identity_unresolved": len(identities) != 1}
+
+
 def _item_from_snapshot(
     key: str,
     snapshot: Mapping[str, object],
     *,
     scope_resolver: Optional[ScopeResolver] = None,
+    identity_resolver: Optional[Callable[[str], Mapping[str, object]]] = None,
     now: Optional[float] = None,
 ) -> Dict[str, object]:
     metadata = snapshot.get("metadata", {})
@@ -280,7 +330,14 @@ def _item_from_snapshot(
         or slow > 0
         or bool(last_error)
     )
-    if js8_diagnostic_only:
+    if metadata.get("hearing_state"):
+        severity = "info"
+        state = {"supported": "Available", "unavailable": "Unavailable", "inaccessible": "Not available", "incompatible": "Incompatible response", "partial": "Partial"}.get(
+            str(metadata.get("hearing_state")), "Unknown")
+        action = str(metadata.get("hearing_detail") or "Optional hearing evidence not available")
+        warning = False
+        backoff = False
+    elif js8_diagnostic_only:
         severity = "info"
         state = "Diagnostic"
         action = "Native JS8Call diagnostic differs from the existing JS8 path; CommsPlan is still using the existing path."
@@ -349,6 +406,10 @@ def _item_from_snapshot(
         action_override = "JS8Call status check failed: " + _shorten_error(last_error)
     if action_override and not fldigi_busy_check and (not scheduler_hold or active_scheduler_hold):
         action = action_override
+    if service == "js8call":
+        observed_identity = _js8_observed_identity(metadata)
+        if observed_identity:
+            action = f"{action} {observed_identity}"
     scope = ""
     if scope_resolver is not None:
         try:
@@ -357,8 +418,15 @@ def _item_from_snapshot(
             scope = ""
     if not scope:
         scope = _scope_from_metadata(metadata)
+    identity = _radio_identity_fields(metadata)
+    if not identity and identity_resolver is not None:
+        try:
+            identity = _radio_identity_fields(identity_resolver(str(key or "")))
+        except Exception:
+            identity = {}
     return {
         "key": str(key or ""),
+        **identity,
         "scope": scope,
         "dependency": _dependency_label(str(key or ""), owner),
         "state": state,
@@ -379,13 +447,13 @@ def _item_from_snapshot(
 
 def _collapse_background_ingest_ok_items(items: List[Dict[str, object]]) -> List[Dict[str, object]]:
     collapsed: List[Dict[str, object]] = []
-    groups: Dict[str, List[Dict[str, object]]] = {}
+    groups: Dict[tuple[str, object], List[Dict[str, object]]] = {}
     for item in items:
         if item.get("group") == "background_ingest" and not item.get("is_issue"):
-            groups.setdefault(str(item.get("scope", "") or "Station-wide"), []).append(item)
+            groups.setdefault((str(item.get("scope", "") or "Station-wide"), item.get("radio_id", "")), []).append(item)
         else:
             collapsed.append(item)
-    for scope, group_items in groups.items():
+    for (scope, _radio_id), group_items in groups.items():
         if not group_items:
             continue
         latest = max(group_items, key=lambda item: _float_value(item.get("last_check_ts")))
@@ -403,8 +471,13 @@ def _collapse_background_ingest_ok_items(items: List[Dict[str, object]]) -> List
 def _merge_equivalent_endpoint_items(items: List[Dict[str, object]]) -> List[Dict[str, object]]:
     severity_rank = {"danger": 0, "warning": 1, "info": 2, "ok": 3}
     merged: Dict[str, Dict[str, object]] = {}
+    owners: Dict[str, set[int]] = {}
+    unresolved: Dict[str, bool] = {}
     for item in items:
-        key = _canonical_endpoint_key(item.get("key", ""))
+        raw_key = str(item.get("key", "") or "")
+        key = raw_key.lower() if ":hearing:" in raw_key.lower() else _canonical_endpoint_key(raw_key)
+        owners.setdefault(key, set()).update(_radio_identity_fields(item).get("radio_ids", ()))
+        unresolved[key] = unresolved.get(key, False) or bool(item.get("radio_identity_unresolved"))
         existing = merged.get(key)
         if existing is None:
             merged[key] = item
@@ -427,7 +500,69 @@ def _merge_equivalent_endpoint_items(items: List[Dict[str, object]]) -> List[Dic
             existing.get("last_check_ts")
         ):
             merged[key] = item
-    return list(merged.values())
+    result = []
+    for key, item in merged.items():
+        row = dict(item)
+        if owners[key]:
+            row.update(_radio_identity_fields({"radio_ids": owners[key]}))
+        if unresolved[key]:
+            row.update(radio_id="", radio_identity_unresolved=True)
+        result.append(row)
+    return result
+
+
+def attach_hearing_to_runtime_sources(rows: Iterable[Mapping[str, object]],
+                                      registry: Mapping[str, object]) -> tuple[Dict[str, object], ...]:
+    """Join cached hearing evidence only to the matching API source identity."""
+    hearing = []
+    for key, raw in registry.items():
+        key = str(key or "")
+        if ":hearing:" not in key.lower() or not isinstance(raw, Mapping):
+            continue
+        meta = raw.get("metadata")
+        if not isinstance(meta, Mapping) or not meta.get("hearing_state"):
+            continue
+        endpoint, _, key_instance = key.rpartition(":hearing:")
+        instance = str(meta.get("js8_instance_id") or "").strip()
+        radio = str(meta.get("source_radio_id") or "").strip()
+        config_key = str(meta.get("hearing_configuration_key") or "").strip()
+        if (not instance or not radio or key_instance not in {instance, f"{instance}:{radio}"}
+                or str(meta.get("radio_id") or "").strip() != radio
+                or not config_key
+                or _int_value(meta.get("generation")) <= 0):
+            continue
+        hearing.append((_canonical_endpoint_key(endpoint), radio, instance, config_key, raw, meta))
+    result = []
+    for source in rows:
+        row = dict(source)
+        metadata = row.get("metadata")
+        metadata = dict(metadata) if isinstance(metadata, Mapping) else {}
+        endpoint = str(row.get("location") or "").strip()
+        radio = str(row.get("radio_id") or "").strip()
+        instance = str(metadata.get("js8_instance_id") or "").strip()
+        config_key = str(metadata.get("hearing_configuration_key") or "").strip()
+        if metadata.get("role") == "api" and endpoint and radio and instance and config_key:
+            wanted = (_canonical_endpoint_key("js8call:" + endpoint), radio, instance, config_key)
+            matches = [entry for entry in hearing if entry[:4] == wanted]
+            if len(matches) == 1:
+                _, _, _, _, raw, meta = matches[0]
+                state = str(meta.get("hearing_state") or "unknown")
+                if ("subspace" not in str(meta.get("configured_family") or "").lower()
+                        and "subspace" not in str(meta.get("version") or "").lower()
+                        and state not in {"supported", "partial"}):
+                    continue  # Don't add optional Subspace noise to standard JS8.
+                states = {"supported": "Available", "unavailable": "Unavailable",
+                          "inaccessible": "Not available", "incompatible": "Incompatible response",
+                          "partial": "Partial"}
+                metadata["hearing_summary"] = "Subspace hearing: " + states.get(state, "Unknown")
+                metadata["hearing_detail"] = str(meta.get("hearing_detail") or "Optional hearing evidence not available")
+                if meta.get("event_history_gap"):
+                    metadata["hearing_detail"] += "; polling event backlog dropped; correlated hearing snapshot intact"
+                metadata["hearing_identity"] = _js8_observed_identity(meta)
+                metadata["hearing_checked"] = _format_age(raw.get("last_checked_ts"))
+        row["metadata"] = metadata
+        result.append(row)
+    return tuple(result)
 
 
 def _observability_item(
@@ -440,9 +575,11 @@ def _observability_item(
     action: str,
     last_issue: str = "",
     is_issue: bool = False,
+    radio_id: object = None,
 ) -> Dict[str, object]:
     return {
         "key": key,
+        **_radio_identity_fields({"radio_id": radio_id}),
         "scope": scope,
         "dependency": dependency,
         "state": state,
@@ -543,6 +680,7 @@ def assigned_schedule_observability_items(assignments: Sequence[Mapping[str, obj
                 action="Review assigned Frequency Plan before schedule changes",
                 last_issue=f"{label}: {detail}" if label else detail,
                 is_issue=True,
+                radio_id=raw.get("device_profile_id"),
             )
         )
     return items
@@ -991,6 +1129,7 @@ def summarize_station_health(
     include_ok: bool = True,
     include_scheduler_events: bool = False,
     scope_resolver: Optional[ScopeResolver] = None,
+    identity_resolver: Optional[Callable[[str], Mapping[str, object]]] = None,
     extra_items: Optional[Iterable[Mapping[str, object]]] = None,
 ) -> Dict[str, object]:
     """
@@ -1013,7 +1152,7 @@ def summarize_station_health(
     for key, raw_snapshot in iterable:
         if not isinstance(raw_snapshot, Mapping):
             continue
-        item = _item_from_snapshot(str(key or ""), raw_snapshot, scope_resolver=scope_resolver, now=now)
+        item = _item_from_snapshot(str(key or ""), raw_snapshot, scope_resolver=scope_resolver, identity_resolver=identity_resolver, now=now)
         items.append(item)
     for raw_item in extra_items or ():
         if not isinstance(raw_item, Mapping):

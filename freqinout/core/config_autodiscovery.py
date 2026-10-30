@@ -1228,6 +1228,8 @@ def _target_type(path: Path) -> str:
         return "app_bundle"
     if path.suffix.lower() in {".exe", ".bat", ".cmd", ".sh"}:
         return "file"
+    if path.is_file():
+        return "file"
     if path.is_dir():
         return "directory"
     return "file" if path.name and "." in path.name else "directory"

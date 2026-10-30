@@ -16,9 +16,49 @@ from freqinout.core.operator_application_configuration import (
 RADIO_FIELDS = frozenset(('name','radio_catalog_id','radio_manufacturer','radio_model','device_class','control_backend','flrig_host','flrig_port',
     'rig_host','rig_port',
     'antenna_group','antenna_supported_bands','notes','rf_conflict_group','ptt_group','sdr_host','sdr_port',
-    'sdr_adapter','sdr_target','sdr_control_enabled',
+    'sdr_application','sdr_adapter','sdr_target','sdr_control_enabled',
+    'sdr_verification_state','sdr_verification_json',
     'use_flrig','use_fldigi','use_flmsg','use_flamp','use_js8call','use_varac','use_js8spotter',
     'use_external_js8spotter','use_commstat'))
+
+
+def receiver_launch_selection(bundle):
+    """Project the editor-owned fields without adopting any runtime authority."""
+    row = next((i for i in bundle.get('items', ()) if i.get('instance_key') == 'receiver:sdrpp'), {})
+    return dict(name='SDR++', enabled=bool(row.get('enabled', False)),
+                startup=bool(row.get('launch_at_startup', False)),
+                launch_path_override=str(row.get('path_override') or ''),
+                launch_command_override=str(row.get('command_override') or ''))
+
+
+def _save_receiver_launch(conn, store, radio_id, selection, *, enable_startup=False):
+    # Update only the canonical row; peer slots and extension policy are untouched.
+    from freqinout.core.receiver_software_stack import build_receiver_launch_items
+    item = build_receiver_launch_items({'device_class': 'observer'}, [selection])[0]
+    conn.execute("""INSERT INTO radio_launch_bundles
+        (radio_profile_id,schema_version,launch_enabled,migrated_from_legacy,updated_utc)
+        VALUES (?,1,?,0,strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        ON CONFLICT(radio_profile_id) DO UPDATE SET
+        launch_enabled=CASE WHEN excluded.launch_enabled=1 THEN 1 ELSE launch_enabled END,
+        updated_utc=excluded.updated_utc""", (radio_id, int(enable_startup)))
+    row = conn.execute("SELECT readiness_json FROM radio_launch_bundle_items WHERE radio_profile_id=? AND instance_key='receiver:sdrpp'", (radio_id,)).fetchone()
+    readiness = json.loads(row['readiness_json'] or '{}') if row else {}
+    readiness.update(execution_scope='receive_only')
+    readiness.setdefault('readiness', 'process')
+    conn.execute("""INSERT INTO radio_launch_bundle_items
+        (radio_profile_id,instance_key,app_name,display_order,enabled,launch_at_startup,
+         monitor_health,command_override,path_override,dependencies_json,readiness_json,updated_utc)
+        VALUES (?,'receiver:sdrpp','SDR++',
+        (SELECT COALESCE(MAX(display_order),-1)+1 FROM radio_launch_bundle_items WHERE radio_profile_id=?),
+        ?,?,1,?,?,'[]',?,strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        ON CONFLICT(radio_profile_id,instance_key) DO UPDATE SET
+        enabled=excluded.enabled,launch_at_startup=excluded.launch_at_startup,
+        command_override=excluded.command_override,path_override=excluded.path_override,
+        readiness_json=excluded.readiness_json,updated_utc=excluded.updated_utc""",
+        (radio_id,radio_id,int(item['enabled']),int(item['startup']),
+         item['launch_command_override'],item['launch_path_override'],json.dumps(readiness)))
+    if receiver_launch_selection(store.get_radio_launch_bundle(radio_id)) != selection:
+        raise ValueError('SDR++ launch settings readback did not match. Radio changes were not applied.')
 
 
 def normalize_supported_band(value):
@@ -38,12 +78,16 @@ def load_operator_radio_context(store, radio_id=None):
             if radio_id:
                 loaded = load_operator_application_context(store,{'radio_id':radio_id,'family_key':family})
                 apps[family] = {**loaded['current_values'],**loaded['context']}
+                apps[family]['_unfinished_application'] = load_unfinished_configuration(
+                    store, f'application:{radio_id}:{family}')
         assignment = store.get_effective_assignment_for_device(int(radio_id)) if radio_id else None
         plan = store.get_effective_assigned_plan_for_device(int(radio_id)) if radio_id else None
         profile['antenna_supported_bands'] = ', '.join(json.loads(profile.get('antenna_supported_bands_json') or '[]'))
         profile['_operating_profile_id'] = int((assignment or {}).get('operating_profile_id') or 0)
         profile['_schedule_plan_id'] = int((plan or {}).get('frequency_plan_id') or 0)
-        profile['_launch_snapshot'] = launch_configuration_token(store.get_radio_launch_bundle(int(radio_id))) if radio_id else {}
+        launch_bundle = store.get_radio_launch_bundle(int(radio_id)) if radio_id else {}
+        profile['_launch_snapshot'] = launch_configuration_token(launch_bundle) if radio_id else {}
+        profile['_receiver_launch'] = receiver_launch_selection(launch_bundle)
         profile['_identity_generation'] = store.radio_software_identity_generation(int(radio_id)) if radio_id else 0
         scope = f'radio:{radio_id or "new"}'
         response = dict(profile=profile,application_seeds=apps,operating_profiles=store.list_operating_profiles(),
@@ -55,7 +99,7 @@ def save_operator_radio(store,payload):
     # Runtime BBS/vault snapshots are not radio editor fields. Duplicating them
     # in base/proposed can exhaust the bounded unfinished-edit envelope.
     context_fields = {'id', *LINKS.values(), '_operating_profile_id', '_schedule_plan_id',
-                      '_identity_generation', '_launch_snapshot'}
+                      '_identity_generation', '_launch_snapshot', '_receiver_launch'}
     base = {key: deepcopy(value) for key, value in dict(payload.get('base') or {}).items()
             if key in RADIO_FIELDS or key in context_fields}
     if base.get('id') and '_launch_snapshot' in base:
@@ -63,9 +107,15 @@ def save_operator_radio(store,payload):
     radio_id = int(base.get('id') or 0) or None
     raw_values = deepcopy(dict(payload.get('values') or {}))
     proposed = {**deepcopy(base), **{key:value for key,value in raw_values.items() if key in RADIO_FIELDS}}
+    if isinstance(raw_values.get('__edited_fields__'), (list, tuple)):
+        # Draft-only provenance: canonical writes remain RADIO_FIELDS-only.
+        proposed['__edited_fields__'] = list(raw_values['__edited_fields__'])
     for field in ('name', 'notes'):
         if field in proposed:
             proposed[field] = str(proposed[field] or '').strip()
+    if 'sdr_verification_json' in proposed:
+        from freqinout.core.multi_radio_store import _coerce_json_object_text
+        proposed['sdr_verification_json'] = _coerce_json_object_text(proposed['sdr_verification_json'])
     for field in ('flrig_port','rig_port','sdr_port'):
         if proposed.get(field) not in ('',None):
             try:
@@ -86,6 +136,9 @@ def save_operator_radio(store,payload):
     proposed['_operating_profile_id'] = int(payload.get('operating_profile_id',base.get('_operating_profile_id',0)) or 0)
     proposed['_schedule_plan_id'] = int(payload.get('schedule_plan_id',base.get('_schedule_plan_id',0)) or 0)
     proposed['_identity_generation'] = base.get('_identity_generation',0)
+    selection = payload.get('receiver_launch')
+    if selection is not None:
+        proposed['_receiver_launch'] = deepcopy(selection)
     drafts = deepcopy(dict(payload.get('application_drafts') or {}))
     if (proposed.get('control_backend') == 'flrig' and proposed.get('use_flrig')
             and not proposed.get('fast_light_config_id') and 'fast_light' not in drafts
@@ -124,7 +177,8 @@ def save_operator_radio(store,payload):
 
     def read(conn):
         if published:
-            return {**proposed,**{key:saved_profile.get(key) for key in RADIO_FIELDS if key in proposed}}
+            return {**proposed,**{key:saved_profile.get(key) for key in RADIO_FIELDS if key in proposed},
+                    '_receiver_launch':receiver_launch_selection(store.get_radio_launch_bundle(radio_id))}
         if radio_id is None:
             return deepcopy(base)
         current = store.get_device_profile(radio_id)
@@ -137,7 +191,8 @@ def save_operator_radio(store,payload):
                 '_operating_profile_id':int((assignment or {}).get('operating_profile_id') or 0),
                 '_schedule_plan_id':int((plan or {}).get('frequency_plan_id') or 0),
                 '_identity_generation':store.radio_software_identity_generation(radio_id),
-                '_launch_snapshot':launch_configuration_token(store.get_radio_launch_bundle(radio_id))}
+                '_launch_snapshot':launch_configuration_token(store.get_radio_launch_bundle(radio_id)),
+                '_receiver_launch':receiver_launch_selection(store.get_radio_launch_bundle(radio_id))}
 
     corrections = []
     def validate(values):
@@ -146,6 +201,18 @@ def save_operator_radio(store,payload):
         def radio_issue(message, field):
             issues.append(message)
             corrections.append({'family':'radio','field':field,'message':message})
+        if selection is not None:
+            try:
+                from freqinout.core.receiver_software_stack import build_receiver_launch_items
+                if not isinstance(selection, dict) or selection.get('name') != 'SDR++':
+                    raise ValueError('Review the SDR++ launch settings.')
+                if selection.get('enabled') and not (selection.get('launch_path_override') or selection.get('launch_command_override')):
+                    raise ValueError('Choose an SDR++ application path or launch command, or turn off inclusion in Launch Control.')
+                if selection.get('startup') and not selection.get('enabled'):
+                    raise ValueError('Include SDR++ in Launch Control before selecting startup.')
+                build_receiver_launch_items(values, [selection])
+            except (ValueError, TypeError) as exc:
+                radio_issue(str(exc), '_receiver_launch')
         if invalid_bands:
             radio_issue('Review supported antenna bands on the Radio step. Unrecognized saved values: ' + ', '.join(invalid_bands), 'antenna_supported_bands')
         if values.get('control_backend','manual') not in SUPPORTED_DEVICE_CONTROL_BACKENDS:
@@ -167,6 +234,19 @@ def save_operator_radio(store,payload):
             selected = bool(values.get('use_js8call' if family == 'js8call' else 'use_varac')) if family != 'fast_light' else any(values.get(f'use_{key}') for key in ('flrig','fldigi','flmsg','flamp'))
             draft = drafts.get(family)
             if draft:
+                if radio_id:
+                    unfinished = load_unfinished_configuration(store, f'application:{radio_id}:{family}')
+                    previous = unfinished.get('payload') or {}
+                    replacement = draft.get('replace_saved_draft') or {}
+                    resolves_previous = (previous.get('session_id') in
+                                         {draft.get('operator_session_id'), draft.get('operator_recovered_from')}
+                                         or (replacement.get('revision') == unfinished['revision']
+                                             and replacement.get('session_id') == previous.get('session_id')))
+                    if previous and not resolves_previous:
+                        message = ('Previous unfinished application entries are available. Open this application, '
+                                   'then choose Recover or Use current entries instead before saving the radio.')
+                        issues.append(message)
+                        corrections.append({'family':family,'field':None,'message':message})
                 family_corrections = []
                 issues.extend(application_issues(family,draft['operator_values'], corrections=family_corrections))
                 corrections.extend({'family': family, **item} for item in family_corrections)
@@ -212,7 +292,9 @@ def save_operator_radio(store,payload):
             request['operator_launch_snapshot'] = launch_configuration_token(store.get_radio_launch_bundle(radio_id))
             result=save_operator_application(store,request)
             if result.state != 'saved':
-                raise ValueError('Application settings remain incomplete; the radio was not activated.')
+                detail = ' '.join(result.issues) or 'Review the application entries.'
+                corrections.append({'family':family,'field':None,'message':detail})
+                raise ValueError(f'{family.replace("_", " ")}: {detail} Radio changes were not applied.')
         # Explicit radio Use selections remain independent of app/startup state.
         flags={key:int(bool(values[key])) for key in RADIO_FIELDS if key.startswith('use_') and key in values}
         if flags:
@@ -253,6 +335,9 @@ def save_operator_radio(store,payload):
         component_flags={'JS8Call':'use_js8call','VarAC':'use_varac','FLRig':'use_flrig','FLDigi':'use_fldigi','FLMsg':'use_flmsg','FLAmp':'use_flamp','JS8Spotter':'use_external_js8spotter','CommStat':'use_commstat'}
         for name,flag in component_flags.items():
             family = 'js8call' if name == 'JS8Call' else 'varac' if name == 'VarAC' else 'fast_light' if name in {'FLRig','FLDigi','FLMsg','FLAmp'} else None
+            if (family not in drafts and bool(effective.get(flag)) == bool(base.get(flag))
+                    and (family not in LINKS or effective.get(LINKS[family]) == base.get(LINKS[family]))):
+                continue
             record = retained.get(family)
             if record is not None:
                 prefix = record.bundle_id + ':'
@@ -263,6 +348,9 @@ def save_operator_radio(store,payload):
                              (len(prefix),prefix,int(bool(effective.get(flag))),len(prefix),prefix,radio_id,name))
             else:
                 conn.execute('UPDATE radio_launch_bundle_items SET enabled=? WHERE radio_profile_id=? AND app_name=?',(int(bool(effective.get(flag))),radio_id,name))
+        if selection is not None:
+            _save_receiver_launch(conn, store, radio_id, values['_receiver_launch'],
+                                  enable_startup=bool(selection.get('startup') and not (base.get('_receiver_launch') or {}).get('startup')))
         # A radio save never opts into scheduling. Material changes revoke its
         # intent; the separate Review & enable transaction owns reenabling.
         if (set(changes) - {'id','name','notes','radio_catalog_id','radio_manufacturer','radio_model'}) or drafts or model != old_model or plan != old_plan:

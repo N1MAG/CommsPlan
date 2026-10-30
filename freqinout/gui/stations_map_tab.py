@@ -4568,6 +4568,14 @@ class StationsMapTab(QWidget):
         path_snapshot = self._map_path_snapshot(callsign)
         direct = str(path_snapshot.get("direct") or "").strip()
         relay = str(path_snapshot.get("relay") or "").strip()
+        from freqinout.core.subspace_hearing import hearing_summary, map_scope_allows
+        hearing = hearing_summary(callsign, self._operator_callsign_for_map_actions(),
+                                  band_filter=(self.band_combo.currentData() if getattr(self, "band_combo", None) is not None else None),
+                                  pair_allowed=lambda a, b: map_scope_allows(
+                                      self.operator_index, a, b, local_call=self._operator_callsign_for_map_actions(),
+                                      target=True, group=self._selected_map_group_filter(),
+                                      region=self._selected_map_region_filter()),
+                                  age=self._effective_path_recency_seconds()) if self._map_advanced_source_filter() in {"", "js8call", "hf_apps"} else ""
         relay_edges = path_snapshot.get("relay_edges")
         shared = path_snapshot.get("shared")
         shared_text = ""
@@ -4584,6 +4592,7 @@ class StationsMapTab(QWidget):
                 ("Best Relay", relay or "No relay chain found in this window"),
                 ("Relay Detail", relay_detail),
                 ("Shared Contacts", shared_text),
+                ("Subspace hearing", hearing),
                 ("Layer", "Showing" if bool(getattr(self, "show_link_paths", False)) else "Hidden"),
                 ("Window", self._map_message_context_age_label(self._effective_path_recency_seconds())),
                 ("Scope", active_scope if mode != "off" else "Off"),
@@ -5587,6 +5596,24 @@ class StationsMapTab(QWidget):
         main_window = self._application_window()
         if main_window is None or not hasattr(main_window, "open_messages_section"):
             return
+        from copy import deepcopy
+        from freqinout.core.subspace_hearing import compose_hearing_context, hearing_cache, map_scope_allows
+        payload_snapshot = deepcopy(dict(getattr(self, "_map_selected_payload", {}) or {}))
+        combo = getattr(self, "band_combo", None)
+        recency_reader = getattr(self, "_effective_path_recency_seconds", None)
+        age = int(recency_reader() if callable(recency_reader) else getattr(self, "recency_seconds", 0) or 1800)
+        source_reader = getattr(self, "_map_advanced_source_filter", lambda: "")
+        local_reader = getattr(self, "_operator_callsign_for_map_actions", lambda: "")
+        group_reader = getattr(self, "_selected_map_group_filter", lambda: "")
+        region_reader = getattr(self, "_selected_map_region_filter", lambda: "")
+        hearing_context = compose_hearing_context(
+            callsign, age=age or 1800,
+            band_filter=combo.currentData() if combo is not None else None,
+            pair_allowed=lambda a, b: map_scope_allows(
+                getattr(self, "operator_index", {}), a, b, local_call=local_reader(),
+                target=True, group=group_reader(), region=region_reader(),
+                reachable=(getattr(self, "_now_reachable_callsigns", set())
+                           if getattr(self, "_now_reachable_enabled", False) else None))) if source_reader() in {"", "js8call", "hf_apps"} else {}
         try:
             main_window.open_messages_section("compose")
         except Exception as exc:
@@ -5599,7 +5626,7 @@ class StationsMapTab(QWidget):
             if tab is None:
                 return
             try:
-                payload = dict(getattr(self, "_map_selected_payload", {}) or {})
+                payload = payload_snapshot
                 rows = self._map_payload_rows(payload)
                 intent = {
                     "source": "map",
@@ -5612,6 +5639,12 @@ class StationsMapTab(QWidget):
                     "last_heard_age_label": str(rows.get("js8 heard") or rows.get("updated") or ""),
                     "age_filter_seconds": int(getattr(self, "recency_seconds", 0) or 0),
                 }
+                intent.update(hearing_context)
+                evidence = intent.get("subspace_hearing_evidence")
+                if evidence and (evidence["generation"] != hearing_cache.generation or time.time() > evidence["expires_ts"]):
+                    evidence = dict(evidence, stale=True)
+                    intent["subspace_hearing_evidence"] = evidence
+                    intent["source_label"] = "Hearing context changed · review map evidence"
                 intent = compose_intent_from_mapping(intent).as_dict()
                 prefill = getattr(tab, "prefill_compose_intent", None)
                 if callable(prefill):
@@ -8231,7 +8264,32 @@ class StationsMapTab(QWidget):
             links.append({**record, "lat1": first[0], "lon1": first[1], "lat2": last[0], "lon2": last[1]})
         return links
 
-    def _load_js8_links(
+    def _load_js8_links(self, band_filter=None, my_call="", link_selection=None,
+                        relay_target=None, group_filter="", region_filter="",
+                        reachable_callsigns=None, max_age_sec=None):
+        from freqinout.core.subspace_hearing import map_hearing_links, map_scope_allows
+        links, stats = self._load_legacy_js8_links(
+            band_filter=band_filter, my_call=my_call, link_selection=link_selection,
+            relay_target=relay_target, group_filter=group_filter, region_filter=region_filter,
+            reachable_callsigns=reachable_callsigns, max_age_sec=max_age_sec)
+        positions = {p.callsign.upper(): (p.lat, p.lon) for p in self._station_points_for_map()}
+        mode, station = link_selection or ("off", "")
+
+        def pair_allowed(origin, destination):
+            return map_scope_allows(self.operator_index, origin, destination,
+                                    local_call=my_call, mode=mode, station=station,
+                                    target=bool(relay_target), group=group_filter,
+                                    region=region_filter, reachable=reachable_callsigns)
+
+        native = map_hearing_links(positions, local_call=my_call, target=relay_target or "",
+                                   mode=mode, station=station, band_filter=band_filter,
+                                   age=max_age_sec or 1800, pair_allowed=pair_allowed)
+        # Without a shared native/log event ID there is no proof of common
+        # origin. Preserve separately labeled evidence, never boost confidence.
+        links.extend(native)
+        return links, stats
+
+    def _load_legacy_js8_links(
         self,
         band_filter=None,
         my_call: str = "",
@@ -14785,7 +14843,10 @@ class StationsMapTab(QWidget):
             else selection
         )
 
+        from freqinout.core.subspace_hearing import hearing_cache
+        hearing_sig = hearing_cache.signature(age=self._effective_path_recency_seconds() or 1800)
         map_input_sig = (
+            hearing_sig,
             config_sig,
             bool(self._links_active()),
             bool(sitrep_mode),

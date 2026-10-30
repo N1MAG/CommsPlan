@@ -92,33 +92,7 @@ from freqinout.gui.theme import (
     style_splitter_handles,
 )
 
-CURRENT_CHECKIN_FILE_NAMES = {
-    "TFC": "CheckIns_TFC.txt",
-    "QRU": "CheckIns_QRU.txt",
-    "LATE": "CheckIns_LATE.txt",
-    "ALL": "CheckIns_ALL.txt",
-}
-
-ROLE_CHECKIN_FILE_NAMES = {
-    "NCS": {
-        "TFC": "NCS_CheckIns_TFC.txt",
-        "QRU": "NCS_CheckIns_QRU.txt",
-        "LATE": "NCS_CheckIns_LATE.txt",
-        "ALL": "NCS_CheckIns_ALL.txt",
-        "ACK_PENDING": "NCS_ACK_Pending.txt",
-        "NEXT_TFC": "NCS_Next_TFC.txt",
-        "RELAYS": "NCS_CheckIns_Relays.txt",
-    },
-    "ANCS": {
-        "TFC": "ANCS_CheckIns_TFC.txt",
-        "QRU": "ANCS_CheckIns_QRU.txt",
-        "LATE": "ANCS_CheckIns_LATE.txt",
-        "ALL": "ANCS_CheckIns_ALL.txt",
-        "ACK_PENDING": "ANCS_ACK_Pending.txt",
-        "NEXT_TFC": "ANCS_Next_TFC.txt",
-        "RELAYS": "ANCS_CheckIns_Relays.txt",
-    },
-}
+from freqinout.core.ncs_record_files import CURRENT_CHECKIN_FILE_NAMES, ROLE_CHECKIN_FILE_NAMES, generated_checkin_paths
 
 ACTION_SCOPES = ("NCS", "ANCS", "SHARED", "ALL")
 
@@ -164,9 +138,11 @@ class FldigiNetControlTab(QWidget):
     COL_NOTES = 10
     COL_ROLE = 11
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, preparation_settings=None):
         super().__init__(parent)
-        self.settings = SettingsManager()
+        self._preparation_shell = preparation_settings is not None
+        self._preparation_scope = None
+        self.settings = preparation_settings if preparation_settings is not None else SettingsManager()
 
         self._net_in_progress = False
         self._net_start_utc: Optional[str] = None
@@ -229,16 +205,24 @@ class FldigiNetControlTab(QWidget):
 
         self._build_ui()
         self._apply_theme()
-        self._load_settings()
-        self._load_known_operators()
-        self._setup_timers()
-        self._refresh_qsy_options()
+        if not self._preparation_shell:
+            self._load_settings()
+            self._load_known_operators()
+            self._setup_timers()
+            self._refresh_qsy_options()
         self._set_net_button_styles(active=False)
         self._sync_roster_action_scope_to_role(force=True)
+        from freqinout.gui.net_prepared_receiver import PreparedReceiver
+        self._prepared_receiver = PreparedReceiver(self, "FLDIGI", writer=getattr(preparation_settings, "writer", None))
 
     # ---------------- UI BUILD ---------------- #
 
     def _ncs_radio_profiles(self) -> List[Dict]:
+        scope = getattr(self, "_preparation_scope", None)
+        if scope is not None:
+            return [scope.settings().get('_preparation_profile', {'id': scope.radio_id, 'name': scope.radio_name})]
+        if getattr(self, "_preparation_shell", False):
+            return []
         try:
             profiles = MultiRadioStore().list_runtime_active_device_profiles()
         except Exception as exc:
@@ -259,6 +243,11 @@ class FldigiNetControlTab(QWidget):
         return str(profile.get("name") or profile.get("label") or f"Radio {profile.get('id', '')}").strip()
 
     def _ncs_selected_radio_id(self, profiles: List[Dict]) -> int:
+        scope = getattr(self, "_preparation_scope", None)
+        if scope is not None:
+            return scope.radio_id
+        if getattr(self, "_preparation_shell", False):
+            return 0
         ids = {int(p.get("id", 0) or 0) for p in profiles}
         try:
             selected = int(getattr(self.window(), "_station_command_selected_profile_id", 0) or 0)
@@ -287,6 +276,9 @@ class FldigiNetControlTab(QWidget):
                 widget.deleteLater()
 
     def _select_ncs_radio_session(self, profile_id: int) -> None:
+        if getattr(self, "_preparation_scope", None) is not None:
+            self._prepared_receiver._set_status('Prepared', 'Keep the intended radio; review or cancel preparation before choosing another')
+            return
         if self._net_in_progress:
             return
         ident = int(profile_id or 0)
@@ -328,6 +320,8 @@ class FldigiNetControlTab(QWidget):
         try:
             write_ncs_session_snapshot(self.settings, self._current_ncs_session_snapshot(timing_state=timing_state))
         except Exception as exc:
+            if getattr(self, '_preparation_scope', None) is not None:
+                raise
             log.debug("FLDigi NCS: failed to persist session snapshot: %s", exc)
 
     def _refresh_ncs_session_context(self) -> None:
@@ -335,6 +329,7 @@ class FldigiNetControlTab(QWidget):
             return
         profiles = self._ncs_radio_profiles()
         selected_id = self._ncs_session_radio_id or self._ncs_selected_radio_id(profiles)
+        self._draft_radio_id = selected_id
         theme = resolve_theme(self.settings)
         self._clear_ncs_session_chip_layout()
         if not profiles:
@@ -458,6 +453,7 @@ class FldigiNetControlTab(QWidget):
             session_context_row.addWidget(btn)
         self.ncs_session_summary_label = QLabel("Session: Radio | FLDigi/SSB | NCS")
         self.ncs_session_summary_label.setWordWrap(True)
+        self.ncs_session_summary_label.setTextFormat(Qt.PlainText)
         session_layout.addLayout(session_context_row)
         session_layout.addWidget(self.ncs_session_summary_label)
 
@@ -1734,6 +1730,9 @@ class FldigiNetControlTab(QWidget):
         self._roster_action_scope = scope_key
         if user_selected:
             self._roster_action_scope_user_selected = True
+            receiver = getattr(self, '_prepared_receiver', None)
+            if receiver is not None:
+                receiver.edited()
         if hasattr(self, "roster_scope_buttons"):
             for key, button in self.roster_scope_buttons.items():
                 button.blockSignals(True)
@@ -3163,7 +3162,8 @@ class FldigiNetControlTab(QWidget):
             seen_normalized=getattr(self, "_log_assisted_seen_normalized", set()),
             last_tx_context=str(getattr(self, "_log_assisted_session_tx_context", "") or ""),
             include_tx_context=True,
-            lookup_identity=lookup_operator_identity,
+            lookup_identity=(lambda call: lookup_operator_identity(call, db_path=Path(self.settings.db_path).parent / 'freqinout_nets.db'))
+                            if getattr(self, '_preparation_scope', None) is not None else lookup_operator_identity,
         )
         self._log_assisted_session_offset = int(offset or 0)
         self._log_assisted_session_tx_context = str(tx_context or "")
@@ -3198,6 +3198,11 @@ class FldigiNetControlTab(QWidget):
         self._left_bucket_col.insertWidget(insert_at, widget)
 
     def _enabled_custom_bucket_mappings(self, role: Optional[str] = None) -> List[Dict[str, object]]:
+        if getattr(self, '_preparation_scope', None) is not None:
+            mappings = self._preparation_scope.settings().get('_preparation_macro_mappings', [])
+            active_role = normalize_role(role or self.role_combo.currentText())
+            return [dict(m) for m in mappings if str(m.get('function') or '').upper() == 'CUSTOM'
+                    and active_role != 'JOINER' and str(m.get('scope') or '').upper() in {active_role, 'SHARED'}]
         selected = self._selected_macro_profile_path()
         record = self._macro_profile_record(selected)
         mappings = record.get("mappings")
@@ -3219,6 +3224,10 @@ class FldigiNetControlTab(QWidget):
         return custom_mappings
 
     def _enabled_standard_roster_mappings(self, role: Optional[str] = None) -> List[Dict[str, object]]:
+        if getattr(self, '_preparation_scope', None) is not None:
+            mappings = self._preparation_scope.settings().get('_preparation_macro_mappings', [])
+            return [dict(m) for m in mappings if str(m.get('function') or '').upper()
+                    in {'TFC', 'QRU', 'LATE', 'ALL', 'ACK_PENDING', 'NEXT_TFC', 'RELAYS'} and m.get('source_file')]
         selected = self._selected_macro_profile_path()
         record = self._macro_profile_record(selected)
         mappings = record.get("mappings")
@@ -3289,15 +3298,24 @@ class FldigiNetControlTab(QWidget):
                 self._insert_left_bucket_widget(card)
             card.set_title(title)
             card.set_read_only(False)
-            if source_file:
+            if getattr(self, '_preparation_scope', None) is not None:
+                # Worker-published content only; role changes never erase entered
+                # bucket text or discover files on the Qt thread.
+                if not card.property('preparedBucketInitialized'):
+                    card.set_text(self._preparation_scope.settings().get('_preparation_custom_content', {}).get(source_file, ''))
+                    card.setProperty('preparedBucketInitialized', True)
+            elif source_file:
                 loaded_text = self._read_file(source_file)
                 card.set_text(loaded_text)
             else:
-                card.set_text("")
+                card.set_text('')
             self._custom_bucket_sources[bucket_id] = source_file
             card.setVisible(True)
             self._workspace_visible_bucket_ids.add(bucket_id)
 
+        receiver = getattr(self, '_prepared_receiver', None)
+        if receiver is not None:
+            receiver._connect_edits()
         for bucket_id in list(self._custom_bucket_cards.keys()):
             if bucket_id not in self._workspace_visible_bucket_ids:
                 self._custom_bucket_cards[bucket_id].setVisible(False)
@@ -3316,11 +3334,13 @@ class FldigiNetControlTab(QWidget):
         if role == "ANCS":
             self.partner_primary_label.setText("NCS Callsign:")
             self.partner_primary_btn.setText("Set NCS")
-            self.partner_primary_edit.setText(self._ncs_partner_call)
+            if not getattr(self, '_restoring_preparation', False):
+                self.partner_primary_edit.setText(self._ncs_partner_call)
         else:
             self.partner_primary_label.setText("ANCS Callsign:")
             self.partner_primary_btn.setText("Set ANCS")
-            self.partner_primary_edit.setText(self._ancs_partner_call)
+            if not getattr(self, '_restoring_preparation', False):
+                self.partner_primary_edit.setText(self._ancs_partner_call)
         self._update_partner_action_state()
         if hasattr(self, "_responsive_geometry_timer"):
             self._responsive_geometry_timer.start(0)
@@ -3900,7 +3920,8 @@ class FldigiNetControlTab(QWidget):
             self._workspace_visible_bucket_ids = set(visible_ids)
             self._workspace_visible_bucket_ids.add("roster")
             self._workspace_visible_bucket_ids.add("compare_results")
-            self._refresh_custom_bucket_cards(normalized)
+            if (not getattr(self, '_preparation_shell', False) or getattr(self, '_preparation_scope', None) is not None) and not getattr(self, '_restoring_preparation', False):
+                self._refresh_custom_bucket_cards(normalized)
             self._refresh_known_action_band(normalized)
             self._sync_compare_workspace_tabs()
             self._update_bucket_card_states()
@@ -3984,6 +4005,8 @@ class FldigiNetControlTab(QWidget):
             pass
 
     def on_settings_saved(self):
+        if getattr(self, "_preparation_shell", False):
+            return
         """
         Refresh QSY options when settings are saved.
         """
@@ -3996,6 +4019,8 @@ class FldigiNetControlTab(QWidget):
         return
 
     def on_tab_activated(self) -> None:
+        if getattr(self, "_preparation_shell", False):
+            return
         with perf_span("digi_ncs.on_tab_activated", settings=self.settings, min_ms=5.0):
             self._update_clock_labels()
             self._update_suspend_state()
@@ -4009,6 +4034,9 @@ class FldigiNetControlTab(QWidget):
         QTimer.singleShot(120, self._run_activation_secondary_refresh)
 
     def _run_activation_secondary_refresh(self) -> None:
+        if getattr(self, '_preparation_shell', False):
+            self._activation_secondary_refresh_pending = False
+            return
         if self._activation_secondary_refresh_inflight:
             self._activation_secondary_refresh_pending = False
             self._schedule_activation_secondary_refresh()
@@ -4022,7 +4050,14 @@ class FldigiNetControlTab(QWidget):
             self._activation_secondary_refresh_inflight = False
 
     def set_tab_active(self, active: bool) -> None:
+        receiver = getattr(self, '_prepared_receiver', None)
+        if not active and receiver is not None:
+            receiver.deactivate()
         self._active = bool(active)
+        if active and receiver is not None:
+            receiver.changed.emit()
+        if getattr(self, '_preparation_shell', False) and not self._net_in_progress:
+            return
         if self._active:
             if self._clock_timer and not self._clock_timer.isActive():
                 self._clock_timer.start(1000)
@@ -4078,6 +4113,12 @@ class FldigiNetControlTab(QWidget):
         return None
 
     def _operating_group_for_freq(self, freq_mhz: Optional[float]) -> str:
+        coordinator = getattr(self, '_prepared_receiver', None)
+        prepared = getattr(coordinator, 'prepared', None)
+        if prepared is not None:
+            if coordinator.manual:
+                return ''
+            return str(prepared.request.source.values.values().get('group_name') or '').strip().upper()
         if not freq_mhz:
             return ""
         ops = self._load_operating_groups()
@@ -4099,7 +4140,7 @@ class FldigiNetControlTab(QWidget):
         try:
             from freqinout.core.config_paths import get_config_dir
 
-            db_path = get_config_dir() / "config" / "freqinout_nets.db"
+            db_path = Path(self.settings.db_path).parent / 'freqinout_nets.db' if getattr(self, '_preparation_scope', None) is not None else get_config_dir() / 'config' / 'freqinout_nets.db'
         except Exception:
             return []
         if not db_path.exists():
@@ -4174,6 +4215,9 @@ class FldigiNetControlTab(QWidget):
             self.suspend_btn.setEnabled(True)
 
     def _perform_qsy(self, meta: Dict) -> bool:
+        if getattr(self, '_preparation_scope', None) is not None:
+            self._prepared_receiver._set_status('Prepared', 'Use the intended radio in the Station Control Bar to QSY')
+            return False
         win = self.window()
         return perform_qsy(win, meta)
 
@@ -4313,6 +4357,10 @@ class FldigiNetControlTab(QWidget):
                 pass
 
     def _on_suspend_clicked(self):
+        scope = getattr(self, '_preparation_scope', None)
+        if scope is not None:
+            self._prepared_receiver._set_status('Prepared', f'Use {scope.radio_name} in the Station Control Bar to QSY or set a hold')
+            return
         if self._suspend_active():
             # Resume immediately
             resume_schedule_hold(self.window(), self.settings)
@@ -4458,140 +4506,8 @@ class FldigiNetControlTab(QWidget):
         return f"Current Band: {details or '(unknown)'}"
 
     def _next_net_occurrence(self, row: Dict, now: datetime.datetime) -> Optional[Dict]:
-        """
-        Compute the next occurrence window for a net row, returning
-        start/end/window_start along with active flag.
-        """
-        def day_to_idx(day_name: str) -> Optional[int]:
-            names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-            try:
-                return names.index(day_name)
-            except ValueError:
-                return None
-
-        def parse_time(txt: str) -> Optional[datetime.time]:
-            try:
-                h, m = [int(x) for x in (txt or "").split(":")]
-                if 0 <= h <= 23 and 0 <= m <= 59:
-                    return datetime.time(hour=h, minute=m, tzinfo=datetime.timezone.utc)
-            except Exception:
-                return None
-            return None
-
-        def parse_month_weeks(txt: str) -> List[int]:
-            weeks: List[int] = []
-            for token in (txt or "").split(","):
-                token = token.strip()
-                if not token:
-                    continue
-                try:
-                    val = int(token)
-                except Exception:
-                    continue
-                if 1 <= val <= 5:
-                    weeks.append(val)
-            return sorted(set(weeks))
-
-        def nth_weekday_date(year: int, month: int, weekday_idx: int, nth: int) -> Optional[datetime.date]:
-            try:
-                first = datetime.date(year, month, 1)
-            except Exception:
-                return None
-            offset = (weekday_idx - first.weekday()) % 7
-            day = 1 + offset + (nth - 1) * 7
-            try:
-                return datetime.date(year, month, day)
-            except Exception:
-                return None
-
-        day_name = (row.get("day_utc") or "").strip()
-        day_idx = day_to_idx(day_name) if day_name else None
-        if day_idx is None:
-            return None
-        start_t = parse_time(row.get("start_utc", ""))
-        end_t = parse_time(row.get("end_utc", ""))
-        if start_t is None or end_t is None:
-            return None
-
-        recurrence = (row.get("recurrence") or "Weekly").strip()
-        if recurrence == "Monthly":
-            recurrence = "Periodic"
-        interval_weeks = 2 if recurrence == "Bi-Weekly" else 1
-        offset_weeks = int(row.get("biweekly_offset_weeks", 0) or 0)
-        early = int(row.get("early_checkin", 0) or 0)
-
-        if recurrence == "Daily":
-            start_dt = datetime.datetime.combine(now.date(), start_t)
-            end_dt = datetime.datetime.combine(now.date(), end_t)
-            if end_dt <= start_dt:
-                end_dt += datetime.timedelta(days=1)
-            if end_dt < now:
-                start_dt += datetime.timedelta(days=1)
-                end_dt += datetime.timedelta(days=1)
-            window_start = start_dt - datetime.timedelta(minutes=early)
-            active = window_start <= now < end_dt
-            return {
-                "start_dt": start_dt,
-                "end_dt": end_dt,
-                "window_start": window_start,
-                "active": active,
-                "row": row,
-            }
-
-        if recurrence == "Periodic":
-            weeks = parse_month_weeks(row.get("month_weeks", "")) or [1]
-            for month_offset in range(0, 13):
-                year = (now.year + (now.month - 1 + month_offset) // 12)
-                month = ((now.month - 1 + month_offset) % 12) + 1
-                for nth in weeks:
-                    occ_date = nth_weekday_date(year, month, day_idx, nth)
-                    if not occ_date:
-                        continue
-                    start_dt = datetime.datetime.combine(occ_date, start_t)
-                    end_dt = datetime.datetime.combine(occ_date, end_t)
-                    if end_dt <= start_dt:
-                        end_dt += datetime.timedelta(days=1)
-                    window_start = start_dt - datetime.timedelta(minutes=early)
-                    if end_dt < now:
-                        continue
-                    active = window_start <= now < end_dt
-                    return {
-                        "start_dt": start_dt,
-                        "end_dt": end_dt,
-                        "window_start": window_start,
-                        "active": active,
-                        "row": row,
-                    }
-            return None
-
-        today_idx = now.weekday()
-        days_ahead = (day_idx - today_idx) % 7
-        start_date = now.date() + datetime.timedelta(days=days_ahead)
-        start_dt = datetime.datetime.combine(start_date, start_t)
-        end_dt = datetime.datetime.combine(start_date, end_t)
-        if end_dt <= start_dt:
-            end_dt += datetime.timedelta(days=1)
-
-        if interval_weeks == 2:
-            start_dt += datetime.timedelta(weeks=offset_weeks)
-            end_dt += datetime.timedelta(weeks=offset_weeks)
-
-        interval = datetime.timedelta(weeks=interval_weeks)
-        for _ in range(3):  # safety loop to advance if end already passed
-            window_start = start_dt - datetime.timedelta(minutes=early)
-            if end_dt >= now:
-                active = window_start <= now < end_dt
-                return {
-                    "start_dt": start_dt,
-                    "end_dt": end_dt,
-                    "window_start": window_start,
-                    "active": active,
-                    "row": row,
-                }
-            start_dt += interval
-            end_dt += interval
-
-        return None
+        from freqinout.core.net_schedule_occurrences import next_net_occurrence
+        return next_net_occurrence(row, now)
 
     def _format_next_net_summary(self) -> str:
         occ = self._next_net_from_schedule()
@@ -4721,6 +4637,10 @@ class FldigiNetControlTab(QWidget):
         self._save_macro_profile_selection(path, refresh_metadata=True)
 
     def _refresh_setup_summary(self) -> None:
+        if getattr(self, '_preparation_shell', False) and getattr(self, '_preparation_scope', None) is None:
+            if hasattr(self, 'macro_profile_status'):
+                self.macro_profile_status.setText('Select a net and radio to review local setup.')
+            return
         if not hasattr(self, "macro_profile_details_btn"):
             return
         mode = self._macro_profile_mode()
@@ -5047,7 +4967,7 @@ class FldigiNetControlTab(QWidget):
         try:
             from freqinout.core.config_paths import get_config_dir
 
-            db_path = get_config_dir() / "config" / "freqinout_nets.db"
+            db_path = Path(self.settings.db_path).parent / 'freqinout_nets.db' if getattr(self, '_preparation_scope', None) is not None else get_config_dir() / 'config' / 'freqinout_nets.db'
         except Exception as e:
             log.error("Unable to resolve DB path for known operators: %s", e)
             return
@@ -5495,9 +5415,18 @@ class FldigiNetControlTab(QWidget):
             tmp.write_text(text, encoding="utf-8")
             tmp.replace(p)
         except Exception as e:
+            if getattr(self, '_preparation_scope', None) is not None:
+                raise
             log.error("Failed to write file %s: %s", path, e)
 
     def _resolve_checkin_dir(self) -> Path:
+        if getattr(self, '_preparation_shell', False) and getattr(self, '_preparation_scope', None) is None:
+            raise RuntimeError('Check-in records folder is not yet validated for the selected radio')
+        scope = getattr(self, '_preparation_scope', None)
+        if scope is not None:
+            if not scope.checkin_dir:
+                raise RuntimeError('Selected radio check-in records folder is not configured')
+            return Path(scope.checkin_dir)
         stored = (self.settings.get("fldigi_checkin_dir", "") or "").strip()
         if not stored:
             stored = str(get_fldigi_checkin_dir())
@@ -5594,6 +5523,52 @@ class FldigiNetControlTab(QWidget):
             log.info("Archived %d FLDigi check-in files to %s", len(archived), archive_dir)
         return archived
 
+    def _preserve_pre_start_files(self) -> Optional[Path]:
+        """Copy known surviving working records before a fresh session clears them."""
+        sources = list(self._generated_checkin_file_paths())
+        sources.extend(Path(str(mapping["source_file"]).strip())
+                       for mapping in self._enabled_standard_roster_mappings())
+        survivors = []
+        by_identity = {}
+        for source in sources:
+            source = Path(source).expanduser().absolute()
+            try:
+                stat = source.stat()
+            except FileNotFoundError:
+                continue
+            if not source.is_file():
+                raise OSError(f"Working record is not a file: {source}")
+            if not stat.st_size:
+                continue
+            identity = ("inode", stat.st_dev, stat.st_ino) if stat.st_ino else ("path", str(source.resolve()))
+            if identity in by_identity:
+                by_identity[identity]["sources"].append(str(source))
+                continue
+            entry = {"sources": [str(source)], "content": source.read_bytes()}
+            by_identity[identity] = entry
+            survivors.append(entry)
+        notes = self._roster_notes_archive_text()
+        if not survivors and not notes:
+            return None
+        archive = self._checkin_archive_dir() / (
+            "pre-start-" + datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%SZ")
+            + "-" + uuid.uuid4().hex
+        )
+        archive.mkdir(parents=True, exist_ok=False)
+        manifest = []
+        for index, entry in enumerate(survivors, 1):
+            name = f"{index:03d}-{Path(entry['sources'][0]).name}"
+            with (archive / name).open("xb") as target:
+                target.write(entry["content"])
+            manifest.append({"archive_file": name, "source_paths": entry["sources"]})
+        if notes:
+            with (archive / "roster-notes.txt").open("x", encoding="utf-8") as target:
+                target.write(notes)
+        with (archive / "manifest.json").open("x", encoding="utf-8") as target:
+            json.dump({"working_files": manifest, "roster_notes": bool(notes)}, target, indent=2)
+            target.write("\n")
+        return archive
+
     def _roster_notes_archive_text(self, *, net_name: str = "", archived_utc: str = "") -> str:
         note_rows = [row for row in self._roster_table_rows() if str(row.get("notes") or "").strip()]
         if not note_rows:
@@ -5632,12 +5607,26 @@ class FldigiNetControlTab(QWidget):
         return True
 
     def _start_net(self):
+        receiver = getattr(self, '_prepared_receiver', None)
+        if receiver is not None and receiver.prepared is not None and not receiver.dispatching:
+            receiver.start()
+            return
         if self._net_in_progress:
             QMessageBox.information(self, "Net In Progress", "A net is already active. End it before starting a new one.")
             return
         if not self._validate_before_start():
             return
         main_path, qru_path, late_path = self._ensure_checkin_files()
+        try:
+            preserved = self._preserve_pre_start_files()
+        except Exception as exc:
+            log.error("FLDigi NCS: pre-start preservation failed: %s", exc)
+            QMessageBox.critical(self, "Unable to Preserve Records",
+                                 f"Start was cancelled. Working records were retained.\n{exc}")
+            return
+        if preserved:
+            QMessageBox.information(self, "Working Records Preserved",
+                                    f"Previous working records were copied to:\n{preserved}")
 
         # Clear files to avoid loading stale/pre-populated data
         for path in self._generated_checkin_file_paths():
@@ -5668,7 +5657,7 @@ class FldigiNetControlTab(QWidget):
         self._net_in_progress = True
         profiles = self._ncs_radio_profiles()
         self._ncs_session_radio_id = self._ncs_selected_radio_id(profiles) or None
-        self._ncs_session_id = uuid.uuid4().hex
+        self._ncs_session_id = getattr(getattr(self, '_prepared_receiver', None), 'pending_session_token', '') or uuid.uuid4().hex
         self._net_start_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
         self._net_end_utc = None
         if self._log_assisted_enabled():
@@ -5691,14 +5680,15 @@ class FldigiNetControlTab(QWidget):
         self._set_roster_dirty(False)
         self._set_net_button_styles(active=True)
         self._update_copy_buttons_state()
+        self._refresh_ncs_session_context()
+        log.info("FLDigi net started: %s (%s)", self.net_name_combo.currentText().strip(), self.role_combo.currentText())
+        if getattr(self, '_preparation_scope', None) is None:
+            QTimer.singleShot(0, self._refresh_operator_history_views)
         self._persist_ncs_session_snapshot(timing_state="active")
         self.net_status_changed.emit("FLDIGI", True)
         self.net_session_status_changed.emit(
             "FLDIGI", True, int(self._ncs_session_radio_id or 0), self._ncs_session_id
         )
-        self._refresh_ncs_session_context()
-        log.info("FLDigi net started: %s (%s)", self.net_name_combo.currentText().strip(), self.role_combo.currentText())
-        QTimer.singleShot(0, self._refresh_operator_history_views)
 
     def _start_ad_hoc_net(self):
         """
@@ -5880,6 +5870,25 @@ class FldigiNetControlTab(QWidget):
             setattr(self, flag_attr, False)
 
     def _end_net(self):
+        if getattr(self, '_preparation_scope', None) is None:
+            return self._end_net_impl()
+        was_active = self._net_in_progress
+        token, radio = self._ncs_session_id, self._ncs_session_radio_id
+        previous_end = self._net_end_utc
+        try:
+            return self._end_net_impl()
+        except Exception as exc:
+            self._net_in_progress = was_active
+            self._ncs_session_id, self._ncs_session_radio_id = token, radio
+            self._net_end_utc = previous_end
+            self._set_net_button_styles(active=was_active)
+            self._update_copy_buttons_state()
+            self._prepared_receiver._set_status('Another net active', f'End could not save all records: {exc}; work retained, review records and retry End')
+            if was_active:
+                self._start_log_assisted_timer()
+            return None
+
+    def _end_net_impl(self):
         confirmed, copy_state_summary = self._confirm_end_net()
         if not confirmed:
             return
@@ -5905,6 +5914,9 @@ class FldigiNetControlTab(QWidget):
             self._stop_log_assisted_timer()
             self._set_net_button_styles(active=False)
             self._update_copy_buttons_state()
+            self._refresh_ncs_session_context()
+            self._show_roster_action_status("Net ended. No check-ins were logged.", "info")
+            log.info("FLDigi net ended (no check-ins file content).")
             self._persist_ncs_session_snapshot(timing_state="ended")
             self.net_status_changed.emit("FLDIGI", False)
             self.net_session_status_changed.emit(
@@ -5912,9 +5924,6 @@ class FldigiNetControlTab(QWidget):
             )
             self._ncs_session_radio_id = None
             self._ncs_session_id = ""
-            self._refresh_ncs_session_context()
-            self._show_roster_action_status("Net ended. No check-ins were logged.", "info")
-            log.info("FLDigi net ended (no check-ins file content).")
             return
 
         now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
@@ -5973,8 +5982,18 @@ class FldigiNetControlTab(QWidget):
             )
 
         if entries:
-            upsert_checkins(entries)
-            self._bump_operator_history(entries)
+            if getattr(self, '_preparation_scope', None) is not None:
+                token = self._ncs_session_id
+                if getattr(self, '_prepared_end_counter_token', '') != token:
+                    self._prepared_end_counter_token, self._prepared_end_counted_calls = token, set()
+                counted = self._prepared_end_counted_calls
+                committed = upsert_checkins(entries, db_path=Path(self.settings.db_path).parent / 'freqinout_nets.db',
+                                            raise_on_error=True, already_counted=frozenset(counted))
+                counted.update(committed)
+                self._bump_operator_history(entries)
+            else:
+                upsert_checkins(entries)
+                self._bump_operator_history(entries)
             self._roster_sync_legacy_buffers(write_files=True)
             status_message = f"Net ended. {len(entries)} check-ins imported."
         else:
@@ -5986,13 +6005,6 @@ class FldigiNetControlTab(QWidget):
         self._stop_log_assisted_timer()
         self._set_net_button_styles(active=False)
         self._update_copy_buttons_state()
-        self._persist_ncs_session_snapshot(timing_state="ended")
-        self.net_status_changed.emit("FLDIGI", False)
-        self.net_session_status_changed.emit(
-            "FLDIGI", False, int(session_radio_id or 0), session_id
-        )
-        self._ncs_session_radio_id = None
-        self._ncs_session_id = ""
         self._refresh_ncs_session_context()
         if copy_state_summary:
             state_summary = self._state_summary_text()
@@ -6003,6 +6015,15 @@ class FldigiNetControlTab(QWidget):
                 status_message += " No state summary was available."
         self._show_roster_action_status(status_message)
         log.info("FLDigi net ended: %s (%s)", net_name, role)
+        self._persist_ncs_session_snapshot(timing_state="ended")
+        self.net_status_changed.emit("FLDIGI", False)
+        self.net_session_status_changed.emit(
+            "FLDIGI", False, int(session_radio_id or 0), session_id
+        )
+        self._ncs_session_radio_id = None
+        self._ncs_session_id = ""
+
+
 
     # ---------------- INSERT KNOWN OPERATOR ---------------- #
 
@@ -6099,7 +6120,7 @@ class FldigiNetControlTab(QWidget):
         try:
             from freqinout.core.config_paths import get_config_dir
 
-            db_path = get_config_dir() / "config" / "freqinout_nets.db"
+            db_path = Path(self.settings.db_path).parent / 'freqinout_nets.db' if getattr(self, '_preparation_scope', None) is not None else get_config_dir() / 'config' / 'freqinout_nets.db'
         except Exception:
             return "", "", False
         if not db_path.exists():
@@ -6117,6 +6138,16 @@ class FldigiNetControlTab(QWidget):
         return (row[0] or "").strip(), (row[1] or "").strip().upper(), True
 
     def _bump_operator_history(self, entries: List[Dict]):
+        if getattr(self, '_preparation_scope', None) is not None:
+            # upsert_checkins already updates shared operator counters. Keep only
+            # the FLDigi recent marker here, in the selected configuration root.
+            db_path = Path(self.settings.db_path).parent / 'freqinout_nets.db'
+            with sqlite3.connect(db_path) as conn:
+                conn.execute('CREATE TABLE IF NOT EXISTS fldigi_checkins (callsign TEXT PRIMARY KEY, last_seen_ts REAL)')
+                stamp = datetime.datetime.now(datetime.timezone.utc).timestamp()
+                conn.executemany('INSERT OR REPLACE INTO fldigi_checkins VALUES (?, ?)',
+                                 [(str(e.get('callsign') or '').strip().upper(), stamp) for e in entries])
+            return
         """
         Update operator_checkins table with new/updated operator info and increment checkin_count by 1.
         Schema matches OperatorHistoryTab.
@@ -6124,7 +6155,7 @@ class FldigiNetControlTab(QWidget):
         try:
             from freqinout.core.config_paths import get_config_dir
 
-            db_path = get_config_dir() / "config" / "freqinout_nets.db"
+            db_path = Path(self.settings.db_path).parent / 'freqinout_nets.db' if getattr(self, '_preparation_scope', None) is not None else get_config_dir() / 'config' / 'freqinout_nets.db'
         except Exception:
             return
         if not db_path.exists():

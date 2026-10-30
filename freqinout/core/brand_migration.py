@@ -20,7 +20,7 @@ import sys
 
 from freqinout.core.product_identity import LOCK_FILENAME
 
-SUPPORTED_SOURCES = {"1.2.8", "2.0.4"}
+SUPPORTED_SOURCES = {"1.2.8", "2.0.4", "2.0.8.1"}
 EXCLUDED_ROOTS = {"backups", "cache", "logs", "downloads", LOCK_FILENAME, ".commsplan-journal-recovery.json"}
 FORMAT = "commsplan-profile-backup-v1"
 SIDECAR_POLICY = "omit-validated-nondurable-sidecars-v1"
@@ -69,7 +69,7 @@ def source_version(installation: Path) -> str:
                     return value
     except (OSError, ValueError, SyntaxError) as exc:
         raise MigrationError("Select a source installation with readable version metadata.") from exc
-    raise MigrationError("Only source versions 1.2.8 and 2.0.4 are supported inputs for this preparation helper.")
+    raise MigrationError("Only source versions 1.2.8, 2.0.4 and 2.0.8.1 are supported inputs for this preparation helper.")
 
 
 def _hash(path: Path) -> str:

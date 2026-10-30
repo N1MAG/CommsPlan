@@ -14,6 +14,11 @@ from freqinout.core.protocol_capabilities import capabilities_dict_for, provenan
 _SAFE_ID_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
+def _hearing_configuration_key(profile):
+    from freqinout.core.subspace_hearing import hearing_configuration_key
+    return hearing_configuration_key(profile)
+
+
 def normalize_ingest_path(value: object) -> str:
     raw = str(value or "").strip()
     if not raw:
@@ -176,6 +181,7 @@ def app_instance_from_device_profile(profile: Mapping[str, Any], family: str) ->
             metadata={
                 "profile": radio_name,
                 "js8_instance_id": instance_token,
+                "hearing_configuration_key": _hearing_configuration_key(profile),
                 "variant_family": storage.variant_family,
                 "variant_version": storage.variant_version,
                 "rig_name": storage.rig_name,
@@ -309,7 +315,8 @@ def js8_ingest_sources(instance: AppInstanceDescriptor) -> tuple[IngestSourceDes
                 endpoint=endpoint,
                 checkpoint_key=f"{source_id}_last_id",
                 enabled=instance.enabled,
-                metadata={"role": "api"},
+                metadata={"role": "api", "js8_instance_id": str(instance_metadata.get("js8_instance_id", "") or ""),
+                          "hearing_configuration_key": str(instance_metadata.get("hearing_configuration_key", "") or "")},
             )
         )
     return tuple(sources)

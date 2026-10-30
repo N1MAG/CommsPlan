@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
 )
 
 from .current_page_stack import CurrentPageStack
+from .net_preparation_panel import add_schedule_review_action
 from .theme import button_style, control_icon, font_derived_widget_height, mark_text_size_guard_opt_out
 
 
@@ -71,6 +72,10 @@ class OpsDashboard(QWidget):
         self.body.addWidget(self.stack, 3)
         self.upcoming_box = QGroupBox("Upcoming")
         upcoming_layout = QVBoxLayout(self.upcoming_box)
+        self.upcoming_status = QLabel("Awaiting schedule update")
+        self.upcoming_status.setWordWrap(True)
+        self.upcoming_status.setMinimumHeight(self.upcoming_status.fontMetrics().height() * 2)
+        upcoming_layout.addWidget(self.upcoming_status)
         self.upcoming_table = QTableWidget(0, 3)
         self.upcoming_table.setAccessibleName("Next four schedule and SOP actions")
         self.upcoming_table.horizontalHeader().hide()
@@ -83,7 +88,7 @@ class OpsDashboard(QWidget):
         self.upcoming_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.upcoming_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         upcoming_layout.addWidget(self.upcoming_table)
-        self.schedule_link = QPushButton("Full schedule →")
+        self.schedule_link = QPushButton("Open Schedule")
         self.schedule_link.clicked.connect(lambda: self.select_page("schedule"))
         upcoming_layout.addWidget(self.schedule_link)
         self.upcoming_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
@@ -119,7 +124,9 @@ class OpsDashboard(QWidget):
 
     def _page_changed(self, index):
         self.stack.setCurrentIndex(index)
-        self.pageChanged.emit(self.PAGES[index][0])
+        page = self.PAGES[index][0]
+        self.schedule_link.setVisible(page != "schedule")
+        self.pageChanged.emit(page)
 
     def add_panel(self, key, widget):
         widget.setMinimumHeight(0)
@@ -152,8 +159,14 @@ class OpsDashboard(QWidget):
         self._attention_role = "warning" if count or uncertain or not fresh else "secondary"
         self.attention_button.setStyleSheet(button_style(self._attention_role, self._theme))
 
-    def set_upcoming(self, entries: Sequence[dict], *, published=True):
+    def set_upcoming(self, entries: Sequence[dict], *, published=True, status_text=""):
+        self.upcoming_status.setText(status_text or ("Schedule inputs checked." if published else "Checking schedule inputs…"))
         upcoming = tuple(dict(entry) for entry in entries[:4])
+        if upcoming and upcoming == self._upcoming and self.upcoming_table.rowCount():
+            self._upcoming_published = published
+            for button in self.upcoming_table.findChildren(QPushButton):
+                button.setEnabled(published)
+            return
         if upcoming == self._upcoming and published == self._upcoming_published and self.upcoming_table.rowCount():
             self._fit_upcoming_height()
             return
@@ -167,14 +180,17 @@ class OpsDashboard(QWidget):
             summary = " · ".join(str(entry.get(k) or "--") for k in ("type", "group", "band_freq"))
             for col, text in enumerate((str(entry.get("when_text") or "--"), summary)):
                 item = QTableWidgetItem(text)
-                item.setToolTip(text)
+                source = str(entry.get('schedule_source') or '').strip()
+                item.setToolTip(text + (f"\nSchedule source: {source}" if source else ''))
                 table.setItem(row, col, item)
             label = str(entry.get("action") or "")
             kind = str(entry.get("action_kind") or "")
             if label and kind:
                 button = QPushButton(label)
+                button.setEnabled(published)
                 button.setToolTip(self._action_tooltip(kind) or summary + " · " + label)
                 button.clicked.connect(lambda _checked=False, payload=dict(entry): self.scheduleAction.emit(payload))
+                add_schedule_review_action(button, entry, self.scheduleAction.emit)
                 button.setStyleSheet(button_style(self._action_role(kind), self._theme))
                 table.setCellWidget(row, 2, button)
         if not self._upcoming:

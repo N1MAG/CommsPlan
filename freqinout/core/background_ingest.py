@@ -35,6 +35,8 @@ from freqinout.core.observation_backfill import backfill_observations
 from freqinout.core.observation_queries import ObservationQuery, query_observations
 from freqinout.core.peer_schedule_infer import infer_peer_schedules
 from freqinout.core.propagation_outcome_ingest import ingest_propagation_outcomes
+from freqinout.core.subspace_hearing import HearingRuntime
+from freqinout.core.subspace_files import SubspaceFileRuntime
 from freqinout.core.settings_manager import SettingsManager
 from freqinout.core.sqlite_utils import connect_sqlite
 from freqinout.core.sitrep_fusion import fuse_sitreps
@@ -197,6 +199,10 @@ class BackgroundIngestController(QObject):
         self._job_watchdog_timer: Optional[QTimer] = None
         self._health = get_dependency_health_registry()
         self._running = False
+        self._subspace_runtime = HearingRuntime()
+        self._subspace_files_runtime = SubspaceFileRuntime()
+        self._subspace_lock = threading.RLock()
+        self._subspace_timer = None
         self._cancel_token = CancellationToken()
         self._varac_vault_activity_signature: Optional[object] = None
         # Timer callbacks must stay cache-only. Runtime-profile discovery can
@@ -233,6 +239,13 @@ class BackgroundIngestController(QObject):
         self._running = True
         self._ensure_executor()
         self._refresh_varac_vault_enabled_async()
+        self._subspace_timer = QTimer(self)
+        self._subspace_timer.setInterval(30_000)
+        self._subspace_timer.timeout.connect(self._refresh_subspace_hearing)
+        self._subspace_timer.timeout.connect(self._refresh_subspace_files)
+        self._subspace_timer.start()
+        self._refresh_subspace_hearing()
+        self._refresh_subspace_files()
         # JS8 links/background ingest: low cadence
         self._js8_links_timer = QTimer(self)
         self._js8_links_timer.setInterval(5 * 60 * 1000)  # 5 minutes
@@ -320,9 +333,13 @@ class BackgroundIngestController(QObject):
             QTimer.singleShot(10000, self._infer_peer_schedules)
 
     def stop(self) -> None:
-        self._running = False
+        with self._subspace_lock:
+            self._subspace_runtime.stop()
+            self._subspace_files_runtime.stop()
+            self._running = False
         self._cancel_token.cancel()
         for attr in (
+            "_subspace_timer",
             "_js8_links_timer",
             "_messages_timer",
             "_dynamic_expect_timer",
@@ -554,6 +571,43 @@ class BackgroundIngestController(QObject):
             elif not enabled and activity_timer.isActive():
                 activity_timer.stop()
 
+    def _refresh_subspace_hearing(self) -> None:
+        if not self._running:
+            return
+        with self._runtime_profile_cache_lock:
+            generation = self._runtime_profile_generation
+
+        def configure():
+            profiles = self._runtime_active_profiles()
+            with self._runtime_profile_cache_lock:
+                if self._runtime_profile_cache_generation != generation:
+                    return  # Read failed/raced; an empty result is not configuration.
+            local_call = self._new_worker_settings().get("operator_callsign", "")
+            with self._subspace_lock:
+                if self._running and generation == self._runtime_profile_generation:
+                    self._subspace_runtime.configure(profiles, local_call)
+
+        self._submit_job("subspace_hearing_config", configure)
+
+    def _refresh_subspace_files(self) -> None:
+        if not self._running:
+            return
+        with self._runtime_profile_cache_lock:
+            generation = self._runtime_profile_generation
+
+        def configure():
+            profiles = self._runtime_active_profiles()
+            with self._runtime_profile_cache_lock:
+                if self._runtime_profile_cache_generation != generation:
+                    return
+            if self._running and generation == self._runtime_profile_generation:
+                worker_settings = self._new_worker_settings()
+                self._subspace_files_runtime.configure(
+                    profiles, worker_settings.config_dir / "freqinout_nets.db",
+                    should_continue=lambda: self._running and generation == self._runtime_profile_generation)
+
+        self._submit_job("subspace_files_config", configure)
+
     def refresh_runtime_settings(self) -> None:
         self._runtime_inventory_cache = None
         self._runtime_inventory_cache_ts = 0.0
@@ -561,6 +615,11 @@ class BackgroundIngestController(QObject):
             self._runtime_profile_generation += 1
             self._runtime_profile_cache_generation = -1
             self._runtime_profile_cache = ()
+        with self._subspace_lock:
+            self._subspace_runtime.stop()
+            self._subspace_files_runtime.stop()
+        self._refresh_subspace_hearing()
+        self._refresh_subspace_files()
         self.request_varac_vault_refresh("settings_saved")
 
     def is_running(self) -> bool:
@@ -574,7 +633,7 @@ class BackgroundIngestController(QObject):
             background_pending = any(not future.done() for future in self._job_futures.values())
         with self._realtime_executor_lock:
             realtime_pending = any(not future.done() for future in self._realtime_job_futures.values())
-        return not background_pending and not realtime_pending
+        return not background_pending and not realtime_pending and self._subspace_runtime.is_stopped() and self._subspace_files_runtime.is_stopped()
 
     def has_inflight_jobs(self, *job_names: str) -> bool:
         """Return whether any named background job is queued or running.

@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any, Mapping, Optional
 
-from PySide6.QtCore import QSignalBlocker, QRect, QSize, Qt, Signal
+from PySide6.QtCore import QItemSelectionModel, QSignalBlocker, QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QFontMetrics, QPainter, QPalette
 from PySide6.QtWidgets import (
     QFrame,
@@ -174,6 +174,7 @@ class SoftwareAdministrationWorkspace(QWidget):
     task_selected = Signal(str)
     assign_requested = Signal(str)
     instance_add_requested = Signal(object)
+    review_subspace_files_requested = Signal()
     operator_edit_opened = Signal(object)
     operator_unfinished_discard_requested = Signal(object)
     instance_discovery_requested = Signal(object)
@@ -393,6 +394,12 @@ class SoftwareAdministrationWorkspace(QWidget):
         self.task_navigation.setTextElideMode(Qt.ElideNone)
         self.task_navigation.setItemDelegate(_TaskNavigationDelegate(self.task_navigation))
         self.task_navigation.currentItemChanged.connect(self._on_task_list_changed)
+        # Qt may update selection after currentItemChanged returns. Normalize
+        # the painted row after that event, against the accepted context only.
+        self._task_selection_timer = QTimer(self)
+        self._task_selection_timer.setSingleShot(True)
+        self._task_selection_timer.timeout.connect(self._normalize_task_selection)
+        self.task_navigation.itemSelectionChanged.connect(self._queue_task_selection_normalization)
         # Compatibility aliases make the intended route discoverable to host
         # code while avoiding a second parallel navigation implementation.
         self.task_list = self.task_navigation
@@ -1440,12 +1447,20 @@ class SoftwareAdministrationWorkspace(QWidget):
             index = combo.findData(value)
             combo.setCurrentIndex(index if index >= 0 else 0)
 
+    def _queue_task_selection_normalization(self) -> None:
+        self._task_selection_context = (self._family_key, self._radio_id, self._task_key)
+        self._task_selection_timer.start(0)
+
+    def _normalize_task_selection(self) -> None:
+        if self._task_selection_context == (self._family_key, self._radio_id, self._task_key):
+            self._restore_task_selection(self._task_key)
+
     def _restore_task_selection(self, key: str) -> None:
         item = self._task_list_items.get(key)
         if item is None:
             return
         with QSignalBlocker(self.task_navigation):
-            self.task_navigation.setCurrentItem(item)
+            self.task_navigation.setCurrentItem(item, QItemSelectionModel.ClearAndSelect)
 
     def _rebuild_family_buttons(self) -> None:
         self._clear_layout(self.family_layout)
@@ -1700,6 +1715,7 @@ class SoftwareAdministrationWorkspace(QWidget):
             parent=self.editor_host,
         )
         assistant.completed.connect(self._on_instance_assistant_completed)
+        assistant.review_subspace_files_requested.connect(self.review_subspace_files_requested.emit)
         assistant.cancelled.connect(self._close_instance_assistant)
         assistant.create_radio_requested.connect(self._on_create_radio_requested)
         assistant.varac_native_prepare_requested.connect(

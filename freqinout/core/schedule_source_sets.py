@@ -245,13 +245,13 @@ def _dependency_set_id(source_refs: List[str], category: str) -> str:
     return ""
 
 
-def _rows_for_dependency(settings: Any, category: str, set_id: str) -> List[Dict[str, Any]]:
+def _rows_for_dependency(settings: Any, category: str, set_id: str, *, store: Any = None) -> List[Dict[str, Any]]:
     if category == HF_NET_SOURCE_CATEGORY and str(set_id or "").strip() == NO_NET_SOURCE_SET_ID:
         return []
     sets_key = HF_DAILY_SOURCE_SETS_KEY if category == HF_DAILY_SOURCE_CATEGORY else HF_NET_SOURCE_SETS_KEY
     if str(set_id).startswith("plan:"):
         try:
-            plan = MultiRadioStore().get_frequency_plan(int(set_id.split(":", 1)[1]))
+            plan = (store if store is not None else MultiRadioStore()).get_frequency_plan(int(set_id.split(":", 1)[1]))
         except Exception as exc:
             raise ScheduleSourceError(f"Cannot read declared schedule source {set_id}: {exc}") from exc
         if not plan or str(plan.get("category") or "").lower() != category:
@@ -441,11 +441,12 @@ def assigned_plan_rf_guard_impacts_for_source_update(
     category: str,
     set_id: str,
     updated_rows: List[Dict[str, Any]],
+    *, store: Any = None,
 ) -> List[Dict[str, Any]]:
     dependency_ref = source_schedule_dependency_ref(category, set_id)
     if not dependency_ref:
         return []
-    store = MultiRadioStore()
+    store = store if store is not None else MultiRadioStore()
     plans_by_id = {int(row.get("id", 0) or 0): dict(row) for row in store.list_frequency_plans()}
     devices_by_id = {int(row.get("id", 0) or 0): dict(row) for row in store.list_device_profiles()}
     impacts: List[Dict[str, Any]] = []
@@ -460,8 +461,8 @@ def assigned_plan_rf_guard_impacts_for_source_update(
             continue
         daily_set_id = _dependency_set_id(source_refs, HF_DAILY_SOURCE_CATEGORY)
         net_set_id = _dependency_set_id(source_refs, HF_NET_SOURCE_CATEGORY)
-        daily_rows = _rows_for_dependency(settings, HF_DAILY_SOURCE_CATEGORY, daily_set_id) if daily_set_id else []
-        net_rows = _rows_for_dependency(settings, HF_NET_SOURCE_CATEGORY, net_set_id) if net_set_id else []
+        daily_rows = _rows_for_dependency(settings, HF_DAILY_SOURCE_CATEGORY, daily_set_id, store=store) if daily_set_id else []
+        net_rows = _rows_for_dependency(settings, HF_NET_SOURCE_CATEGORY, net_set_id, store=store) if net_set_id else []
         if category == HF_DAILY_SOURCE_CATEGORY:
             daily_rows = [dict(row) for row in updated_rows]
         elif category == HF_NET_SOURCE_CATEGORY:
@@ -671,10 +672,10 @@ def refresh_source_backed_frequency_plans(
     return saved
 
 
-def source_sets_for_category(settings: Any, legacy_key: str, category: str) -> List[Dict[str, Any]]:
+def source_sets_for_category(settings: Any, legacy_key: str, category: str, *, strict: bool = False, store: Any = None) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     try:
-        store = MultiRadioStore()
+        store = store if store is not None else MultiRadioStore()
         for plan in store.list_frequency_plans():
             if str(plan.get("category") or "").strip().lower() != category:
                 continue
@@ -692,7 +693,9 @@ def source_sets_for_category(settings: Any, legacy_key: str, category: str) -> L
                     "storage": "db",
                 }
             )
-    except Exception:
+    except Exception as exc:
+        if strict:
+            raise ScheduleSourceError(f"Cannot read schedule source catalog: {exc}") from exc
         rows = []
     for row in source_sets(settings, legacy_key):
         legacy = dict(row)
@@ -720,11 +723,12 @@ def source_set_row_by_id_for_category(
     sets_key: str,
     category: str,
     set_id: str,
+    *, strict: bool = False,
 ) -> Optional[Dict[str, Any]]:
     target = str(set_id or "").strip()
     if not target or target == LIVE_SOURCE_SET_ID:
         return None
-    for row in source_sets_for_category(settings, sets_key, category):
+    for row in source_sets_for_category(settings, sets_key, category, strict=strict):
         if str(row.get("id") or "").strip() == target:
             return row
     return None

@@ -1021,39 +1021,47 @@ class _SoftwareAutofillWorker(QObject):
                 results = dict(payload.get("varac_results") or {})
                 install = results.get("varac_path")
                 if install and install.path:
-                    candidates.append(
-                        {
-                            "family_key": "varac",
-                            "name": "Detected VarAC installation",
-                            "application_path": install.path,
-                            "configuration_path": getattr(results.get("varac_ini_path"), "path", ""),
-                            "storage_path": getattr(results.get("varac_db_path"), "path", ""),
-                            "secondary_storage_path": getattr(results.get("message_paths.varac"), "path", ""),
-                            "outbox_path": getattr(results.get("varac_outbox_dir"), "path", ""),
-                            "provenance": "detected",
-                        }
-                    )
+                    candidate = {
+                        "family_key": "varac", "name": "Detected VarAC installation",
+                        "application_path": install.path, "provenance": "detected",
+                    }
+                    for field, result_key in (
+                        ("configuration_path", "varac_ini_path"),
+                        ("storage_path", "varac_db_path"),
+                        ("secondary_storage_path", "message_paths.varac"),
+                        ("outbox_path", "varac_outbox_dir"),
+                    ):
+                        path = getattr(results.get(result_key), "path", "")
+                        if path:
+                            candidate[field] = path
+                    candidates.append(candidate)
             elif self.section == "js8":
                 results = dict(payload.get("js8_results") or {})
                 profiles = tuple(payload.get("js8_file_profiles") or ())
                 install_candidates = tuple(payload.get("install_candidates") or ())
-                install_path = next(
-                    (
-                        str(getattr(candidate, "path", "") or "")
-                        for candidate in install_candidates
-                        if str(getattr(candidate, "app_id", "") or "").strip().casefold() == "js8call"
-                    ),
-                    "",
-                )
-                if install_path:
+                installs = {}
+                for candidate in install_candidates:
+                    path = str(getattr(candidate, "path", "") or "").strip()
+                    if (str(getattr(candidate, "app_id", "")).casefold() == "js8call"
+                            and path and getattr(candidate, "exists", False)
+                            and getattr(candidate, "executable", False)):
+                        installs.setdefault(path, candidate)
+                # Application selection and native-profile selection are
+                # independent. Discovery ordering cannot prove ownership.
+                for path, candidate in installs.items():
+                    candidates.append({
+                        "family_key": "js8call", "name": f"{candidate.display_name} application",
+                        "application_path": path, "provenance": "detected",
+                        "suggestion_kind": "application",
+                    })
+                results.pop("path_js8call", None)
+                if len(installs) == 1:
+                    install_path, candidate = next(iter(installs.items()))
                     results["path_js8call"] = PathDetectionResult(
-                        key="path_js8call",
-                        label="JS8Call application path",
-                        path=install_path,
-                        confidence="detected",
-                        reason="Detected by the guided application scan.",
-                        exists=Path(install_path).exists(),
-                        target_type="file",
+                        key="path_js8call", label="JS8Call application path", path=install_path,
+                        confidence=candidate.confidence,
+                        reason="One runnable installation found by the guided application scan.",
+                        exists=True, target_type=candidate.target_type,
                     )
                 for profile in profiles:
                     try:
@@ -1067,10 +1075,15 @@ class _SoftwareAutofillWorker(QObject):
                             "host": "127.0.0.1",
                             "port": tcp_port,
                             "udp_port": 2242,
-                            "rig_name": profile.rig_name,
-                            "application_path": install_path,
-                            "configuration_path": profile.ini_path,
-                            "storage_path": profile.application_data_root,
+                            **({"rig_name": profile.rig_name} if profile.rig_name else {}),
+                            **{field: path for field, path in (
+                                ("configuration_path", profile.ini_path),
+                                ("storage_path", profile.application_data_root),
+                                ("directed_path", profile.directed_path),
+                                ("all_path", profile.all_path),
+                                ("inbox_path", profile.inbox_path),
+                            ) if path},
+                            "suggestion_kind": "profile",
                             "provenance": "detected",
                             "storage_mode": profile.storage_mode,
                         }
@@ -1546,6 +1559,9 @@ class SettingsTab(QWidget):
         """
 
         self._receiver_control_test_service_ready = bool(ready)
+        editor = getattr(self, '_operator_radio_dialog', None)
+        if editor is not None:
+            editor.set_receiver_control_test_service_ready(bool(ready))
 
     def _receiver_control_test_service_is_ready(self) -> bool:
         """Return cached service availability only; never discover a receiver."""
@@ -1758,6 +1774,7 @@ class SettingsTab(QWidget):
         self._operator_station_generation = 0
         self._operator_station_job_action: str | None = None
         self._operator_station_review_pending = False
+        self._operator_station_shutdown = False
         self._operator_station_pending_action: tuple[str, Dict[str, Any]] | None = None
         # The Settings selector only consumes the latest lifecycle-owned
         # operational projection.  It must never probe an endpoint while
@@ -1823,7 +1840,7 @@ class SettingsTab(QWidget):
     # ---------- station setup overview ---------------------------------
 
     def _operator_station_request_review(self) -> None:
-        if self._operator_station_setup is None:
+        if self._operator_station_setup is None or getattr(self, "_operator_station_shutdown", False):
             return
         if self._operator_station_job is not None:
             self._operator_station_review_pending = True
@@ -1845,7 +1862,7 @@ class SettingsTab(QWidget):
         job.start()
 
     def _operator_station_start_action(self, action: str, payload: Mapping[str, Any]) -> None:
-        if self._operator_station_setup is None:
+        if self._operator_station_setup is None or getattr(self, "_operator_station_shutdown", False):
             return
         if self._operator_station_job is not None:
             self._operator_station_review_pending = True
@@ -1879,6 +1896,8 @@ class SettingsTab(QWidget):
             self._operator_station_dispatch_pending()
 
     def _operator_station_dispatch_pending(self) -> None:
+        if getattr(self, "_operator_station_shutdown", False):
+            return
         if self._operator_station_job is not None:
             return
         pending_action = self._operator_station_pending_action
@@ -1892,6 +1911,8 @@ class SettingsTab(QWidget):
             QTimer.singleShot(0, self._operator_station_request_review)
 
     def _operator_station_job_result(self, response: object) -> None:
+        if getattr(self, "_operator_station_shutdown", False):
+            return
         job = self._operator_station_job
         if job is None or self._operator_station_setup is None:
             return
@@ -6227,13 +6248,14 @@ class SettingsTab(QWidget):
         add_row = QHBoxLayout()
         self.add_group_btn = QPushButton("Add Group")
         self.add_group_btn.clicked.connect(self._add_operating_group_inline)
-        self.edit_group_btn = QPushButton("Focus Editor")
+        self.edit_group_btn = QPushButton("Edit Configuration")
         self.edit_group_btn.clicked.connect(self._focus_operating_group_editor)
-        self.edit_group_btn.setVisible(False)
+        self.edit_group_btn.setToolTip("Unlock the selected configuration in the editor below.")
         self.delete_group_btn = QPushButton("Delete Configuration")
         self.delete_group_btn.clicked.connect(self._delete_operating_groups)
         add_row.addStretch()
         add_row.addWidget(self.add_group_btn)
+        add_row.addWidget(self.edit_group_btn)
         add_row.addWidget(self.delete_group_btn)
         ops_layout.addLayout(add_row)
         cond_scope_hint = QLabel(
@@ -6436,6 +6458,8 @@ class SettingsTab(QWidget):
         self.op_group_add_config_btn.clicked.connect(self._add_operating_group_inline)
         self.op_group_save_btn = QPushButton("Save Changes")
         self.op_group_save_btn.clicked.connect(self._save_operating_group_editor)
+        self.op_group_cancel_btn = QPushButton("Cancel")
+        self.op_group_cancel_btn.clicked.connect(self._cancel_operating_group_editor)
         op_group_detail_layout.addWidget(self.op_group_detail_summary_label, 0, 0, 1, 4)
         op_group_detail_layout.addWidget(QLabel("Group"), 1, 0)
         op_group_detail_layout.addWidget(self.op_group_name_edit, 1, 1)
@@ -6451,25 +6475,39 @@ class SettingsTab(QWidget):
         op_group_detail_layout.addWidget(self.op_group_fldigi_mode_combo, 3, 3)
         op_group_detail_layout.addWidget(QLabel("Offset"), 4, 0)
         op_group_detail_layout.addWidget(self.op_group_fldigi_offset_edit, 4, 1)
-        op_group_detail_layout.addWidget(self.op_group_auto_tune_chk, 4, 2)
-        op_group_detail_layout.addWidget(self.op_group_condition_levels_chk, 4, 3)
-        op_group_detail_layout.addWidget(QLabel("FastLight Names"), 5, 0)
-        op_group_detail_layout.addWidget(self.op_group_fastlight_delim_combo, 5, 1)
-        op_group_detail_layout.addWidget(QLabel("Signed"), 5, 2)
-        op_group_detail_layout.addWidget(self.op_group_fastlight_signed_combo, 5, 3)
-        op_group_detail_layout.addWidget(QLabel("Custom Delimiter"), 6, 0)
-        op_group_detail_layout.addWidget(self.op_group_fastlight_custom_delim_edit, 6, 1)
-        op_group_detail_layout.addWidget(QLabel("Unsigned"), 6, 2)
-        op_group_detail_layout.addWidget(self.op_group_fastlight_unsigned_combo, 6, 3)
-        op_group_detail_layout.addWidget(QLabel("Preferred Forms"), 7, 0)
-        op_group_detail_layout.addWidget(self.op_group_fastlight_form_family_combo, 7, 1, 1, 3)
+        op_group_detail_layout.addWidget(self.op_group_auto_tune_chk, 4, 2, 1, 2)
+        op_group_detail_layout.addWidget(self.op_group_condition_levels_chk, 5, 0, 1, 4)
+        op_group_detail_layout.addWidget(QLabel("FastLight Names"), 6, 0)
+        op_group_detail_layout.addWidget(self.op_group_fastlight_delim_combo, 6, 1)
+        op_group_detail_layout.addWidget(QLabel("Signed"), 6, 2)
+        op_group_detail_layout.addWidget(self.op_group_fastlight_signed_combo, 6, 3)
+        op_group_detail_layout.addWidget(QLabel("Custom Delimiter"), 7, 0)
+        op_group_detail_layout.addWidget(self.op_group_fastlight_custom_delim_edit, 7, 1)
+        op_group_detail_layout.addWidget(QLabel("Unsigned"), 7, 2)
+        op_group_detail_layout.addWidget(self.op_group_fastlight_unsigned_combo, 7, 3)
+        op_group_detail_layout.addWidget(QLabel("Preferred Forms"), 8, 0)
+        op_group_detail_layout.addWidget(self.op_group_fastlight_form_family_combo, 8, 1, 1, 3)
         editor_actions = QHBoxLayout()
         editor_actions.addStretch()
         editor_actions.addWidget(self.op_group_add_config_btn)
         editor_actions.addWidget(self.op_group_save_btn)
-        op_group_detail_layout.addLayout(editor_actions, 8, 0, 1, 4)
+        editor_actions.addWidget(self.op_group_cancel_btn)
+        op_group_detail_layout.addLayout(editor_actions, 9, 0, 1, 4)
         op_group_detail_layout.setColumnStretch(1, 1)
         op_group_detail_layout.setColumnStretch(3, 1)
+        self._op_group_editor_fields = (
+            self.op_group_name_edit, self.op_group_mode_combo, self.op_group_band_combo,
+            self.op_group_freq_edit, self.op_group_vfo_combo, self.op_group_fldigi_mode_combo,
+            self.op_group_fldigi_offset_edit, self.op_group_auto_tune_chk,
+            self.op_group_condition_levels_chk, self.op_group_fastlight_delim_combo,
+            self.op_group_fastlight_custom_delim_edit, self.op_group_fastlight_signed_combo,
+            self.op_group_fastlight_unsigned_combo, self.op_group_fastlight_form_family_combo,
+        )
+        for field in self._op_group_editor_fields:
+            signal = field.textChanged if isinstance(field, QLineEdit) else (
+                field.currentTextChanged if isinstance(field, QComboBox) else field.toggled)
+            signal.connect(self._on_operating_group_editor_changed)
+        self._set_operating_group_editing(False)
         op_configs_layout.addWidget(self.op_group_detail_card)
         op_groups_browser_layout.addWidget(op_configs_box)
         ops_layout.addLayout(op_groups_browser_layout)
@@ -6510,6 +6548,7 @@ class SettingsTab(QWidget):
         self.local_net_group_combo.setInsertPolicy(QComboBox.NoInsert)
         self.local_net_group_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.local_net_group_combo.currentIndexChanged.connect(self._on_local_net_group_combo_changed)
+        self.local_net_group_combo.editTextChanged.connect(self._on_local_net_group_text_changed)
         self.local_net_group_action_btn = QPushButton("Enable Group")
         self.local_net_group_action_btn.clicked.connect(self._toggle_local_net_group)
         self.add_local_net_btn = QPushButton("Add Configuration")
@@ -6525,6 +6564,14 @@ class SettingsTab(QWidget):
         local_row.addWidget(self.add_local_net_btn)
         local_row.addWidget(self.delete_local_net_btn)
         local_layout.addLayout(local_row)
+        catalog_actions = QHBoxLayout()
+        self.local_net_catalog_add_btn = QPushButton("Add from catalog…")
+        self.local_net_catalog_add_btn.clicked.connect(self._add_local_net_from_catalog)
+        self.local_net_catalog_review_btn = QPushButton("Review catalog changes…")
+        self.local_net_catalog_review_btn.clicked.connect(self._review_local_net_catalog_changes)
+        catalog_actions.addWidget(self.local_net_catalog_review_btn)
+        catalog_actions.addStretch()
+        local_layout.addLayout(catalog_actions)
 
         self.local_net_group_list = QListWidget()
         self.local_net_group_list.setObjectName("localCommsGroupList")
@@ -6563,7 +6610,7 @@ class SettingsTab(QWidget):
         local_header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         local_header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         local_header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        local_header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        local_header.setSectionResizeMode(4, QHeaderView.Stretch)
         local_header.setSectionResizeMode(5, QHeaderView.Stretch)
         self.local_net_table.verticalHeader().setVisible(False)
         self.local_net_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -6585,8 +6632,10 @@ class SettingsTab(QWidget):
         local_detail_layout.setHorizontalSpacing(10)
         local_detail_layout.setVerticalSpacing(4)
         self.local_net_summary_label = QLabel("Select or create a local group configuration.")
+        self.local_net_summary_label.setTextFormat(Qt.PlainText)
         self.local_net_summary_label.setWordWrap(True)
         self.local_net_group_edit = QLineEdit()
+        self.local_net_group_edit.textChanged.connect(self._update_local_net_action_buttons)
         self.local_net_resource_combo = QComboBox()
         self.local_net_resource_combo.setEditable(True)
         self.local_net_resource_combo.addItems(LOCAL_NET_RESOURCE_OPTIONS)
@@ -6617,10 +6666,14 @@ class SettingsTab(QWidget):
         local_detail_layout.addWidget(QLabel("Notes"), 3, 0, Qt.AlignTop)
         local_detail_layout.addWidget(self.local_net_notes_edit, 3, 1, 1, 3)
         local_editor_actions = QHBoxLayout()
+        local_editor_actions.addWidget(self.local_net_catalog_add_btn)
         local_editor_actions.addStretch()
         local_editor_actions.addWidget(self.local_net_add_config_btn)
         local_editor_actions.addWidget(self.local_net_save_btn)
         local_detail_layout.addLayout(local_editor_actions, 4, 0, 1, 4)
+        self.local_net_catalog_hint = QLabel("Name the group, then add frequencies from the catalog or enter a target manually.")
+        self.local_net_catalog_hint.setWordWrap(True)
+        local_detail_layout.addWidget(self.local_net_catalog_hint, 5, 0, 1, 4)
         local_detail_layout.setColumnStretch(1, 1)
         local_detail_layout.setColumnStretch(3, 1)
         local_layout.addWidget(self.local_net_detail_card)
@@ -7154,6 +7207,9 @@ class SettingsTab(QWidget):
         )
         self.software_administration_workspace.instance_add_requested.connect(
             self._on_software_instance_add_requested
+        )
+        self.software_administration_workspace.review_subspace_files_requested.connect(
+            self._on_review_subspace_files_requested
         )
         self.software_administration_workspace.operator_edit_opened.connect(
             lambda payload: self._save_operator_application_payload(payload, action='load'))
@@ -10104,6 +10160,11 @@ class SettingsTab(QWidget):
         self.settings_action_feedback_label = QLabel("Settings ready.")
         self.settings_action_feedback_label.setWordWrap(True)
         bottom_row.addWidget(self.settings_action_feedback_label, 1)
+        self.review_saved_guardrails_btn = QPushButton("Review warnings…")
+        self.review_saved_guardrails_btn.setToolTip("Show the saved warning details and affected radios.")
+        self.review_saved_guardrails_btn.clicked.connect(self._review_saved_guardrails)
+        self.review_saved_guardrails_btn.hide()
+        bottom_row.addWidget(self.review_saved_guardrails_btn)
         self.save_btn = QPushButton("Save Settings")
         self.save_btn.clicked.connect(self._save_settings_button)
         bottom_row.addWidget(self.save_btn)
@@ -10122,6 +10183,27 @@ class SettingsTab(QWidget):
         self._refresh_settings_mode_visibility()
         self._update_sections_nav_size()
         self._apply_accessibility_width_guards()
+
+    def _queue_settings_callback(self, callback, *, delay: int = 0, context: QObject | None = None):
+        """Deliver deferred UI work only while its Settings owner/context live."""
+        from shiboken6 import isValid
+        parent = context if context is not None else self
+        if (not isValid(self) or not isValid(parent)
+                or getattr(self, "_operator_station_shutdown", False)):
+            return None
+        timer = QTimer(parent)
+        timer.setSingleShot(True)
+        def deliver():
+            try:
+                if (isValid(self) and isValid(parent)
+                        and not getattr(self, "_operator_station_shutdown", False)):
+                    callback()
+            finally:
+                if isValid(timer):
+                    timer.deleteLater()
+        timer.timeout.connect(deliver)
+        timer.start(max(0, int(delay)))
+        return timer
 
     def _make_collapsible_group(
         self,
@@ -10185,7 +10267,17 @@ class SettingsTab(QWidget):
             "help_context_key": str(help_context_key or "").strip().lower(),
         }
         self._apply_collapsed_state(group, content, checked)
-        QTimer.singleShot(0, lambda g=group, w=content: self._apply_collapsed_state(g, w, header_btn.isChecked()))
+        layout_timer = QTimer(group)
+        layout_timer.setSingleShot(True)
+        def apply_deferred_layout():
+            from shiboken6 import isValid
+            if (getattr(self, "_operator_station_shutdown", False)
+                    or not all(isValid(widget) for widget in (group, content, header_btn))
+                    or (isinstance(self, QObject) and not isValid(self))):
+                return
+            self._apply_collapsed_state(group, content, header_btn.isChecked())
+        layout_timer.timeout.connect(apply_deferred_layout)
+        layout_timer.start(0)
         return group
 
     def _register_collapsible_group(self, group: QGroupBox, summary_fn) -> None:
@@ -10578,7 +10670,7 @@ class SettingsTab(QWidget):
         self._select_settings_section_group(self.message_auth_section_group)
         self.message_auth_signing_toggle.setChecked(True)
         self.signing_return_to_software_btn.show()
-        QTimer.singleShot(0, self._reveal_software_signing_owner)
+        self._queue_settings_callback(self._reveal_software_signing_owner)
 
     def _reveal_software_signing_owner(self) -> None:
         if self.sections_stack.currentWidget() is not self.message_auth_section_group:
@@ -10933,7 +11025,7 @@ class SettingsTab(QWidget):
         entries["operator_info"] = attention(checked=True, issues=operator_issues, dirty=operator_dirty)
         group_issues = [format_readiness_issue(issue) for issue in report.issues if issue.section_key == "operating_groups"]
         entries["operating_groups"] = attention(checked=True, issues=group_issues,
-            dirty=_settings_operating_group_configuration_signature(getattr(self, "operating_groups", ())) !=
+            dirty=bool(getattr(self, "_op_group_editor_dirty", False)) or _settings_operating_group_configuration_signature(getattr(self, "operating_groups", ())) !=
                   (self._configuration_saved_group_signature if hasattr(self, "_configuration_saved_group_signature") else
                    _settings_operating_group_configuration_signature(saved.get("operating_groups", ()))))
         radio_issues = [format_readiness_issue(issue) for issue in report.issues
@@ -12209,6 +12301,8 @@ class SettingsTab(QWidget):
             assistant.set_unfinished(response['unfinished'])
         if response.get('error'):
             assistant.set_operation_status(response['error'], error=True)
+            if response.get('conflict_context'):
+                assistant.set_conflict_review(response['conflict_context'])
             return
         if response.get('discarded'):
             assistant.set_unfinished(None)
@@ -12219,11 +12313,12 @@ class SettingsTab(QWidget):
             if 'context' in response:
                 context = dict(response['context'])
                 values = {**assistant.values(), **dict(response.get('current_values', {}))}
-                assistant.editor.set_values(values, preserve_dirty=True)
+                assistant.set_editor_values(values, preserve_dirty=True)
                 if not assistant.editor.is_dirty():
                     assistant.operator_base_values = assistant.values()
                 assistant._expected_identity_generation = context.get('expected_identity_generation')
                 assistant._replacement_instance_id = context.get('expected_current_instance_id')
+                assistant.operator_draft_revision = context.get('operator_draft_revision')
                 assistant._raw_fields.update(context)
                 assistant.set_operation_status('Saved unfinished work is available; choose Recover or Discard.' if response.get('unfinished',{}).get('payload') else 'Ready to edit. Save changes only CommsPlan settings.')
             return
@@ -12445,6 +12540,13 @@ class SettingsTab(QWidget):
             imported_manifest = self.multi_radio_store.get_software_instance_manifest(
                 f"{family}:{system_key}"
             )
+
+        if family == "js8call":
+            # The receive-source intent is independent of imported identity.
+            # Omitted fields preserve the selected application's existing values.
+            for key in ("received_files_enabled", "received_files_path", "received_files_existing"):
+                if key in payload:
+                    app_values[key] = payload[key]
 
         if native_result is None:
             native_plan = self._native_plan_for_software_instance_payload(payload, profile)
@@ -12767,6 +12869,11 @@ class SettingsTab(QWidget):
         feedback = getattr(self, "settings_action_feedback_label", None)
         if isinstance(feedback, QLabel):
             feedback.setText(success_message + " Open Health to verify the live application.")
+
+    def _on_review_subspace_files_requested(self) -> None:
+        host = resolve_help_host(self)
+        if host is not None and hasattr(host, "open_subspace_files"):
+            host.open_subspace_files()
 
     def _on_software_administration_operational_route_requested(self, route: str) -> None:
         if str(route or "").strip().lower() != "fio spotter":
@@ -13225,7 +13332,7 @@ class SettingsTab(QWidget):
         if target_group is not None:
             self._select_settings_section_group(target_group)
             if target_key == "radio_profiles" and radio_id:
-                QTimer.singleShot(0, lambda ident=int(radio_id): self.focus_radio_profile(ident))
+                self._queue_settings_callback(lambda ident=int(radio_id): self.focus_radio_profile(ident))
             return True
 
         self._select_first_visible_settings_section()
@@ -13634,7 +13741,7 @@ class SettingsTab(QWidget):
                         and hasattr(self, "gpg_keys_table")
                     ):
                         self._gpg_keys_auto_probe_attempted = True
-                        QTimer.singleShot(0, lambda: self._refresh_gpg_keys_table(show_dialog_on_error=False))
+                        self._queue_settings_callback(lambda: self._refresh_gpg_keys_table(show_dialog_on_error=False))
             except Exception:
                 pass
 
@@ -13651,7 +13758,7 @@ class SettingsTab(QWidget):
                 pass
 
         _reset()
-        QTimer.singleShot(0, _reset)
+        self._queue_settings_callback(_reset, context=scroll)
 
     def _sync_current_section_scroll_size(self) -> None:
         if not hasattr(self, "sections_stack"):
@@ -13675,7 +13782,7 @@ class SettingsTab(QWidget):
         if stacked_mode:
             header_btn = self._section_meta.get(group, {}).get("header_btn")
             if not checked and header_btn:
-                QTimer.singleShot(0, lambda btn=header_btn: btn.setChecked(True))
+                self._queue_settings_callback(lambda btn=header_btn: btn.setChecked(True), context=header_btn)
             # Collapsible behavior is disabled while using stacked section navigation.
             self._apply_collapsed_state(group, content, True)
             return
@@ -15224,7 +15331,7 @@ class SettingsTab(QWidget):
             self._apply_mesh_saved_device_actions_layout()
             self._refresh_fit_content_section_height(getattr(self, "local_mesh_section_group", None))
 
-        QTimer.singleShot(0, refresh)
+        self._queue_settings_callback(refresh)
 
     def _mesh_ble_scan_is_active(self) -> bool:
         return bool(getattr(self, "_mesh_ble_scan_thread", None) is not None)
@@ -15339,6 +15446,10 @@ class SettingsTab(QWidget):
 
     def shutdown(self) -> None:
         """Cancel Settings-owned device work before QObject teardown."""
+
+        self._operator_station_shutdown = True
+        self._operator_station_review_pending = False
+        self._operator_station_pending_action = None
 
         status_cache = getattr(self, "_status_recipe_read_cache", None)
         if status_cache is not None:
@@ -16597,7 +16708,7 @@ class SettingsTab(QWidget):
                     self._select_settings_section_group(group)
                     break
             if target == "radio_profiles" and radio_id:
-                QTimer.singleShot(0, lambda ident=int(radio_id): self.focus_radio_profile(ident))
+                self._queue_settings_callback(lambda ident=int(radio_id): self.focus_radio_profile(ident))
             return True
         return False
 
@@ -16676,19 +16787,20 @@ class SettingsTab(QWidget):
         }
         if base_edit is not None:
             base_edit.textChanged.connect(lambda _text: self._refresh_contextual_autofill_buttons())
-        QTimer.singleShot(0, lambda rid=rule_id: self._wire_contextual_autofill_rule(rid))
-        QTimer.singleShot(0, self._refresh_contextual_autofill_buttons)
+        self._queue_settings_callback(lambda rid=rule_id: self._wire_contextual_autofill_rule(rid))
+        self._queue_settings_callback(self._refresh_contextual_autofill_buttons)
         return btn
 
     def _wire_contextual_autofill_rule(self, rule_id: str) -> None:
+        from shiboken6 import isValid
         rule = self._contextual_autofill_rules.get(rule_id, {})
         edits: List[QLineEdit] = []
         base_edit = rule.get("base_edit")
-        if isinstance(base_edit, QLineEdit):
+        if isinstance(base_edit, QLineEdit) and isValid(base_edit):
             edits.append(base_edit)
         for key in [str(key) for key in (rule.get("keys") or [])]:
             edit = self._autofill_target_edit(key)
-            if isinstance(edit, QLineEdit):
+            if isinstance(edit, QLineEdit) and isValid(edit):
                 edits.append(edit)
         prop_name = f"fio_autofill_wired_{rule_id}"
         for edit in edits:
@@ -16789,6 +16901,9 @@ class SettingsTab(QWidget):
             radio_role=radio_role,
             families=(family_by_section[normalized],),
             inputs=_guided_discovery_input_snapshot(settings_values),
+            # This route is an explicit Find/Find Again action. Recheck disk
+            # rather than reusing a completed scan from an earlier attempt.
+            force_refresh=True,
         )
         if not self._guided_software_discovery.register_request(discovery_request):
             self._set_software_autofill_feedback(
@@ -16863,7 +16978,6 @@ class SettingsTab(QWidget):
         worker.finished.connect(worker.deleteLater)
         worker.cancelled.connect(worker.deleteLater)
         worker.failed.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
         thread.finished.connect(self._on_software_autofill_thread_finished)
         self._software_autofill_active_request = request_copy
         self._software_autofill_thread = thread
@@ -17003,15 +17117,30 @@ class SettingsTab(QWidget):
                 "Search could not complete. Existing settings were not changed.",
             )
 
-    def _on_software_autofill_thread_finished(self) -> None:
-        thread = self.sender()
+    def _on_software_autofill_thread_finished(self, owned_thread=None) -> None:
+        thread = owned_thread if owned_thread is not None else self.sender()
+        if thread is None:
+            return
+        # finished() precedes native thread-local/object cleanup. Deleting the
+        # QThread wrapper at that point can block the GUI waiting for a worker
+        # destructor which itself needs the GIL. Poll complete exit without
+        # blocking Python or discarding the retained worker wrappers.
+        try:
+            exited = thread.wait(0)
+        except RuntimeError:
+            return
+        if not exited:
+            QTimer.singleShot(10, lambda: self._on_software_autofill_thread_finished(thread))
+            return
         if thread is not getattr(self, "_software_autofill_thread", None):
+            thread.deleteLater()
             return
         self._software_autofill_thread = None
         self._software_autofill_worker = None
         self._software_autofill_active_request = None
         pending = self._software_autofill_pending_request
         self._software_autofill_pending_request = None
+        thread.deleteLater()
         if not bool(getattr(self, "_software_autofill_shutdown", False)) and pending:
             self._start_software_autofill_request(pending)
 
@@ -17955,6 +18084,13 @@ class SettingsTab(QWidget):
 
     def _save_settings(self, show_message: bool = True):
         _perf_t0 = time.perf_counter()
+        if getattr(self, "_op_group_editor_dirty", False):
+            if show_message:
+                self._publish_settings_action_feedback(status="blocked",
+                    summary="Operating Group changes are still in the editor. Choose Save Changes or Cancel there first.")
+                self._select_settings_section_group(self.op_groups_section_group)
+                self._reveal_operating_group_editor()
+            return False
         if self._varac_bbs_vault_editor_has_pending_changes():
             if not show_message:
                 log.info("SettingsTab: skipped pending Managed BBS location editor changes during quiet shutdown save.")
@@ -18487,6 +18623,7 @@ class SettingsTab(QWidget):
 
 
         log.info("SettingsTab: settings saved.")
+        self._cache_configuration_attention()
         self._refresh_runtime_projection_ui(refresh_multi_radio=False)
         if show_message:
             radio_id, target = self._selected_settings_feedback_target()
@@ -19221,6 +19358,12 @@ class SettingsTab(QWidget):
     def _publish_save_guardrail_feedback(self) -> None:
         warnings = self._current_multi_rig_guardrail_messages()
         collection_error = str(getattr(self, "_last_multi_rig_guardrail_collection_error", "") or "").strip()
+        button = getattr(self, "review_saved_guardrails_btn", None)
+        self._saved_guardrail_error = collection_error
+        if button is not None:
+            button.setVisible(bool(warnings or collection_error))
+            button.setText("Review check error…" if collection_error else "Review warnings…")
+            button.setToolTip(collection_error or "\n".join(warnings))
         if collection_error:
             self._publish_settings_action_feedback(
                 status="failed",
@@ -19237,6 +19380,16 @@ class SettingsTab(QWidget):
             detail="\n".join(warnings),
             action_type="save_guardrails",
         )
+        self._set_settings_action_feedback_status("partial",
+            self._save_guardrail_feedback_summary(len(warnings)) + " " + str(warnings[0]),
+            "\n".join(warnings))
+
+    def _review_saved_guardrails(self) -> None:
+        error = str(getattr(self, "_saved_guardrail_error", "") or "")
+        if error:
+            QMessageBox.information(self, "Guardrail check error", error)
+        else:
+            self._review_device_profile_guardrail_conflicts()
 
     @staticmethod
     def _guardrail_readiness_status_text(warnings: Sequence[str]) -> str:
@@ -23960,7 +24113,8 @@ class SettingsTab(QWidget):
             lines.append("Warnings: " + " | ".join(status.warnings))
         QApplication.clipboard().setText("\n".join(lines))
         self.multi_rig_copy_summary_btn.setText("Copied")
-        QTimer.singleShot(1500, lambda: self.multi_rig_copy_summary_btn.setText("Copy Summary"))
+        self._queue_settings_callback(lambda: self.multi_rig_copy_summary_btn.setText("Copy Summary"),
+                                      delay=1500, context=self.multi_rig_copy_summary_btn)
 
     def _configured_text(self, key: str) -> str:
         try:
@@ -27617,6 +27771,13 @@ class SettingsTab(QWidget):
             return None
         editor = OperatorRadioEditor(profile={**dict(existing or {}), **dict(retry_draft or {})},
                                      initial_step=initial_step or 'radio',parent=self)
+        editor.set_receiver_control_test_service_ready(
+            getattr(self, '_receiver_control_test_service_is_ready', lambda: False)())
+        receiver_request = getattr(self, 'receiver_control_test_requested', None)
+        receiver_result = getattr(self, 'receiver_control_test_completed', None)
+        if receiver_request is not None and receiver_result is not None:
+            editor.receiver_control_test_requested.connect(receiver_request.emit)
+            receiver_result.connect(editor.apply_receiver_control_test_result)
         self._operator_radio_dialog = editor
         editor._resume_draft_on_load = bool(resume_draft and not existing)
         self._operator_radio_result = None
@@ -27800,6 +27961,8 @@ class SettingsTab(QWidget):
             editor.set_unfinished(response['unfinished'])
         if response.get('error'):
             editor.set_status(response['error'])
+            if response.get('conflict_context'):
+                editor.set_conflict_review(response['conflict_context'])
             if job.action in {'radio_save', 'radio_keep_draft'}:
                 editor.show_save_failure((response['error'],), draft_only=job.action == 'radio_keep_draft')
             return
@@ -28555,6 +28718,11 @@ class SettingsTab(QWidget):
                     "observed_fingerprint": str(draft.get("observed_fingerprint") or "").strip(),
                     "native_verification_summary": str(draft.get("native_verification_summary") or "").strip(),
                 }
+
+            if family == "js8call":
+                for key in ("received_files_enabled", "received_files_path", "received_files_existing"):
+                    if key in draft:
+                        application_values[key] = draft[key]
 
             evidence = {
                 "source": str(draft.get("mode") or "manual"),
@@ -30931,10 +31099,7 @@ class SettingsTab(QWidget):
             QMessageBox.warning(self, "Custom Tools", issue)
             return
         self._custom_tool_items_cache.append({"name": name, "command": command})
-        self._launch_items_cache = self.launch_orchestrator.build_default_items(
-            self._launch_items_cache,
-            custom_tools=self._custom_tool_items_cache,
-        )
+        self._reconcile_launch_catalog()
         self._refresh_custom_tools_table()
         self._refresh_launch_control_table()
         if self.custom_tools_table.rowCount() > 0:
@@ -30974,10 +31139,7 @@ class SettingsTab(QWidget):
             return
         command = self.launch_orchestrator.format_script_launch_command(str(script_path))
         self._custom_tool_items_cache.append({"name": name, "command": command})
-        self._launch_items_cache = self.launch_orchestrator.build_default_items(
-            self._launch_items_cache,
-            custom_tools=self._custom_tool_items_cache,
-        )
+        self._reconcile_launch_catalog()
         self._refresh_custom_tools_table()
         self._refresh_launch_control_table()
         if self.custom_tools_table.rowCount() > 0:
@@ -31015,10 +31177,7 @@ class SettingsTab(QWidget):
             launch_item["name"] = name
             launch_item["launch_command_override"] = command
             break
-        self._launch_items_cache = self.launch_orchestrator.build_default_items(
-            self._launch_items_cache,
-            custom_tools=self._custom_tool_items_cache,
-        )
+        self._reconcile_launch_catalog()
         self._refresh_custom_tools_table()
         self._refresh_launch_control_table()
         if row < self.custom_tools_table.rowCount():
@@ -31032,10 +31191,7 @@ class SettingsTab(QWidget):
         if row < 0 or row >= len(self._custom_tool_items_cache):
             return
         del self._custom_tool_items_cache[row]
-        self._launch_items_cache = self.launch_orchestrator.build_default_items(
-            self._launch_items_cache,
-            custom_tools=self._custom_tool_items_cache,
-        )
+        self._reconcile_launch_catalog()
         self._refresh_custom_tools_table()
         self._refresh_launch_control_table()
         self._mark_settings_dirty()
@@ -31051,15 +31207,20 @@ class SettingsTab(QWidget):
             self._custom_tool_items_cache[target_row],
             self._custom_tool_items_cache[row],
         )
-        self._launch_items_cache = self.launch_orchestrator.build_default_items(
-            self._launch_items_cache,
-            custom_tools=self._custom_tool_items_cache,
-        )
+        self._reconcile_launch_catalog()
         self._refresh_custom_tools_table()
         self._refresh_launch_control_table()
         if target_row < self.custom_tools_table.rowCount():
             self.custom_tools_table.selectRow(target_row)
         self._mark_settings_dirty()
+
+    def _reconcile_launch_catalog(self) -> None:
+        # Observer bundles are explicit, capability-scoped assignments. A shared
+        # tool catalog edit must never synthesize standard-scoped launch rows.
+        profile = self._launch_bundle_source_profile() or {}
+        if profile.get("device_class") != "observer":
+            self._launch_items_cache = self.launch_orchestrator.build_default_items(
+                self._launch_items_cache, custom_tools=self._custom_tool_items_cache)
 
     def _launch_bundle_source_profile(self) -> Optional[Dict[str, Any]]:
         profile = self._selected_settings_radio_profile()
@@ -31150,8 +31311,16 @@ class SettingsTab(QWidget):
             return True
         return bool(self._radio_software_enabled(profile, software_key))
 
-    def _is_launch_item_configured(self, name: str) -> bool:
+    def _is_launch_item_configured(self, name: str, item=None) -> bool:
         profile = self._launch_bundle_source_profile()
+        if name == "SDR++":
+            from freqinout.core.receiver_software_stack import is_receive_only_launch_item
+            candidates = [item] if isinstance(item, dict) else getattr(self, "_launch_items_cache", [])
+            return bool(isinstance(profile, dict) and profile.get("device_class") == "observer"
+                        and any(row.get("instance_key") == "receiver:sdrpp"
+                                and is_receive_only_launch_item(row)
+                                and (row.get("launch_path_override") or row.get("launch_command_override"))
+                                for row in candidates if isinstance(row, dict)))
         if not self._launch_item_allowed_for_profile(name, profile):
             return False
         if self._custom_tool_command(name):
@@ -31203,7 +31372,7 @@ class SettingsTab(QWidget):
             if not isinstance(item, dict):
                 continue
             name = str(item.get("name", "") or "").strip()
-            if not name or not self._is_launch_item_configured(name):
+            if not name or not self._is_launch_item_configured(name, item):
                 continue
             scoped = dict(item)
             scoped.update(self._radio_launch_overrides_for_name(name, profile))
@@ -31339,6 +31508,9 @@ class SettingsTab(QWidget):
         radio_id = self._selected_launch_radio_id()
         if not radio_id:
             return
+        if not any(str(item.get("name", "")) == app_name and item.get("enabled", True)
+                   for item in self._launch_items_cache if isinstance(item, dict)):
+            return
         manual_items: List[Dict[str, object]] = []
         for row in self._launch_items_cache:
             if not isinstance(row, dict):
@@ -31430,9 +31602,10 @@ class SettingsTab(QWidget):
             fresh.setdefault("startup", False)
             fresh.setdefault("monitor_health", True)
             ordered.append(fresh)
-        self._launch_items_cache = ordered
+        if (self._launch_bundle_source_profile() or {}).get("device_class") != "observer":
+            self._launch_items_cache = ordered
 
-        visible_items = [item for item in self._launch_items_cache if self._is_launch_item_configured(str(item.get("name", "")))]
+        visible_items = [item for item in self._launch_items_cache if self._is_launch_item_configured(str(item.get("name", "")), item)]
         self._launch_visible_names = [str(item.get("name", "")) for item in visible_items]
 
         self._launch_table_loading = True
@@ -31457,7 +31630,7 @@ class SettingsTab(QWidget):
             self.launch_control_table.setItem(row, 2, startup_item)
 
             start_btn = QPushButton("Start")
-            start_btn.setEnabled(not self.launch_orchestrator.is_active())
+            start_btn.setEnabled(not self.launch_orchestrator.is_active() and bool(item.get("enabled", True)))
             start_btn.clicked.connect(lambda _checked=False, app_name=name: self._start_launch_control_item(app_name))
             self.launch_control_table.setCellWidget(row, 3, start_btn)
 
@@ -31526,7 +31699,11 @@ class SettingsTab(QWidget):
         for row in range(self.launch_control_table.rowCount() if has_rows else 0):
             widget = self.launch_control_table.cellWidget(row, 3)
             if isinstance(widget, QPushButton):
-                widget.setEnabled(not self.launch_orchestrator.is_active())
+                name_item = self.launch_control_table.item(row, 0)
+                key = str(name_item.data(Qt.UserRole) or "") if name_item else ""
+                included = any(str(item.get("instance_key", item.get("name", ""))) == key
+                               and bool(item.get("enabled", True)) for item in self._launch_items_cache)
+                widget.setEnabled(not self.launch_orchestrator.is_active() and included)
 
     def _refresh_launch_control_guidance(self) -> None:
         if not hasattr(self, "launch_guidance_card"):
@@ -31614,26 +31791,13 @@ class SettingsTab(QWidget):
 
     def _reset_launch_order(self) -> None:
         self._sync_launch_cache_from_table()
-        existing_map = {
-            str(item.get("name", "")).strip(): item
-            for item in self._launch_items_cache
-            if isinstance(item, dict)
-        }
-        reset_items: List[Dict[str, object]] = []
-        for name in self.launch_orchestrator.launch_catalog_order(self._custom_tool_items_cache):
-            prev = existing_map.get(name, {})
-            reset_items.append(
-                {
-                    "name": name,
-                    "enabled": bool(prev.get("enabled", True)),
-                    "startup": bool(prev.get("startup", False)),
-                    "monitor_health": bool(prev.get("monitor_health", True)),
-                    "instance_key": str(prev.get("instance_key", name) or name),
-                    "dependencies": list(prev.get("dependencies", []) or []),
-                    "readiness_policy": dict(prev.get("readiness_policy", {}) or {}),
-                }
-            )
-        self._launch_items_cache = reset_items
+        order = self.launch_orchestrator.launch_catalog_order(self._custom_tool_items_cache)
+        ranks = {name: index for index, name in enumerate(order)}
+        # Reorder existing assignments; never reconstruct rows from catalog
+        # defaults (which would discard receiver targets and capability scope).
+        self._launch_items_cache = sorted(
+            [dict(item) for item in self._launch_items_cache if isinstance(item, dict)],
+            key=lambda item: ranks.get(str(item.get("name", "")), len(ranks)))
         self._refresh_launch_control_table()
         self._mark_settings_dirty()
 
@@ -32745,6 +32909,7 @@ class SettingsTab(QWidget):
                 cond_level = 5
             if cond_level < 1 or cond_level > 5:
                 cond_level = 5
+        before_groups = [dict(row) for row in self.operating_groups]
         existing_values = target or next((row for row in self.operating_groups
                                            if str(row.get("operating_group_key", "") or "") == group_key), {})
         row_values = {
@@ -32782,15 +32947,18 @@ class SettingsTab(QWidget):
                     g["fastlight_unsigned_suffix"] = str(fastlight_unsigned_suffix or "group_default").strip()
                 if fastlight_form_family is not None:
                     g["fastlight_form_family"] = str(fastlight_form_family or "group_default").strip().upper()
+        previous_name = next((str(row.get("group", "") or "") for row in before_groups
+                              if row.get("operating_group_frequency_key") == target.get("operating_group_frequency_key")), name)
+        if previous_name != name:
+            self.operating_groups = _settings_rename_operating_group_family(
+                self.operating_groups, group_key, name, previous_name)
         self._refresh_operating_groups_table()
-        # Persist immediately so additions survive app restarts without requiring an explicit Save click.
-        try:
-            self._save_settings_quiet()
-            self._settings_dirty = False
-            self._set_save_button_state("success")
-            self._emit_operating_groups_changed()
-        except Exception:
-            log.exception("Failed to persist Operating Group; will remain in-memory only.")
+        # Group edits own only this persisted key, not other Settings drafts.
+        if self._persist_operating_groups_quiet() is False:
+            self.operating_groups = before_groups
+            self._refresh_operating_groups_table()
+            return False
+        return True
 
     def _load_known_operating_group_catalog(self) -> None:
         try:
@@ -33235,15 +33403,19 @@ class SettingsTab(QWidget):
                 group_list.setCurrentRow(row)
                 return
 
-    def _persist_operating_groups_quiet(self) -> None:
+    def _persist_operating_groups_quiet(self) -> bool:
         try:
             self.settings.set("operating_groups", self._table_to_operating_groups())
-            self._cache_configuration_attention()
-            self._settings_dirty = False
-            self._set_save_button_state("success")
-            self._emit_operating_groups_changed()
-        except Exception:
+        except Exception as exc:
             log.exception("Failed to persist Operating Groups.")
+            self._publish_settings_action_feedback(status="failed",
+                summary="Operating Group changes were not saved. Correct the problem and retry.", detail=str(exc))
+            return False
+        self._cache_configuration_attention()
+        self._set_save_button_state("info" if getattr(self, "_settings_dirty", False) else "success")
+        self._refresh_section_nav_health()
+        self._emit_operating_groups_changed()
+        return True
 
     def _refresh_operating_groups_table(self):
         _perf_t0 = time.perf_counter()
@@ -33345,6 +33517,8 @@ class SettingsTab(QWidget):
             sel_chk = QCheckBox()
             sel_chk.setFixedWidth(22)
             sel_chk.stateChanged.connect(self._update_op_group_action_buttons)
+            sel_chk.stateChanged.connect(
+                lambda state, r=row: self.op_groups_table.setCurrentCell(r, 2) if state else None)
             sel_chk.stateChanged.connect(lambda _state: self._refresh_op_group_detail_panel())
             sel_wrap = QWidget()
             sel_layout = QHBoxLayout(sel_wrap)
@@ -33519,12 +33693,14 @@ class SettingsTab(QWidget):
         }
 
     def _refresh_op_group_detail_panel(self) -> None:
+        if getattr(self, "_op_group_editor_editing", False):
+            return
         table = getattr(self, "op_groups_table", None)
         if table is None:
             return
         row = int(table.currentRow())
         selected_rows = self._selected_op_rows() if hasattr(self, "_selected_op_rows") else []
-        if selected_rows:
+        if (row < 0 or row >= table.rowCount()) and selected_rows:
             row = selected_rows[0]
         if row < 0 or row >= table.rowCount():
             summary = "Select a group row to review VFO, FLDigi, auto-tune, and condition-level details."
@@ -33576,6 +33752,7 @@ class SettingsTab(QWidget):
         if isinstance(summary_label, QLabel):
             summary_label.setText(summary)
         self._populate_operating_group_editor(row if row >= 0 and row < table.rowCount() else None)
+        self._set_operating_group_editing(False)
 
     def _populate_operating_group_editor(self, row: int | None) -> None:
         table = getattr(self, "op_groups_table", None)
@@ -33648,18 +33825,71 @@ class SettingsTab(QWidget):
         self._refresh_op_group_fastlight_form_family_options()
         self._set_combo_data_if_present(self.op_group_fastlight_form_family_combo, policy.get("fastlight_form_family", "group_default"))
 
+    def _set_operating_group_editing(self, editing: bool) -> None:
+        self._op_group_editor_editing = bool(editing)
+        if not editing:
+            self._op_group_editor_dirty = False
+        for field in getattr(self, "_op_group_editor_fields", ()):
+            field.setEnabled(editing)
+        for name in ("op_groups_table", "op_group_list", "add_group_btn", "delete_group_btn",
+                     "op_group_add_config_btn", "known_op_group_combo", "enable_known_group_btn"):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.setEnabled(not editing)
+        table = getattr(self, "op_groups_table", None)
+        has_row = table is not None and (table.currentRow() >= 0 or bool(self._selected_op_rows()))
+        self.edit_group_btn.setEnabled(bool(has_row and not editing))
+        self.op_group_save_btn.setEnabled(editing)
+        self.op_group_cancel_btn.setVisible(editing)
+        self.op_group_detail_card.setTitle("Edit Configuration" if editing else "Selected Configuration — read only")
+
+    def _operating_group_editor_signature(self) -> tuple:
+        return tuple(field.text() if isinstance(field, QLineEdit) else (
+            (field.currentText(), field.currentData()) if isinstance(field, QComboBox) else field.isChecked())
+            for field in getattr(self, "_op_group_editor_fields", ()))
+
+    def _on_operating_group_editor_changed(self, *_args) -> None:
+        if not getattr(self, "_op_group_editor_editing", False):
+            return
+        self._op_group_editor_dirty = self._operating_group_editor_signature() != getattr(self, "_op_group_editor_baseline", ())
+        self._refresh_section_nav_health()
+
+    def _reveal_operating_group_editor(self) -> None:
+        scroll = getattr(self, "sections_scroll", None)
+        self.op_group_name_edit.setFocus(Qt.OtherFocusReason)
+        if scroll is not None:
+            scroll.ensureWidgetVisible(self.op_group_name_edit, 0, 16)
+            # Align the editor's heading, rather than exposing only its first
+            # field at the bottom edge of a compact viewport.
+            offset = self.op_group_detail_card.mapTo(scroll.viewport(), self.op_group_detail_card.rect().topLeft()).y()
+            bar = scroll.verticalScrollBar()
+            bar.setValue(bar.value() + offset - 8)
+
     def _focus_operating_group_editor(self) -> None:
+        if not getattr(self, "_op_group_editor_editing", False):
+            self._refresh_op_group_detail_panel()
+            if getattr(self, "_op_group_editor_original_key", None) is None:
+                return
+            self._op_group_editor_baseline = self._operating_group_editor_signature()
+            self._set_operating_group_editing(True)
+        self._reveal_operating_group_editor()
+
+    def _cancel_operating_group_editor(self) -> None:
+        self._set_operating_group_editing(False)
         self._refresh_op_group_detail_panel()
-        if hasattr(self, "op_group_name_edit"):
-            self.op_group_name_edit.setFocus()
+        self._refresh_section_nav_health()
 
     def _add_operating_group_inline(self) -> None:
+        if getattr(self, "_op_group_editor_editing", False):
+            return
         selected_group = self._current_operating_group_name()
         self._populate_operating_group_editor(None)
         self._op_group_editor_original_key = None
         self.op_group_name_edit.setText(selected_group or "")
         self.op_group_freq_edit.clear()
-        self.op_group_name_edit.setFocus()
+        self._op_group_editor_baseline = self._operating_group_editor_signature()
+        self._set_operating_group_editing(True)
+        self._reveal_operating_group_editor()
 
     def _save_operating_group_editor(self) -> None:
         old_key = getattr(self, "_op_group_editor_original_key", None)
@@ -33692,7 +33922,7 @@ class SettingsTab(QWidget):
                 QMessageBox.warning(self, "Group Name", f"{new_name} already identifies a different Operating Group.")
                 return
         try:
-            self._upsert_operating_group(
+            saved = self._upsert_operating_group(
                 new_name,
                 new_mode,
                 new_band,
@@ -33713,20 +33943,31 @@ class SettingsTab(QWidget):
         except ValueError as exc:
             QMessageBox.warning(self, "Duplicate Frequency", str(exc))
             return
-        if old_group and old_group != new_name:
-            old_group_key = str(old_key.get("operating_group_key", "") or "")
-            self.operating_groups = _settings_rename_operating_group_family(
-                self.operating_groups, old_group_key, new_name, old_group
-            )
-            self._refresh_operating_groups_table()
-            self._persist_operating_groups_quiet()
+        if saved is False:
+            return
+        saved_row = next((row for row in self.operating_groups
+                          if row.get("group") == new_name and row.get("band") == new_band
+                          and normalize_operating_group_mode(row.get("mode"), new_band) == new_mode
+                          and _settings_frequency_hz(row.get("frequency")) == _settings_frequency_hz(new_freq_txt)), {})
+        self._set_operating_group_editing(False)
+        self._select_operating_group(new_name)
+        for row in range(self.op_groups_table.rowCount()):
+            item = self.op_groups_table.item(row, 1)
+            if item is not None and item.data(Qt.UserRole) == saved_row.get("operating_group_frequency_key"):
+                self.op_groups_table.setCurrentCell(row, 2)
+                break
+        self._refresh_op_group_detail_panel()
+        self._refresh_section_nav_health()
+        self._publish_settings_action_feedback(status="succeeded", summary="Operating Group configuration saved.")
+        self._publish_save_guardrail_feedback()
 
     def _update_op_group_action_buttons(self):
         theme = resolve_theme(self.settings)
         has_selection = bool(self._selected_op_rows())
         role = "info" if has_selection else "muted"
-        self.edit_group_btn.setEnabled(True)
-        self.delete_group_btn.setEnabled(True)
+        self.edit_group_btn.setEnabled(bool((has_selection or self.op_groups_table.currentRow() >= 0)
+                                           and not getattr(self, "_op_group_editor_editing", False)))
+        self.delete_group_btn.setEnabled(not getattr(self, "_op_group_editor_editing", False))
         self.edit_group_btn.setStyleSheet(button_style(role, theme))
         self.delete_group_btn.setStyleSheet(button_style(role, theme))
         self._refresh_known_operating_group_preview()
@@ -34210,30 +34451,13 @@ class SettingsTab(QWidget):
     # ---------- Local Net Profiles ---------- #
 
     def _normalize_local_net_profile(self, row: Dict) -> Dict[str, str]:
-        # Legacy map: name->group, service->resource.
-        group = str(row.get("group", row.get("name", "")) or "").strip()
-        resource = str(row.get("resource", row.get("service", "")) or "").strip()
-        mode = str(row.get("mode", "") or "").strip()
-        target = str(row.get("target", "") or "").strip()
-        notes = str(row.get("notes", "") or "").strip()
-        if not resource:
-            resource = LOCAL_NET_RESOURCE_OPTIONS[0]
-        return {
-            "group": group,
-            "resource": resource,
-            "mode": mode,
-            "target": target,
-            "notes": notes,
-        }
+        from freqinout.core.local_group_frequency import normalize_local_profile
+        return normalize_local_profile(row, default_resource=LOCAL_NET_RESOURCE_OPTIONS[0])
 
     @staticmethod
     def _local_net_profile_row_key(row: Dict[str, str]) -> Tuple[str, str, str, str]:
-        return (
-            str(row.get("group", "")).strip().upper(),
-            str(row.get("resource", "")).strip().upper(),
-            str(row.get("mode", "")).strip().upper(),
-            str(row.get("target", "")).strip().upper(),
-        )
+        from freqinout.core.local_group_frequency import local_profile_key
+        return local_profile_key(row)
 
     def _table_to_local_net_profiles(self) -> List[Dict[str, str]]:
         cleaned: List[Dict[str, str]] = []
@@ -34281,11 +34505,6 @@ class SettingsTab(QWidget):
         )
 
     def _current_local_net_group_name(self) -> str:
-        group_list = getattr(self, "local_net_group_list", None)
-        if isinstance(group_list, QListWidget):
-            item = group_list.currentItem()
-            if item is not None:
-                return str(item.data(Qt.UserRole) or item.text() or "").strip().upper()
         combo = getattr(self, "local_net_group_combo", None)
         if isinstance(combo, QComboBox):
             text = combo.currentText().strip().upper()
@@ -34293,7 +34512,19 @@ class SettingsTab(QWidget):
             if combo.currentIndex() == 0 and not str(combo.currentData() or "").strip() and text == placeholder:
                 return ""
             return text
+        group_list = getattr(self, "local_net_group_list", None)
+        if isinstance(group_list, QListWidget):
+            item = group_list.currentItem()
+            if item is not None:
+                return str(item.data(Qt.UserRole) or item.text() or "").strip().upper()
         return ""
+
+    def _local_net_catalog_group_name(self) -> str:
+        """The visible editor owns the destination, including an unsaved group."""
+        editor = getattr(self, "local_net_group_edit", None)
+        if isinstance(editor, QLineEdit):
+            return editor.text().strip().upper()
+        return self._current_local_net_group_name()
 
     def _is_local_net_group_enabled(self, group: object) -> bool:
         group_name = str(group or "").strip().upper()
@@ -34327,7 +34558,8 @@ class SettingsTab(QWidget):
         self._update_local_net_action_buttons()
 
     def _on_local_net_group_selected(self) -> None:
-        group = self._current_local_net_group_name()
+        item = self.local_net_group_list.currentItem()
+        group = str(item.data(Qt.UserRole) or item.text() or "").strip().upper() if item else ""
         combo = getattr(self, "local_net_group_combo", None)
         if isinstance(combo, QComboBox) and group:
             idx = combo.findText(group)
@@ -34356,6 +34588,10 @@ class SettingsTab(QWidget):
                         group_list.setCurrentRow(row)
                     break
         self._refresh_local_net_profiles_table()
+
+    def _on_local_net_group_text_changed(self, _text: str) -> None:
+        # Typing a new group is a valid destination before it has any rows.
+        self._update_local_net_action_buttons()
 
     def _toggle_local_net_group(self) -> None:
         group = self._current_local_net_group_name()
@@ -34404,6 +34640,23 @@ class SettingsTab(QWidget):
             self.local_net_group_action_btn.setText("Disable Group" if group_enabled else "Enable Group")
             self.local_net_group_action_btn.setStyleSheet(
                 button_style("warning" if group_enabled else ("eligible_info" if group else "muted"), theme)
+            )
+        linked = any(
+            str(row.get("group", "")).strip().upper() == group
+            and bool(row.get("frequency_resource_key"))
+            for row in self.local_net_profiles if isinstance(row, dict)
+        )
+        catalog_group = self._local_net_catalog_group_name()
+        for name, enabled in (("local_net_catalog_add_btn", bool(catalog_group)),
+                              ("local_net_catalog_review_btn", bool(group) and linked)):
+            button = getattr(self, name, None)
+            if button is not None:
+                button.setEnabled(enabled)
+                button.setStyleSheet(button_style("eligible_info" if enabled else "muted", theme))
+        if hasattr(self, "local_net_catalog_add_btn"):
+            self.local_net_catalog_add_btn.setToolTip(
+                f"Choose frequencies to add to {catalog_group}." if catalog_group
+                else "Enter a Group name in the configuration editor first."
             )
         self.edit_local_net_btn.setStyleSheet(button_style(role, theme))
         self.delete_local_net_btn.setStyleSheet(button_style(role, theme))
@@ -34478,13 +34731,19 @@ class SettingsTab(QWidget):
                     item.setTextAlignment(Qt.AlignCenter)
                     item.setSizeHint(QSize(max(110, 14 * len(group_name)), 34))
                     group_list.addItem(item)
-                target_group = selected_group if selected_group in groups else (groups[0] if groups else "")
+                target_group = selected_group if selected_group in groups else (groups[0] if not selected_group and groups else "")
                 if target_group:
                     for row_idx in range(group_list.count()):
                         item = group_list.item(row_idx)
                         if item and str(item.data(Qt.UserRole) or "") == target_group:
                             group_list.setCurrentRow(row_idx)
                             selected_group = target_group
+                            if isinstance(combo, QComboBox) and combo.currentText().strip().upper() != target_group:
+                                combo_blocked = combo.blockSignals(True)
+                                try:
+                                    combo.setCurrentText(target_group)
+                                finally:
+                                    combo.blockSignals(combo_blocked)
                             break
             finally:
                 group_list.blockSignals(was_blocked)
@@ -34504,10 +34763,14 @@ class SettingsTab(QWidget):
             sel_layout.setAlignment(Qt.AlignCenter)
             sel_layout.addWidget(sel_chk)
             table.setCellWidget(row, 0, sel_wrap)
-            table.setItem(row, 1, QTableWidgetItem(prof.get("group", "")))
+            group_item = QTableWidgetItem(prof.get("group", ""))
+            group_item.setData(Qt.UserRole, dict(prof))
+            table.setItem(row, 1, group_item)
             table.setItem(row, 2, QTableWidgetItem(prof.get("resource", "")))
             table.setItem(row, 3, QTableWidgetItem(prof.get("mode", "")))
-            table.setItem(row, 4, QTableWidgetItem(prof.get("target", "")))
+            target_item = QTableWidgetItem(prof.get("target", ""))
+            target_item.setToolTip(prof.get("target", ""))
+            table.setItem(row, 4, target_item)
             table.setItem(row, 5, QTableWidgetItem(prof.get("notes", "")))
         table.setColumnHidden(5, True)
         # These group tables sit in compact Settings panels; six rows keeps the section scannable.
@@ -34528,13 +34791,17 @@ class SettingsTab(QWidget):
         self._refresh_section_titles()
 
     def _local_profile_from_row(self, row: int) -> Dict[str, str]:
-        return {
+        group_item = self.local_net_table.item(row, 1)
+        stored = group_item.data(Qt.UserRole) if group_item else None
+        result = dict(stored) if isinstance(stored, dict) else {}
+        result.update({
             "group": self.local_net_table.item(row, 1).text().strip() if self.local_net_table.item(row, 1) else "",
             "resource": self.local_net_table.item(row, 2).text().strip() if self.local_net_table.item(row, 2) else "",
             "mode": self.local_net_table.item(row, 3).text().strip() if self.local_net_table.item(row, 3) else "",
             "target": self.local_net_table.item(row, 4).text().strip() if self.local_net_table.item(row, 4) else "",
             "notes": self.local_net_table.item(row, 5).text().strip() if self.local_net_table.item(row, 5) else "",
-        }
+        })
+        return result
 
     def _set_local_combo_text_if_present(self, combo: QComboBox, value: str) -> None:
         text = str(value or "").strip()
@@ -34573,11 +34840,17 @@ class SettingsTab(QWidget):
         self._set_local_combo_text_if_present(self.local_net_resource_combo, resource)
         self._set_local_combo_text_if_present(self.local_net_mode_combo, mode)
         self.local_net_target_edit.setText(target)
+        self.local_net_target_edit.setCursorPosition(0)
         self.local_net_notes_edit.setPlainText(notes)
         summary = f"{group or 'New local group'}"
         if resource:
             summary += f" / {resource}"
-        if target:
+        if row >= 0 and row < table.rowCount() and profile.get("frequency_resource_key"):
+            from freqinout.core.local_group_frequency import snapshot_for_profile
+            saved = snapshot_for_profile(profile)
+            summary += f" / {saved.label}" if saved else " / Catalog reference needs review"
+            summary += "\nSaved catalog snapshot. Editing resource, mode, or target makes this a manual configuration."
+        elif target:
             summary += f" / {target}"
         self.local_net_summary_label.setText(summary)
 
@@ -34617,23 +34890,74 @@ class SettingsTab(QWidget):
                 if self._local_net_profile_row_key(normalized) == old_key:
                     old_row = normalized
                     break
+        if old_row is not None:
+            from freqinout.core.local_group_frequency import updated_local_profile
+            candidate = updated_local_profile(old_row, candidate)
+        if candidate.get("frequency_resource_key"):
+            candidate_key = self._local_net_profile_row_key(candidate)
+            if any(self._local_net_profile_row_key(row) == candidate_key
+                   and self._local_net_profile_row_key(row) != old_key for row in self.local_net_profiles):
+                QMessageBox.warning(self, "Local Comms Groups", "This frequency is already assigned to that group. The existing configuration was kept.")
+                return
         self._upsert_local_net_profile(candidate, old_row=old_row)
         self._select_local_net_group(candidate.get("group", ""))
 
-    def _persist_local_net_profiles_quiet(self) -> None:
+    def _persist_local_net_profiles_quiet(self) -> bool:
         try:
-            if hasattr(self.settings, "set"):
-                self.settings.set("local_net_profiles", self._table_to_local_net_profiles())
-            elif hasattr(self.settings, "_data"):
-                self.settings._data["local_net_profiles"] = self._table_to_local_net_profiles()  # type: ignore[attr-defined]
+            if not callable(getattr(self.settings, "set", None)):
+                raise RuntimeError("Persistent settings storage is unavailable")
+            self.settings.set("local_net_profiles", self._table_to_local_net_profiles())
+        except Exception:
+            log.exception("Failed to persist Local Net Profiles.")
+            return False
+        # UI feedback cannot turn a successful durable write into a failure.
+        try:
             self._settings_dirty = False
             self._set_save_button_state("success")
-            try:
-                self.local_net_profiles_changed.emit()
-            except Exception:
-                pass
+            self.local_net_profiles_changed.emit()
         except Exception:
-            log.exception("Failed to persist Local Net Profiles; will remain in-memory only.")
+            log.exception("Failed to update Local Net Profiles save feedback.")
+        return True
+
+    def _add_local_net_from_catalog(self) -> None:
+        self._choose_local_net_catalog_resources(review_only=False)
+
+    def _review_local_net_catalog_changes(self) -> None:
+        self._choose_local_net_catalog_resources(review_only=True)
+
+    def _choose_local_net_catalog_resources(self, *, review_only: bool) -> None:
+        group = self._current_local_net_group_name() if review_only else self._local_net_catalog_group_name()
+        if not group:
+            return
+        from freqinout.core.known_operating_groups import net_resources_db_path
+        from freqinout.core.local_group_frequency import merge_catalog_frequencies
+        from freqinout.core.resource_catalog_store import ResourceCatalogStore
+        from freqinout.gui.group_frequency_picker import GroupFrequencyPickerDialog
+
+        try:
+            dialog = GroupFrequencyPickerDialog(
+                ResourceCatalogStore(net_resources_db_path()), group, self.local_net_profiles,
+                review_only=review_only, parent=self,
+            )
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            merged, added, _skipped = merge_catalog_frequencies(
+                self.local_net_profiles, group, dialog.selected_resources,
+                replace_existing=review_only,
+            )
+            if not added:
+                return
+            previous = self.local_net_profiles
+            self.local_net_profiles = merged
+            if not self._persist_local_net_profiles_quiet():
+                self.local_net_profiles = previous
+                QMessageBox.warning(self, "Local Comms Groups", "Could not save catalog selections. Please try again.")
+                return
+            self._refresh_local_net_profiles_table()
+            self._select_local_net_group(group)
+        except Exception:
+            log.exception("Failed to select local group catalog frequencies")
+            QMessageBox.warning(self, "Local Comms Groups", "Could not load catalog selections. Please try again.")
 
     def _open_local_net_profile_dialog(self, existing: Optional[Dict[str, str]] = None) -> Optional[Dict[str, str]]:
         dlg = QDialog(self)

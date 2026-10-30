@@ -1,6 +1,7 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import datetime
+import math
 import re
 import sqlite3
 import time
@@ -10,10 +11,11 @@ import uuid
 from pathlib import Path
 from typing import List, Dict, Set, Optional
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, Signal, QEvent
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QWidget,
+    QFrame,
     QVBoxLayout,
     QHBoxLayout,
     QGridLayout,
@@ -30,8 +32,12 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
     QSizePolicy,
     QScrollArea,
+    QMenu,
+    QToolButton,
 )
 
+from freqinout.core.net_schedule_occurrences import next_net_occurrence
+from freqinout.core.schedule_targeting import schedule_row_matches_target_context
 from freqinout.core.settings_manager import SettingsManager
 from freqinout.core.software_status_service import SoftwareStatusService
 from freqinout.core.logger import log
@@ -42,6 +48,7 @@ from freqinout.core.js8_spotter_forms import (
     PURPOSE_NET_CHECKIN,
     PURPOSE_NET_NOTIFICATION,
     discover_effective_spotter_forms,
+    resolve_net_form_options,
     extract_form_codes,
     forms_enabled_for,
     legacy_default_forms_for,
@@ -57,6 +64,7 @@ from freqinout.core.js8_send_service import (
 from freqinout.core.js8_source_context import resolve_js8_source_context
 from freqinout.core.multi_radio_store import MultiRadioStore
 from freqinout.core.ncs_session_contract import NcsSessionSnapshot, write_ncs_session_snapshot
+from freqinout.core.ncs_workbench_model import is_incidental_net_traffic, net_traffic_payload
 from freqinout.utils.timezones import get_timezone
 from freqinout.radio_interface.js8_api_client import JS8ApiClientRegistry, JS8ApiEndpoint
 from freqinout.radio_interface.js8_rx_hub import JS8RxHub
@@ -83,9 +91,10 @@ from freqinout.gui.qsy_helper import (
     active_hold_button_text,
     active_hold_status_text,
 )
+from freqinout.core.group_utils import normalize_group_name
 from freqinout.core.config_paths import get_config_dir
 from freqinout.gui.theme import (
-    resolve_theme, button_style, fit_child_combo_boxes, fit_combo_box_to_contents,
+    resolve_theme, active_app_theme, button_style, fit_child_combo_boxes, fit_combo_box_to_contents,
     font_derived_widget_height,
 )
 
@@ -137,12 +146,27 @@ class JS8CallNetControlTab(QWidget):
           is within next 20 minutes.
         * Prefills net name if the field is empty and no net is in progress.
     """
+    form_tools_ready = Signal(object, object, object)
+    roster_groups_ready = Signal(object, object, object)
     net_status_changed = Signal(str, bool)
     net_session_status_changed = Signal(str, bool, int, str)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, preparation_settings=None):
         super().__init__(parent)
-        self.settings = SettingsManager()
+        self._roster_groups_inflight = False
+        self._roster_group_names = ()
+        self._roster_groups_checked = 0.0
+        self._roster_groups_cache_scope = None
+        self._query_destination_session = None
+        self.roster_groups_ready.connect(self._publish_roster_groups)
+        self._form_tools_executor = None
+        self._form_tools_inflight = False
+        self._form_mappings_generation = 0
+        self._form_mappings_dirty = False
+        self.form_tools_ready.connect(self._publish_form_tools)
+        self._preparation_shell = preparation_settings is not None
+        self._preparation_scope = None
+        self.settings = preparation_settings if preparation_settings is not None else SettingsManager()
         self._status_service = SoftwareStatusService(self.settings)
 
         self._net_in_progress = False
@@ -206,6 +230,7 @@ class JS8CallNetControlTab(QWidget):
         self._checkins_saved: Set[str] = set()
         self._group_target: str = ""
         self._spotter_form: Optional[str] = None
+        self._available_net_form_codes = set()
         self._expected_form: Optional[str] = None
         self._status_mismatch: Dict[str, bool] = {}
         self._pending_announcements: Dict[str, float] = {}  # callsign -> ts waiting for completion
@@ -237,14 +262,307 @@ class JS8CallNetControlTab(QWidget):
 
         self._build_ui()
         self._apply_theme()
-        self._load_settings()
-        self._setup_timer()
-        self._setup_clock_timer()
-        self._update_clock_labels()
-        self._setup_js8_rx_timer()
-        self._update_suspend_state()
-        self._refresh_auto_query_flags()
-        self._refresh_qsy_options()
+        if not self._preparation_shell:
+            self._load_settings()
+            self._setup_timer()
+            self._setup_clock_timer()
+            self._update_clock_labels()
+            self._setup_js8_rx_timer()
+            self._update_suspend_state()
+            self._refresh_auto_query_flags()
+            self._refresh_qsy_options()
+        from freqinout.gui.net_prepared_receiver import PreparedReceiver
+        self._prepared_receiver = PreparedReceiver(self, "JS8", writer=getattr(preparation_settings, "writer", None))
+        from freqinout.gui.ncs_workbench_panel import NcsWorkbenchPanel
+        from freqinout.gui.ncs_workbench_controller import NcsWorkbenchController
+        self.workbench_panel = NcsWorkbenchPanel(self)
+        self._workbench_layout.insertWidget(0, self.workbench_panel, 1)
+        self._mount_workbench_rail()
+        # Reuse the original buttons and guarded handlers at their target.
+        self._js8_action_row.removeWidget(self.ack_btn)
+        self._js8_action_row.removeWidget(self.ack_callsign_btn)
+
+        self.query_group_selector = QComboBox()
+        self.query_group_selector.setEditable(True)
+        self.query_group_selector.setInsertPolicy(QComboBox.NoInsert)
+        self.query_group_selector.setProperty('fio_no_auto_fit', True)
+        self.query_group_selector.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.query_group_selector.setMinimumContentsLength(12)
+        self.query_group_selector.setAccessibleName('Expect query group destination')
+        self.query_group_selector.setToolTip('HF roster group to query. Selection sends nothing and does not change net identity.')
+        self.query_group_selector.lineEdit().textChanged.connect(self._update_query_controls)
+        self.query_context_widget = QWidget()
+        self._query_context_grid = QGridLayout(self.query_context_widget)
+        self._query_context_grid.setContentsMargins(0, 0, 0, 0)
+        self._query_group_label = QLabel('Query group')
+        self._query_form_label = QLabel('Form')
+        self.workbench_panel.query_picker_layout.addWidget(self.query_context_widget)
+        self.spotter_combo.setPlaceholderText('Query form (optional)')
+        self.spotter_combo.show()
+        self.review_form_tools_btn.setText('Reload forms')
+        self.review_form_tools_btn.setToolTip('Reload available optional query forms; selection sends nothing')
+        self.review_form_tools_btn.hide()
+        self._mount_live_query_actions()
+        self.workbench = NcsWorkbenchController(self, self.workbench_panel)
+        self.workbench_panel.state_presented.connect(self._update_workspace_presentation)
+        self.workbench_panel.workspace_changed.connect(self._ncs_workspace_changed)
+        self.workbench_panel.editor_reveal_requested.connect(self._reveal_saved_message_editor)
+        self._ncs_workspace_scroll = {}
+        self._ncs_workspace_mode = 'traffic'
+        self._prepared_receiver.changed.connect(self._update_workspace_presentation)
+        self._update_workspace_presentation()
+        self._update_checkin_empty_state()
+
+
+    def _reveal_saved_message_editor(self):
+        def reveal():
+            if self._is_shutting_down or not self.workbench_panel.manage_messages_toggle.isChecked():
+                return
+            editor = self.workbench_panel.saved_library.editor
+            area = self.js8_ncs_scroll_area
+            top = editor.mapTo(area.widget(), editor.rect().topLeft()).y()
+            if editor.height() > area.viewport().height():
+                area.verticalScrollBar().setValue(top)
+            else:
+                area.ensureWidgetVisible(editor, 0, 0)
+        QTimer.singleShot(0, reveal)
+
+    def _ncs_workspace_changed(self, mode):
+        bar = self.js8_ncs_scroll_area.verticalScrollBar()
+        old = getattr(self, '_ncs_workspace_mode', 'traffic')
+        cache = getattr(self, '_ncs_workspace_scroll', {})
+        cache[old] = bar.value()
+        self._ncs_workspace_scroll = cache
+        self._ncs_workspace_mode = mode
+        if hasattr(self, 'workspace_menu_button'):
+            self.workspace_menu_button.setText('Net workspace')
+        def position():
+            if self._is_shutting_down or self._ncs_workspace_mode != mode:
+                return
+            if mode == 'traffic' and mode in cache:
+                bar.setValue(cache[mode])
+            elif mode in {'compose', 'library'}:
+                bar.setValue(0)
+            else:
+                bar.setValue(0)
+        QTimer.singleShot(0, position)
+
+    def _mount_workbench_rail(self):
+        panel = self.workbench_panel
+        panel._external_navigation = True
+        panel._legacy_message_controls = False
+        panel.navigation_widget.hide()
+        self._rail_workspace = QWidget(self.net_action_rail)
+        self._rail_workspace.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        rows = QVBoxLayout(self._rail_workspace)
+        rows.setContentsMargins(0, 0, 0, 0)
+        for button in (panel.manage_messages_toggle, panel.sent_activity_toggle):
+            rows.addWidget(button)
+            button.show()
+        self.workspace_menu_button = QPushButton('Traffic')
+        self.workspace_menu = QMenu(self.workspace_menu_button)
+        for label, button in (('Traffic', panel.traffic_button),
+                              ('Saved messages', panel.manage_messages_toggle), ('Sent activity', panel.sent_activity_toggle)):
+            action = self.workspace_menu.addAction(label)
+            action.triggered.connect(lambda checked=False, control=button:
+                panel.show_traffic() if control is panel.traffic_button else control.setChecked(True))
+        self.workspace_menu_button.setMenu(self.workspace_menu)
+        self.workspace_menu_button.setAccessibleName('NCS workspace')
+        self.workspace_menu_button.hide()
+        rows.insertWidget(0, self.workspace_menu_button)
+        rows.insertWidget(1, panel.traffic_button)
+        self.query_menu_button = QPushButton('Query…')
+        self.query_menu = QMenu(self.query_menu_button)
+        self.query_menu.aboutToShow.connect(self._populate_net_query_menu)
+        self.query_menu_button.setMenu(self.query_menu)
+        self.query_menu_button.hide()
+        self._secondary_actions_button = QPushButton('Tools…')
+        tools = QMenu(self._secondary_actions_button)
+        self._secondary_actions_button.setMenu(tools)
+        tools.addAction('Reload forms').triggered.connect(self.review_form_tools_btn.click)
+        self._topics_action = tools.addAction('Topics')
+        self._topics_action.setCheckable(True)
+        self._topics_action.triggered.connect(panel.topics_button.setChecked)
+        panel.topics_button.toggled.connect(self._topics_action.setChecked)
+        tools.addAction('Refresh traffic').triggered.connect(panel.refresh_button.click)
+        self._records_menu = tools.addMenu('Open net record…')
+        self._records_menu.aboutToShow.connect(self._populate_record_menu)
+        rows.addWidget(self._secondary_actions_button)
+        panel.topics_button.hide()
+        panel.run_controls_widget.hide()
+        self.net_actions_menu.addMenu(tools)
+        # ACK controls join the direct operational action strip after construction.
+        self._net_rail_layout.insertWidget(1, self._rail_workspace)
+        # Lifecycle → activity → reusable configuration. Reuse command objects
+        # and original guarded handlers; only their presentation owner changes.
+        for control in (self.net_actions_more, self.net_action_buttons, self._rail_workspace, self.net_setup_toggle):
+            self._net_rail_layout.removeWidget(control)
+        self._net_rail_layout.insertWidget(0, self.net_actions_more)
+        self._net_rail_layout.insertWidget(1, self.net_action_buttons)
+        self._rail_separators = []
+        for position in (2, 3):
+            line = QFrame()
+            line.setFrameShape(QFrame.Shape.HLine)
+            line.setFrameShadow(QFrame.Shadow.Sunken)
+            self._net_rail_layout.insertWidget(position, line)
+            self._rail_separators.append(line)
+        self._net_rail_layout.insertWidget(3, self._rail_workspace)
+        self._rail_configuration = QWidget()
+        self._rail_configuration.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        configuration = QVBoxLayout(self._rail_configuration)
+        configuration.setContentsMargins(0, 0, 0, 0)
+        for control in (panel.manage_messages_toggle, self._secondary_actions_button, self.net_setup_toggle):
+            rows.removeWidget(control)
+            configuration.addWidget(control)
+        self._net_rail_layout.insertWidget(5, self._rail_configuration)
+        self._rail_workspace.setAccessibleName('Net activity')
+        self._rail_configuration.setAccessibleName('Configuration and tools')
+        panel.group_context_label.hide()
+        panel.traffic_button.hide()
+        # Hidden compatibility buttons keep the original guarded handlers/state.
+        for button in (panel.query_group_button, panel.query_station_button, panel.undo_button):
+            button.setParent(self.net_action_rail)
+            button.hide()
+        for button in (self.net_setup_toggle, panel.manage_messages_toggle, panel.sent_activity_toggle):
+            action = self.net_actions_menu.addAction(button.text())
+            action.triggered.connect(button.click)
+            self._net_menu_actions.append((action, button))
+        self._compact_ack_menu = self.net_actions_menu.addMenu('Acknowledge')
+        self._compact_ack_menu.aboutToShow.connect(self._populate_compact_ack_menu)
+        self._undo_net_action = self.net_actions_menu.addAction('Undo last exclusion')
+        self._undo_net_action.triggered.connect(panel.undo_button.click)
+
+    def _populate_record_menu(self):
+        self._records_menu.clear()
+        for index in range(self.workbench_panel.run_selector.count()):
+            selector = self.workbench_panel.run_selector
+            action = self._records_menu.addAction(selector.itemText(index))
+            action.triggered.connect(lambda checked=False, ident=selector.itemData(index):
+                self.workbench_panel.action_requested.emit('open_run', ident))
+        if not self._records_menu.actions():
+            self._records_menu.addAction('No retained nets').setEnabled(False)
+
+    def _mount_live_query_actions(self):
+        panel = self.workbench_panel
+        self.live_query_widget = QWidget()
+        self._live_query_layout = QGridLayout(self.live_query_widget)
+        self._live_query_layout.setContentsMargins(0, 0, 0, 0)
+        self.query_target_mode = QComboBox()
+        self.query_target_mode.addItem('Group', 'group')
+        self.query_target_mode.addItem('Selected station', 'station')
+        self.query_target_mode.setAccessibleName('Query destination type')
+        self.query_target_label = QLabel()
+        self.query_target_label.setWordWrap(True)
+        self.live_query_buttons = []
+        for label, command in [('Expect query', 'expect'), ('SNR?', 'SNR?'), ('QUERY MSGS', 'QUERY MSGS')]:
+            button = QPushButton(label)
+            button.clicked.connect(lambda checked=False, cmd=command: self._send_live_query(cmd))
+            self.live_query_buttons.append(button)
+        panel.query_picker_layout.addWidget(self.live_query_widget)
+        self.query_target_mode.currentIndexChanged.connect(self._update_live_query_target)
+        self.query_group_selector.currentTextChanged.connect(self._update_live_query_target)
+        panel.roster_table.itemSelectionChanged.connect(self._update_live_query_target)
+        self._update_live_query_target()
+
+    def _update_live_query_target(self):
+        if not hasattr(self, 'query_target_mode'):
+            return
+        mode = self.query_target_mode.currentData()
+        station = self.workbench_panel._selected_roster() or {}
+        target = self._query_group_destination() if mode == 'group' else str(station.get('from_call') or station.get('callsign') or '')
+        self.query_target_label.setText(('Group: ' if mode == 'group' else 'Station: ') + (normalize_group_name(target) if mode == 'group' else target or 'Select a station'))
+        writable = bool(self._net_in_progress and self.workbench_panel._snapshot.get('writable'))
+        for button in self.live_query_buttons:
+            button.setEnabled(writable and bool(target))
+            button.setToolTip('Send to ' + target if writable and target else 'Start an active net and select a destination')
+        expect = self.live_query_buttons[0]
+        available = self._spotter_form in self._available_net_form_codes
+        expect.setEnabled(writable and bool(target) and available)
+        if writable and target and not available:
+            expect.setToolTip('Select an available form to send an Expect query')
+
+    def _send_live_query(self, command):
+        mode = self.query_target_mode.currentData()
+        station = dict(self.workbench_panel._selected_roster() or {})
+        target = self._query_group_destination() if mode == 'group' else str(station.get('from_call') or station.get('callsign') or '')
+        self._dispatch_menu_query(command, mode, target, station, self._ncs_session_id, self.workbench.generation)
+
+    def _populate_compact_ack_menu(self):
+        self._compact_ack_menu.clear()
+        run_id = self._ncs_session_id
+        for target in self.workbench_panel._snapshot.get('query_groups', ()):
+            action = self._compact_ack_menu.addAction('Group: ' + normalize_group_name(target))
+            action.setEnabled(self.ack_btn.isEnabled())
+            action.triggered.connect(lambda checked=False, destination=target, ident=run_id:
+                self.workbench.acknowledge(destination=destination, expected_run=ident))
+        action = self._compact_ack_menu.addAction('Selected station')
+        action.setEnabled(self.ack_callsign_btn.isEnabled() and bool(self.workbench_panel._selected_roster()))
+        action.triggered.connect(self.ack_callsign_btn.click)
+
+    def _dispatch_menu_query(self, command, mode, target, station, session, generation):
+        panel = self.workbench_panel
+        selected = panel._selected_roster() or {}
+        current = self._query_group_destination() if mode == 'group' else str(selected.get('from_call') or selected.get('callsign') or '')
+        if (session != self._ncs_session_id or generation != self.workbench.generation or target != current):
+            self.workbench._status('Destination changed. Open Query again to review the current target.')
+            return
+        if command == 'expect':
+            (panel.query_group_button if mode == 'group' else panel.query_station_button).click()
+        else:
+            payload = dict(panel._draft(), target_mode=mode, target_station=dict(station), command=command)
+            panel.action_requested.emit('utility_query', payload)
+
+    def _reflow_query_context(self, compact):
+        if not hasattr(self, '_query_context_grid') or compact == getattr(self, '_query_context_compact', None):
+            return
+        self._query_context_compact = compact
+        grid = self._query_context_grid
+        while grid.count(): grid.takeAt(0)
+        for column in range(5): grid.setColumnStretch(column, 0)
+        grid.addWidget(self._query_group_label, 0, 0)
+        grid.addWidget(self.query_group_selector, 0, 1, 1, 2 if compact else 1)
+        grid.addWidget(self._query_form_label, 1 if compact else 0, 0 if compact else 2)
+        grid.addWidget(self.spotter_combo, 1 if compact else 0, 1 if compact else 3)
+
+        grid.setColumnStretch(1, 1)
+        if not compact: grid.setColumnStretch(3, 1)
+
+    def _focus_query_choice(self, kind):
+        def focus():
+            if self._is_shutting_down:
+                return
+            field = self.query_group_selector if kind == 'group' else self.spotter_combo
+            self.js8_ncs_scroll_area.ensureWidgetVisible(field)
+            field.setFocus()
+            field.showPopup()
+        QTimer.singleShot(0, focus)
+
+    def _populate_net_query_menu(self):
+        panel = self.workbench_panel
+        self.query_menu.clear()
+        self.query_menu.addAction('Change query group…').triggered.connect(lambda: self._focus_query_choice('group'))
+        self.query_menu.addAction('Choose query form…').triggered.connect(lambda: self._focus_query_choice('form'))
+        self.query_menu.addSeparator()
+        group = self._query_group_destination()
+        station = panel._selected_roster() or {}
+        call = str(station.get('from_call') or station.get('callsign') or '')
+        writable = bool(self._net_in_progress and panel._snapshot.get('writable'))
+        for label, mode, target in (('Group', 'group', group), ('Station', 'station', call)):
+            heading = self.query_menu.addAction(f'{label}: {normalize_group_name(target) if mode == "group" else target or "Select a station"}')
+            heading.setEnabled(False)
+            for text, command in (('Expect query', 'expect'), ('SNR?', 'SNR?'), ('QUERY MSGS', 'QUERY MSGS')):
+                action = self.query_menu.addAction(text)
+                action.setEnabled(writable and bool(target) and
+                    (command != 'expect' or self._spotter_form in self._available_net_form_codes))
+                action.triggered.connect(lambda checked=False, cmd=command, target_mode=mode, destination=target,
+                    row=dict(station), session=self._ncs_session_id, generation=self.workbench.generation:
+                    self._dispatch_menu_query(cmd, target_mode, destination, row, session, generation))
+            if mode == 'group': self.query_menu.addSeparator()
+
+    def _ncs_nets_db_path(self):
+        if getattr(self, '_preparation_scope', None) is not None or self._preparation_shell:
+            return Path(self.settings.db_path).parent / 'freqinout_nets.db'
+        return _nets_db_path()
 
     def _send_js8_message(self, text: str) -> bool:
         """
@@ -274,6 +592,11 @@ class JS8CallNetControlTab(QWidget):
         return False
 
     def _ncs_radio_profiles(self) -> List[Dict]:
+        scope = getattr(self, "_preparation_scope", None)
+        if scope is not None:
+            return [scope.settings().get('_preparation_profile', {'id': scope.radio_id, 'name': scope.radio_name})]
+        if getattr(self, "_preparation_shell", False):
+            return []
         try:
             profiles = MultiRadioStore().list_runtime_active_device_profiles()
         except Exception as exc:
@@ -295,6 +618,11 @@ class JS8CallNetControlTab(QWidget):
         return str(profile.get("name") or profile.get("label") or f"Radio {profile.get('id', '')}").strip()
 
     def _ncs_selected_radio_id(self, profiles: List[Dict]) -> int:
+        scope = getattr(self, "_preparation_scope", None)
+        if scope is not None:
+            return scope.radio_id
+        if getattr(self, "_preparation_shell", False):
+            return 0
         ids = {int(p.get("id", 0) or 0) for p in profiles}
         try:
             selected = int(getattr(self.window(), "_station_command_selected_profile_id", 0) or 0)
@@ -323,6 +651,9 @@ class JS8CallNetControlTab(QWidget):
                 widget.deleteLater()
 
     def _select_ncs_radio_session(self, profile_id: int) -> None:
+        if getattr(self, "_preparation_scope", None) is not None:
+            self._prepared_receiver._set_status('Prepared', 'Keep the intended radio; review or cancel preparation before choosing another')
+            return
         if self._net_in_progress:
             return
         ident = int(profile_id or 0)
@@ -364,6 +695,8 @@ class JS8CallNetControlTab(QWidget):
         try:
             write_ncs_session_snapshot(self.settings, self._current_ncs_session_snapshot(timing_state=timing_state))
         except Exception as exc:
+            if getattr(self, '_preparation_scope', None) is not None:
+                raise
             log.debug("JS8 NCS: failed to persist session snapshot: %s", exc)
 
     def _refresh_ncs_session_context(self) -> None:
@@ -371,6 +704,7 @@ class JS8CallNetControlTab(QWidget):
             return
         profiles = self._ncs_radio_profiles()
         selected_id = self._ncs_session_radio_id or self._ncs_selected_radio_id(profiles)
+        self._draft_radio_id = selected_id
         theme = resolve_theme(self.settings)
         self._clear_ncs_session_chip_layout()
         if not profiles:
@@ -386,6 +720,8 @@ class JS8CallNetControlTab(QWidget):
             self.ncs_session_chip_layout.addWidget(chip)
         self.ncs_session_chip_layout.addStretch()
         selected_profile = next((p for p in profiles if int(p.get("id", 0) or 0) == selected_id), None)
+        self._preparation_radio_id = selected_id or None
+        self._preparation_operating_id = (selected_profile or {}).get("operating_profile_id")
         radio_name = self._ncs_profile_name(selected_profile)
         role = self.role_combo.currentText().strip() if hasattr(self, "role_combo") else "NCS"
         net_name = self.net_name_edit.text().strip() if hasattr(self, "net_name_edit") else ""
@@ -396,12 +732,21 @@ class JS8CallNetControlTab(QWidget):
             summary = f"{summary} | Active"
         self.ncs_session_summary_label.setText(summary)
         self.ncs_session_summary_label.setToolTip(summary)
+        self._ncs_context_radio_name = radio_name
+        self._update_workspace_presentation()
 
     # ---------------- UI ---------------- #
 
     def _build_ui(self):
-        outer_layout = QVBoxLayout(self)
+        outer_layout = QHBoxLayout(self)
         outer_layout.setContentsMargins(0, 0, 0, 0)
+        # Persistent task rail: net controls never scroll below the roster.
+        self.net_action_rail = QWidget(self)
+        rail_layout = QVBoxLayout(self.net_action_rail)
+        self._net_rail_layout = rail_layout
+        rail_layout.setContentsMargins(0, 0, 0, 0)
+        self.net_action_rail.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        outer_layout.addWidget(self.net_action_rail)
         self.js8_ncs_scroll_area = QScrollArea(self)
         self.js8_ncs_scroll_area.setWidgetResizable(True)
         self.js8_ncs_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -425,7 +770,13 @@ class JS8CallNetControlTab(QWidget):
         header.addWidget(self.local_label)
         layout.addLayout(header)
 
-        session_group = QGroupBox("NCS Session")
+        self.net_context_label = QLabel()
+        self.net_context_label.setWordWrap(True)
+        self.net_context_label.setTextFormat(Qt.PlainText)
+        self.net_context_label.setAccessibleName('Net radio, group and role')
+        layout.addWidget(self.net_context_label)
+        session_group = QGroupBox("Radio")
+        self._js8_session_group = session_group
         session_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         session_layout = QVBoxLayout()
         session_layout.setContentsMargins(12, 10, 12, 10)
@@ -435,14 +786,16 @@ class JS8CallNetControlTab(QWidget):
         self.ncs_session_chip_layout = QHBoxLayout()
         self.ncs_session_chip_layout.setSpacing(8)
         chip_row.addLayout(self.ncs_session_chip_layout, 1)
-        self.ncs_session_summary_label = QLabel("Session: Radio | JS8Call | NCS")
+        self.ncs_session_summary_label = QLabel("Session: Radio | JS8Call | NCS", session_group)
         self.ncs_session_summary_label.setWordWrap(True)
+        self.ncs_session_summary_label.setTextFormat(Qt.PlainText)
         session_layout.addLayout(chip_row)
-        session_layout.addWidget(self.ncs_session_summary_label)
+        self.ncs_session_summary_label.hide()
         session_group.setLayout(session_layout)
         layout.addWidget(session_group)
 
         setup_group = QGroupBox("Net Setup")
+        self._js8_setup_group = setup_group
         setup_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         controls_grid = QGridLayout()
         self._js8_setup_grid = controls_grid
@@ -472,23 +825,37 @@ class JS8CallNetControlTab(QWidget):
         self._js8_group_label = QLabel("Group:")
         controls_grid.addWidget(self._js8_group_label, 1, 0)
         self.set_group_btn = QPushButton("Set Group")
-        self.group_edit = QLineEdit()
-        self.group_edit.setPlaceholderText("@GROUP")
+        self.group_selector = QComboBox()
+        self.group_selector.setEditable(True)
+        self.group_selector.setInsertPolicy(QComboBox.NoInsert)
+        self.group_selector.setProperty('fio_no_auto_fit', True)
+        self.group_selector.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.group_selector.setMinimumContentsLength(12)
+        self.group_selector.setAccessibleName('Net group destination')
+        self.group_edit = self.group_selector.lineEdit()
+        self.group_edit.setPlaceholderText("Select operating group")
         controls_grid.addWidget(self.set_group_btn, 1, 1)
-        controls_grid.addWidget(self.group_edit, 1, 2, 1, 2)
+        controls_grid.addWidget(self.group_selector, 1, 2, 1, 2)
 
-        self._js8_expect_label = QLabel("Expect:")
+        self._js8_expect_label = QLabel("Query form:")
         controls_grid.addWidget(self._js8_expect_label, 1, 4)
         self.set_spotter_btn = QPushButton("Set Expect Query")
+        self.review_form_tools_btn = QPushButton("Review form tools")
+        self.review_form_tools_btn.setToolTip("Load current form-tool mappings for review; Set Expect Query adopts a selection.")
+        self.review_form_tools_btn.clicked.connect(self._review_form_tools)
         self.spotter_combo = QComboBox()
-        self.spotter_combo.setMinimumWidth(220)
-        self.spotter_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.spotter_combo.setProperty("fio_no_auto_fit", True)
+        self.spotter_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.spotter_combo.setMinimumContentsLength(12)
         controls_grid.addWidget(self.set_spotter_btn, 1, 5)
         controls_grid.addWidget(self.spotter_combo, 1, 6, 1, 4)
 
         self._js8_qsy_label = QLabel("QSY:")
         controls_grid.addWidget(self._js8_qsy_label, 2, 0)
         self.qsy_combo = QComboBox()
+        self.qsy_combo.setProperty("fio_no_auto_fit", True)
+        self.qsy_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.qsy_combo.setMinimumContentsLength(12)
         self.qsy_combo.currentIndexChanged.connect(self._update_qsy_button_enabled)
         controls_grid.addWidget(self.qsy_combo, 2, 1, 1, 3)
         self.hold_duration_combo = QComboBox()
@@ -497,7 +864,7 @@ class JS8CallNetControlTab(QWidget):
         self._js8_hold_label = QLabel("Hold:")
         controls_grid.addWidget(self.hold_duration_combo, 2, 4)
         self.suspend_btn = QPushButton("QSY + Hold")
-        controls_grid.addWidget(self.suspend_btn, 2, 5)
+        controls_grid.addWidget(self.suspend_btn, 2, 5, alignment=Qt.AlignLeft)
         self.ad_hoc_btn = QPushButton("Ad Hoc Net")
         controls_grid.addWidget(self.ad_hoc_btn, 2, 6)
         controls_grid.setColumnStretch(2, 1)
@@ -507,13 +874,35 @@ class JS8CallNetControlTab(QWidget):
         controls_grid.setColumnStretch(8, 2)
         controls_grid.setColumnStretch(9, 2)
         setup_group.setLayout(controls_grid)
+        self._configure_setup_sections()
+        self.net_setup_toggle = QPushButton('Net setup')
+        self.net_setup_toggle.setCheckable(True)
+        self.net_setup_toggle.setChecked(True)
+        self.net_setup_toggle.setAccessibleName('Show or hide net setup fields')
+        self.net_setup_toggle.toggled.connect(self._update_workspace_presentation)
+        rail_layout.addWidget(self.net_setup_toggle)
         layout.addWidget(setup_group)
+        self.form_tools_status = QLabel()
+        self.form_tools_status.hide()
+        self.form_tools_status.setWordWrap(True)
+        self.form_tools_status.setTextFormat(Qt.PlainText)
+        self.form_tools_status.setAccessibleName("Form tools review status")
+        layout.addWidget(self.form_tools_status)
+
+        self.preparation_label = QLabel()
+        self.preparation_label.setObjectName("js8NetPreparation")
+        self.preparation_label.setWordWrap(True)
+        self.preparation_label.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        self.preparation_label.setOpenExternalLinks(False)
+        self.preparation_label.linkActivated.connect(self._open_preparation_link)
+        layout.addWidget(self.preparation_label)
 
         # Check-ins table
-        checkins_group = QGroupBox("Check-Ins")
+        checkins_group = QWidget()
         checkins_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         table_layout = QVBoxLayout()
-        table_layout.setContentsMargins(12, 12, 12, 12)
+        self._workbench_layout = table_layout
+        table_layout.setContentsMargins(0, 0, 0, 0)
         table_layout.setSpacing(8)
         filter_row = QHBoxLayout()
         filter_row.addWidget(QLabel("Check-in Filter:"))
@@ -527,6 +916,10 @@ class JS8CallNetControlTab(QWidget):
         self.fcc_lookup_btn.clicked.connect(lambda: open_call_finder(self, self._selected_callsign() or ""))
         filter_row.addWidget(self.fcc_lookup_btn)
         filter_row.addStretch()
+        for index in range(filter_row.count()):
+            widget = filter_row.itemAt(index).widget()
+            if widget is not None:
+                widget.hide()
         table_layout.addLayout(filter_row)
         self.checkin_table = QTableWidget(0, 10)
         self.checkin_table.setHorizontalHeaderLabels(
@@ -549,15 +942,18 @@ class JS8CallNetControlTab(QWidget):
         table_layout.addWidget(self.checkin_table, 1)
 
         # Buttons row
-        btn_row = QHBoxLayout()
+        self.net_action_buttons = QWidget()
+        self.net_action_buttons.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        btn_row = QVBoxLayout(self.net_action_buttons)
+        btn_row.setContentsMargins(0, 0, 0, 0)
         self._js8_action_row = btn_row
         btn_row.setSpacing(8)
         self.start_btn = QPushButton("Start Net")
-        self.ack_btn = QPushButton("ACK GROUP")
-        self.ack_callsign_btn = QPushButton("ACK CALLSIGN")
+        self.ack_btn = QPushButton("ACK group…")
+        self.ack_callsign_btn = QPushButton("ACK station…")
         self.group_spotter_btn = QPushButton("E? GROUP")
         self.single_spotter_btn = QPushButton("E? Callsign")
-        self.save_btn = QPushButton("Save Checkins")
+        self.save_btn = QPushButton("Save check-ins")
         self.end_btn = QPushButton("End Net")
         self.ack_btn.setEnabled(False)
         self.ack_callsign_btn.setEnabled(False)
@@ -571,13 +967,30 @@ class JS8CallNetControlTab(QWidget):
         btn_row.addWidget(self.group_spotter_btn)
         btn_row.addWidget(self.single_spotter_btn)
         btn_row.addWidget(self.save_btn)
+        btn_row.addSpacing(self.fontMetrics().lineSpacing())
         btn_row.addWidget(self.end_btn)
         btn_row.addStretch()
 
-        table_layout.addLayout(btn_row)
+        self.net_actions_menu = QMenu(self)
+        self._net_menu_actions = []
+        for command in (self.start_btn, self.save_btn, self.end_btn):
+            if command is self.end_btn:
+                self.net_actions_menu.addSeparator()
+            action = self.net_actions_menu.addAction(command.text())
+            action.triggered.connect(lambda checked=False, button=command: button.click())
+            self._net_menu_actions.append((action, command))
+        self.net_actions_menu.aboutToShow.connect(self._sync_net_action_menu)
+        self.net_actions_more = QPushButton('Net actions')
+        self.net_actions_more.setMenu(self.net_actions_menu)
+        self.net_actions_more.setAccessibleName('Net actions: Start, save or end')
+        rail_layout.addWidget(self.net_actions_more)
+        rail_layout.addWidget(self.net_action_buttons)
+        rail_layout.addStretch()
         checkins_group.setLayout(table_layout)
         layout.addWidget(checkins_group, 1)
         self._update_checkin_empty_state()
+        self.group_spotter_btn.hide()
+        self.single_spotter_btn.hide()
 
         # Signals
         self.start_btn.clicked.connect(self._start_net)
@@ -590,14 +1003,21 @@ class JS8CallNetControlTab(QWidget):
         self.set_group_btn.clicked.connect(self._set_group_target)
         self.set_spotter_btn.clicked.connect(self._set_spotter_form)
         self.spotter_combo.currentIndexChanged.connect(self._on_spotter_selection_changed)
+        self.spotter_combo.activated.connect(self._adopt_query_selection)
+        self.group_edit.textChanged.connect(self._adopt_group_text)
+        self.group_edit.editingFinished.connect(self._on_group_choice_finished)
+        self.group_selector.activated.connect(self._on_group_choice_finished)
         self.group_edit.textChanged.connect(self._update_group_button_state)
+        self.group_edit.textChanged.connect(self._update_preparation_summary)
         self.checkin_filter_combo.currentIndexChanged.connect(self._on_checkin_filter_changed)
         self.checkin_table.cellClicked.connect(self._on_checkin_table_clicked)
         self.refresh_spin.valueChanged.connect(self._update_timer_interval)
         self.suspend_btn.clicked.connect(self._on_suspend_clicked)
         self.ad_hoc_btn.clicked.connect(self._start_ad_hoc_net)
         self.role_combo.currentTextChanged.connect(lambda _text: self._on_ncs_session_context_changed())
-        self.net_name_edit.textChanged.connect(lambda _text: self._on_ncs_session_context_changed())
+        self.role_combo.currentTextChanged.connect(self._update_workspace_presentation)
+        self.net_name_edit.editingFinished.connect(self._on_ncs_session_context_changed)
+        self.net_name_edit.textChanged.connect(self._update_preparation_summary)
 
         self._set_net_button_styles(active=False)
         self._refresh_ncs_session_context()
@@ -607,82 +1027,149 @@ class JS8CallNetControlTab(QWidget):
         super().resizeEvent(event)
         self._reflow_ncs_layouts()
 
+    def _configure_setup_sections(self):
+        """Build task groups once; reflow moves cached controls only."""
+        root = self._js8_setup_grid
+        while root.count():
+            root.takeAt(0)
+        for column in range(10):
+            root.setColumnStretch(column, 0)
+        self._identity_grid = QGridLayout()
+        self._query_grid = QGridLayout()
+        self._radio_grid = QGridLayout()
+        root.addLayout(self._identity_grid, 0, 0)
+        for control in (self._js8_expect_label, self.spotter_combo, self.set_spotter_btn,
+                        self.review_form_tools_btn, self._js8_qsy_label, self.qsy_combo,
+                        self._js8_hold_label, self.hold_duration_combo, self.suspend_btn,
+                        self._js8_refresh_label, self.refresh_spin, self.set_group_btn):
+            control.hide()
+        # Retained only for old draft/test adapters; deliberately absent from UI.
+        self.radio_change_toggle = QToolButton(self)
+        self.radio_change_toggle.hide()
+        self.radio_change_controls = QWidget(self)
+        self.radio_change_controls.setLayout(self._radio_grid)
+        self.radio_change_controls.hide()
+        self.net_options_toggle = QToolButton(self)
+        self.net_options_toggle.hide()
+        self.net_options_controls = QWidget(self)
+        self.net_options_controls.hide()
+        self._js8_setup_mode = None
+
+    def _update_workspace_presentation(self, *_args):
+        if not hasattr(self, 'net_setup_toggle'):
+            return
+        shown = self.net_setup_toggle.isChecked()
+        self._js8_setup_group.setVisible(shown)
+        self._js8_session_group.setVisible(shown and not self._net_in_progress)
+        self.net_setup_toggle.setText('Edit setup' if self._net_in_progress else 'Net setup')
+        role = self.role_combo.currentText().strip()
+        panel = getattr(self, 'workbench_panel', None)
+        snapshot = getattr(panel, '_snapshot', {}) if panel is not None else {}
+        run = snapshot.get('run') or {}
+        group = normalize_group_name(run.get('group_name') or self._group_target) or 'Group not set'
+        name = run.get('label') or self.net_name_edit.text().strip() or 'Net not named'
+        radio = getattr(self, '_ncs_context_radio_name', '') or 'Radio not selected'
+        self.net_context_label.setText(f'{radio} · {name} · {group} · {role}' if not shown else f'{radio} · {group} · {role}')
+        self.net_context_label.setToolTip(self.ncs_session_summary_label.text())
+        if panel is not None:
+            panel.group_context_label.setText(f'Group: {group}')
+            writable = bool(self._net_in_progress and snapshot.get('writable'))
+            self.save_btn.setEnabled(writable)
+            self.save_btn.setToolTip('Save participating stations for this active net' if writable
+                                     else 'Start an active net to save check-ins')
+            self._present_ack_group_menu(snapshot, writable)
+            self.ack_callsign_btn.setEnabled(writable)
+            self._update_query_controls()
+            self._update_live_query_target()
+        self._update_preparation_summary()
+
     def _reflow_ncs_layouts(self) -> None:
-        """Reposition existing controls only; never reload NCS state on resize."""
-        controls = (
-            self._js8_role_label,
-            self.role_combo,
-            self._js8_net_name_label,
-            self.net_name_edit,
-            self._js8_refresh_label,
-            self.refresh_spin,
-            self._js8_group_label,
-            self.group_edit,
-            self.set_group_btn,
-            self._js8_expect_label,
-            self.spotter_combo,
-            self.set_spotter_btn,
-            self._js8_qsy_label,
-            self.qsy_combo,
-            self._js8_hold_label,
-            self.hold_duration_combo,
-            self.suspend_btn,
-            self.ad_hoc_btn,
-        )
+        """Reposition cached controls; labels and data never choose breakpoints."""
         metrics = self.fontMetrics()
-        widest_control = max(
-            max(int(widget.minimumSizeHint().width()), int(widget.sizeHint().width()))
-            for widget in controls
-        )
-        compact = self.width() < max(1000, (widest_control * 4) + (metrics.horizontalAdvance("M") * 8))
-        grid = getattr(self, "_js8_setup_grid", None)
-        if grid is not None:
+        self.spotter_combo.setMaximumWidth(metrics.horizontalAdvance("M") * 46)
+        panel = getattr(self, 'workbench_panel', None)
+        commands = (self.net_setup_toggle, self.start_btn, self.save_btn, self.end_btn)
+        if panel is not None:
+            commands += (panel.manage_messages_toggle, panel.sent_activity_toggle, self._secondary_actions_button)
+        rail_floor = sum(max(button.sizeHint().height(), button.minimumHeight()) for button in commands)
+        rail_floor += self._js8_action_row.spacing() * (len(commands) + 2)
+        rail_floor += metrics.lineSpacing() * 3
+        short = self.height() < rail_floor
+        self.net_actions_more.setVisible(short)
+        self.net_action_buttons.setVisible(not short)
+        if panel is not None:
+            self.ack_btn.show()
+            self.ack_callsign_btn.show()
+            self.net_setup_toggle.setVisible(not short)
+            for button in (panel.manage_messages_toggle, panel.sent_activity_toggle):
+                button.setVisible(not short)
+            self.workspace_menu_button.setVisible(short)
+        available = self.js8_ncs_scroll_area.viewport().width()
+        panel = getattr(self, 'workbench_panel', None)
+        if panel is not None:
+            panel.set_workspace_width(max(0, available - metrics.horizontalAdvance('M') * 4))
+        # A short setup form stays grouped at a readable width on large screens.
+        self._js8_setup_group.setMaximumWidth(metrics.horizontalAdvance('M') * 92)
+        compact = available < metrics.horizontalAdvance('M') * 76
+        self._js8_setup_compact = compact
+        self._reflow_query_context(compact)
+        if hasattr(self, '_live_query_layout') and compact != getattr(self, '_live_query_compact', None):
+            self._live_query_compact = compact
+            grid = self._live_query_layout
+            while grid.count(): grid.takeAt(0)
+            controls = (self.query_target_mode, self.query_target_label, *self.live_query_buttons, self.ack_btn, self.ack_callsign_btn, panel.send_toggle)
+            for index, widget in enumerate(controls):
+                grid.addWidget(widget, index // (3 if compact else 8), index % (3 if compact else 8))
+                widget.show()
+            grid.setColumnStretch(1, 0)
+            grid.setColumnStretch(8, 1)
+            grid.invalidate()
+            self.live_query_widget.updateGeometry()
+            panel.query_picker_layout.invalidate()
+            panel.group_action_widget.layout().invalidate()
+            panel.group_action_widget.updateGeometry()
+            panel.layout().invalidate()
+            panel.layout().activate()
+            panel.updateGeometry()
+        if self._js8_setup_mode == compact:
+            return
+        self._js8_setup_mode = compact
+        identity, query, radio = self._identity_grid, self._query_grid, self._radio_grid
+        for grid in (identity, query, radio):
             while grid.count():
                 grid.takeAt(0)
-            for column in range(10):
+            for column in range(6):
                 grid.setColumnStretch(column, 0)
-            if compact:
-                rows = (
-                    (self._js8_role_label, self.role_combo),
-                    (self._js8_net_name_label, self.net_name_edit),
-                    (self._js8_refresh_label, self.refresh_spin),
-                    (self._js8_group_label, self.group_edit),
-                    (self._js8_expect_label, self.spotter_combo),
-                    (self._js8_qsy_label, self.qsy_combo),
-                    (self._js8_hold_label, self.hold_duration_combo),
-                )
-                for row, (label, field) in enumerate(rows):
-                    grid.addWidget(label, row, 0)
-                    grid.addWidget(field, row, 1)
-                grid.addWidget(self.set_group_btn, 7, 1)
-                grid.addWidget(self.set_spotter_btn, 8, 1)
-                grid.addWidget(self.suspend_btn, 9, 0)
-                grid.addWidget(self.ad_hoc_btn, 9, 1)
-                grid.setColumnStretch(1, 1)
-            else:
-                grid.addWidget(self._js8_role_label, 0, 0)
-                grid.addWidget(self.role_combo, 0, 1)
-                grid.addWidget(self._js8_net_name_label, 0, 2)
-                grid.addWidget(self.net_name_edit, 0, 3, 1, 3)
-                grid.addWidget(self._js8_refresh_label, 0, 6)
-                grid.addWidget(self.refresh_spin, 0, 7)
-                grid.addWidget(self._js8_group_label, 1, 0)
-                grid.addWidget(self.group_edit, 1, 1, 1, 2)
-                grid.addWidget(self.set_group_btn, 1, 3)
-                grid.addWidget(self._js8_expect_label, 1, 4)
-                grid.addWidget(self.spotter_combo, 1, 5, 1, 2)
-                grid.addWidget(self.set_spotter_btn, 1, 7)
-                grid.addWidget(self._js8_qsy_label, 2, 0)
-                grid.addWidget(self.qsy_combo, 2, 1, 1, 2)
-                grid.addWidget(self._js8_hold_label, 2, 3)
-                grid.addWidget(self.hold_duration_combo, 2, 4)
-                grid.addWidget(self.suspend_btn, 2, 5)
-                grid.addWidget(self.ad_hoc_btn, 2, 6, 1, 2)
-                for column in (3, 5):
-                    grid.setColumnStretch(column, 1)
-        action_row = getattr(self, "_js8_action_row", None)
-        if action_row is not None:
-            action_row.setDirection(QHBoxLayout.TopToBottom if compact else QHBoxLayout.LeftToRight)
+        identity.addWidget(self._js8_net_name_label, 0, 0)
+        identity.addWidget(self.net_name_edit, 0, 1, 1, 3 if not compact else 1)
+        identity.addWidget(self.ad_hoc_btn, 1 if compact else 0, 1 if compact else 4, alignment=Qt.AlignLeft)
+        identity.addWidget(self._js8_group_label, 2 if compact else 1, 0)
+        identity.addWidget(self.group_selector, 2 if compact else 1, 1)
+        identity.addWidget(self._js8_role_label, 3 if compact else 1, 0 if compact else 3)
+        identity.addWidget(self.role_combo, 3 if compact else 1, 1 if compact else 4)
+        identity.setColumnStretch(1, 1)
+        self._js8_setup_group.updateGeometry()
+
+    def event(self, event):
+        result = super().event(event)
+        if (event.type() in (QEvent.Type.LayoutRequest, QEvent.Type.FontChange, QEvent.Type.StyleChange)
+                and hasattr(self, 'net_actions_more') and not getattr(self, '_ncs_reflow_pending', False)):
+            self._ncs_reflow_pending = True
+            QTimer.singleShot(0, self._publish_ncs_reflow)
+        return result
+
+    def _publish_ncs_reflow(self):
+        self._ncs_reflow_pending = False
+        if self._is_shutting_down:
+            return
+        self._reflow_ncs_layouts()
+
+    def _sync_net_action_menu(self):
+        if hasattr(self, '_undo_net_action'):
+            self._undo_net_action.setEnabled(self.workbench_panel.undo_button.isEnabled())
+        for action, button in self._net_menu_actions:
+            action.setText(button.text())
+            action.setEnabled(button.isEnabled())
 
     def _on_ncs_session_context_changed(self) -> None:
         self._persist_ncs_session_snapshot()
@@ -698,6 +1185,8 @@ class JS8CallNetControlTab(QWidget):
         self._load_settings()
 
     def on_settings_saved(self):
+        if getattr(self, "_preparation_shell", False):
+            return
         """
         Slot invoked when Settings tab emits settings_saved.
         """
@@ -712,6 +1201,8 @@ class JS8CallNetControlTab(QWidget):
         return
 
     def on_tab_activated(self) -> None:
+        if getattr(self, "_preparation_shell", False):
+            return
         with perf_span("js8_ncs.on_tab_activated", settings=self.settings, min_ms=5.0):
             self._update_clock_labels()
             self._update_suspend_state()
@@ -719,7 +1210,20 @@ class JS8CallNetControlTab(QWidget):
             self._refresh_group_completer()
 
     def set_tab_active(self, active: bool) -> None:
+        receiver = getattr(self, '_prepared_receiver', None)
+        if not active and receiver is not None:
+            receiver.deactivate()
         self._active = bool(active)
+        if active:
+            self._refresh_group_completer()
+        if active and self._form_mappings_dirty and not self._net_in_progress:
+            self._review_form_tools()
+        if active and receiver is not None:
+            receiver.changed.emit()
+        if getattr(self, '_preparation_shell', False):
+            if self._active:
+                self._apply_pending_fcc_identities()
+            return
         if self._active:
             self._apply_pending_fcc_identities()
             if self._clock_timer and not self._clock_timer.isActive():
@@ -741,6 +1245,8 @@ class JS8CallNetControlTab(QWidget):
 
         # Net name autocomplete from net_schedule
         net_sched = data.get("net_schedule", [])
+        self._preparation_schedule = list(net_sched) if isinstance(net_sched, list) else []
+        self._preparation_callsign = bool(str(data.get("operator_callsign") or data.get("callsign") or "").strip())
         net_names = sorted(
             {row.get("net_name", "") for row in net_sched if isinstance(row, dict) and row.get("net_name")}
         )
@@ -780,7 +1286,7 @@ class JS8CallNetControlTab(QWidget):
             self._all_offset_key = ""
         if self._directed_path:
             try:
-                all_path = self._directed_path.parent / "ALL.TXT"
+                all_path = self._scoped_all_path()
                 size_now = all_path.stat().st_size if all_path.exists() else 0
                 saved_all = self._settings_int(
                     self._all_offset_key,
@@ -802,30 +1308,139 @@ class JS8CallNetControlTab(QWidget):
         # Spotter forms dropdown
         global_forms_path = str(self.settings.get("js8_forms_path", "") or "").strip()
         legacy_forms_path = str(data.get("js8_forms_path", "") or "").strip() if not global_forms_path else ""
-        self.spotter_combo.clear()
-        forms = []
-        for definition in discover_effective_spotter_forms(global_forms_path, legacy_forms_path):
-            label = definition.form_code
-            if definition.title:
-                label = f"{definition.form_code} - {definition.title}"
-            forms.append((definition.form_code, label))
-        if forms:
-            for code, label in forms:
-                self.spotter_combo.addItem(label, code)
-            self.spotter_combo.setEnabled(True)
-            self.set_spotter_btn.setEnabled(True)
-            self.group_spotter_btn.setEnabled(True)
-            self.single_spotter_btn.setEnabled(True)
-        else:
-            self.spotter_combo.addItem("No forms found")
-            self.spotter_combo.setEnabled(False)
-            self.set_spotter_btn.setEnabled(False)
-            self.group_spotter_btn.setEnabled(False)
-            self.single_spotter_btn.setEnabled(False)
+        # Active nets retain their picker until an explicit review.
+        if not getattr(self, "_net_in_progress", False):
+            self._refresh_form_tool_choices(data, global_forms_path, legacy_forms_path)
         fit_combo_box_to_contents(self.spotter_combo)
         self._refresh_ncs_session_context()
+        self._update_preparation_summary()
+
+    def _refresh_form_tool_choices(self, data, global_forms_path, legacy_forms_path):
+        selected = self.spotter_combo.currentData()
+        definitions = discover_effective_spotter_forms(global_forms_path, legacy_forms_path)
+        forms = resolve_net_form_options(definitions, data.get(MAPPER_SETTINGS_KEY, []),
+                                         group_key=self._query_operating_group_key()).options
+        self._publish_form_tool_choices(forms)
+        self._net_form_tools_group_key = self._query_operating_group_key()
+
+    def _publish_form_tool_choices(self, forms):
+        selected = self.spotter_combo.currentData() or self._spotter_form
+        self._available_net_form_codes = {code for code, _ in forms}
+        self.spotter_combo.blockSignals(True)
+        self.spotter_combo.clear()
+        for code, label in forms:
+            self.spotter_combo.addItem(label, code)
+        # Preserve a draft or committed choice even if the current catalog removed it.
+        for code in dict.fromkeys(filter(None, (selected, self._spotter_form))):
+            if self.spotter_combo.findData(code) < 0:
+                self.spotter_combo.addItem(f"{code} — unavailable (review)", code)
+        if self.spotter_combo.count():
+            self.spotter_combo.setCurrentIndex(self.spotter_combo.findData(selected) if selected else -1)
+            self.spotter_combo.setPlaceholderText("Select a form")
+        else:
+            self.spotter_combo.addItem("No forms found")
+        self.spotter_combo.blockSignals(False)
+        has_choices = bool(forms or selected or self._spotter_form)
+        self.spotter_combo.setEnabled(has_choices)
+        self._on_spotter_selection_changed()
+        self.spotter_combo.setToolTip("Optional query form. Selecting changes the next query and sends nothing.")
+
+    def on_form_mappings_saved(self):
+        self._form_mappings_generation += 1
+        self._form_mappings_dirty = True
+        if self._net_in_progress:
+            self.form_tools_status.setText('Form mappings changed. Reload forms to review the new choices; current query and net are retained.')
+            self.form_tools_status.show()
+        elif self._active:
+            self._review_form_tools()
+
+    def _query_operating_group_key(self):
+        prepared = getattr(getattr(self, '_prepared_receiver', None), 'prepared', None)
+        values = prepared.request.source.values.values() if prepared is not None else {}
+        if values.get('operating_group_key'):
+            return str(values['operating_group_key'])
+        from freqinout.core.operating_group_identity import operating_group_options
+        name = normalize_group_name(self._group_target if self._net_in_progress else self.group_edit.text())
+        matches = [group.operating_group_key for group in operating_group_options(
+            self.settings.get('operating_groups', []) or [])
+            if normalize_group_name(group.group_name) == name]
+        return matches[0] if len(matches) == 1 else ''
+
+    def _form_tools_scope(self):
+        receiver = getattr(self, '_prepared_receiver', None)
+        return (str(self.settings.db_path), id(getattr(self, '_preparation_scope', None)),
+                getattr(receiver, 'generation', 0), self._ncs_session_id,
+                self.spotter_combo.currentData(), self._spotter_form,
+                self._form_mappings_generation, self._query_operating_group_key())
+
+    def _review_form_tools(self):
+        # The settings getters here are cached and remain on their owner thread.
+        if self._form_tools_inflight or self._is_shutting_down:
+            return
+        from freqinout.core.ncs_form_tools import read_net_form_tools
+        from freqinout.core.scheduler_serial_executor import DaemonSerialExecutor
+        if self._form_tools_executor is None:
+            self._form_tools_executor = DaemonSerialExecutor(thread_name_prefix='fio-ncs-form-tools')
+        token = self._form_tools_scope()
+        path = self.settings.db_path
+        fallback = str(self.settings.get('js8_forms_path', '') or '')
+        group_key = self._query_operating_group_key()
+        self._form_tools_inflight = True
+        self.review_form_tools_btn.setEnabled(False)
+        self.form_tools_status.show()
+        self.form_tools_status.setText('Reviewing current form tools…')
+        future = self._form_tools_executor.submit(read_net_form_tools, path,
+                                                  fallback_path=fallback, group_key=group_key)
+        def completed(result):
+            try:
+                value, error = result.result(), None
+            except Exception as exc:
+                value, error = None, str(exc)
+            if self._is_shutting_down:
+                return
+            try:
+                self.form_tools_ready.emit(token, value, error)
+            except RuntimeError:
+                pass
+        future.add_done_callback(completed)
+
+    def _publish_form_tools(self, token, snapshot, error):
+        self._form_tools_inflight = False
+        if self._is_shutting_down:
+            return
+        self.review_form_tools_btn.setEnabled(True)
+        if token != self._form_tools_scope():
+            self.form_tools_status.setText('Form tools review superseded; current work retained. Review again when ready.')
+            if self._form_mappings_dirty and self._active and not self._net_in_progress:
+                QTimer.singleShot(0, self._review_form_tools)
+            return
+        if error:
+            self.form_tools_status.setText('Could not review form tools; current choices retained. ' + str(error))
+            return
+        self._form_mappings_dirty = False
+        self._net_form_tools_group_key = self._query_operating_group_key()
+        self._publish_form_tool_choices(snapshot.choices.options)
+        self._net_form_tools_revision = snapshot.revision
+        if self._spotter_form and self._spotter_form not in self._available_net_form_codes:
+            self.form_tools_status.setText('The selected query form is unavailable. Choose another form to send a query; starting and receiving remain available.')
+        elif snapshot.choices.missing_preferred or snapshot.choices.ambiguous:
+            self.form_tools_status.setText('Choose any available query form when needed. Queries are optional and can change during the net.')
+        else:
+            self.form_tools_status.setText('Query forms updated.')
+            QTimer.singleShot(4000, lambda: self.form_tools_status.hide() if self.form_tools_status.text() == 'Query forms updated.' else None)
+        fit_combo_box_to_contents(self.spotter_combo)
+
+    def _scoped_all_path(self):
+        scope = getattr(self, '_preparation_scope', None)
+        return Path(scope.all_path) if scope is not None and scope.all_path else self._directed_path.parent / 'ALL.TXT'
 
     def _refresh_ncs_offset_keys(self):
+        scope = getattr(self, '_preparation_scope', None)
+        if scope is not None:
+            from freqinout.core.ingest_source_model import stable_source_id
+            self._directed_offset_key = 'js8_ncs_directed_offset_' + stable_source_id('js8call', scope.instance_id, 'directed', scope.directed_path, prefix='source')
+            self._all_offset_key = 'js8_ncs_all_offset_' + stable_source_id('js8call', scope.instance_id, 'all', scope.all_path, prefix='source')
+            return
         if not self._directed_path:
             self._directed_offset_key = ""
             self._all_offset_key = ""
@@ -902,23 +1517,32 @@ class JS8CallNetControlTab(QWidget):
         if self._js8_rx_hub is None or self._js8_rx_hub.endpoint() != (host, port):
             if self._js8_rx_hub is not None and self._js8_rx_registered:
                 try:
-                    self._js8_rx_hub.unregister_listener(self._on_js8_rx_messages)
+                    self._js8_rx_hub.unregister_listener(getattr(self, '_scoped_rx_callback', self._on_js8_rx_messages))
                 except Exception:
                     pass
                 self._js8_rx_registered = False
             self._js8_rx_hub = JS8RxHub.instance(host, port)
         if not self._js8_rx_registered:
-            self._js8_rx_hub.register_listener(self._on_js8_rx_messages)
+            epoch = int(getattr(self, '_ncs_rx_epoch', 0))
+            def receive(messages):
+                if epoch == int(getattr(self, '_ncs_rx_epoch', 0)):
+                    self._on_js8_rx_messages(messages)
+            self._scoped_rx_callback = receive
+            self._js8_rx_hub.register_listener(self._scoped_rx_callback)
             self._js8_rx_registered = True
         try:
             self._js8_rx_hub.start(host, port)
         except RuntimeError:
             self._js8_rx_hub = JS8RxHub.instance(host, port)
-            self._js8_rx_hub.register_listener(self._on_js8_rx_messages)
+            self._js8_rx_hub.register_listener(getattr(self, '_scoped_rx_callback', self._on_js8_rx_messages))
             self._js8_rx_registered = True
             self._js8_rx_hub.start(host, port)
 
     def _js8_live_source_context(self) -> Dict[str, str]:
+        scope = getattr(self, '_preparation_scope', None)
+        if scope is not None:
+            return {'source_radio_id': str(scope.radio_id), 'js8_instance_id': scope.instance_id.split(':')[-1],
+                    'source_id': scope.instance_id}
         host = (self.settings.get("js8_host", "") or "").strip() or "127.0.0.1"
         try:
             port = int(self.settings.get("js8_port", 2442) or 2442)
@@ -1036,6 +1660,10 @@ class JS8CallNetControlTab(QWidget):
         self._update_suspend_state(snapshot=snapshot)
 
     def _on_suspend_clicked(self):
+        scope = getattr(self, '_preparation_scope', None)
+        if scope is not None:
+            self._prepared_receiver._set_status('Prepared', f'Use {scope.radio_name} in the Station Control Bar to QSY or set a hold')
+            return
         if self._suspend_active():
             resume_schedule_hold(self.window(), self.settings)
             self._set_suspend_button(False)
@@ -1077,11 +1705,11 @@ class JS8CallNetControlTab(QWidget):
         theme = resolve_theme(self.settings)
         if active:
             self.start_btn.setStyleSheet(button_style("muted", theme))
-            self.ack_btn.setStyleSheet(button_style("eligible_info", theme))
-            self.ack_callsign_btn.setStyleSheet(button_style("eligible_info", theme))
+            self.ack_btn.setStyleSheet("")
+            self.ack_callsign_btn.setStyleSheet("")
             self.group_spotter_btn.setStyleSheet(button_style("eligible_info", theme))
             self.single_spotter_btn.setStyleSheet(button_style("eligible_info", theme))
-            self.save_btn.setStyleSheet(button_style("eligible_success", theme))
+            self.save_btn.setStyleSheet("")
             self.end_btn.setStyleSheet(button_style("eligible_danger", theme))
             self.ad_hoc_btn.setStyleSheet(button_style("muted", theme))
             self.start_btn.setEnabled(False)
@@ -1099,6 +1727,7 @@ class JS8CallNetControlTab(QWidget):
             self.ad_hoc_btn.setEnabled(True)
         self._update_group_button_state()
         self._update_spotter_button_state()
+        self._update_workspace_presentation()
 
     def _apply_theme(self) -> None:
         theme = resolve_theme(self.settings)
@@ -1109,6 +1738,7 @@ class JS8CallNetControlTab(QWidget):
         self._update_group_button_state()
         self._update_spotter_button_state()
         self._refresh_ncs_session_context()
+        self._update_preparation_summary()
 
     def apply_theme(self) -> None:
         self._apply_theme()
@@ -1173,51 +1803,47 @@ class JS8CallNetControlTab(QWidget):
             self.suspend_btn.setEnabled(True)
 
     def _perform_qsy(self, meta: Dict) -> bool:
+        if getattr(self, '_preparation_scope', None) is not None:
+            self._prepared_receiver._set_status('Prepared', 'Use the intended radio in the Station Control Bar to QSY')
+            return False
         win = self.window()
         return perform_qsy(win, meta)
 
     # ---------------- START / END NET ---------------- #
 
     def _validate_before_start(self) -> bool:
+        self._finish_group_selection()
         if not self.net_name_edit.text().strip():
-            # Try auto-prefill once if empty
             self._auto_prefill_net_name()
-        if not self.net_name_edit.text().strip():
-            QMessageBox.warning(self, "Missing Net Name", "Enter Net Name before starting the net.")
+        self._preparation_callsign = bool(self._my_callsign())
+        self._update_preparation_summary()
+        missing_name = not self.net_name_edit.text().strip()
+        missing_group = not self._group_target
+        if missing_name or missing_group:
+            self._open_preparation_link('name' if missing_name else 'group')
             return False
-
-        cs = self._my_callsign()
-        if not cs:
-            QMessageBox.warning(self, "Missing Callsign", "Configure your callsign in the Settings tab.")
-            return False
-        if not self._directed_path:
-            QMessageBox.warning(
-                self,
-                "DIRECTED.TXT Not Configured",
-                "JS8Call DIRECTED.TXT path is not configured or does not exist.\n"
-                "Set it in the Settings tab.",
-            )
-            return False
-        if not self._group_target:
-            QMessageBox.warning(
-                self,
-                "Group Required",
-                "Set Call Group to Start Net.",
-            )
-            return False
-        return True
+        return bool(self._preparation_callsign and self._directed_path)
 
     def _start_net(self):
+        receiver = getattr(self, '_prepared_receiver', None)
+        if receiver is not None and receiver.prepared is not None and not receiver.dispatching:
+            receiver.start()
+            return
         if self._net_in_progress:
             QMessageBox.information(self, "Net In Progress", "A net is already active. End it before starting a new one.")
+            return
+        workbench = getattr(self, 'workbench', None)
+        if workbench is not None and workbench.run is not None and (workbench.busy or workbench.dirty_drafts or workbench.pending_label):
+            QMessageBox.information(self, 'Pending net work', 'Wait for the current net record and working drafts to finish saving before starting another net.')
             return
         if not self._validate_before_start():
             return
 
+        self._ncs_workbench_started_ts = time.time()
         self._net_in_progress = True
         profiles = self._ncs_radio_profiles()
         self._ncs_session_radio_id = self._ncs_selected_radio_id(profiles) or None
-        self._ncs_session_id = uuid.uuid4().hex
+        self._ncs_session_id = getattr(getattr(self, '_prepared_receiver', None), 'pending_session_token', '') or uuid.uuid4().hex
         self._net_start_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
         self._net_end_utc = None
         self._all_calls_seen.clear()
@@ -1239,18 +1865,13 @@ class JS8CallNetControlTab(QWidget):
         self.end_btn.setEnabled(True)
         self.ack_btn.setEnabled(True)
         self.ack_callsign_btn.setEnabled(True)
-        self._persist_ncs_session_snapshot(timing_state="active")
-        self.net_status_changed.emit("JS8", True)
-        self.net_session_status_changed.emit(
-            "JS8", True, int(self._ncs_session_radio_id or 0), self._ncs_session_id
-        )
         self._refresh_ncs_session_context()
 
           # Track file size so we only read new lines
         try:
             if self._directed_path:
                 self._last_directed_size = self._directed_path.stat().st_size
-                all_path = self._directed_path.parent / "ALL.TXT"
+                all_path = self._scoped_all_path()
                 self._last_all_size = all_path.stat().st_size if all_path.exists() else 0
         except Exception:
             self._last_directed_size = 0
@@ -1262,6 +1883,15 @@ class JS8CallNetControlTab(QWidget):
 
         log.info("JS8Call net started: %s (%s)", self.net_name_edit.text().strip(), self.role_combo.currentText())
         self._refresh_operator_history_views()
+        self._persist_ncs_session_snapshot(timing_state="active")
+        self.net_status_changed.emit("JS8", True)
+        self.net_session_status_changed.emit(
+            "JS8", True, int(self._ncs_session_radio_id or 0), self._ncs_session_id
+        )
+        if getattr(self, 'workbench', None) is not None:
+            self.workbench.on_started()
+            self.net_setup_toggle.setChecked(False)
+
 
     def _start_ad_hoc_net(self):
         """
@@ -1287,6 +1917,24 @@ class JS8CallNetControlTab(QWidget):
         self._start_net()
 
     def _end_net(self):
+        workbench = getattr(self, 'workbench', None)
+        if workbench is not None and workbench.run is not None:
+            if workbench._end_retry:
+                workbench.request_end(lambda: None)
+                return
+            if not self._net_in_progress:
+                return
+            session_id, generation = self._ncs_session_id, workbench.generation
+            choice = JS8CallNetControlTab._confirm_end_net(self)
+            if self._ncs_session_id != session_id or workbench.generation != generation or not self._net_in_progress:
+                workbench._status('Net context changed during confirmation; no End or concluding message was requested.')
+                return
+            if choice is not None:
+                workbench.request_end(lambda: self._end_net_impl(_send_concluded=choice))
+            return
+        JS8CallNetControlTab._end_net_impl(self)
+
+    def _confirm_end_net(self):
         prompt = QMessageBox(self)
         prompt.setIcon(QMessageBox.Question)
         prompt.setWindowTitle("End Net")
@@ -1297,38 +1945,65 @@ class JS8CallNetControlTab(QWidget):
         prompt.setDefaultButton(btn_yes)
         prompt.exec()
         clicked = prompt.clickedButton()
-        if clicked == btn_no:
+        if clicked not in (btn_yes, btn_end_no_tx):
+            return None
+        return clicked == btn_yes
+
+    def _end_net_impl(self, *, _send_concluded=None):
+        if not self._net_in_progress:
             return
-        send_concluded = clicked == btn_yes
         session_radio_id = getattr(self, "_ncs_session_radio_id", None)
         session_id = getattr(self, "_ncs_session_id", "")
+        send_concluded = _send_concluded
+        if send_concluded is None:
+            send_concluded = JS8CallNetControlTab._confirm_end_net(self)
+            if (send_concluded is None or not self._net_in_progress
+                    or getattr(self, '_ncs_session_id', '') != session_id
+                    or getattr(self, '_ncs_session_radio_id', None) != session_radio_id):
+                return
 
-        if not self._net_in_progress:
-            log.info("JS8Call End Net clicked but net_in_progress flag not set; writing log from current state.")
+        previous_end = self._net_end_utc
+        self._net_end_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
+        try:
+            if not self._save_checkins(show_message=False):
+                raise RuntimeError("Check-in counters could not be saved")
+            log_path = self._write_net_log_file()
+            if not log_path:
+                raise RuntimeError("Net log could not be saved")
+        except Exception as exc:
+            self._net_end_utc = previous_end
+            log.error("JS8CallNetControl: unable to end net: %s", exc)
+            QMessageBox.critical(self, "Net Not Ended",
+                                 f"Unable to save the net record: {exc}\n"
+                                 "Check the log location and database, then retry End. "
+                                 "The active session and check-ins have been retained.")
+            return
 
+        if getattr(self, '_preparation_scope', None) is not None:
+            try:
+                self._persist_ncs_session_snapshot(timing_state='ended')
+            except Exception as exc:
+                self._net_end_utc = previous_end
+                self._prepared_receiver._set_status('Another net active', f'End record could not be saved: {exc}; work retained, retry End')
+                return
         if self._poll_timer:
             self._poll_timer.stop()
-
-        self._net_end_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
-
-        # Send net concluded to group if set
+        tx_confirmed = not send_concluded
         if send_concluded:
-            group = self._group_target or self.group_edit.text().strip().upper()
-            if group:
-                if not group.startswith("@"):
-                    group = "@" + group
-                mycall = self._my_callsign()
-                if mycall:
-                    self._send_js8_message(f"{mycall}: {group} NET CONCLUDED")
-
-        # Record check-ins once more at end (no duplicate increments)
-        self._save_checkins(show_message=False)
-
-        # Write the net log file from the current panels
-        self._write_net_log_file()
+            try:
+                group = self._group_target or self.group_edit.text().strip().upper()
+                if group:
+                    if not group.startswith("@"):
+                        group = "@" + group
+                    mycall = self._my_callsign()
+                    if mycall:
+                        tx_confirmed = self._send_js8_message(f"{mycall}: {group} NET CONCLUDED") is True
+            except Exception as exc:
+                log.error("JS8CallNetControl: concluding message outcome not confirmed: %s", exc)
 
         self._net_in_progress = False
-        self._persist_ncs_session_snapshot(timing_state="ended")
+        if getattr(self, '_preparation_scope', None) is None:
+            self._persist_ncs_session_snapshot(timing_state="ended")
         self.net_status_changed.emit("JS8", False)
         self.net_session_status_changed.emit(
             "JS8", False, int(session_radio_id or 0), session_id
@@ -1346,59 +2021,103 @@ class JS8CallNetControlTab(QWidget):
         self._checkins_saved.clear()
         getattr(self, "_fcc_identity_pending", {}).clear()
         self._clear_table()
-        QMessageBox.information(self, "Net Ended", "JS8Call net ended and log saved.")
+        if tx_confirmed:
+            QMessageBox.information(self, "Net Ended", f"JS8Call net ended and log saved:\n{log_path}")
+        else:
+            QMessageBox.warning(self, "Net Ended; Message Not Confirmed",
+                                f"JS8Call net ended and log saved:\n{log_path}\n\n"
+                                "The concluding message was not confirmed; inspect JS8Call before retrying.")
 
     # ---------------- AUTO-PREFILL NET NAME ---------------- #
 
     def _auto_prefill_net_name(self):
-        """
-        Prefill net_name_edit from net_schedule if:
-          - net is NOT in progress
-          - net_name_edit is currently empty
-          - there's a net on current UTC day whose (start_utc - early_checkin)
-            is within the next 20 minutes.
-        """
-        if self._net_in_progress:
+        if self._net_in_progress or self.net_name_edit.text().strip():
             return
-        if self.net_name_edit.text().strip():
-            return
-
-        data = self.settings.all()
-        net_sched = data.get("net_schedule", [])
-        if not isinstance(net_sched, list):
-            return
-
-        now_utc = datetime.datetime.now(datetime.timezone.utc)
-        day_name = now_utc.strftime("%A")
-        now_min = now_utc.hour * 60 + now_utc.minute
-
-        best_row = None
-        best_delta = 9999
-
-        for row in net_sched:
-            try:
-                if row.get("day_utc") != day_name:
-                    continue
-                smin = self._parse_hhmm(row.get("start_utc", ""))
-                if smin is None:
-                    continue
-                early = int(row.get("early_checkin", "0") or 0)
-                s_eff = max(0, smin - early)
-                delta = s_eff - now_min
-                if 0 <= delta <= 20 and delta < best_delta:
-                    best_row = row
-                    best_delta = delta
-            except Exception:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        group = (self._group_target or self.group_edit.text()).strip().upper().lstrip("@")
+        candidates = set()
+        for row in getattr(self, "_preparation_schedule", []):
+            if not isinstance(row, dict):
                 continue
+            mode = str(row.get("mode") or "").strip().upper().replace(" ", "")
+            if mode not in {"JS8", "JS8CALL"}:
+                continue
+            if not schedule_row_matches_target_context(
+                row, device_profile_id=getattr(self, "_preparation_radio_id", None),
+                operating_profile_id=getattr(self, "_preparation_operating_id", None),
+            ):
+                continue
+            row_group = str(row.get("primary_js8call_group") or "").strip().upper().lstrip("@")
+            if group and row_group and group != row_group:
+                continue
+            occurrence = next_net_occurrence(row, now)
+            if occurrence and (occurrence["active"] or datetime.timedelta(0) <= occurrence["window_start"] - now <= datetime.timedelta(minutes=20)):
+                name = str(row.get("net_name") or "").strip()
+                if name:
+                    candidates.add(name)
+        if len(candidates) == 1:
+            self.net_name_edit.setText(next(iter(candidates)))
+        elif len(candidates) > 1:
+            self.net_name_edit.setPlaceholderText("Multiple scheduled nets; choose or enter a name")
 
-        if best_row:
-            nn = (best_row.get("net_name") or "").strip()
-            if nn and not self.net_name_edit.text().strip():
-                self.net_name_edit.setText(nn)
+    def _update_preparation_summary(self, *_args):
+        if not hasattr(self, "preparation_label"):
+            return
+        missing = []
+        for field, absent, description in (
+            (self.net_name_edit, not self.net_name_edit.text().strip(), 'Required: enter a net name'),
+            (self.group_selector, not self._group_target, 'Required: select or enter a group')):
+            absent = bool(absent and not self._net_in_progress)
+            if field.property('fioRequiredMissing') != absent:
+                field.setProperty('fioRequiredMissing', absent)
+                field.style().unpolish(field)
+                field.style().polish(field)
+                field.update()
+            field.setAccessibleDescription(description if absent else '')
+        if not self.net_name_edit.text().strip():
+            missing.append('<a href="name">net name</a>')
+        if not getattr(self, "_preparation_callsign", False):
+            missing.append('<a href="callsign">callsign</a>')
+        if not getattr(self, "_directed_path", None):
+            missing.append('<a href="js8">DIRECTED.TXT</a>')
+        if not self._group_target:
+            missing.append('<a href="group">group destination</a>')
+        accent = active_app_theme()["accent"]
+        links = ", ".join(missing).replace("<a href=", f'<a style="color:{accent}" href=')
+        if self._net_in_progress:
+            self.preparation_label.setText('')
+            self.preparation_label.hide()
+        else:
+            self.preparation_label.setText("Before Start: " + links if missing else "Setup complete. Start Net checks the selected source before listening.")
+            self.preparation_label.show()
+            # Remain clickable for the existing validation/automatic-name route;
+            # neutral styling never presents incomplete local setup as ready.
+            style = button_style('muted' if missing else 'eligible_success', resolve_theme(self.settings))
+            if self.start_btn.styleSheet() != style:
+                self.start_btn.setStyleSheet(style)
+            self.start_btn.setToolTip('Complete: ' + ', '.join(text for key, text in
+                [('name', 'net name'), ('callsign', 'callsign'), ('js8', 'DIRECTED.TXT'), ('group', 'group destination')]
+                if any(f'href="{key}"' in item for item in missing)) if missing
+                else 'Start this net after the existing source and session checks.')
+
+
+    def _open_preparation_link(self, link):
+        if link in {"name", "group"}:
+            self.net_setup_toggle.setChecked(True)
+            field = self.net_name_edit if link == "name" else self.group_edit
+            field.setFocus()
+            self.js8_ncs_scroll_area.ensureWidgetVisible(field)
+        elif link in {"callsign", "js8"}:
+            host = self.window()
+            if hasattr(host, "open_settings_section"):
+                host.open_settings_section("operator_info" if link == "callsign" else "js8call",
+                                           radio_id=getattr(self, "_preparation_radio_id", None))
 
     # ---------------- POLLING DIRECTED.TXT ---------------- #
 
     def _poll_directed_file(self):
+        if getattr(self, '_preparation_scope', None) is not None and not self._net_in_progress:
+            return
         if self._is_shutting_down or self._polling_directed:
             return
         self._polling_directed = True
@@ -1521,6 +2240,8 @@ class JS8CallNetControlTab(QWidget):
 
                         # During an active net, record/update the check-in row
                         if self._net_in_progress:
+                            if not self._receiver_traffic_belongs_to_net('', line.split('\t', 4)[-1]):
+                                continue
                             if (
                                 not self._should_accept_checkin_line(line)
                                 and call_primary not in self._checkins
@@ -1532,7 +2253,7 @@ class JS8CallNetControlTab(QWidget):
                             if speed_guess is not None:
                                 mode_name = js8_speed_name(speed_guess)
                             base_call = self._base_callsign(call_primary) if call_primary else ""
-                            if base_call and self._checkins.get(base_call, {}).get("offset") is not None:
+                            if base_call and self._checkins.get(call_primary, {}).get("offset") is not None:
                                 offset_line = None
                             self._upsert_checkin(
                                 call_primary,
@@ -1565,7 +2286,7 @@ class JS8CallNetControlTab(QWidget):
             return
         if not self._directed_path:
             return
-        all_path = self._directed_path.parent / "ALL.TXT"
+        all_path = self._scoped_all_path()
         if not all_path.exists():
             return
         try:
@@ -1721,7 +2442,7 @@ class JS8CallNetControlTab(QWidget):
             if pending.get(call) != token:
                 self._drop_fcc_pending(call)
                 continue
-            record = broker.identity(call)
+            record = broker.identity(JS8CallNetControlTab._base_callsign(call))
             if record is None:
                 # The worker may still be in flight. Keep the session token
                 # so its eventual result can fill this row.
@@ -1734,8 +2455,9 @@ class JS8CallNetControlTab(QWidget):
         grouped: Dict[str, list] = {}
         for record in tuple(rows or ()):
             call = str(getattr(record, "callsign", "") or "").strip().upper()
-            if call in getattr(self, "_fcc_identity_pending", {}):
-                grouped.setdefault(call, []).append(record)
+            for pending_call in getattr(self, "_fcc_identity_pending", {}):
+                if JS8CallNetControlTab._base_callsign(pending_call) == call:
+                    grouped.setdefault(pending_call, []).append(record)
         token = self._fcc_session_token()
         for call, records in grouped.items():
             if self._fcc_identity_pending.get(call) != token:
@@ -1744,7 +2466,7 @@ class JS8CallNetControlTab(QWidget):
             if not self._active:
                 continue
             broker = getattr(self, "_fcc_identity_broker", None)
-            record = broker.identity(call) if broker is not None else None
+            record = broker.identity(JS8CallNetControlTab._base_callsign(call)) if broker is not None else None
             if record is None:
                 continue
             self._apply_fcc_identity(call, (record,), token, update_widget=True)
@@ -1753,11 +2475,16 @@ class JS8CallNetControlTab(QWidget):
         self._checkin_rows = {}
         self._clear_table()
         for cs, data in self._checkins.items():
-            self._update_row(cs, data)
+            if cs not in getattr(self, '_excluded_checkins', set()):
+                self._update_row(cs, data)
         self._update_checkin_empty_state()
 
     def _update_checkin_empty_state(self) -> None:
         if not hasattr(self, "checkin_empty_label") or not hasattr(self, "checkin_table"):
+            return
+        if hasattr(self, 'workbench_panel'):
+            self.checkin_empty_label.hide()
+            self.checkin_table.hide()
             return
         has_rows = self.checkin_table.rowCount() > 0
         self.checkin_empty_label.setVisible(not has_rows)
@@ -1793,9 +2520,7 @@ class JS8CallNetControlTab(QWidget):
     def _delete_action_text(self) -> str:
         if not self._net_in_progress:
             return ""
-        if self._checkin_filter_mode() != "All Callsigns":
-            return ""
-        return "Delete"
+        return "Exclude"
 
     def _on_checkin_filter_changed(self) -> None:
         self._rebuild_checkin_table()
@@ -1810,19 +2535,14 @@ class JS8CallNetControlTab(QWidget):
         callsign = item.text().strip().upper() if item else ""
         if not callsign:
             return
-        resp = QMessageBox.question(
-            self,
-            "Delete Check-in",
-            f"Remove {callsign} from this net?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-        if resp != QMessageBox.Yes:
+        workbench = getattr(self, 'workbench', None)
+        if workbench is not None:
+            row = next((row for row in workbench.snapshot.get('roster', ()) if row.get('from_call') == callsign), None)
+            if row:
+                workbench.annotate('station', row, {'excluded': True})
             return
-        self._checkins.pop(callsign, None)
-        self._drop_fcc_pending(callsign)
-        self._status_mismatch.pop(callsign, None)
-        self._checkins_saved.discard(callsign)
+        # Compatibility fixture path: retain data and count markers independently.
+        self._excluded_checkins = getattr(self, '_excluded_checkins', set()) | {callsign}
         self._rebuild_checkin_table()
 
     def _region_for_state(self, st: str) -> str:
@@ -1894,7 +2614,7 @@ class JS8CallNetControlTab(QWidget):
             return meta
         try:
             root = Path(__file__).resolve().parents[2]
-            db_path = _nets_db_path()
+            db_path = self._ncs_nets_db_path()
             if not db_path.exists():
                 return meta
             conn = sqlite3.connect(db_path)
@@ -1976,6 +2696,27 @@ class JS8CallNetControlTab(QWidget):
                     item.setBackground(QColor(theme["surface_alt"]))
         self._update_checkin_empty_state()
 
+    def _receiver_traffic_belongs_to_net(self, recipient: str, text: str = '') -> bool:
+        """Raw receiver evidence may establish only its explicitly addressed net.
+
+        Canonical reports use pinned source, reception time and destination for
+        association, retaining relay provenance without a blanket relay exclusion.
+        Existing accepted stations remain independent of this test.
+        """
+        if not self._ncs_session_id:
+            return True  # Existing unscoped compatibility callers have no run.
+        destination = str(recipient or '').strip().upper()
+        if not destination and ':' in text:
+            destination = text.split(':', 1)[1].strip().split(' ', 1)[0].upper()
+        if '>' in destination:
+            return False
+        group = str(self._group_target or '').strip().upper()
+        if group and not group.startswith('@'):
+            group = '@' + group
+        # Additional query groups enter through canonical, timestamp-qualified evidence.
+        # Raw buffered lines have no reliable query-time fence here.
+        return bool(destination and destination in {group, self._my_callsign().upper()})
+
     def _upsert_checkin(
         self,
         callsign: str,
@@ -1990,11 +2731,15 @@ class JS8CallNetControlTab(QWidget):
         cs = (callsign or "").strip().upper()
         if not cs:
             return
+        workbench = getattr(self, 'workbench', None)
+        if workbench is not None and cs in workbench.excluded:
+            return
         base = cs.split("/", 1)[0]
+        identity = cs if workbench is not None else base
         meta = self._lookup_operator_meta(base)
         if grid:
             meta["grid"] = grid
-        data = self._checkins.get(base, {})
+        data = self._checkins.get(identity, {})
         current_name = str(data.get("name") or "").strip()
         current_state = str(data.get("state") or "").strip().upper()
         local_name = str(meta.get("name") or "").strip()
@@ -2030,15 +2775,15 @@ class JS8CallNetControlTab(QWidget):
                 if not state and fcc_state:
                     state = fcc_state
                     data["_fcc_state_fallback"] = True
-                self._drop_fcc_pending(base)
+                self._drop_fcc_pending(identity)
             else:
-                self._queue_fcc_identity(base, token)
+                self._queue_fcc_identity(identity, token)
                 try:
                     broker.request(base, interactive=False)
                 except Exception:
                     pass
         elif name and state:
-            self._drop_fcc_pending(base)
+            self._drop_fcc_pending(identity)
         current_status = (data.get("status") or "").upper()
         # Do not downgrade from ACKED/F!xxx to NEW
         if status:
@@ -2048,6 +2793,14 @@ class JS8CallNetControlTab(QWidget):
                 status_to_use = status
         else:
             status_to_use = data.get("status", "")
+        try:
+            snr = float(snr) if snr not in (None, "") else None
+            if snr is not None and not math.isfinite(snr):
+                snr = None
+        except (TypeError, ValueError, OverflowError):
+            snr = None
+        if snr is not None:
+            data["snr_received_ts"] = time.time()
         data.update(
             {
                 "name": name,
@@ -2060,11 +2813,16 @@ class JS8CallNetControlTab(QWidget):
                 "status": status_to_use,
             }
         )
-        self._checkins[base] = data
-        self._status_mismatch[base] = status_mismatch
-        self._update_row(base, data)
+        self._checkins[identity] = data
+        self._status_mismatch[identity] = status_mismatch
+        self._update_row(identity, data)
 
     def _selected_callsign(self) -> Optional[str]:
+        panel = getattr(self, 'workbench_panel', None)
+        if panel is not None:
+            selected_row = panel._selected_roster() or {}
+            if selected_row.get('from_call'):
+                return str(selected_row['from_call']).strip().upper()
         selected = self.checkin_table.selectedItems()
         if not selected:
             return None
@@ -2072,36 +2830,53 @@ class JS8CallNetControlTab(QWidget):
         item = self.checkin_table.item(row, 0)
         return item.text().strip().upper() if item else None
 
+    def _adopt_group_text(self, *_args):
+        """Adopt an idle CP group immediately; preserve active-session ownership."""
+        if self._net_in_progress:
+            return
+        name = normalize_group_name(self.group_edit.text())
+        self._group_target = '@' + name if name else ''
+        self._update_workspace_presentation()
+
+    def _on_group_choice_finished(self, *_args):
+        self._finish_group_selection()
+        key = self._query_operating_group_key()
+        if not self._net_in_progress and key != getattr(self, '_net_form_tools_group_key', ''):
+            self._form_mappings_dirty = True
+            self._review_form_tools()
+
+    def _finish_group_selection(self, *_args):
+        name = normalize_group_name(self.group_edit.text())
+        if self._net_in_progress and name != normalize_group_name(self._group_target):
+            self.form_tools_status.setText('The active net retains its operating group. End it before changing groups; your draft is retained.')
+            self.form_tools_status.show()
+            return
+        self.group_edit.setText(name)
+        self._adopt_group_text()
+
     def _set_group_target(self):
-        txt = self.group_edit.text().strip().upper()
-        if txt and not txt.startswith("@"):
-            txt = "@" + txt.lstrip("@")
-        if txt.count("@") > 1:
-            txt = "@" + txt.replace("@", "")
-        self._group_target = txt
-        self.group_edit.setText(txt)
-        self._update_group_button_state()
+        # Compatibility for old callers/drafts. There is no user-facing Set step.
+        self._finish_group_selection()
 
     def _update_group_button_state(self):
-        theme = resolve_theme(self.settings)
-        current = self.group_edit.text().strip().upper()
-        if current and not current.startswith("@"):
-            current = "@" + current
-        needs_set = bool(current) and current != (self._group_target or "")
-        if self._group_target and not needs_set:
-            self.set_group_btn.setStyleSheet(button_style("muted", theme))
-        elif needs_set:
-            self.set_group_btn.setStyleSheet(button_style("eligible_info", theme))
-        else:
-            self.set_group_btn.setStyleSheet(button_style("muted", theme))
+        self.set_group_btn.hide()
+
+    def _adopt_query_selection(self, *_args):
+        code = self._current_spotter_code()
+        self._spotter_form = code if code in self._available_net_form_codes else None
+        self._expected_form = self._spotter_form
+        self._on_spotter_selection_changed()
 
     def _set_spotter_form(self):
         if not self.spotter_combo.isEnabled():
             QMessageBox.warning(self, "Spotter", "No MCF forms found.")
             return
+        if self._current_spotter_code() not in self._available_net_form_codes:
+            QMessageBox.warning(self, "Spotter", "Select an available form first.")
+            return
         self._spotter_form = self._current_spotter_code()
         self._expected_form = self._spotter_form
-        self._update_spotter_button_state()
+        self._on_spotter_selection_changed()
 
     def _current_spotter_code(self) -> str:
         data = self.spotter_combo.currentData()
@@ -2121,61 +2896,131 @@ class JS8CallNetControlTab(QWidget):
         else:
             self.set_spotter_btn.setStyleSheet(button_style("muted", theme))
 
+    def _update_query_controls(self):
+        panel = getattr(self, 'workbench_panel', None)
+        if panel is None:
+            return
+        writable = bool(self._net_in_progress and panel._snapshot.get('writable'))
+        available = self._spotter_form in self._available_net_form_codes
+        for button in (panel.query_group_button, panel.query_station_button):
+            has_target = button is panel.query_station_button or bool(self._query_group_destination())
+            button.setEnabled(writable and available and has_target)
+            button.setToolTip('Send the selected form query' if writable and available else
+                              'Choose an optional query form to send a query' if writable else
+                              'Start an active net to send a query; queries are not required to start')
+        self._update_live_query_target()
+
     def _on_spotter_selection_changed(self) -> None:
         theme = resolve_theme(self.settings)
         current = self._current_spotter_code()
+        available = getattr(self, "_available_net_form_codes", set())
+        self.set_spotter_btn.setEnabled(current in available)
+        self.group_spotter_btn.setEnabled(self._spotter_form in available)
+        self.single_spotter_btn.setEnabled(self._spotter_form in available)
         if current and current != (self._spotter_form or ""):
             self.set_spotter_btn.setStyleSheet(button_style("eligible_info", theme))
         else:
             self._update_spotter_button_state()
+        self._update_query_controls()
+
+    def _roster_groups_scope(self):
+        return (str(self._ncs_nets_db_path()), id(self.settings), id(self._preparation_scope))
 
     def _refresh_group_completer(self):
-        groups: Set[str] = set()
-        mycall = self._base_callsign(self._my_callsign())
-        db_path = _nets_db_path()
-        if mycall and db_path.exists():
+        scope = self._roster_groups_scope()
+        if scope != self._roster_groups_cache_scope:
+            self._roster_groups_cache_scope = scope
+            self._roster_group_names = ()
+            self._roster_groups_checked = 0.0
+        self._present_roster_group_choices()
+        if self._roster_groups_inflight or self._is_shutting_down:
+            return
+        if time.monotonic() - self._roster_groups_checked < 2:
+            return
+        from freqinout.core.operator_groups import load_hf_roster_group_names
+        from freqinout.core.scheduler_serial_executor import DaemonSerialExecutor
+        if self._form_tools_executor is None:
+            self._form_tools_executor = DaemonSerialExecutor(thread_name_prefix='fio-ncs-form-tools')
+        token = self._roster_groups_scope()
+        self._roster_groups_inflight = True
+        future = self._form_tools_executor.submit(load_hf_roster_group_names, token[0])
+        def completed(result):
             try:
-                conn = sqlite3.connect(db_path)
-                cur = conn.cursor()
-                cur.execute(
-                    "SELECT group1, group2, group3, groups_json FROM operator_checkins WHERE callsign=?",
-                    (mycall,),
-                )
-                row = cur.fetchone()
-                conn.close()
-                if row:
-                    g1, g2, g3, groups_json = row
-                    for g in (g1, g2, g3):
-                        if g:
-                            groups.add(str(g).strip().upper())
-                    if groups_json:
-                        try:
-                            for g in json.loads(groups_json):
-                                if g:
-                                    groups.add(str(g).strip().upper())
-                        except Exception:
-                            pass
-            except Exception as e:
-                log.debug("JS8CallNetControl: group lookup failed: %s", e)
-        for g in self.settings.get("primary_js8_groups", []) or []:
-            if g:
-                groups.add(str(g).strip().upper())
-        normalized = []
-        for g in groups:
-            if not g:
+                value, error = result.result(), None
+            except Exception as exc:
+                value, error = (), str(exc)
+            if not self._is_shutting_down:
+                try:
+                    self.roster_groups_ready.emit(token, value, error)
+                except RuntimeError:
+                    pass
+        future.add_done_callback(completed)
+
+    def _publish_roster_groups(self, token, groups, error):
+        self._roster_groups_inflight = False
+        if self._is_shutting_down:
+            return
+        if token != self._roster_groups_scope():
+            QTimer.singleShot(0, self._refresh_group_completer)
+            return
+        self._roster_groups_checked = time.monotonic()
+        if error:
+            self.group_selector.setToolTip('Roster groups could not be loaded; your entered group is retained. Reopen NCS to retry.')
+            return
+        self._roster_group_names = tuple(groups)
+        self._present_roster_group_choices()
+
+    def _present_roster_group_choices(self):
+        for combo in (self.group_selector, getattr(self, 'query_group_selector', None)):
+            if combo is None:
                 continue
-            up = g if g.startswith("@") else f"@{g}"
-            normalized.append(up)
-            normalized.append(up.lstrip("@"))
-        normalized = sorted(set(normalized))
-        if normalized:
-            completer = QCompleter(normalized, self)
+            current = combo.currentText()
+            blocked = combo.blockSignals(True)
+            edit_blocked = combo.lineEdit().blockSignals(True)
+            combo.clear()
+            combo.addItems(list(self._roster_group_names))
+            combo.setCurrentIndex(-1)
+            combo.setEditText(current)
+            combo.lineEdit().blockSignals(edit_blocked)
+            combo.blockSignals(blocked)
+            completer = QCompleter(list(self._roster_group_names), combo)
             completer.setCaseSensitivity(Qt.CaseInsensitive)
-            completer.setFilterMode(Qt.MatchStartsWith)
-            completer.setCompletionMode(QCompleter.InlineCompletion)
-            self.group_edit.setCompleter(completer)
+            combo.setCompleter(completer)
+        self.group_edit.setPlaceholderText('Select or enter a roster group')
+
+    def _query_group_destination(self):
+        name = normalize_group_name(self.query_group_selector.currentText())
+        return '@' + name if name else ''
+
+    def _present_ack_group_menu(self, snapshot, writable):
+        session = self._ncs_session_id
+        if self._net_in_progress and session != self._query_destination_session:
+            self._query_destination_session = session
+            self.query_group_selector.setEditText(normalize_group_name(self._group_target))
+        targets = tuple(snapshot.get('query_groups') or ())
+        key = ((snapshot.get('run') or {}).get('run_id'), targets)
+        if key != getattr(self, '_ack_menu_key', None):
+            old = self.ack_btn.menu()
+            menu = QMenu(self.ack_btn) if targets else None
+            if menu is not None:
+                for target in targets:
+                    action = menu.addAction(normalize_group_name(target))
+                    action.triggered.connect(lambda checked=False, dest=target, run_id=key[0]:
+                        self.workbench.acknowledge(destination=dest, expected_run=run_id))
+            self.ack_btn.setMenu(menu)
+            if old is not None:
+                old.deleteLater()
+            self._ack_menu_key = key
+        self.ack_btn.setEnabled(bool(writable and targets))
+        self.ack_btn.setToolTip('Acknowledge to a group queried in this net' if targets else 'Submit an Expect group query before acknowledging a group')
 
     def _ack_checkins(self):
+        workbench = getattr(self, 'workbench', None)
+        if workbench is not None and workbench.run is not None:
+            if self.ack_btn.menu() is not None:
+                return
+            workbench.acknowledge()
+            return
         if not self._net_in_progress:
             QMessageBox.information(self, "Net", "Start the net before ACK.")
             return
@@ -2202,6 +3047,14 @@ class JS8CallNetControlTab(QWidget):
                 self._upsert_checkin(cs, status="ACKED")
 
     def _ack_callsign(self):
+        workbench = getattr(self, 'workbench', None)
+        if workbench is not None and workbench.run is not None:
+            selected = self._selected_callsign()
+            if not selected:
+                workbench._status('Select a station before acknowledging it.')
+                return
+            workbench.acknowledge(selected)
+            return
         if not self._net_in_progress:
             QMessageBox.information(self, "Net", "Start the net before ACK.")
             return
@@ -2223,10 +3076,16 @@ class JS8CallNetControlTab(QWidget):
             self._upsert_checkin(cs, status="ACKED")
 
     def _group_spotter(self):
+        if getattr(self, 'workbench', None) is not None and self.workbench.run:
+            self.workbench.query(self._query_group_destination())
+            return
+        if self._spotter_form not in getattr(self, '_available_net_form_codes', set()):
+            QMessageBox.warning(self, 'Form unavailable', 'Review form tools and select an available form before sending. Your choice is retained.')
+            return
         if not self._net_in_progress:
             QMessageBox.information(self, "Net", "Start the net first.")
             return
-        group = self._group_target or self.group_edit.text().strip().upper()
+        group = self._query_group_destination()
         if group and not group.startswith("@"):
             group = "@" + group
         if not group:
@@ -2253,6 +3112,13 @@ class JS8CallNetControlTab(QWidget):
         self._send_js8_message(text)
 
     def _single_spotter(self):
+        if getattr(self, 'workbench', None) is not None and self.workbench.run:
+            row = self.workbench_panel._selected_roster() or {}
+            self.workbench.query(str(row.get('from_call') or ''))
+            return
+        if self._spotter_form not in getattr(self, '_available_net_form_codes', set()):
+            QMessageBox.warning(self, 'Form unavailable', 'Review form tools and select an available form before sending. Your choice is retained.')
+            return
         if not self._net_in_progress:
             QMessageBox.information(self, "Net", "Start the net first.")
             return
@@ -2281,11 +3147,23 @@ class JS8CallNetControlTab(QWidget):
         self._send_js8_message(text)
 
     def _save_checkins(self, *, show_message: bool = True):
+        workbench = getattr(self, 'workbench', None)
+        if getattr(self, '_end_participant_calls', None) is not None:
+            # The workbench worker already committed every eligible counter and
+            # once-per-base marker. End must not enter a second increment path.
+            self._refresh_operator_history_views()
+            return True
+        if show_message and workbench is not None and workbench.run is not None:
+            workbench.save_participants()
+            return False  # Explicit UI action is asynchronous; End uses its own gate.
         """
         Increment check-in counters for current check-ins (once per net).
         """
         try:
-            for cs in self._checkins.keys():
+            calls = getattr(self, '_end_participant_calls', None)
+            for cs in (self._checkins.keys() if calls is None else calls):
+                if calls is None and cs in getattr(getattr(self, 'workbench', None), 'excluded', set()):
+                    continue
                 base = cs.split("/", 1)[0]
                 if base in self._checkins_saved:
                     continue
@@ -2293,9 +3171,13 @@ class JS8CallNetControlTab(QWidget):
                 self._checkins_saved.add(base)
         except Exception as e:
             log.error("JS8CallNetControl: save checkins failed: %s", e)
+            if show_message:
+                QMessageBox.critical(self, "Save Failed", f"Unable to record all check-ins: {e}\nRetry Save.")
+            return False
         if show_message:
             QMessageBox.information(self, "Saved", "Check-ins recorded for this net.")
         self._refresh_operator_history_views()
+        return True
 
     # ---------------- LOG FILE WRITING ---------------- #
 
@@ -2303,7 +3185,7 @@ class JS8CallNetControlTab(QWidget):
         """
         Write net log into net_logs directory under DIRECTED.TXT's directory.
 
-        Filename: netname-ROLE-YYYYMMDD.txt
+        Filename: netname-ROLE-YYYYMMDD-occurrence.txt
         Header:
           # Net: ...
           # Role: ...
@@ -2314,7 +3196,7 @@ class JS8CallNetControlTab(QWidget):
           one full callsign per line.
         """
         if not self._directed_path:
-            return
+            raise RuntimeError("DIRECTED.TXT location is not configured")
 
         net_name = self.net_name_edit.text().strip()
         role = self.role_combo.currentText().strip().upper()
@@ -2328,16 +3210,17 @@ class JS8CallNetControlTab(QWidget):
         try:
             net_logs_dir.mkdir(parents=True, exist_ok=True)
         except Exception as e:
-            log.error("JS8CallNetControl: unable to create net_logs directory: %s", e)
-            return
+            raise OSError(f"Unable to create net log directory {net_logs_dir}: {e}") from e
 
         safe_net = "".join(c for c in net_name if c.isalnum() or c in ("_", "-", " "))
         safe_net = safe_net.replace(" ", "_") or "net"
-        filename = f"{safe_net}-{role}-{date_str}.txt"
+        filename = f"{safe_net}-{role}-{date_str}-{uuid.uuid4().hex}.txt"
         path = net_logs_dir / filename
 
         # Collect all full callsigns from the table
-        all_calls = list(self._checkins.keys())
+        excluded = getattr(getattr(self, 'workbench', None), 'excluded', set())
+        complete = getattr(self, '_end_participant_calls', None)
+        all_calls = list(complete) if complete is not None else [call for call in self._checkins if call not in excluded]
 
         # Try to find band from net_schedule
         band = self._lookup_band_for_net(net_name)
@@ -2355,11 +3238,20 @@ class JS8CallNetControlTab(QWidget):
         for cs in all_calls:
             lines.append(cs)
 
+        created = False
         try:
-            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            with path.open("x", encoding="utf-8") as output:
+                created = True
+                output.write("\n".join(lines) + "\n")
             log.info("JS8Call net log written to %s", path)
+            return path
         except Exception as e:
-            log.error("JS8CallNetControl: failed to write net log file %s: %s", path, e)
+            if created:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    log.exception("Unable to remove incomplete net log %s", path)
+            raise OSError(f"Unable to write net log {path}: {e}") from e
 
     def _lookup_band_for_net(self, net_name: str) -> str:
         """
@@ -2431,7 +3323,7 @@ class JS8CallNetControlTab(QWidget):
         return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat()
 
     def _open_operator_db(self) -> sqlite3.Connection:
-        db_path = _nets_db_path()
+        db_path = self._ncs_nets_db_path()
         db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(db_path, timeout=2.0)
         try:
@@ -2512,6 +3404,9 @@ class JS8CallNetControlTab(QWidget):
         return snr_val, offset_val
 
     def _get_js8_client(self):
+        scope = getattr(self, '_preparation_scope', None)
+        if scope is not None:
+            return JS8ApiClientRegistry.get(JS8ApiEndpoint(*scope.endpoint), timeout_s=1.0, auto_reconnect=True)
         if self._js8_client:
             return self._js8_client
         if js8net is None:
@@ -2694,6 +3589,7 @@ class JS8CallNetControlTab(QWidget):
         except Exception as e:
             self._operator_schema_ready = False
             log.error("JS8CallNetControl: failed to increment checkin count for %s: %s", cs, e)
+            raise
         finally:
             try:
                 conn.close()
@@ -3139,21 +4035,16 @@ class JS8CallNetControlTab(QWidget):
             self._maybe_process_next_query()
 
     def _on_js8_rx_messages(self, messages: List[dict]) -> None:
+        if getattr(self, '_preparation_scope', None) is not None and not self._net_in_progress:
+            return
         if self._is_shutting_down or self._polling_rx:
             return
         self._polling_rx = True
         try:
             source_context = self._js8_live_source_context()
-            try:
-                if any("F!" in str((msg.get("params", {}) or {}).get("TEXT") or msg.get("value") or "").upper() for msg in messages if isinstance(msg, dict)):
-                    MessageIngestor(self.settings).ingest_spotter_from_js8_events(
-                        messages,
-                        source_radio_id=source_context.get("source_radio_id", ""),
-                        js8_instance_id=source_context.get("js8_instance_id", ""),
-                        source_key=source_context.get("source_id", ""),
-                    )
-            except Exception as exc:
-                log.debug("JS8CallNetControl: Spotter live ingest failed: %s", exc)
+            workbench = getattr(self, 'workbench', None)
+            if workbench is not None:
+                workbench.enqueue_events(messages, source_context)
             for msg in messages:
                 now_ts = time.time()
                 self._last_rx_ts = now_ts
@@ -3177,7 +4068,9 @@ class JS8CallNetControlTab(QWidget):
                         if base_frm in self._awaiting_grid_responses and "GRID" in combined:
                             self._mark_backlog_retrieved(base_frm, "", "GRID")
                             self._awaiting_grid_responses.pop(base_frm, None)
-                        if self._net_in_progress:
+                        if self._net_in_progress and self._receiver_traffic_belongs_to_net(str(p.get('TO') or ''), txt) and net_traffic_payload(
+                            txt or ' '.join((cmd_txt, extra_txt)), recipient=str(p.get('TO') or '')) and not is_incidental_net_traffic(
+                            txt or ' '.join((cmd_txt, extra_txt)), recipient=str(p.get('TO') or '')):
                             # Extract metrics from API payload when available
                             try:
                                 snr_val = float(p.get("SNR")) if p.get("SNR") not in (None, "") else None
@@ -3200,7 +4093,7 @@ class JS8CallNetControlTab(QWidget):
                             except Exception:
                                 offset_val = None
                             self._upsert_checkin(
-                                base_frm,
+                                frm,
                                 status="NEW",
                                 mode=mode_name,
                                 snr=snr_val,
@@ -3247,25 +4140,34 @@ class JS8CallNetControlTab(QWidget):
                             if 4 <= len(token) <= 6 and token[:2].isalpha() and token[2:4].isdigit():
                                 self._update_operator_grid(base_frm or frm, token, self._active_group_name())
                                 break
-                    # Spotter form response handling
-                    if self._net_in_progress and self._expected_form:
+                    # Form identity describes received content; it is not reply
+                    # matching or a check-in purpose/selected-query restriction.
+                    if self._net_in_progress and base_frm and self._receiver_traffic_belongs_to_net(str(p.get('TO') or ''), txt) and not is_incidental_net_traffic(
+                        txt or ' '.join((cmd_txt, extra_txt)), recipient=str(p.get('TO') or '')):
                         forms_found = extract_form_codes(combined)
-                        for form in forms_found:
-                            if not self._is_checkin_form_code(form):
-                                continue
-                            if base_frm:
-                                mismatch = form != self._expected_form
-                                self._upsert_checkin(
-                                    base_frm,
-                                    status=form,
-                                    status_mismatch=mismatch,
-                                )
+                        if forms_found:
+                            self._upsert_checkin(frm, status=forms_found[0], status_mismatch=False)
                 except Exception:
                     continue
         finally:
             self._polling_rx = False
 
+    def closeEvent(self, event) -> None:
+        self.shutdown()
+        super().closeEvent(event)
+
     def shutdown(self) -> None:
+        if self._is_shutting_down:
+            return
+        self._is_shutting_down = True
+        if getattr(self, 'workbench', None) is not None:
+            self.workbench.close()
+        executor = getattr(self, '_form_tools_executor', None)
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+        receiver = getattr(self, '_prepared_receiver', None)
+        if receiver is not None:
+            receiver.close()
         self._is_shutting_down = True
         try:
             if self._poll_timer:
@@ -3279,7 +4181,7 @@ class JS8CallNetControlTab(QWidget):
             pass
         try:
             if self._js8_rx_hub and self._js8_rx_registered:
-                self._js8_rx_hub.unregister_listener(self._on_js8_rx_messages)
+                self._js8_rx_hub.unregister_listener(getattr(self, '_scoped_rx_callback', self._on_js8_rx_messages))
                 self._js8_rx_registered = False
         except Exception:
             pass
@@ -3303,14 +4205,9 @@ class JS8CallNetControlTab(QWidget):
         return bool(extract_form_codes(msg_text))
 
     def _should_accept_checkin_line(self, line: str) -> bool:
-        mode = self._checkin_filter_mode()
-        if mode in {"Mapped Check-ins", "F!103 / F!104"}:
-            return self._line_has_checkin_form(line)
-        if mode == "Any Spotter":
-            return self._line_has_any_spotter_form(line)
-        if mode == "All Callsigns":
-            return True
-        return self._line_has_checkin_form(line)
+        # Mapping/query choices are tools, never an incoming roster whitelist.
+        text = self._message_text_from_line(line)
+        return bool(net_traffic_payload(text)) and not is_incidental_net_traffic(text)
 
     def _message_text_from_line(self, line: str) -> str:
         if "\t" in line:
@@ -3389,7 +4286,7 @@ class JS8CallNetControlTab(QWidget):
     # ---------------- Auto-query backlog ---------------- #
 
     def _backlog_db_path(self) -> Path:
-        return _nets_db_path()
+        return self._ncs_nets_db_path()
 
     def _backlog_upsert(self, callsign: str, msg_id: str, kind: str, status: str = "PENDING") -> None:
         try:
@@ -3837,7 +4734,7 @@ class JS8CallNetControlTab(QWidget):
     def _load_net_rows(self) -> List[Dict]:
         data = []
         try:
-            db_path = _nets_db_path()
+            db_path = self._ncs_nets_db_path()
             if db_path.exists():
                 conn = sqlite3.connect(db_path)
                 cur = conn.cursor()
@@ -3881,7 +4778,7 @@ class JS8CallNetControlTab(QWidget):
     def _load_daily_rows(self) -> List[Dict]:
         data = []
         try:
-            db_path = get_config_dir() / "config" / "freqinout.db"
+            db_path = Path(self.settings.db_path) if getattr(self, '_preparation_scope', None) is not None else get_config_dir() / 'config' / 'freqinout.db'
             if db_path.exists():
                 conn = sqlite3.connect(db_path)
                 cur = conn.cursor()

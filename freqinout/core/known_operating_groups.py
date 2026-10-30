@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from itertools import chain
 import math
 import sqlite3
 from pathlib import Path
@@ -8,6 +9,7 @@ from typing import Any, Dict, Iterable, List, Mapping
 
 from freqinout.core.config_paths import get_config_dir
 from freqinout.core.mode_utils import normalize_operating_group_mode
+from freqinout.core.operating_group_frequency import normalize_frequency_hz
 from freqinout.core.resource_catalog_migration import (
     read_legacy_compatibility_rows,
     resource_catalog_authority_state,
@@ -36,6 +38,26 @@ BUILTIN_STANDARD_GROUPS: tuple[Dict[str, Any], ...] = (
         "net_names": ["JS8Call default calling frequencies"],
         "status": "standard",
         "source_note": "Built-in conventional JS8Call defaults.",
+    },
+    {
+        "group": "VARAC STANDARD",
+        "configs": [
+            {"band": "160M", "mode": "Digi", "frequency": "1.995", "fldigi_mode": "", "fldigi_offset": ""},
+            {"band": "80M", "mode": "Digi", "frequency": "3.595", "fldigi_mode": "", "fldigi_offset": ""},
+            {"band": "40M", "mode": "Digi", "frequency": "7.105", "fldigi_mode": "", "fldigi_offset": ""},
+            {"band": "30M", "mode": "Digi", "frequency": "10.133", "fldigi_mode": "", "fldigi_offset": ""},
+            {"band": "20M", "mode": "Digi", "frequency": "14.105", "fldigi_mode": "", "fldigi_offset": ""},
+            {"band": "17M", "mode": "Digi", "frequency": "18.107", "fldigi_mode": "", "fldigi_offset": ""},
+            {"band": "15M", "mode": "Digi", "frequency": "21.105", "fldigi_mode": "", "fldigi_offset": ""},
+            {"band": "12M", "mode": "Digi", "frequency": "24.927", "fldigi_mode": "", "fldigi_offset": ""},
+            {"band": "10M", "mode": "Digi", "frequency": "28.105", "fldigi_mode": "", "fldigi_offset": ""},
+            {"band": "6M", "mode": "Digi", "frequency": "50.330", "fldigi_mode": "", "fldigi_offset": ""},
+            {"band": "2M", "mode": "Digi", "frequency": "144.170", "fldigi_mode": "", "fldigi_offset": ""},
+        ],
+        "resource_sets": ["Built-in Standards"],
+        "net_names": ["VarAC USB calling frequencies"],
+        "status": "standard",
+        "source_note": "VarAC USB calling frequencies; regional and FM channels excluded.",
     },
     {
         "group": "FT8 STANDARD",
@@ -78,6 +100,23 @@ BUILTIN_STANDARD_GROUPS: tuple[Dict[str, Any], ...] = (
         "source_note": "Built-in conventional WSJT-X WSPR defaults.",
     },
 )
+
+# Supplemental delivered choices are independent of seasonal net membership.
+# Resource rows are processed first so their overlapping modem metadata wins.
+DELIVERED_GROUP_FREQUENCIES = {
+    "MAGNET": (("20M", "14.115"), ("40M", "7.115"), ("80M", "3.585"),
+               ("30M", "10.115"), ("10M", "28.115")),
+    "AMRRON": (("20M", "14.110"), ("40M", "7.110"), ("80M", "3.588")),
+}
+
+
+def _delivered_group_rows():
+    for group, frequencies in DELIVERED_GROUP_FREQUENCIES.items():
+        for band, frequency in frequencies:
+            yield {"group_name": group, "band": band, "mode": "Digi", "frequency": frequency,
+                   "fldigi_mode": "Cont-4/250", "fldigi_offset": "900", "source_type": "builtin",
+                   "source_ref": "delivered-group-presets", "resource_set": "Built-in Presets"}
+
 
 WEFAX_STATIONS: tuple[Dict[str, Any], ...] = (
     {
@@ -383,8 +422,8 @@ def build_known_operating_group_catalog(
     wefax_station_override: str = "",
 ) -> List[Dict[str, Any]]:
     groups: Dict[str, Dict[str, Any]] = {}
-    seen_configs: set[tuple[str, str, str, str]] = set()
-    for row in rows:
+    seen_configs: set[tuple[str, str, str, int | str]] = set()
+    for row in chain(rows, _delivered_group_rows()):
         config = _normalize_catalog_config(row)
         if config is None:
             continue
@@ -395,7 +434,7 @@ def build_known_operating_group_catalog(
             group,
             str(config["mode"]),
             str(config["band"]),
-            str(config["frequency"]),
+            normalize_frequency_hz(config["frequency"]) or str(config["frequency"]),
         )
         if key in seen_configs:
             continue
@@ -423,7 +462,24 @@ def build_known_operating_group_catalog(
                 "source_note": "",
             }
         )
-    builtin = [dict(entry) for entry in BUILTIN_STANDARD_GROUPS]
+    builtin = [{**entry, "configs": [dict(cfg) for cfg in entry["configs"]]}
+               for entry in BUILTIN_STANDARD_GROUPS]
+    # An imported resource may use a delivered standard's name. Keep one group,
+    # retain additional resource frequencies, and leave standard defaults intact.
+    for standard in builtin:
+        matching = next((entry for entry in catalog if entry["group"] == standard["group"]), None)
+        if matching is None:
+            continue
+        seen = {(cfg["band"], cfg["mode"], normalize_frequency_hz(cfg["frequency"]) or str(cfg["frequency"]))
+                for cfg in standard["configs"]}
+        for cfg in matching["configs"]:
+            identity = (cfg["band"], cfg["mode"], normalize_frequency_hz(cfg["frequency"]) or str(cfg["frequency"]))
+            if identity not in seen:
+                standard["configs"].append(cfg)
+                seen.add(identity)
+        standard["resource_sets"] = sorted(set(standard["resource_sets"]) | set(matching["resource_sets"]))
+        standard["net_names"] = sorted(set(standard["net_names"]) | set(matching["net_names"]))
+        catalog.remove(matching)
     builtin.append(
         _wefax_station_entry(
             station_grid6=station_grid6,

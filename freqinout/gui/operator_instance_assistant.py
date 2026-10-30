@@ -2,8 +2,8 @@
 
 This module deliberately keeps the old assistant's host-facing signals while
 moving the visible editing surface to :class:`ApplicationSetupEditor`.  It
-does not persist drafts, inspect the filesystem, launch applications, or call
-native preparation code.
+does not persist drafts, launch applications, or call native preparation code.
+Received-file directory checks run in a bounded background worker.
 """
 
 from __future__ import annotations
@@ -14,10 +14,12 @@ from types import SimpleNamespace
 from typing import Any, Iterable, Mapping
 from uuid import uuid4
 
-from PySide6.QtCore import Qt, Signal, QEvent
+from PySide6.QtCore import Qt, Signal, QEvent, QTimer
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QFileDialog,
+    QCheckBox,
+    QComboBox,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -31,7 +33,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from freqinout.gui.operator_application_editor import ApplicationSetupEditor
+from freqinout.gui.operator_application_editor import ApplicationSetupEditor, application_task_view_scope
+from freqinout.gui.received_files_config import ReceivedFilesCounter
 from freqinout.gui.theme import active_app_theme, button_style, label_style, control_height_for_font
 
 
@@ -60,6 +63,20 @@ def _bool(value: object) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on", "managed"}
     return bool(value)
+
+
+def _recovered_edited_fields(base: Mapping[str, Any], values: Mapping[str, Any]) -> set[str]:
+    marked = {key for key in values.get('__edited_fields__', ()) if isinstance(key, str)}
+    if '__edited_fields__' in values:
+        return marked
+    for key, value in values.items():
+        if key.startswith('_') or key.startswith('operator_'):
+            continue
+        if key in base and value != base[key]:
+            marked.add(key)
+        elif key not in base and value not in (None, '', False, (), [], {}):
+            marked.add(key)
+    return marked
 
 
 def _radio_id(row: Mapping[str, Any]) -> Any:
@@ -112,6 +129,7 @@ class OperatorInstanceAssistant(QWidget):
     discover_requested = Signal(str)
     recover_requested = Signal(object)
     discard_unfinished_requested = Signal(object)
+    review_subspace_files_requested = Signal()
 
     # Kept for hosts that connected these optional legacy signals.  They are
     # never emitted by this cache-only editor.
@@ -152,12 +170,15 @@ class OperatorInstanceAssistant(QWidget):
         self.managed_root = _text(managed_root)
         self.visible_components = tuple(visible_components or ())
         self.visible_fields = tuple(visible_fields or ())
+        self._application_discovery_enabled = True
         self.task_scope = str(task_scope or "").strip().lower()
         self._editing_existing = bool(editing_existing)
         self._replacement_requested = bool(replacement_requested or editing_existing)
         self._existing_instances = self.existing_instances
         self._initial_raw = self._mapping_from_draft(initial_draft)
+        self._review_edited_fields = {key for key in self._initial_raw.get('__edited_fields__', ()) if isinstance(key, str)}
         self._raw_fields = deepcopy(self._initial_raw)
+        self._discovery_candidates: tuple[dict[str, Any], ...] = ()
         self._discovery_results: tuple[dict[str, Any], ...] = ()
         self._selected_discovery_paths = {}
         self._varac_native_presentation: Any = None
@@ -168,10 +189,11 @@ class OperatorInstanceAssistant(QWidget):
         self._discovery_requested = False
         self.operator_session_id = uuid4().hex
         self._unfinished_envelope: dict[str, Any] | None = None
+        self._conflict_review_context: dict[str, Any] | None = None
         self._unfinished_token: Any = None
         self._unfinished_revision: Any = None
         self._recovered_from: Any = None
-        self.operator_draft_revision: Any = None
+        self.operator_draft_revision: Any = self._initial_raw.get('operator_draft_revision')
         self._replacement_instance_id = self._find_original_instance_id()
         self._initial_instance_id = _first(
             self._initial_raw,
@@ -219,7 +241,9 @@ class OperatorInstanceAssistant(QWidget):
         self.editor.add_form_context(self._context_widget)
         self.editor.full_family_review_requested.connect(self._full_family_review_requested)
         if self.task_scope:
-            self.editor.set_task_scope(self.task_scope)
+            self.set_task_scope(self.task_scope)
+        else:
+            self.set_view_scope(visible_components=visible_components, visible_fields=visible_fields)
         # The assistant is embedded in the Settings workspace, whose editor
         # stack may be shorter than this form's natural hint.  Let the local
         # field scroll own that overflow so the editor footer remains inside
@@ -239,7 +263,8 @@ class OperatorInstanceAssistant(QWidget):
         heading = self.editor.findChild(QLabel, 'operatorApplicationHeading')
         if heading is not None:
             heading.hide()
-        self.operator_base_values = deepcopy(self.editor.values())
+        self._set_received_files_values(self._initial_raw)
+        self.operator_base_values = deepcopy(self.values())
 
         self.editor.value_changed.connect(self._editor_value_changed)
         self.editor.save_requested.connect(self._complete)
@@ -251,6 +276,16 @@ class OperatorInstanceAssistant(QWidget):
         self.use_discovery_button.clicked.connect(self._use_discovery)
         self.discovery_list.itemSelectionChanged.connect(self._discovery_selection_changed)
         self.create_radio_button.clicked.connect(self.create_radio_requested.emit)
+        if self.family_key == "js8call":
+            self.review_subspace_files_button.clicked.connect(
+                self.review_subspace_files_requested.emit
+            )
+            self.received_enabled.toggled.connect(self._received_files_edited)
+            self.received_path.textChanged.connect(self._received_files_edited)
+            self.received_choice.currentIndexChanged.connect(self._received_files_edited)
+            self.received_browse.clicked.connect(self._browse_received_files)
+            self.received_check_again.clicked.connect(self._received_files_changed)
+            self._received_files_changed()
         self.set_operation_status("Saved")
         self.editor.set_discovery_state('ready')
         self.use_discovery_button.setVisible(not self.visible_components)
@@ -290,7 +325,16 @@ class OperatorInstanceAssistant(QWidget):
         self.editor.apply_theme(palette)
         self._size_discovery_list()
         self.operation_status_label.setStyleSheet(label_style('danger' if self._status_error else 'muted',palette))
-        for button in (self.use_discovery_button,self.create_radio_button,self.recover_button,self.discard_unfinished_button):
+        for button in (
+            self.use_discovery_button,
+            self.create_radio_button,
+            self.recover_button,
+            self.discard_unfinished_button,
+            self.conflict_review_button,
+            self.review_subspace_files_button,
+            self.received_browse,
+            self.received_check_again,
+        ):
             button.setStyleSheet(button_style('secondary',palette))
 
     def set_busy(self, busy: bool) -> None:
@@ -301,6 +345,8 @@ class OperatorInstanceAssistant(QWidget):
         self.create_radio_button.setEnabled(not self._busy)
         self.recover_button.setEnabled(not self._busy)
         self.discard_unfinished_button.setEnabled(not self._busy)
+        self.conflict_review_button.setEnabled(not self._busy)
+        self.received_files_group.setEnabled(not self._busy)
 
     def _size_discovery_list(self) -> None:
         count = self.discovery_list.count()
@@ -312,9 +358,12 @@ class OperatorInstanceAssistant(QWidget):
     def set_discovery_results(self, results: Iterable[Mapping[str, Any]]) -> None:
         """Publish candidates without changing the draft until one is selected."""
 
+        self._discovery_candidates = tuple(
+            deepcopy(dict(row)) for row in results if isinstance(row, Mapping)
+        )
         rows: list[dict[str, Any]] = []
         component_paths_seen = set()
-        for raw in results:
+        for raw in self._discovery_candidates if self._application_discovery_enabled else ():
             if isinstance(raw, Mapping):
                 row = deepcopy(dict(raw))
                 if self.family_key == 'fast_light' and self.visible_components:
@@ -332,7 +381,7 @@ class OperatorInstanceAssistant(QWidget):
                 if self._row_has_values(row):
                     rows.append(row)
         self._discovery_results = tuple(rows)
-        self.discovery_group.setVisible(bool(rows) or self._discovery_requested)
+        self.discovery_group.setVisible(self._application_discovery_enabled and (bool(rows) or self._discovery_requested))
         self.discovery_list.clear()
         for row in rows:
             name = _text(_first(row, "name", "instance_name", "label")) or "Unnamed configuration"
@@ -382,7 +431,23 @@ class OperatorInstanceAssistant(QWidget):
         return None
 
     def values(self) -> dict[str, Any]:
-        return self.editor.values()
+        values = self.editor.values()
+        if self.family_key == "js8call":
+            values.update(received_files_enabled=self.received_enabled.isChecked(),
+                          received_files_path=self.received_path.text().strip(),
+                          received_files_existing=self.received_choice.currentData())
+        return values
+
+    def set_editor_values(self, values: Mapping[str, Any], *, preserve_dirty: bool = True) -> bool:
+        """Publish a worker snapshot without overwriting an active draft."""
+        values = self._seed_form_values(values)
+        if not self.editor.set_values(values, preserve_dirty=preserve_dirty):
+            return False
+        self._review_edited_fields.clear()
+        if self.family_key == "js8call":
+            self._set_received_files_values(values)
+            self._received_files_changed()
+        return True
 
     def set_view_scope(
         self,
@@ -392,17 +457,25 @@ class OperatorInstanceAssistant(QWidget):
     ) -> None:
         """Limit the visible editor task while preserving the atomic draft."""
         self.visible_components = tuple(visible_components) if visible_components is not None else ()
-        self.use_discovery_button.setVisible(not self.visible_components)
+        self._selected_discovery_paths = {}
+        path_fields = {"application_path", *(f"{c}_application_path" for c in ("flrig", "fldigi", "flmsg", "flamp"))}
+        self._application_discovery_enabled = (
+            (visible_components is None or bool(visible_components))
+            and (visible_fields is None or bool(path_fields.intersection(visible_fields)))
+        )
+        self.editor.find_button.setVisible(self._application_discovery_enabled)
         self.visible_fields = tuple(visible_fields) if visible_fields is not None else ()
         self.editor.set_view_scope(
             visible_components=(self.visible_components if visible_components is not None else None),
             visible_fields=(self.visible_fields if visible_fields is not None else None),
         )
 
+        self.set_discovery_results(self._discovery_candidates)
+
     def set_task_scope(self, task_key: str | None) -> None:
         """Show the editor surface for one software task without dropping draft data."""
         self.task_scope = str(task_key or "").strip().lower()
-        self.editor.set_task_scope(task_key)
+        self.set_view_scope(**application_task_view_scope(task_key))
 
     def review_all_fast_light_components(self) -> None:
         """Expand a component-scoped Fast Light editor without changing its draft."""
@@ -420,8 +493,7 @@ class OperatorInstanceAssistant(QWidget):
         heading = self.findChild(QLabel, "operatorInstanceAssistantHeading")
         if heading is not None:
             heading.setText("Fast Light setup")
-        self.visible_components = ()
-        self.visible_fields = ()
+        self.set_view_scope()
 
     def draft(self) -> SimpleNamespace:
         return _DraftView(self._draft_payload_values(), self.family_key)
@@ -461,8 +533,57 @@ class OperatorInstanceAssistant(QWidget):
         self.recover_button.setEnabled(not self._busy)
         self.discard_unfinished_button.setEnabled(not self._busy)
 
+    def set_conflict_review(self, context: Mapping[str, Any] | None) -> None:
+        self._conflict_review_context = deepcopy(dict(context)) if isinstance(context, Mapping) else None
+        self.conflict_review_button.setVisible(self._conflict_review_context is not None)
+        self.conflict_review_button.setEnabled(not self._busy)
+
+    def _review_saved_changes(self) -> None:
+        if self._busy or self._conflict_review_context is None:
+            return
+        from freqinout.core.configuration_review import application_review
+        review = application_review(self.operator_base_values,
+                                    {**self.values(), '__edited_fields__': sorted(self._review_edited_fields)},
+                                    self._conflict_review_context)
+        box = QMessageBox(self)
+        box.setWindowTitle('Review saved application changes')
+        box.setTextFormat(Qt.PlainText)
+        box.setText('Review your entries alongside the current saved settings.')
+        summary = review['summary']
+        if len(summary) > 360 or len(summary.splitlines()) > 4:
+            box.setInformativeText('Review the changed fields in Show Details. Unedited fields use the current saved settings. Nothing is saved until you choose Save.')
+            box.setDetailedText(summary)
+        else:
+            box.setInformativeText(summary)
+        apply = box.addButton('Use reviewed entries', QMessageBox.ButtonRole.AcceptRole)
+        keep = box.addButton('Keep editing', QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(keep)
+        box.exec()
+        if box.clickedButton() is not apply:
+            return
+        received_before = (self.received_enabled.isChecked(), self.received_path.text(), self.received_choice.currentData())
+        self.editor.set_values(self._seed_form_values(review['values']), preserve_dirty=False)
+        if self.family_key == 'js8call':
+            self._set_received_files_values(review['values'])
+            received_after = (self.received_enabled.isChecked(), self.received_path.text(), self.received_choice.currentData())
+            if received_after != received_before:
+                self._received_generation += 1
+                self._received_timer.stop()
+                self._received_accessible = False
+                self.received_status.setText('Directory not checked. You can save these choices.' if received_after[0] else 'Monitoring off')
+        self.operator_base_values = deepcopy(dict(review['base']))
+        context = deepcopy(dict(review['context']))
+        self._raw_fields.update(context)
+        self._expected_identity_generation = context.get('expected_identity_generation')
+        self._replacement_instance_id = context.get('expected_current_instance_id')
+        self.operator_draft_revision = context.get('operator_draft_revision')
+        self.editor.set_dirty(True)
+        self.set_conflict_review(None)
+        self.set_operation_status('Reviewed entries are ready. Choose Save to apply them.')
+
     def _draft_payload_values(self) -> dict[str, Any]:
-        values = self.editor.values()
+        values = self.values()
+        values['__edited_fields__'] = sorted(self._review_edited_fields)
         # The application editor uses a typed spin box, while the legacy
         # assistant draft contract carries JS8 offset text for atomic payload
         # compatibility.  Keep the editor typed without changing the saved
@@ -535,6 +656,51 @@ class OperatorInstanceAssistant(QWidget):
         self._context_layout.addWidget(self.discovery_group)
         self.discovery_group.setVisible(False)
 
+        self.received_files_group = QGroupBox("Received files", self._context_widget)
+        received_layout = QVBoxLayout(self.received_files_group)
+        self.received_enabled = QCheckBox("Monitor received files")
+        received_layout.addWidget(self.received_enabled)
+        path_row = QHBoxLayout()
+        self.received_path = QLineEdit()
+        self.received_path.setAccessibleName("Received files directory")
+        self.received_path.setPlaceholderText("Choose an accessible directory")
+        path_row.addWidget(self.received_path, 1)
+        self.received_browse = QPushButton("Browse…")
+        self.received_browse.setAccessibleName("Browse for received files directory")
+        path_row.addWidget(self.received_browse)
+        received_layout.addLayout(path_row)
+        self.received_choice = QComboBox()
+        self.received_choice.setAccessibleName("Existing files choice")
+        self.received_choice.addItem("Review existing files", "review")
+        self.received_choice.addItem("Monitor new files", "new")
+        received_layout.addWidget(self.received_choice)
+        self.received_status = QLabel("Monitoring off")
+        self.received_status.setAccessibleName("Received files status")
+        self.received_status.setWordWrap(True)
+        self.received_status.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        received_layout.addWidget(self.received_status)
+        hint = QLabel("Files may be shared by instances; sender and receiving radio remain unverified.")
+        hint.setWordWrap(True)
+        received_layout.addWidget(hint)
+        actions = QHBoxLayout()
+        self.review_subspace_files_button = QPushButton("Review received files", self.received_files_group)
+        self.review_subspace_files_button.setObjectName("operatorInstanceReviewSubspaceFiles")
+        self.review_subspace_files_button.setAccessibleName("Review received files")
+        actions.addWidget(self.review_subspace_files_button)
+        self.received_check_again = QPushButton("Check directory")
+        actions.addWidget(self.received_check_again)
+        actions.addStretch()
+        received_layout.addLayout(actions)
+        self._context_layout.addWidget(self.received_files_group)
+        self.received_files_group.setVisible(self.family_key == "js8call")
+        self._received_generation = 0
+        self._received_accessible = False
+        self._received_counter = ReceivedFilesCounter(self)
+        self._received_counter.finished.connect(self._received_count_finished)
+        self._received_timer = QTimer(self)
+        self._received_timer.setSingleShot(True)
+        self._received_timer.timeout.connect(self._count_received_files)
+
         # Parent before any visibility changes. A parentless button would
         # briefly show as a native top-level window,
         # disrupting macOS activation/Spaces even after it is reparented.
@@ -559,6 +725,11 @@ class OperatorInstanceAssistant(QWidget):
         self.discard_unfinished_button.clicked.connect(self._discard_unfinished)
         recovery_actions.addWidget(self.recover_button)
         recovery_actions.addWidget(self.discard_unfinished_button)
+        self.conflict_review_button = QPushButton('Review saved changes…')
+        self.conflict_review_button.setObjectName('operatorInstanceReviewSavedChanges')
+        self.conflict_review_button.setVisible(False)
+        self.conflict_review_button.clicked.connect(self._review_saved_changes)
+        recovery_actions.addWidget(self.conflict_review_button)
         recovery_actions.addStretch(1)
         self._context_layout.addLayout(recovery_actions)
 
@@ -617,10 +788,15 @@ class OperatorInstanceAssistant(QWidget):
 
     def _seed_form_values(self, raw: Mapping[str, Any]) -> dict[str, Any]:
         values = deepcopy(dict(raw))
+        if self.family_key == "js8call":
+            values["received_files_enabled"] = _bool(raw.get("received_files_enabled", raw.get("js8_received_files_enabled", False)))
+            values["received_files_path"] = _text(raw.get("received_files_path", raw.get("js8_received_files_path", ""))).strip()
+            choice = raw.get("received_files_existing", raw.get("js8_received_files_existing", "review"))
+            values["received_files_existing"] = choice if choice in {"review", "new"} else "review"
         aliases = {
             "application_path": ("install_path", "path", "js8_application_path", "varac_install_path", "flrig_path"),
             "configuration_path": ("ini_path", "profile_path", "js8_profile_path", "flrig_config_path", "varac_ini_path"),
-            "settings_root": ("storage_path", "application_data_root", "data_path"),
+            "settings_root": ("settings_root",),
             "instance_name": ("name", "label"),
             "launch_command": ("launch_cmd", "launcher_path"),
             "working_directory": ("working_dir",),
@@ -694,7 +870,64 @@ class OperatorInstanceAssistant(QWidget):
 
     # ----- interaction -----------------------------------------------------
 
+    def _set_received_files_values(self, values: Mapping[str, Any]) -> None:
+        enabled = values.get("received_files_enabled", values.get("js8_received_files_enabled", False))
+        path = values.get("received_files_path", values.get("js8_received_files_path", ""))
+        choice = values.get("received_files_existing", values.get("js8_received_files_existing", "review"))
+        for widget in (self.received_enabled, self.received_path, self.received_choice):
+            widget.blockSignals(True)
+        try:
+            self.received_enabled.setChecked(_bool(enabled))
+            self.received_path.setText(_text(path))
+            self.received_choice.setCurrentIndex(max(0, self.received_choice.findData(choice)))
+        finally:
+            for widget in (self.received_enabled, self.received_path, self.received_choice):
+                widget.blockSignals(False)
+
+    def _browse_received_files(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Choose received files directory", self.received_path.text())
+        if path:
+            self.received_path.setText(path)
+
+    def _received_files_edited(self, *_args) -> None:
+        self.editor.update_external_fields({
+            "received_files_enabled": self.received_enabled.isChecked(),
+            "received_files_path": self.received_path.text().strip(),
+            "received_files_existing": self.received_choice.currentData(),
+        })
+        self._received_files_changed()
+
+    def _received_files_changed(self, *_args) -> None:
+        self._received_generation += 1
+        self._received_accessible = False
+        self._received_timer.stop()
+        if not self.received_enabled.isChecked():
+            self.received_status.setText("Monitoring off")
+        elif not self.received_path.text().strip():
+            self.received_status.setText("Choose a directory to enable monitoring.")
+        else:
+            self.received_status.setText("Checking directory… You can save these choices while the check runs.")
+            self._received_timer.start(300)
+
+    def _count_received_files(self) -> None:
+        self._received_counter.request(self._received_generation, self.received_path.text().strip())
+
+    def _received_count_finished(self, generation, path, count, more, error) -> None:
+        if generation != self._received_generation or path != self.received_path.text().strip():
+            return
+        self._received_accessible = not bool(error)
+        self.received_status.setToolTip(str(error or ''))
+        if error:
+            self.received_status.setText("Directory unavailable. You can save and check again later.")
+        elif more and count == 100:
+            self.received_status.setText("100 or more existing files; monitoring uses saved settings")
+        elif more:
+            self.received_status.setText(f"First 100 entries: {count} files; more entries may exist")
+        else:
+            self.received_status.setText(f"{count} existing files; monitoring uses saved settings")
+
     def _editor_value_changed(self, key: str, value: object) -> None:
+        self._review_edited_fields.add(str(key))
         self._raw_fields[str(key)] = deepcopy(value)
 
     def _clear_default_rig_name(self, _index: int) -> None:
@@ -706,6 +939,8 @@ class OperatorInstanceAssistant(QWidget):
             rig.clear()
 
     def _request_discovery(self) -> None:
+        if not self._application_discovery_enabled:
+            return
         self._discovery_requested = True
         self.editor.set_discovery_state('searching')
         self.discovery_group.setVisible(True)
@@ -728,7 +963,7 @@ class OperatorInstanceAssistant(QWidget):
     def _discovery_selection_changed(self) -> None:
         selected = self.discovery_list.selectedItems()
         self.use_discovery_button.setEnabled(not self._busy and bool(selected))
-        if self._busy or not selected:
+        if self._busy or not self._application_discovery_enabled or not selected:
             return
         row = selected[0].data(Qt.ItemDataRole.UserRole)
         if not isinstance(row, Mapping):
@@ -744,9 +979,9 @@ class OperatorInstanceAssistant(QWidget):
         self.editor.set_discovery_state('selected')
         if all(current.get(key) == value for key, value in paths.items()):
             return
+        self._review_edited_fields.update(key for key, value in paths.items() if current.get(key) != value)
         current.update(paths)
-        self.editor.set_values(current, preserve_dirty=False)
-        self.editor.set_dirty(True)
+        self.editor.apply_draft_values(current)
         self.set_operation_status("Application path filled. Review the remaining fields before applying.")
 
     def _discovery_application_paths(self, row: Mapping[str, Any]) -> dict[str, Any]:
@@ -768,14 +1003,14 @@ class OperatorInstanceAssistant(QWidget):
         return paths
 
     def _use_discovery(self) -> None:
-        if self._busy:
+        if self._busy or not self._application_discovery_enabled:
             return
         item = self.discovery_list.currentItem()
         value = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
         if not isinstance(value, Mapping):
             return
         row = deepcopy(dict(value))
-        if self.family_key == 'fast_light' and self.visible_components:
+        if (self.family_key == 'fast_light' and self.visible_components) or row.get("suggestion_kind") == "application":
             self._discovery_selection_changed()
             return
         self._raw_fields.update(row)
@@ -786,9 +1021,10 @@ class OperatorInstanceAssistant(QWidget):
             self._raw_fields.pop('operator_source_instance_id',None)
             self._raw_fields.pop('operator_source_snapshot',None)
         current = self.editor.values()
-        current.update(self._explicit_form_values(row))
-        self.editor.set_values(current, "Suggested values", preserve_dirty=False)
-        self.editor.set_dirty(True)
+        suggested = self._explicit_form_values(row)
+        self._review_edited_fields.update(key for key, value in suggested.items() if current.get(key) != value)
+        current.update(suggested)
+        self.editor.apply_draft_values(current, "Suggested values")
         self.editor.set_discovery_state('selected')
         self.set_operation_status("Suggested settings loaded. Review, then Apply to radio setup." if getattr(self, '_radio_setup_context', False)
                                   else "Suggested settings loaded. Review and Save to keep them.")
@@ -796,11 +1032,22 @@ class OperatorInstanceAssistant(QWidget):
     def _explicit_form_values(self, raw: Mapping[str, Any]) -> dict[str, Any]:
         """Return only fields actually supplied by a suggestion row."""
 
+        if "_suggestion_fields" in raw:
+            supplied = set(raw["_suggestion_fields"])
+            explicit = dict(raw.get("_suggestion_values") or ())
+            raw = {key: value for key, value in raw.items() if key in supplied}
+            raw.update(explicit)
         values: dict[str, Any] = {}
         aliases = {
             "application_path": ("application_path", "install_path", "path", "js8_application_path", "varac_install_path", "flrig_path"),
             "configuration_path": ("configuration_path", "ini_path", "profile_path", "js8_profile_path", "flrig_config_path", "varac_ini_path", "existing_ini"),
-            "settings_root": ("settings_root", "storage_path", "application_data_root", "data_path"),
+            "settings_root": ("settings_root",),
+            "storage_path": ("storage_path", "application_data_root", "db_path", "varac_db_path", "fldigi_log_path"),
+            "secondary_storage_path": ("secondary_storage_path", "incoming_path", "fldigi_checkin_dir"),
+            "outbox_path": ("outbox_path", "outbox_dir"),
+            "directed_path": ("directed_path", "js8_directed_path"),
+            "all_path": ("all_path", "js8_all_path"),
+            "inbox_path": ("inbox_path", "js8_inbox_path"),
             "instance_name": ("instance_name", "name", "label"),
             "launch_command": ("launch_command", "launch_cmd", "launcher_path"),
             "working_directory": ("working_directory", "working_dir"),
@@ -944,6 +1191,31 @@ class OperatorInstanceAssistant(QWidget):
         if not isinstance(source, Mapping) or not isinstance(base, Mapping) or old_session in (None, ""):
             self.set_operation_status("The unfinished draft has an invalid persistence envelope.", error=True)
             return
+        if self.editor.is_dirty():
+            box = QMessageBox(self)
+            box.setWindowTitle("Recover saved application draft?")
+            box.setText("Load the previous draft instead of the application entries on screen?")
+            box.setInformativeText(
+                "Loading replaces your current unsaved application entries. "
+                "Choose Keep editing to retain them. Saved settings are unchanged."
+            )
+            recover = box.addButton("Load previous draft", QMessageBox.ButtonRole.AcceptRole)
+            keep = box.addButton("Keep editing", QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(keep)
+            box.exec()
+            if box.clickedButton() is not recover:
+                return
+        fresh_context = {'operator_launch_snapshot': deepcopy(self._raw_fields.get('operator_launch_snapshot')),
+                         'expected_identity_generation': self._expected_identity_generation,
+                         'expected_current_instance_id': self._replacement_instance_id,
+                         'replacement_instance_id': self._replacement_instance_id,
+                         'operator_draft_revision': envelope.get('revision')}
+        fresh_values = deepcopy(self.operator_base_values)
+        compared_fields = ('expected_identity_generation', 'expected_current_instance_id',
+                           'replacement_instance_id', 'operator_launch_snapshot')
+        needs_review = (isinstance(operator_context, Mapping) and
+                        any(key in operator_context and operator_context[key] != fresh_context.get(key)
+                            for key in compared_fields))
         self.operator_session_id = uuid4().hex
         self._recovered_from = _text(old_session)
         self.operator_draft_revision = envelope.get("revision")
@@ -972,18 +1244,36 @@ class OperatorInstanceAssistant(QWidget):
         self._raw_fields["operator_session_id"] = self.operator_session_id
         self._raw_fields["operator_recovered_from"] = self._recovered_from
         self.editor.set_values(self._seed_form_values(source), "Recovered unfinished draft", preserve_dirty=False)
+        self._set_received_files_values(source)
+        self._received_files_changed()
         self.operator_base_values = deepcopy(dict(base))
+        self._review_edited_fields = _recovered_edited_fields(base, source)
         self.editor.set_dirty(True)
         self._unfinished_envelope = None
         self.recover_button.setVisible(False)
         self.discard_unfinished_button.setVisible(False)
+        self.set_conflict_review(None)
         self.set_operation_status("Unfinished draft recovered. Review and Save to publish.")
+        if needs_review:
+            self.set_conflict_review({'current_values': fresh_values, 'context': fresh_context})
 
     def _discard_unfinished(self) -> None:
         if self._busy:
             return
         envelope = deepcopy(self._unfinished_envelope or {})
         if not envelope:
+            return
+        if getattr(self, '_radio_setup_context', False):
+            previous = envelope.get('payload')
+            if not isinstance(previous, Mapping) or previous.get('session_id') in (None, ''):
+                self.set_operation_status('The unfinished draft has an invalid persistence envelope.', error=True)
+                return
+            self._raw_fields['replace_saved_draft'] = {
+                'revision': envelope.get('revision'), 'session_id': previous['session_id']}
+            self.operator_draft_revision = envelope.get('revision')
+            self.set_unfinished(None)
+            self.editor.set_dirty(True)
+            self.set_operation_status('Current entries selected. The previous draft is replaced only when you Save radio.')
             return
         revision = envelope.get("revision")
         payload = {
@@ -994,7 +1284,8 @@ class OperatorInstanceAssistant(QWidget):
         self.discard_unfinished_requested.emit(payload)
 
     def _complete(self, _editor_values: object = None) -> None:
-        operator_values = self.editor.values()
+        operator_values = self.values()
+        operator_values['__edited_fields__'] = sorted(self._review_edited_fields)
         raw_fields = deepcopy(self._raw_fields)
         raw_fields.update(deepcopy(operator_values))
         payload = deepcopy(raw_fields)

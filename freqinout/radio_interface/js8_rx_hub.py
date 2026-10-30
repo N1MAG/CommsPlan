@@ -142,7 +142,7 @@ class JS8RxHub(QObject):
 
     _instances: Dict[Tuple[str, int], "JS8RxHub"] = {}
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 2442) -> None:
+    def __init__(self, host: str = "127.0.0.1", port: int = 2442, *, settings=None) -> None:
         app = QCoreApplication.instance()
         super().__init__(app)
         self._listeners: List[Callable[[List[dict]], None]] = []
@@ -161,10 +161,10 @@ class JS8RxHub(QObject):
         self._last_rx_activity_ts: float = 0.0
         self._last_ptt_ts: float = 0.0
         self._ptt_active: bool = False
-        self._software_status = SoftwareStatusService(SettingsManager())
+        self._software_status = SoftwareStatusService(settings if settings is not None else SettingsManager())
 
     @classmethod
-    def instance(cls, host: Optional[str] = None, port: Optional[int] = None) -> "JS8RxHub":
+    def instance(cls, host: Optional[str] = None, port: Optional[int] = None, *, settings=None) -> "JS8RxHub":
         host_txt = str(host or "127.0.0.1").strip() or "127.0.0.1"
         port_num = int(port or 2442)
         key = (host_txt, port_num)
@@ -173,7 +173,7 @@ class JS8RxHub(QObject):
             cls._instances.pop(key, None)
             existing = None
         if existing is None:
-            cls._instances[key] = cls(host=host_txt, port=port_num)
+            cls._instances[key] = cls(host=host_txt, port=port_num, settings=settings)
         return cls._instances[key]
 
     def is_valid(self) -> bool:
@@ -223,7 +223,7 @@ class JS8RxHub(QObject):
         except Exception:
             self._detach_api_listener()
 
-    def start(self, host: Optional[str] = None, port: Optional[int] = None) -> bool:
+    def start(self, host: Optional[str] = None, port: Optional[int] = None, *, native_only=False) -> bool:
         if not self.is_valid():
             return False
         if host is not None:
@@ -235,7 +235,7 @@ class JS8RxHub(QObject):
             if not timer.isActive():
                 timer.start()
             return True
-        if js8net is None:
+        if native_only or js8net is None:
             return False
         if not self._net_started:
             if not self._js8call_running():

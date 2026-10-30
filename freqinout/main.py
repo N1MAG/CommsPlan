@@ -15,6 +15,12 @@ if __name__ == "__main__" and sys.argv[1:2] == ["--migration-preparation"]:
     from freqinout.core.brand_migration_native import main as native_preparation
     raise SystemExit(native_preparation(sys.argv[2:], require_report=True))
 
+from freqinout.core.qt_graphics import configure_qt_quick_backend
+
+# Shared by source and frozen entry points; must precede GUI imports and
+# QApplication (including the fatal-startup fallback application).
+_qt_quick_backend = configure_qt_quick_backend()
+
 from PySide6.QtCore import QEventLoop, QLockFile, QTimer, Qt
 from PySide6.QtWidgets import QApplication, QMessageBox
 from PySide6.QtGui import QIcon
@@ -240,6 +246,7 @@ def main():
         return
 
     _set_windows_app_user_model_id()
+    log.info("Qt Quick graphics backend: %s", _qt_quick_backend or "platform default")
     stage_started = time.perf_counter()
     app = QApplication(sys.argv)
     _apply_application_identity(app)

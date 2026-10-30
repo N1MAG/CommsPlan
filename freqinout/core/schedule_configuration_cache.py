@@ -28,6 +28,11 @@ CONFIGURATION_KEYS = (
     'freqplanner_hf_net_schedule_sets', 'freqplanner_selected_hf_daily_schedule_set_id',
     'freqplanner_selected_hf_net_schedule_set_id',
     'freqplanner_selected_sop_schedule_plan_id',
+    # Planner's detached presentation/context inputs. Keep this list narrow;
+    # unrelated checkpoints and traffic do not invalidate schedule inputs.
+    'timezone', 'display_time_mode', 'band_colors', 'ui_theme', 'ui_text_size',
+    'perf_metrics_enabled', 'multi_rig_migration_version',
+    'multi_rig_migration_deferred', 'multi_rig_migration_summary_v3',
 )
 
 

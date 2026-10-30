@@ -33,6 +33,23 @@ PINS = {
 SIZES = {599820856: 127357124, 599820861: 289942566, 599820862: 221432335, 599820863: 231295017}
 RELEASE_ID = 399666322
 REPOSITORY_ID = 1117899300
+# Keep the original pre-brand baseline and the exact current public release.
+BASELINES = {
+    "2.0.4": {"commit": HISTORICAL_COMMIT, "release_id": RELEASE_ID,
+              "pins": PINS, "sizes": SIZES, "product": "FreqInOut"},
+    "2.0.8.1": {
+        "commit": "e991370a24c0a8cb913ab7f5eeed319efbb0a204",
+        "release_id": 425573452, "product": "CommsPlan",
+        "pins": {
+            "windows": ("CommsPlan-2.0.8.1-windows-x86_64-setup-unsigned.exe", "c46631e25687ddcdd99c6d88951ff77e5f2afe5d1e4d1ba4aa6462df9b149b38", 681849828),
+            "linux": ("CommsPlan-2.0.8.1-linux-amd64.deb", "25453d8f5971313a42b887462bf0f93ecaa23f0a1abf3cf5ea0e8312815e6b7e", 681849825),
+            "macos-arm64": ("CommsPlan-2.0.8.1-macos-arm64-unsigned.dmg", "f60c30bbe1d0d8261d6a63388d50caf44f22d8f73d4ab6236d5298c463620546", 681849833),
+            "macos-x86_64": ("CommsPlan-2.0.8.1-macos-x86_64-unsigned.dmg", "b04b02b0389090a67ca9d1f531dc511a932cc2c99a281a64521795a0cc852f34", 681849829),
+        },
+        "sizes": {681849828: 129739388, 681849825: 292410742,
+                  681849833: 223709483, 681849829: 229832268},
+    },
+}
 PROTECTED = {"freqinout.db": ("device_profiles", "js8_instances", "fast_light_configs"),
  "freqinout_nets.db": ("sop_profiles", "daily_schedule_tab", "net_schedule", "fldigi_checkins", "message_viewer_paths")}
 SEED = '\nimport sqlite3\nfrom pathlib import Path\nfrom freqinout.version import __version__\nfrom freqinout.core.db_initializer import ensure_all_tables\nfrom freqinout.core.settings_manager import SettingsManager\nfrom freqinout.core.config_paths import get_config_dir\nfrom freqinout.core import multi_radio_store as m\nassert __version__ == "2.0.4"\nensure_all_tables()\ns = SettingsManager()\ns.set_many({\'callsign\': \'N0TEST\', \'grid\': \'DM79\', \'launch_control_enabled\': False, \'use_scheduler\': False, \'main_window_geometry\': \'synthetic-retained-geometry\'})\nassert m.get_multi_rig_migration_version(s._conn) == 3\nnow = "2026-10-12T00:00:00Z"\nfor index, name in enumerate(("FT-710", "FTDX-10")):\n    root = "C:/Radio Profiles/" + name\n    js8 = s._conn.execute("INSERT INTO js8_instances(system_key,name,port,profile_path,install_path,created_utc,updated_utc) VALUES(?,?,?,?,?,?,?)",\n        ("test-js8-"+name, name+" JS8", 2442+index, root+"/JS8Call", "C:/Program Files/JS8Call/JS8Call.exe", now, now)).lastrowid\n    fast = s._conn.execute("INSERT INTO fast_light_configs(system_key,name,flrig_port,fldigi_port,flrig_path,fldigi_path,fldigi_log_path,created_utc,updated_utc) VALUES(?,?,?,?,?,?,?,?,?)",\n        ("test-fast-"+name, name+" Fast Light", 12345+index, 7362+index, "C:/Radio Apps/flrig.exe", "C:/Radio Apps/fldigi.exe", root+"/fldigi/logs", now, now)).lastrowid\n    s._conn.execute("INSERT INTO device_profiles(system_key,name,radio_manufacturer,radio_model,js8_instance_id,fast_light_config_id,js8_port,flrig_port,fldigi_port,launch_enabled,scheduler_enabled,created_utc,updated_utc) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",\n        ("test-radio-"+name, name, "Yaesu", name, js8, fast, 2442+index, 12345+index, 7362+index, 0, 0, now, now))\ns._conn.commit()\ns.close()\np = get_config_dir()\nwith sqlite3.connect(p / "config/freqinout_nets.db") as db:\n    db.execute("INSERT INTO sop_profiles(name,operating_group,frequency,sop_start_utc) VALUES(\'Retained SOP\',\'TEST\',\'7.110\',\'2026-10-12T01:00:00Z\')")\n    db.execute("INSERT INTO daily_schedule_tab(day_utc,band,mode,frequency,start_utc,end_utc,group_name) VALUES(\'Monday\',\'40m\',\'USB\',\'7.110\',\'01:00\',\'02:00\',\'TEST NET\')")\n    db.execute("INSERT INTO net_schedule(day_utc,band,mode,frequency,start_utc,end_utc,early_checkin,comment) VALUES(\'Tuesday\',\'80m\',\'USB\',\'3.580\',\'03:00\',\'04:00\',15,\'retained net\')")\n    db.executemany("INSERT INTO fldigi_checkins(callsign,last_seen_ts) VALUES(?,?)", [(f"N0T{n:03d}",1700000000+n) for n in range(100)])\n    db.execute("INSERT INTO message_viewer_paths(origin,path) VALUES(\'FLMSG\',\'C:/Radio Profiles/FT-710/NBEMS/messages\')")\n(p / "messages").mkdir()\n(p / "messages/retained-message.txt").write_text("Synthetic retained message\\n", encoding="utf-8")\nfor filename in ("freqinout.db", "freqinout_nets.db"):\n    with sqlite3.connect(p / "config" / filename) as db:\n        db.execute("PRAGMA wal_checkpoint(TRUNCATE)")\n'
@@ -71,13 +88,15 @@ def snapshot(profile, columns=None):
     return result
 
 
-def seed_profile(work):
-    source = work/"exact-2.0.4-source"
+def seed_profile(work, *, baseline="2.0.4"):
+    selected = BASELINES[baseline]
+    commit = selected["commit"]
+    source = work/("exact-"+baseline+"-source")
     source.mkdir()
-    exists = subprocess.run(["git","cat-file","-e",HISTORICAL_COMMIT+"^{commit}"],cwd=ROOT,capture_output=True)
+    exists = subprocess.run(["git","cat-file","-e",commit+"^{commit}"],cwd=ROOT,capture_output=True)
     if exists.returncode:
-        checked(["git","fetch","--no-tags","--depth=1","origin",HISTORICAL_COMMIT],cwd=ROOT)
-    archive = subprocess.check_output(["git","archive",HISTORICAL_COMMIT],cwd=ROOT)
+        checked(["git","fetch","--no-tags","--depth=1","origin",commit],cwd=ROOT)
+    archive = subprocess.check_output(["git","archive",commit],cwd=ROOT)
     with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
         for member in tar.getmembers():
             path = Path(member.name)
@@ -87,7 +106,7 @@ def seed_profile(work):
     profile = work/"synthetic-station"
     env = dict(os.environ,FREQINOUT_CONFIG_DIR=str(profile),QT_QPA_PLATFORM="offscreen",PYTHONPATH=str(source),PYTHONDONTWRITEBYTECODE="1")
     fence = "import socket\ndef refuse(*a, **k): raise RuntimeError('Network forbidden during synthetic fixture creation')\nsocket.socket.connect=refuse\nsocket.socket.connect_ex=refuse\nsocket.socket.sendto=refuse\nsocket.create_connection=refuse\n"
-    checked([sys.executable,"-c",fence+SEED],cwd=source,env=env)
+    checked([sys.executable,"-c",fence+SEED.replace('assert __version__ == "2.0.4"', f'assert __version__ == "{baseline}"')],cwd=source,env=env)
     return profile
 
 
@@ -124,20 +143,21 @@ def launch(executable, profile, work, label, *, expected=0):
         lock.unlink()
 
 
-def verify_historical_asset(filename, expected, asset_id):
+def verify_historical_asset(filename, expected, asset_id, *, baseline="2.0.4"):
+    selected = BASELINES[baseline]
     def api(url):
         request = urllib.request.Request(url, headers={"Accept":"application/vnd.github+json", "User-Agent":"CommsPlan-native-qualification"})
         token = os.environ.get("GH_TOKEN")
         if token: request.add_header("Authorization", "Bearer "+token)
         with urllib.request.urlopen(request, timeout=60) as response:
             return json.load(response)
-    repo = api("https://api.github.com/repos/N1MAG/FreqInOut")
+    repo = api("https://api.github.com/repos/N1MAG/CommsPlan")
     if repo.get("id") != REPOSITORY_ID: raise RuntimeError("Historical repository identity changed")
-    release = api(f"https://api.github.com/repos/N1MAG/FreqInOut/releases/{RELEASE_ID}")
-    if release.get("id") != RELEASE_ID or release.get("tag_name") != "v2.0.4":
+    release = api(f"https://api.github.com/repos/N1MAG/CommsPlan/releases/{selected['release_id']}")
+    if release.get("id") != selected["release_id"] or release.get("tag_name") != "v"+baseline:
         raise RuntimeError("Historical release identity changed")
     asset = next((a for a in release.get("assets", []) if a.get("id") == asset_id), None)
-    if not asset or asset.get("name") != filename or asset.get("size") != SIZES[asset_id] or asset.get("digest") != "sha256:"+expected:
+    if not asset or asset.get("name") != filename or asset.get("size") != selected["sizes"][asset_id] or asset.get("digest") != "sha256:"+expected:
         raise RuntimeError("Historical release asset identity/digest changed")
     return asset["browser_download_url"]
 
@@ -225,20 +245,21 @@ def check_shared_lock(first, second, pristine, work, label):
         stop_test_process(owner,profile)
 
 
-def install_package(package, work, *, old=False):
+def install_package(package, work, *, old=False, baseline="2.0.4"):
+    product = BASELINES[baseline]["product"] if old else "CommsPlan"
     if sys.platform == "win32":
         appdir = work/"Installed"
         checked([package,"/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART",f"/DIR={appdir}"])
-        return appdir/("FreqInOut.exe" if old else "CommsPlan.exe")
+        return appdir/(product+".exe")
     if sys.platform.startswith("linux"):
         checked(["sudo","apt-get","install","--yes","--allow-downgrades",package])
-        return Path("/usr/bin/freqinout" if old else "/usr/bin/commsplan")
+        return Path("/usr/bin/freqinout" if product == "FreqInOut" else "/usr/bin/commsplan")
     mount = work/("old-volume" if old else "new-volume")
     mount.mkdir(exist_ok=True)
-    appname = "FreqInOut.app" if old else "CommsPlan.app"
+    appname = product+".app"
     applications = work/"Applications"
     applications.mkdir(exist_ok=True)
-    other = applications/("CommsPlan.app" if old else "FreqInOut.app")
+    other = applications/("CommsPlan.app" if product == "FreqInOut" else "FreqInOut.app")
     if other.exists():
         index = 1
         retained = work/("retained-"+other.name)
@@ -255,22 +276,23 @@ def install_package(package, work, *, old=False):
     return app/"Contents/MacOS"/app.stem
 
 
-def qualify(package, workspace, *, allow_local_macos=False):
+def qualify(package, workspace, *, allow_local_macos=False, baseline="2.0.4"):
     if os.environ.get("GITHUB_ACTIONS") != "true" and not (sys.platform == "darwin" and allow_local_macos):
         raise RuntimeError("Native package qualification is CI-only; it must never change an operator installation")
     package = Path(package).resolve(strict=True)
     work = Path(workspace).resolve()
     work.mkdir(parents=True,exist_ok=False)
     key = "windows" if sys.platform == "win32" else ("linux" if sys.platform.startswith("linux") else "macos-"+platform.machine().lower())
-    filename,expected,asset_id = PINS[key]
+    selected = BASELINES[baseline]
+    filename,expected,asset_id = selected["pins"][key]
     historical = work/filename
-    url = verify_historical_asset(filename,expected,asset_id)
-    download_historical(url,historical,SIZES[asset_id])
+    url = verify_historical_asset(filename,expected,asset_id,baseline=baseline)
+    download_historical(url,historical,selected["sizes"][asset_id])
     if digest(historical) != expected: raise RuntimeError("Historical package SHA-256 mismatch")
-    profile = seed_profile(work)
+    profile = seed_profile(work,baseline=baseline)
     before_rows = snapshot(profile)
-    old = install_package(historical,work,old=True)
-    launch(old,profile,work,"old-2.0.4-baseline")
+    old = install_package(historical,work,old=True,baseline=baseline)
+    launch(old,profile,work,"old-"+baseline+"-baseline")
     if snapshot(profile,before_rows) != before_rows: raise RuntimeError("Historical baseline changed synthetic station data")
     pristine = work/"pre-upgrade-profile"
     shutil.copytree(profile,pristine,ignore=shutil.ignore_patterns("backups","freqinout.lock","packaged-smoke-test.ok",".commsplan-packaged-startup.json"))
@@ -278,9 +300,11 @@ def qualify(package, workspace, *, allow_local_macos=False):
         old_root = old.parent if sys.platform == "win32" else Path("/opt/freqinout/FreqInOut")
         retained = work/"retained-old-runtime"
         shutil.copytree(old_root,retained,symlinks=True)
-        old_copy = retained/("FreqInOut.exe" if sys.platform == "win32" else "FreqInOut")
+        old_copy = retained/(selected["product"]+(".exe" if sys.platform == "win32" else ""))
     else:
-        old_copy = work/"retained-FreqInOut.app/Contents/MacOS/FreqInOut"
+        retained = work/"retained-old-runtime.app"
+        shutil.copytree(old.parents[2],retained,symlinks=True)
+        old_copy = retained/"Contents/MacOS"/selected["product"]
     check_running_refusal(old,package,profile,work,before_rows)
     before = hashes(profile/"config")
     message = (profile/"messages/retained-message.txt").read_bytes()
@@ -310,8 +334,8 @@ def qualify(package, workspace, *, allow_local_macos=False):
     shutil.copytree(profile,restored,ignore=shutil.ignore_patterns("config","backups","freqinout.lock","packaged-smoke-test.ok",".commsplan-packaged-startup.json"))
     shutil.copytree(backup/"config",restored/"config")
     if hashes(restored/"config") != before: raise RuntimeError("Cold restore did not retain backup bytes")
-    rollback = install_package(historical,work,old=True)
-    launch(rollback,restored,work,"old-2.0.4-rollback")
+    rollback = install_package(historical,work,old=True,baseline=baseline)
+    launch(rollback,restored,work,"old-"+baseline+"-rollback")
     if snapshot(restored,before_rows) != before_rows: raise RuntimeError("Old executable rollback changed station rows")
     # Reinstall the candidate to exercise a real package uninstall after rollback.
     candidate = install_package(package,work)
@@ -325,7 +349,7 @@ def qualify(package, workspace, *, allow_local_macos=False):
         shutil.rmtree(work/"Applications/CommsPlan.app")
     if (profile/"messages/retained-message.txt").read_bytes() != message: raise RuntimeError("Uninstall changed profile message")
     if snapshot(profile,before_rows) != before_rows: raise RuntimeError("Uninstall changed station databases")
-    result = {"status":"passed","historical_commit":HISTORICAL_COMMIT,"historical_asset_id":asset_id,"historical_sha256":expected,"candidate_sha256":digest(package),"platform":key,"protected_rows":{k:len(v[1]) for k,v in before_rows.items()},"backup":str(backup),"scope":"disposable synthetic native install, populated upgrade/reopen, corrupt/partial refusal, backup restore/old executable rollback, uninstall preservation; no hardware or live credentials"}
+    result = {"status":"passed","baseline_version":baseline,"historical_commit":selected["commit"],"historical_asset_id":asset_id,"historical_sha256":expected,"candidate_sha256":digest(package),"platform":key,"protected_rows":{k:len(v[1]) for k,v in before_rows.items()},"backup":str(backup),"scope":"disposable synthetic native install, populated upgrade/reopen, corrupt/partial refusal, backup restore/old executable rollback, uninstall preservation; no hardware or live credentials"}
     shutil.copy2(backup/"manifest.json",work/"backup-manifest.json")
     (work/"protected-snapshot.json").write_text(json.dumps(before_rows,indent=2)+"\n")
     (work/"result.json").write_text(json.dumps(result,indent=2)+"\n")
@@ -338,7 +362,11 @@ def main():
     parser.add_argument("--package",type=Path,required=True)
     parser.add_argument("--workspace",type=Path,required=True)
     parser.add_argument("--allow-local-macos",action="store_true")
+    parser.add_argument("--baseline", choices=tuple(BASELINES), action="append",
+                        help="Repeat to select baselines; default qualifies both releases.")
     args=parser.parse_args()
-    qualify(args.package,args.workspace,allow_local_macos=args.allow_local_macos)
+    for baseline in args.baseline or BASELINES:
+        qualify(args.package,args.workspace/baseline,
+                allow_local_macos=args.allow_local_macos,baseline=baseline)
 
 if __name__ == "__main__": main()

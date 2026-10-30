@@ -73,6 +73,15 @@ _TASK_SCOPE_COMPONENTS = {
 }
 
 
+def application_task_view_scope(task_key: str | None) -> dict:
+    """Resolve one presentation scope for both the editor and its suggestions."""
+    key = str(task_key or "").strip().lower()
+    return {
+        "visible_components": _TASK_SCOPE_COMPONENTS.get(key),
+        "visible_fields": _TASK_SCOPE_FIELDS.get(key),
+    }
+
+
 def _text(value: object) -> str:
     return "" if value is None else str(value)
 
@@ -204,6 +213,10 @@ class ApplicationSetupEditor(QWidget):
             self._load_controls_from_data()
         finally:
             self._loading = False
+        # Establish the baseline from the same normalized control snapshot
+        # used for subsequent edits and values(), including optional fields.
+        self._sync_controls_to_data()
+        self._baseline = deepcopy(self._data)
         self._dirty = False
         self.set_status(status)
         self._refresh_dirty_label()
@@ -263,6 +276,23 @@ class ApplicationSetupEditor(QWidget):
         self._dirty = bool(dirty)
         self._refresh_dirty_label()
 
+    def update_external_fields(self, values: Mapping[str, Any]) -> None:
+        """Include host-owned controls in the same draft and dirty baseline."""
+        changed = [(key, deepcopy(value)) for key, value in values.items()
+                   if self._data.get(key) != value or key not in self._data]
+        for key, value in changed:
+            self._data[key] = value
+        for key, value in changed:
+            self._mark_changed(key, value)
+
+    def apply_draft_values(self, values: Mapping[str, Any], status: str = "Saved") -> None:
+        """Replace draft controls while retaining the last published baseline."""
+        baseline = deepcopy(self._baseline)
+        self.set_values(values, status, preserve_dirty=False)
+        self._baseline = baseline
+        self._dirty = self._data != self._baseline
+        self._refresh_dirty_label()
+
     def field_widget(self, key: str) -> QWidget | None:
         return self._field_widgets.get(str(key))
 
@@ -303,11 +333,7 @@ class ApplicationSetupEditor(QWidget):
         :meth:`values`, so a component editor can be used without losing the
         other Fast Light components or their launch identities.
         """
-        key = str(task_key or "").strip().lower()
-        self.set_view_scope(
-            visible_components=_TASK_SCOPE_COMPONENTS.get(key),
-            visible_fields=_TASK_SCOPE_FIELDS.get(key),
-        )
+        self.set_view_scope(**application_task_view_scope(task_key))
 
     def _set_field_visible(self, key: str, visible: bool) -> None:
         widget = self._field_widgets.get(key)

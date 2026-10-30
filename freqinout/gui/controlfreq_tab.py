@@ -45,6 +45,8 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QSplitter,
     QAbstractItemView,
+    QAbstractButton,
+    QAbstractSpinBox,
     QInputDialog,
     QMenu,
     QCompleter,
@@ -57,6 +59,7 @@ from PySide6.QtWidgets import (
     QStyleOptionViewItem,
 )
 
+from freqinout.core.ops_outlook_rules import OutlookRules
 from freqinout.core.config_paths import get_config_dir
 from freqinout.core.condition_sop_policy import evaluate_condition_sop_invocations
 from freqinout.core.group_utils import normalize_group_name
@@ -115,6 +118,7 @@ from freqinout.core.station_readiness import (
     visible_status_programs,
 )
 from freqinout.core.settings_manager import SettingsManager
+from freqinout.core.schedule_recurrence import biweekly_week_is_eligible
 from freqinout.core.sitrep_metadata import source_family_label
 from freqinout.core.sop_manager import SOPManager
 from freqinout.core.source_view_contracts import source_contract_for
@@ -573,7 +577,7 @@ class _OperatorRosterReadWorker:
                     pass
 
 
-class ControlFreqTab(QWidget):
+class ControlFreqTab(QWidget, OutlookRules):
     """
     ControlFreq: summary/console view for activity and operational status.
     """
@@ -613,7 +617,8 @@ class ControlFreqTab(QWidget):
         self._startup_shell_ready = not startup_gated
         self.settings = settings_manager if settings_manager is not None else SettingsManager()
         self.plan_context_service = plan_context_service
-        self._sop_manager = SOPManager(settings=SettingsManager(initialized_source=self.settings))
+        self._sop_manager = SOPManager(db_path=Path(self.settings.db_path).with_name("freqinout_nets.db"),
+                                       settings=SettingsManager(initialized_source=self.settings))
         self._timer: Optional[QTimer] = None
         self._active = False
         self._brief_cache = LatestReadCache("fio-ops-brief")
@@ -819,6 +824,9 @@ class ControlFreqTab(QWidget):
         self._focus_autocomplete_timer.setInterval(125)
         self._focus_autocomplete_timer.timeout.connect(self._request_focus_suggestions)
         self.destroyed.connect(lambda *_args: self._shutdown_background_executors())
+        from freqinout.gui.ops_outlook_publication import OpsOutlookPublication
+        # Settings path is already bound during startup; construction is I/O free.
+        self._outlook = OpsOutlookPublication(self, Path(self.settings.db_path).parent)
         self._build_ui()
         refresh_hold_duration_combo(self.hold_duration_combo, self.settings, self._runtime_hold_duration_profile())
         self._restore_ui_state()
@@ -1062,17 +1070,17 @@ class ControlFreqTab(QWidget):
         )
         self.plan_context_label = PlanContextLabel(
             "controlfreq",
-            service=self.plan_context_service,
             fallback_text=controlfreq_context_text,
-            create_service=self.plan_context_service is not None,
+            # This retained legacy label is hidden. The visible control bar and
+            # outlook publication own context; a host refresh of this label must
+            # never trigger an independent live-store discovery on Qt.
+            create_service=False,
         )
         self.plan_context_label.setToolTip(
             "Use this context to confirm which radio and assigned Frequency Plan Ops Center is displaying."
         )
         self.plan_context_label.setVisible(False)
         root.addWidget(self.plan_context_label)
-        if self.plan_context_service is not None:
-            self.plan_context_label.refresh_context(refresh=True)
 
         updated_row = QHBoxLayout()
 
@@ -1564,7 +1572,8 @@ class ControlFreqTab(QWidget):
         self.schedule_box = QGroupBox("Schedule Outlook")
         schedule_layout = QVBoxLayout(self.schedule_box)
         schedule_header = QHBoxLayout()
-        self.schedule_now_marker = QLabel("● NOW")
+        self.schedule_now_marker = QLabel("Next events")
+        self.schedule_now_marker.setToolTip("Upcoming schedule starts and SOP actions; the radio's current destination is shown in the Station Control Bar.")
         self.schedule_now_marker.setStyleSheet("font-weight: 700;")
         schedule_header.addWidget(self.schedule_now_marker)
         schedule_header.addStretch(1)
@@ -1581,6 +1590,16 @@ class ControlFreqTab(QWidget):
         self.schedule_details_btn.toggled.connect(self._set_schedule_details_visible)
         schedule_header.addWidget(self.schedule_details_btn)
         schedule_layout.addLayout(schedule_header)
+        status_row = QHBoxLayout()
+        self.schedule_input_status = QLabel("Checking schedule inputs…")
+        self.schedule_input_status.setWordWrap(True)
+        status_row.addWidget(self.schedule_input_status, 1)
+        self.schedule_input_retry = QPushButton("Retry")
+        self.schedule_input_retry.setStyleSheet(button_style("secondary", self._theme()))
+        self.schedule_input_retry.clicked.connect(self._outlook.retry)
+        self.schedule_input_retry.setVisible(False)
+        status_row.addWidget(self.schedule_input_retry)
+        schedule_layout.addLayout(status_row)
         self.schedule_timeline_container = QWidget()
         self.schedule_timeline_container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.schedule_timeline_layout = QVBoxLayout(self.schedule_timeline_container)
@@ -1679,6 +1698,9 @@ class ControlFreqTab(QWidget):
         self.schedule_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.schedule_table.customContextMenuRequested.connect(self._on_schedule_context_menu)
         sched_header = self.schedule_table.horizontalHeader()
+        # These columns have bounded time/type/frequency/action formats. Avoid
+        # asking every hidden row widget for a size hint on each publication.
+        sched_header.setResizeContentsPrecision(16)
         sched_header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         sched_header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         sched_header.setSectionResizeMode(2, QHeaderView.Stretch)
@@ -1886,6 +1908,9 @@ class ControlFreqTab(QWidget):
         self._request_ops_geometry_sync()
 
     def _dashboard_card_enabled(self, key: str) -> bool:
+        # The current dashboard always consumes these producers. Legacy saved
+        # card visibility keys cannot disable its overview (approved contract).
+        # Legacy workspaces still expose independent card/propagation demand.
         return hasattr(self, "dashboard") or bool(self._view_cards.get(key, True))
 
     def _arrange_dashboard_toolbar(self) -> None:
@@ -2621,6 +2646,11 @@ class ControlFreqTab(QWidget):
         self._schedule_persist_ui_state()
 
     def _refresh_newly_visible_cards(self, previous_cards: Dict[str, bool]) -> None:
+        if hasattr(self, "_outlook"):
+            if self._outlook.demanded():
+                self._outlook.request()
+            else:
+                self._outlook.deactivate()
         if hasattr(self, "dashboard"):
             return
         try:
@@ -2937,7 +2967,7 @@ class ControlFreqTab(QWidget):
             return
         self._startup_shell_ready = True
         if self._active:
-            self._reload_sop_manager_settings()
+            self._sync_sop_manager_settings()
             self._ensure_operator_roster_read()
             self._refresh_status_widgets()
             QTimer.singleShot(2500, self._schedule_focus_index_backfill)
@@ -2945,6 +2975,10 @@ class ControlFreqTab(QWidget):
 
     def set_tab_active(self, active: bool) -> None:
         self._active = bool(active)
+        if self._active:
+            self._outlook.request()
+        else:
+            self._outlook.deactivate()
         if not self._active:
             self._clear_intelligence_search()
         if self._active:
@@ -2957,7 +2991,7 @@ class ControlFreqTab(QWidget):
             # the shell and endpoint services time to settle before beginning
             # small cooperative batches.
             QTimer.singleShot(2500, self._schedule_focus_index_backfill)
-            self._reload_sop_manager_settings()
+            self._sync_sop_manager_settings()
             if self._timer is None:
                 self._timer = QTimer(self)
                 self._timer.timeout.connect(self._on_periodic_refresh_tick)
@@ -3086,18 +3120,14 @@ class ControlFreqTab(QWidget):
             self._heavy_refresh_pending = False
 
     def on_settings_saved(self) -> None:
-        try:
-            self.plan_context_label.invalidate_context()
-            self.plan_context_label.refresh_context(refresh=True)
-        except Exception:
-            pass
         self._invalidate_theme_cache()
         self._settings_reload_mtime_ns = 0
-        try:
-            self.settings.reload()
-        except Exception:
-            pass
-        self._reload_sop_manager_settings()
+        host_settings = getattr(self.window(), "settings", None)
+        if host_settings is not None and host_settings is not self.settings:
+            # The host has already published committed preferences. Input
+            # revalidation belongs to the worker, not this notification.
+            self.settings._data = dict(host_settings._data)
+        self._sync_sop_manager_settings()
         self._invalidate_sop_window_cache()
         self._invalidate_activity_cache()
         self._invalidate_schedule_row_caches()
@@ -3335,9 +3365,10 @@ class ControlFreqTab(QWidget):
         self.on_sop_data_changed()
 
     def on_sop_data_changed(self) -> None:
+        self._outlook.invalidate()
         # SOP edits can happen while ControlFreq is inactive; invalidate refresh gates
         # so the next activation redraws immediately.
-        self._reload_sop_manager_settings()
+        self._sync_sop_manager_settings()
         self._invalidate_sop_window_cache()
         self._sop_outlook_refresh_pending = True
         self._last_refresh_ts = 0.0
@@ -3348,15 +3379,13 @@ class ControlFreqTab(QWidget):
             QTimer.singleShot(0, self._refresh_schedule_outlook)
             QTimer.singleShot(0, self._refresh_scheduler_strip)
 
-    def _reload_sop_manager_settings(self) -> None:
-        if not getattr(self, "_startup_shell_ready", True) or getattr(self, "_closing", False):
-            return
-        try:
-            mgr_settings = getattr(self._sop_manager, "settings", None)
-            if mgr_settings is not None and hasattr(mgr_settings, "reload"):
-                mgr_settings.reload()
-        except Exception:
-            pass
+    def _sync_sop_manager_settings(self) -> None:
+        # Other condition/SOP readers may use this manager; synchronize the
+        # already published settings without opening a second settings reader.
+        manager_settings = getattr(self._sop_manager, "settings", None)
+        if manager_settings is not None and hasattr(self.settings, "_data"):
+            manager_settings._data = self.settings._data
+
 
     def _invalidate_sop_window_cache(self) -> None:
         self._sop_cache_epoch += 1
@@ -3430,6 +3459,8 @@ class ControlFreqTab(QWidget):
             pass
 
     def _refresh_clock_display(self) -> None:
+        if hasattr(self, "_outlook"):
+            self._outlook.tick()
         now_utc = dt.datetime.now(dt.timezone.utc)
         self._current_time_full_text = self._format_display_datetime(now_utc, with_seconds=True)
         self.current_time_label.setText(self._current_time_full_text)
@@ -3663,7 +3694,14 @@ class ControlFreqTab(QWidget):
         return self._focus_executor
 
     def _shutdown_background_executors(self) -> None:
+        if hasattr(self, "_outlook"):
+            self._outlook.close()
         self._closing = True
+        self._net_review_generation = int(getattr(self, "_net_review_generation", 0)) + 1
+        worker = getattr(self, "_net_review_worker", None)
+        if worker is not None:
+            worker.stop()
+            self._net_review_worker = None
         self._operator_roster_generation += 1
         self._operator_roster_pending = False
         roster_executor = self._operator_roster_executor
@@ -4319,7 +4357,7 @@ class ControlFreqTab(QWidget):
             include_secondary = include_heavy = False
         with perf_span("controlfreq.refresh_all", settings=self.settings, min_ms=10.0):
             if include_secondary or include_heavy:
-                self._reload_settings_if_changed()
+                self._sync_published_settings()
             self._refresh_frequency_control(include_intersections=False)
             if include_status:
                 self._refresh_status_widgets()
@@ -4474,7 +4512,7 @@ class ControlFreqTab(QWidget):
             self._apply_frequency_action_busy_override(self._frequency_action_busy_reason(status))
 
             next_change = getattr(sched, "next_change_utc", None)
-            fallback_preview = self._next_schedule_outlook_preview if isinstance(self._next_schedule_outlook_preview, dict) else None
+            fallback_preview = self._next_schedule_outlook_preview if isinstance(self._next_schedule_outlook_preview, dict) and (not hasattr(self, "_outlook") or self._outlook.current()) else None
             fallback_freq = None
             if isinstance(fallback_preview, dict):
                 fallback_freq = fallback_preview.get("freq_mhz")
@@ -4804,22 +4842,18 @@ class ControlFreqTab(QWidget):
         self._refresh_propagation_snapshot()
 
     def _db_path(self) -> Path:
-        return get_config_dir() / "config" / "freqinout_nets.db"
+        return Path(self.settings.db_path).with_name("freqinout_nets.db")
 
     def _settings_db_path(self) -> Path:
-        return get_config_dir() / "config" / "freqinout.db"
+        return Path(self.settings.db_path)
 
-    def _reload_settings_if_changed(self) -> None:
-        try:
-            db_path = Path(getattr(self.settings, "db_path", self._settings_db_path()))
-            mtime_ns = int(db_path.stat().st_mtime_ns) if db_path.exists() else 0
-            if mtime_ns and mtime_ns == int(self._settings_reload_mtime_ns or 0):
-                return
-            self.settings.reload()
-            self._settings_reload_mtime_ns = mtime_ns
-            self._invalidate_theme_cache()
-        except Exception:
-            pass
+    def _sync_published_settings(self) -> None:
+        # Committed outlook metadata and revision discovery belong to the worker.
+        # Startup loaded standalone preferences; explicit settings notifications
+        # synchronize host preferences. An ordinary render must not replace a
+        # validated catalogue with an older host settings view.
+        if hasattr(self, "_outlook"):
+            self._outlook.request()
 
     @staticmethod
     def _safe_db_mtime(db_path: Path) -> float:
@@ -4850,6 +4884,8 @@ class ControlFreqTab(QWidget):
                 pass
 
     def _invalidate_schedule_row_caches(self) -> None:
+        if hasattr(self, "_outlook"):
+            self._outlook.invalidate()
         self._daily_schedule_rows_cache = []
         self._daily_schedule_rows_cache_ts = 0.0
         self._daily_schedule_rows_cache_mtime = 0.0
@@ -4877,20 +4913,9 @@ class ControlFreqTab(QWidget):
                     )
                 except Exception:
                     pass
-        try:
-            store = MultiRadioStore(settings_db_path())
-            primary = store.get_runtime_primary_device_profile()
-            if not primary:
-                return None, None
-            device_profile_id = int(primary.get("id", 0) or 0)
-            assignment = store.get_effective_assignment_for_device(device_profile_id)
-            operating_profile_id = assignment.get("operating_profile_id") if assignment else None
-            return (
-                device_profile_id or None,
-                int(operating_profile_id) if operating_profile_id not in (None, "") else None,
-            )
-        except Exception:
-            return None, None
+        outlook = getattr(self, "_outlook", None)
+        publication = outlook.publication if outlook is not None else None
+        return publication.resolved_target if publication is not None else (None, None)
 
     def _filter_schedule_rows_for_runtime_target(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         device_profile_id, operating_profile_id = self._primary_schedule_target_context()
@@ -4908,36 +4933,14 @@ class ControlFreqTab(QWidget):
         return filtered
 
     def _daily_schedule_rows(self) -> List[Dict[str, Any]]:
-        db_path = self._settings_db_path()
-        now_ts = time.time()
-        db_mtime = self._safe_db_mtime(db_path)
-        if (
-            self._daily_schedule_rows_cache
-            and (now_ts - float(self._daily_schedule_rows_cache_ts) < self._daily_schedule_rows_cache_ttl_sec)
-            and abs(float(self._daily_schedule_rows_cache_mtime) - db_mtime) < 0.0001
-        ):
-            return self._filter_schedule_rows_for_runtime_target(self._daily_schedule_rows_cache)
-        rows = self._load_schedule_rows(db_path, "daily_schedule_tab")
-        self._daily_schedule_rows_cache = rows
-        self._daily_schedule_rows_cache_ts = now_ts
-        self._daily_schedule_rows_cache_mtime = db_mtime
-        return self._filter_schedule_rows_for_runtime_target(rows)
+        publication = self._outlook.publication
+        return publication.daily_rows if publication is not None else ()
+
 
     def _net_schedule_rows(self) -> List[Dict[str, Any]]:
-        db_path = self._db_path()
-        now_ts = time.time()
-        db_mtime = self._safe_db_mtime(db_path)
-        if (
-            self._net_schedule_rows_cache
-            and (now_ts - float(self._net_schedule_rows_cache_ts) < self._net_schedule_rows_cache_ttl_sec)
-            and abs(float(self._net_schedule_rows_cache_mtime) - db_mtime) < 0.0001
-        ):
-            return self._filter_schedule_rows_for_runtime_target(self._net_schedule_rows_cache)
-        rows = self._load_schedule_rows(db_path, "net_schedule_tab")
-        self._net_schedule_rows_cache = rows
-        self._net_schedule_rows_cache_ts = now_ts
-        self._net_schedule_rows_cache_mtime = db_mtime
-        return self._filter_schedule_rows_for_runtime_target(rows)
+        publication = self._outlook.publication
+        return publication.net_rows if publication is not None else ()
+
 
     def _peer_schedule_rows(self) -> List[Dict[str, Any]]:
         snapshot = getattr(self, "_operator_roster_snapshot", None)
@@ -8786,77 +8789,104 @@ class ControlFreqTab(QWidget):
             return
         if not self._dashboard_card_enabled("schedule"):
             return
-        self._reload_sop_manager_settings()
-        now_utc = dt.datetime.now(dt.timezone.utc)
-        if self._show_local:
-            # "Today" should respect local day boundaries in local display mode.
-            tz = self._get_display_tz()
-            now_local = now_utc.astimezone(tz)
-            today_end_local = now_local.replace(hour=23, minute=59, second=59, microsecond=0)
-            today_end = today_end_local.astimezone(dt.timezone.utc)
-            tomorrow_start = (today_end_local + dt.timedelta(seconds=1)).astimezone(dt.timezone.utc)
-            tomorrow_end = (
-                (today_end_local + dt.timedelta(days=1)).replace(hour=23, minute=59, second=59, microsecond=0)
-            ).astimezone(dt.timezone.utc)
-        else:
-            today_end = now_utc.replace(hour=23, minute=59, second=59, microsecond=0)
-            tomorrow_start = today_end + dt.timedelta(seconds=1)
-            tomorrow_end = tomorrow_start.replace(hour=23, minute=59, second=59, microsecond=0)
-        day_mode = 1 if self._show_local else 0
-        today_horizon_hours = max(1, int(math.ceil(max(0.0, (today_end - now_utc).total_seconds()) / 3600.0)))
-        today_key = (
-            "today",
-            int(now_utc.timestamp() // 60),
-            int(today_end.timestamp()),
-            day_mode,
-            int(self._sop_cache_epoch),
-        )
-        sop_actions_today = self._get_cached_sop_actions(
-            key=today_key,
-            ttl_sec=self._sop_today_cache_ttl_sec,
-            builder=lambda: self._sop_manager.build_upcoming_actions(
-                horizon_hours=today_horizon_hours,
-                only_active=True,
-                now_utc=now_utc,
-            ),
-        )
-        tomorrow_key = (
-            "tomorrow",
-            int(tomorrow_start.timestamp()),
-            int(tomorrow_end.timestamp()),
-            day_mode,
-            int(self._sop_cache_epoch),
-        )
-        sop_actions_tomorrow = self._get_cached_sop_actions(
-            key=tomorrow_key,
-            ttl_sec=self._sop_tomorrow_cache_ttl_sec,
-            builder=lambda: self._build_sop_actions_in_window(
-                tomorrow_start,
-                tomorrow_end,
-                only_active=True,
-            ),
-        )
-        today_rows = self._collect_schedule_rows(
-            now_utc,
-            today_end,
-            include_day=False,
-            include_hf=True,
-            resolve_multiday=bool(self._show_local),
-            preloaded_sop_actions=sop_actions_today,
-        )
-        week_rows = self._collect_schedule_rows(
-            tomorrow_start,
-            tomorrow_end,
-            include_day=True,
-            include_hf=False,
-            preloaded_sop_actions=sop_actions_tomorrow,
-        )
-        week_rows = [
-            r
-            for r in week_rows
-            if not isinstance(r.get("when_utc"), dt.datetime)
-            or (tomorrow_start <= r.get("when_utc") <= tomorrow_end)
-        ]
+        if self._outlook.current():
+            self._apply_outlook_publication(self._outlook.publication)
+        self._outlook.request()
+
+    def _apply_outlook_publication(self, publication) -> None:
+        selected = self._schedule_entries_by_row.get(self.schedule_table.currentRow())
+        column = self.schedule_table.currentColumn()
+        scroll = self.schedule_table.verticalScrollBar().value()
+        heights = (self.schedule_table.minimumHeight(), self.schedule_table.maximumHeight())
+        outer_scroll = self.controlfreq_scroll.verticalScrollBar().value() if hasattr(self, "controlfreq_scroll") else None
+        try:
+            if self._render_outlook_publication(publication):
+                if hasattr(self._outlook, "render_failed") and not self._outlook.current():
+                    raise RuntimeError("Schedule evidence expired during display; retry")
+                self._outlook_last_render_publication = publication
+        except Exception as exc:
+            self._outlook_render_identity = None
+            if not hasattr(self._outlook, "render_failed"):
+                raise
+            self._outlook.render_failed(exc)
+            # Keep the last complete values visible even if a row decorator or
+            # layout operation failed. This recovery path uses plain text and
+            # no data-dependent action widgets or failing row decorators.
+            self._restore_outlook_display(self._outlook.publication, selected, column, scroll, heights)
+            if outer_scroll is not None:
+                self.controlfreq_scroll.verticalScrollBar().setValue(outer_scroll)
+
+    def _restore_outlook_display(self, publication, selected, column, scroll, heights):
+        layout = getattr(self, "schedule_timeline_layout", None)
+        if layout is not None:
+            self._clear_widget_layout(layout)
+            if publication is None:
+                label = QLabel("Schedule display unavailable. Retry to check the inputs.")
+                label.setWordWrap(True)
+                layout.addWidget(label)
+            else:
+                rows = list(publication.today[:5])
+                if self.schedule_later_btn.isChecked():
+                    rows.extend(publication.tomorrow[:5])
+                for entry in rows:
+                    label = QLabel(" · ".join(str(entry.get(k) or "--")
+                                             for k in ("when_text", "type", "group", "band_freq")))
+                    label.setWordWrap(True)
+                    layout.addWidget(label)
+        table = self.schedule_table
+        table.setUpdatesEnabled(False)
+        try:
+            table.setMinimumHeight(heights[0])
+            table.setMaximumHeight(heights[1])
+            table.setRowCount(0)
+            self._schedule_entries_by_row.clear()
+            if publication is None:
+                return
+            for title, entries in (("Today", publication.today), ("Tomorrow", publication.tomorrow)):
+                self._append_section_row_to(table, title)
+                for entry in entries:
+                    row = table.rowCount()
+                    table.insertRow(row)
+                    self._schedule_entries_by_row[row] = entry
+                    for col, key in enumerate(("when_text", "type", "group", "band_freq")):
+                        table.setItem(row, col, QTableWidgetItem(str(entry.get(key) or "--")))
+            if selected is not None:
+                fields = ("type", "source_key", "source_row_id", "source_identity", "when_utc", "group", "band_freq")
+                expected = tuple(selected.get(k) for k in fields)
+                rows = [r for r, item in self._schedule_entries_by_row.items()
+                        if tuple(item.get(k) for k in fields) == expected]
+                if len(rows) == 1:
+                    table.selectRow(rows[0])
+                    table.setCurrentCell(rows[0], max(0, column))
+            table.verticalScrollBar().setValue(scroll)
+        finally:
+            table.setUpdatesEnabled(True)
+
+    def _render_outlook_publication(self, publication) -> bool:
+        if not self._dashboard_card_enabled("schedule") or not self._outlook.current():
+            self._outlook_raw_published()
+            return False
+        now_utc = publication.evaluated_at
+        today_rows, week_rows = publication.today, publication.tomorrow
+        broker = getattr(self, '_net_preparation', None)
+        if broker is not None:
+            today_rows = tuple(dict(row, action=broker.label_for(row)) if row.get('action_kind') == 'prepare_net' else row for row in today_rows)
+            week_rows = tuple(dict(row, action=broker.label_for(row)) if row.get('action_kind') == 'prepare_net' else row for row in week_rows)
+        render_identity = (getattr(publication, "action_token", None), today_rows, week_rows,
+                           self.schedule_later_btn.isChecked(), self.schedule_table.font().toString())
+        if getattr(self, "_outlook_render_identity", None) == render_identity:
+            # Polls renew validity without rebuilding identical widgets, moving
+            # scroll, or discarding the operator's selection every five seconds.
+            self._next_schedule_outlook_preview = self._next_schedule_outlook_entry(now_utc, today_rows + week_rows)
+            if hasattr(self, "dashboard"):
+                self.dashboard.set_upcoming(today_rows + week_rows)
+            self._outlook_raw_published()
+            return True
+        self._outlook_render_identity = render_identity
+        selected = self._schedule_entries_by_row.get(self.schedule_table.currentRow())
+        selected_column = self.schedule_table.currentColumn()
+        table_scroll = self.schedule_table.verticalScrollBar().value()
+        outer_scroll = self.controlfreq_scroll.verticalScrollBar().value() if hasattr(self, "controlfreq_scroll") else None
         self._next_schedule_outlook_preview = self._next_schedule_outlook_entry(now_utc, today_rows + week_rows)
         if hasattr(self, "dashboard"):
             self.dashboard.set_upcoming(today_rows + week_rows)
@@ -8873,45 +8903,76 @@ class ControlFreqTab(QWidget):
         if self.shortwave_listening_outlook_toggle.isChecked():
             self._schedule_shortwave_listening_outlook_refresh(now_utc)
             self._render_shortwave_listening_outlook(now_utc)
-        self.schedule_table.setRowCount(0)
-        self._schedule_entries_by_row.clear()
-        self._append_section_row_to(self.schedule_table, "Today")
-        if today_rows:
-            for entry in today_rows:
-                self._append_schedule_data_row(entry)
-        else:
-            self._append_schedule_data_row(
-                {
-                    "when_text": "--",
-                    "type": "--",
-                    "group": "No upcoming events today",
-                    "band_freq": "--",
-                    "action": "",
-                    "action_kind": "",
-                    "when_utc": None,
-                }
-            )
-        self._append_section_row_to(self.schedule_table, "Tomorrow")
-        if week_rows:
-            for entry in week_rows:
-                self._append_schedule_data_row(entry)
-        else:
-            self._append_schedule_data_row(
-                {
-                    "when_text": "--",
-                    "type": "--",
-                    "group": "No upcoming events tomorrow",
-                    "band_freq": "--",
-                    "action": "",
-                    "action_kind": "",
-                    "when_utc": None,
-                }
-            )
-        self._apply_elide_tooltips(self.schedule_table, 2)
-        self._apply_elide_tooltips(self.schedule_table, 3)
-        self._fit_table_height_to_rows(self.schedule_table, min_rows=0, max_rows=8, empty_rows=1)
+        self._outlook_raw_published()
+        self.schedule_table.setUpdatesEnabled(False)
+        try:
+            self._schedule_render_palette = self._urgency_palette()
+            self._schedule_render_styles = {kind: button_style(self._schedule_action_button_role(kind), self._theme())
+                                            for kind in ("qsy", "prepare_net", "open_net", "open_sop")}
+            self.schedule_table.setRowCount(0)
+            self._schedule_entries_by_row.clear()
+            self._append_section_row_to(self.schedule_table, "Today")
+            if today_rows:
+                for entry in today_rows:
+                    self._append_schedule_data_row(entry)
+            else:
+                self._append_schedule_data_row(
+                    {
+                        "when_text": "--",
+                        "type": "--",
+                        "group": "No upcoming events today",
+                        "band_freq": "--",
+                        "action": "",
+                        "action_kind": "",
+                        "when_utc": None,
+                    }
+                )
+            self._append_section_row_to(self.schedule_table, "Tomorrow")
+            if week_rows:
+                for entry in week_rows:
+                    self._append_schedule_data_row(entry)
+            else:
+                self._append_schedule_data_row(
+                    {
+                        "when_text": "--",
+                        "type": "--",
+                        "group": "No upcoming events tomorrow",
+                        "band_freq": "--",
+                        "action": "",
+                        "action_kind": "",
+                        "when_utc": None,
+                    }
+                )
+            self._apply_elide_tooltips(self.schedule_table, 2)
+            self._apply_elide_tooltips(self.schedule_table, 3)
+            row_height = font_derived_widget_height(self.schedule_table, vertical_padding=12, floor=28,
+                                                   include_size_hints=False)
+            for row in range(self.schedule_table.rowCount()):
+                button = self.schedule_table.cellWidget(row, 4)
+                if button is not None:
+                    row_height = max(row_height, button.sizeHint().height() + 4)
+                    break
+            self.schedule_table.verticalHeader().setDefaultSectionSize(row_height)
+            self._fit_table_height_to_rows(self.schedule_table, min_rows=0, max_rows=8, empty_rows=1,
+                                           resize_rows=False)
+        finally:
+            self._schedule_render_palette = self._schedule_render_styles = None
+            self.schedule_table.setUpdatesEnabled(True)
         self._fit_group_box_to_contents(self.schedule_box)
         self._refresh_scheduler_strip()
+        if selected is not None:
+            identity_fields = ("type", "source_key", "source_row_id", "source_identity", "when_utc", "group", "band_freq")
+            selected_identity = tuple(selected.get(k) for k in identity_fields)
+            matching = [r for r, item in self._schedule_entries_by_row.items()
+                        if tuple(item.get(k) for k in identity_fields) == selected_identity]
+            if len(matching) == 1:
+                self.schedule_table.selectRow(matching[0])
+                self.schedule_table.setCurrentCell(matching[0], max(0, selected_column))
+        self.schedule_table.verticalScrollBar().setValue(table_scroll)
+        if outer_scroll is not None:
+            self.controlfreq_scroll.verticalScrollBar().setValue(outer_scroll)
+        return True
+
 
     def _set_schedule_details_visible(self, visible: bool) -> None:
         self.schedule_table.setVisible(bool(visible))
@@ -8974,11 +9035,13 @@ class ControlFreqTab(QWidget):
             band_freq = str(entry.get("band_freq") or "--")
             summary = QLabel(f"{event_type} · {group} · {band_freq}")
             summary.setWordWrap(True)
-            summary.setToolTip(summary.text())
+            source = str(entry.get('schedule_source') or '').strip()
+            summary.setToolTip(summary.text() + (f"\nSchedule source: {source}" if source else ''))
             row_layout.addWidget(summary, 1)
             action_label = str(entry.get("action") or "").strip()
             action_kind = str(entry.get("action_kind") or "").strip()
             if action_label and action_kind:
+                from freqinout.gui.net_preparation_panel import add_schedule_review_action
                 action = QPushButton(action_label)
                 action.setMaximumWidth(132)
                 action.setToolTip(self._schedule_action_tooltip(action_kind))
@@ -8986,6 +9049,7 @@ class ControlFreqTab(QWidget):
                 action.clicked.connect(
                     lambda _checked=False, payload=dict(entry): self._on_schedule_action_clicked(payload)
                 )
+                add_schedule_review_action(action, entry, self._on_schedule_action_clicked)
                 row_layout.addWidget(action)
             layout.addWidget(frame)
 
@@ -9055,20 +9119,27 @@ class ControlFreqTab(QWidget):
         for col, value in enumerate(cols):
             item = QTableWidgetItem(value)
             item.setFlags(item.flags() ^ Qt.ItemIsEditable)
+            source = str(entry.get('schedule_source') or '').strip()
+            if source:
+                item.setToolTip(f"{value}\nSchedule source: {source}")
             self.schedule_table.setItem(row, col, item)
         self._style_schedule_row(row, entry)
         action_label = str(entry.get("action") or "").strip()
         action_kind = str(entry.get("action_kind") or "").strip()
         if action_label and action_kind:
+            from freqinout.gui.net_preparation_panel import add_schedule_review_action
             btn = QPushButton(action_label)
             btn.setCursor(Qt.PointingHandCursor)
             btn.setMinimumWidth(96)
             btn.setMaximumWidth(132)
             btn.setToolTip(self._schedule_action_tooltip(action_kind))
             btn.clicked.connect(lambda _=False, payload=entry: self._on_schedule_action_clicked(payload))
+            add_schedule_review_action(btn, entry, self._on_schedule_action_clicked)
             try:
                 theme = self._theme()
-                btn.setStyleSheet(button_style(self._schedule_action_button_role(action_kind), theme))
+                styles = getattr(self, "_schedule_render_styles", None)
+                btn.setStyleSheet(styles.get(action_kind) if styles and action_kind in styles else
+                                 button_style(self._schedule_action_button_role(action_kind), theme))
             except Exception:
                 pass
             self.schedule_table.setCellWidget(row, 4, btn)
@@ -9078,7 +9149,7 @@ class ControlFreqTab(QWidget):
         kind = (action_kind or "").strip().lower()
         if kind == "qsy":
             return "warning"
-        if kind in {"open_net", "open_sop"}:
+        if kind in {"prepare_net", "open_net", "open_sop"}:
             return "primary"
         return "secondary"
 
@@ -9087,8 +9158,10 @@ class ControlFreqTab(QWidget):
         kind = (action_kind or "").strip().lower()
         if kind == "qsy":
             return "Tune radio now and pause schedule control for the selected hold duration."
+        if kind == "prepare_net":
+            return "Prepare the selected net in its radio-scoped net-control workspace. Start remains separate."
         if kind == "open_net":
-            return "Open Net Schedule tab."
+            return "Review this exact row in Net Schedule."
         if kind == "open_sop":
             return "Open SOP Builder tab."
         return "Run row action."
@@ -9105,9 +9178,12 @@ class ControlFreqTab(QWidget):
                 return
             menu = QMenu(self.schedule_table)
             act = menu.addAction(action_label)
+            review = menu.addAction('Review schedule') if action_kind == 'prepare_net' else None
             chosen = menu.exec(self.schedule_table.viewport().mapToGlobal(pos))
             if chosen == act:
                 self._on_schedule_action_clicked(entry)
+            elif review is not None and chosen == review:
+                self._on_schedule_action_clicked(dict(entry, action_kind='open_net', action='Review schedule'))
         except Exception as e:
             log.debug("ControlFreq: schedule row context-menu failed: %s", e)
 
@@ -9115,7 +9191,7 @@ class ControlFreqTab(QWidget):
         when_utc = entry.get("when_utc")
         if not isinstance(when_utc, dt.datetime):
             return
-        palette = self._urgency_palette()
+        palette = getattr(self, "_schedule_render_palette", None) or self._urgency_palette()
         now_utc = dt.datetime.now(dt.timezone.utc)
         mins = int((when_utc - now_utc).total_seconds() // 60)
         bg = None
@@ -9138,9 +9214,15 @@ class ControlFreqTab(QWidget):
             type_item.setFont(f)
 
     def _on_schedule_action_clicked(self, entry: Dict[str, Any]) -> None:
+        if hasattr(self, "_outlook") and not self._outlook.current(entry):
+            self._outlook.tick()
+            return
         kind = str(entry.get("action_kind") or "").strip().lower()
+        if kind == 'prepare_net':
+            self._request_net_preparation(entry)
+            return
         if kind == "open_net":
-            self._navigate_to_tab("Net Schedule")
+            self._request_net_review(entry)
             return
         if kind == "open_sop":
             self._navigate_to_tab("SOP")
@@ -9167,6 +9249,114 @@ class ControlFreqTab(QWidget):
                 self._refresh_frequency_control()
 
             QTimer.singleShot(800, _refresh_qsy_hero)
+
+    def _request_net_preparation(self, entry):
+        from freqinout.gui.ops_net_preparation import OpsNetPreparation
+        if not hasattr(self, '_net_preparation'):
+            self._net_preparation = OpsNetPreparation(self)
+        self._net_preparation.request(entry)
+
+    @staticmethod
+    def _net_review_editor_snapshot(tab: Any) -> Any:
+        if tab is None:
+            return None
+        try:
+            table = tab.table
+            cells = []
+            for row in range(table.rowCount()):
+                for col in range(table.columnCount()):
+                    item = table.item(row, col)
+                    if item is not None:
+                        cells.append((row, col, "item", item.text()))
+                    root = table.cellWidget(row, col)
+                    if root is None:
+                        continue
+                    if col == getattr(tab, "COL_SELECT", -1):
+                        cells.append((row, col, "source", str(root.property("source_row_id")),
+                                      str(root.property("source_key")), str(root.property("source_identity")),
+                                      str(root.property("source_snapshot"))))
+                    for widget in [root, *root.findChildren(QWidget)]:
+                        if isinstance(widget, QComboBox):
+                            state = (widget.currentIndex(), widget.currentText(), str(widget.currentData()))
+                        elif isinstance(widget, QLineEdit):
+                            state = widget.text()
+                        elif isinstance(widget, QAbstractButton):
+                            state = widget.isChecked()
+                        elif isinstance(widget, QAbstractSpinBox):
+                            state = widget.text()
+                        else:
+                            continue
+                        cells.append((row, col, type(widget).__name__, state))
+            return (tab._selected_freqplanner_source_id(), bool(tab._dirty), tuple(cells))
+        except Exception:
+            return False
+
+    def _request_net_review(self, entry: Dict[str, Any], *, from_preparation=False) -> None:
+        from freqinout.gui.bounded_snapshot_worker import SnapshotWorkerController
+        from freqinout.gui.net_schedule_tab import net_source_identity
+
+        win = self.window()
+        tab = getattr(win, "net_tab", None)
+        editor_snapshot = self._net_review_editor_snapshot(tab)
+        if editor_snapshot is False:
+            QMessageBox.information(self, "Review net", "Finish the current schedule edits before reviewing this net.")
+            return
+        payload = dict(entry)
+        payload['_preparation_review'] = bool(from_preparation)
+        try:
+            key = str(payload.get("source_key") or "")
+            row_id = int(payload.get("source_row_id") or (key[4:] if key.startswith("NET:") else 0))
+        except (TypeError, ValueError):
+            row_id = 0
+        expected = payload.get("source_identity")
+        if row_id <= 0 or not isinstance(expected, (tuple, list)):
+            QMessageBox.information(self, "Review net", "This net schedule row is missing or no longer uniquely identifiable. Refresh the upcoming schedule and review the schedule directly.")
+            return
+        path = self._db_path()
+        expected = tuple(expected)
+        generation = int(getattr(self, "_net_review_generation", 0)) + 1
+        self._net_review_generation = generation
+        self._net_review_context = (payload, int(getattr(win, "_navigation_epoch", 0)), tab, editor_snapshot)
+        worker = getattr(self, "_net_review_worker", None)
+        if worker is None:
+            worker = SnapshotWorkerController(self, self._net_review_completed)
+            self._net_review_worker = worker
+
+        def read() -> bool:
+            with sqlite3.connect(path.absolute().as_uri() + "?mode=ro", uri=True, timeout=0.5) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute("SELECT * FROM net_schedule_tab WHERE id = ?", (row_id,)).fetchall()
+                return len(rows) == 1 and net_source_identity(dict(rows[0])) == expected
+
+        worker.request(generation, read)
+
+    def _net_review_completed(self, generation: int, valid: object, error: object) -> None:
+        if getattr(self, "_closing", False) or generation != getattr(self, "_net_review_generation", 0):
+            return
+        payload, epoch, tab, snapshot = self._net_review_context
+        if not payload.get("_preparation_review") and hasattr(self, "_outlook") and not self._outlook.current(payload):
+            return
+        win = self.window()
+        if (int(getattr(win, "_navigation_epoch", 0)) != epoch or
+                getattr(win, "net_tab", None) is not tab or
+                self._net_review_editor_snapshot(tab) != snapshot):
+            return
+        if error is not None:
+            QMessageBox.information(self, "Review net", "The net schedule could not be checked. Try again after the schedule is available.")
+            return
+        if not valid:
+            QMessageBox.information(self, "Review net", "This net schedule row is missing or no longer uniquely identifiable. Refresh the upcoming schedule and review the schedule directly.")
+            return
+        self._navigate_to_tab("Net Schedule")
+        tab = getattr(win, "net_tab", None)
+        if tab is None or not hasattr(tab, "focus_live_source_row"):
+            result = "missing"
+        else:
+            result = tab.focus_live_source_row(payload)
+        if result == "draft_changed":
+            QMessageBox.information(self, "Review net", "The unsaved schedule row differs from the upcoming net. Finish or discard your edits, then refresh the upcoming schedule.")
+        elif result == "missing":
+            QMessageBox.information(self, "Review net", "This net schedule row is missing or no longer uniquely identifiable. Refresh the upcoming schedule and review the schedule directly.")
 
     def _schedule_qsy_meta(self, entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         group = str(entry.get("group") or "").strip().upper()
@@ -9221,320 +9411,9 @@ class ControlFreqTab(QWidget):
         # Backward-compat shim for legacy callers.
         self._refresh_schedule_outlook()
 
-    @staticmethod
-    def _action_enabled(value: Any) -> bool:
-        if isinstance(value, bool):
-            return value
-        if value is None:
-            return False
-        if isinstance(value, (int, float)):
-            return int(value) != 0
-        txt = str(value).strip().lower()
-        if not txt:
-            return False
-        return txt in {"1", "true", "yes", "y", "on", "enabled"}
 
-    def _build_sop_actions_in_window(
-        self,
-        start: dt.datetime,
-        end: dt.datetime,
-        *,
-        only_active: bool = True,
-    ) -> List[Dict[str, Any]]:
-        out: List[Dict[str, Any]] = []
-        try:
-            if end <= start:
-                return out
-            max_total_rows = 400
-            condition_levels = self._sop_manager._condition_level_map()  # type: ignore[attr-defined]
-            profiles = self._sop_manager.list_profiles()
-            for profile in profiles:
-                if only_active and not bool(profile.get("active")):
-                    continue
-                profile_id = int(profile.get("id") or 0)
-                if profile_id <= 0:
-                    continue
-                full = self._sop_manager.get_profile(profile_id)
-                if not full:
-                    continue
-                operating_group = str(full.get("operating_group") or "")
-                for action in list(full.get("actions") or []):
-                    if not self._action_enabled(action.get("enabled", True)):
-                        continue
-                    action_group = str(action.get("group_name") or "").strip().upper() or str(operating_group).strip().upper()
-                    group_level = condition_levels.get(action_group)
-                    if not self._sop_manager._action_condition_match(  # type: ignore[attr-defined]
-                        str(action.get("condition_levels") or "ALL"),
-                        group_level,
-                    ):
-                        continue
-                    interval_m = int(action.get("interval_minutes") or 0)
-                    if interval_m <= 0:
-                        interval_m = max(1, int(action.get("interval_hours") or 3)) * 60
-                    interval_m = max(1, interval_m)
-                    interval_phase_m = max(0, int(action.get("interval_phase_minutes") or 0)) % interval_m
-                    action_for_occurrence = dict(action)
-                    if not str(action_for_occurrence.get("daily_start_utc") or "").strip():
-                        action_for_occurrence["daily_start_utc"] = str(full.get("sop_start_utc") or "00:00")
-                    if not str(action_for_occurrence.get("daily_end_utc") or "").strip():
-                        action_for_occurrence["daily_end_utc"] = "23:59"
-                    action_for_occurrence["interval_minutes"] = interval_m
-                    action_for_occurrence["interval_phase_minutes"] = interval_phase_m
-                    occurrences = self._sop_manager.build_action_occurrences_in_window(
-                        action_for_occurrence,
-                        window_start_utc=start,
-                        window_end_utc=end + dt.timedelta(seconds=1),
-                    )
-                    if not occurrences:
-                        continue
-                    max_per_action = min(
-                        240,
-                        int(math.ceil((end - start).total_seconds() / max(60, interval_m * 60))) + 2,
-                    )
-                    emitted = 0
-                    rule = str(action.get("contact_rule") or "none").strip()
-                    selected_target = (action.get("contact_target") or "").strip().upper()
-                    targets: List[str] = []
-                    if rule in {"hub_or_hub_alt", "ncs_or_ancs"}:
-                        if selected_target and selected_target != "__ANY_ROLE__":
-                            targets = [selected_target]
-                        else:
-                            targets = ["Any (Role Match)"]
-                    elif rule == "group":
-                        targets = [selected_target] if selected_target else ["Any (Group Match)"]
-                    elif rule in {"callsign", "peer", "local_profile", "local_group"}:
-                        targets = [selected_target] if selected_target else []
-                    action_band = (action.get("band") or "").strip().upper()
-                    action_freq = (action.get("frequency") or "").strip() or str(full.get("frequency") or "")
-                    action_id = int(action.get("id") or 0)
-                    software = str(action.get("software") or "")
-                    mode = str(action.get("mode") or "").strip().upper()
-                    action_key = str(action.get("action_key") or "")
-                    action_label = str(action.get("action_label") or "")
-                    description = str(action.get("description") or "")
-                    for due, _due_end in occurrences:
-                        if due < start or due > end:
-                            continue
-                        if emitted >= max_per_action:
-                            break
-                        if len(out) >= max_total_rows:
-                            break
-                        # ControlFreq outlook does not render alignment warnings for SOP rows;
-                        # keep this lightweight to avoid per-occurrence DB schedule scans.
-                        aligned = True
-                        out.append(
-                            {
-                                "profile_id": profile_id,
-                                "profile_name": str(full.get("name") or ""),
-                                "operating_group": action_group or operating_group,
-                                "band": action_band,
-                                "frequency": action_freq,
-                                "action_id": action_id,
-                                "software": software,
-                                "mode": mode,
-                                "action_key": action_key,
-                                "action_label": action_label,
-                                "description": description,
-                                "contact_rule": rule,
-                                "contact_target": selected_target,
-                                "contact_targets": targets,
-                                "interval_minutes": interval_m,
-                                "interval_phase_minutes": interval_phase_m,
-                                "next_due_utc": due,
-                                "aligned": aligned,
-                                "status": "Upcoming",
-                                "is_completed": False,
-                            }
-                        )
-                        emitted += 1
-                    if len(out) >= max_total_rows:
-                        break
-                if len(out) >= max_total_rows:
-                    break
-        except Exception as e:
-            log.debug("ControlFreq: SOP window build failed: %s", e)
-        out.sort(
-            key=lambda x: (
-                x.get("next_due_utc") if isinstance(x.get("next_due_utc"), dt.datetime) else dt.datetime.max.replace(tzinfo=dt.timezone.utc),
-                str(x.get("profile_name") or ""),
-                str(x.get("action_label") or ""),
-            )
-        )
-        return out
 
-    def _collect_schedule_rows(
-        self,
-        start: dt.datetime,
-        end: dt.datetime,
-        include_day: bool = False,
-        include_hf: bool = True,
-        resolve_multiday: bool = False,
-        preloaded_sop_actions: Optional[List[Dict[str, Any]]] = None,
-    ) -> List[Dict[str, Any]]:
-        rows_out: List[Dict[str, Any]] = []
-        group_filter = self.group_combo.currentData() or ""
-        search = (self.search_edit.text() or "").strip().upper()
-        tz = self._get_display_tz()
-        scan_multi_day = bool(resolve_multiday or include_day)
 
-        # SOP upcoming actions
-        try:
-            if preloaded_sop_actions is None:
-                horizon_hours = max(1, int(math.ceil(max(0.0, (end - start).total_seconds()) / 3600.0)))
-                actions = self._sop_manager.build_upcoming_actions(
-                    horizon_hours=horizon_hours, only_active=True, now_utc=start
-                )
-            else:
-                actions = preloaded_sop_actions
-            for a in actions:
-                due = a.get("next_due_utc") or a.get("due_utc")
-                if not isinstance(due, dt.datetime):
-                    continue
-                if due.tzinfo is None:
-                    due = due.replace(tzinfo=dt.timezone.utc)
-                else:
-                    due = due.astimezone(dt.timezone.utc)
-                status_txt = str(a.get("status") or "").strip().upper()
-                due_window_start = start
-                if status_txt in {"DUE NOW", "OVERDUE", "COMPLETED"}:
-                    # SOP due-now items are represented by the current interval start,
-                    # which may be a few minutes before "now". Keep them visible.
-                    due_window_start = start - dt.timedelta(minutes=30)
-                if not (due_window_start <= due <= end):
-                    continue
-                grp = (a.get("operating_group") or "").strip().upper()
-                if group_filter and grp != group_filter:
-                    continue
-                label = a.get("action_label") or a.get("action") or "SOP"
-                band = (a.get("band") or "").strip().upper()
-                freq = (a.get("frequency") or "").strip()
-                software = str(a.get("software") or "").strip()
-                software_norm = software.lower()
-                action_key = str(a.get("action_key") or "").strip()
-                action_key_norm = action_key.lower()
-                contact_rule = str(a.get("contact_rule") or "").strip().lower()
-                profile_name = str(a.get("profile_name") or "").strip()
-                description = str(a.get("description") or "").strip()
-                targets = [str(x).strip() for x in (a.get("contact_targets") or []) if str(x).strip()]
-                contact_target = str(a.get("contact_target") or "").strip()
-                if not contact_target and targets:
-                    contact_target = targets[0]
-                is_local_net_action = (
-                    software_norm in {"local net", "local"}
-                    or contact_rule in {"local_profile", "local_group"}
-                    or action_key_norm.startswith("local_")
-                )
-                if is_local_net_action:
-                    # Keep Local Net Group/Net text predictable for quick NCS scanning.
-                    profile_part = profile_name or "Local Net"
-                    target_part = contact_target or "-"
-                    description_part = description or str(label).strip() or "-"
-                    group_text = f"{profile_part} - {target_part} - {description_part}"
-                else:
-                    group_text = f"{grp} {label}".strip() or profile_name or "SOP"
-                display_due = due if due >= start else start
-                when = self._format_display_time(display_due, include_day, tz)
-                search_blob = " ".join(
-                    [
-                        grp,
-                        str(label),
-                        group_text,
-                        profile_name,
-                        contact_target,
-                        description,
-                        "SOP",
-                    ]
-                ).upper()
-                if search and search not in search_blob:
-                    continue
-                rows_out.append(
-                    {
-                        "when_text": when,
-                        "when_utc": due,
-                        "type": "SOP",
-                        "group": group_text,
-                        "band_freq": f"{band} {freq}".strip(),
-                        "band": band,
-                        "freq_mhz": None,
-                        "action": "Open SOP",
-                        "action_kind": "open_sop",
-                    }
-                )
-        except Exception as e:
-            log.debug("ControlFreq: SOP load failed: %s", e)
-
-        # HF + Net schedule (simple view)
-        if include_hf:
-            rows_out.extend(self._load_hf_schedule(start, end, include_day, tz, scan_multi_day=scan_multi_day))
-        rows_out.extend(self._load_net_schedule(start, end, include_day, tz, scan_multi_day=scan_multi_day))
-        rows_out.sort(
-            key=lambda r: (
-                r.get("when_utc") if isinstance(r.get("when_utc"), dt.datetime) else dt.datetime.max.replace(tzinfo=dt.timezone.utc),
-                str(r.get("type") or ""),
-                str(r.get("group") or ""),
-            )
-        )
-        return rows_out[:200]
-
-    def _load_hf_schedule(
-        self,
-        start: dt.datetime,
-        end: dt.datetime,
-        include_day: bool,
-        tz: dt.tzinfo,
-        *,
-        scan_multi_day: bool = False,
-    ) -> List[Dict[str, Any]]:
-        rows_out: List[Dict[str, Any]] = []
-        rows = self._daily_schedule_rows()
-        if not rows:
-            return rows_out
-        group_filter = self.group_combo.currentData() or ""
-        search = (self.search_edit.text() or "").strip().upper()
-        for r in rows:
-            row = r
-            day = (row.get("day") or row.get("day_utc") or row.get("day_name") or "").strip()
-            grp = (row.get("group_name") or row.get("group") or "").strip().upper()
-            if group_filter and grp != group_filter:
-                continue
-            start_hm = (row.get("start") or row.get("start_utc") or "").strip()
-            band = (row.get("band") or "").strip().upper()
-            freq_raw = row.get("frequency") or row.get("freq") or ""
-            recurrence = row.get("recurrence") or "Weekly"
-            month_weeks = row.get("month_weeks") or ""
-            when_utc = self._resolve_schedule_time_utc(
-                start,
-                end,
-                day or "ALL",
-                start_hm,
-                scan_multi_day,
-                recurrence,
-                month_weeks,
-            )
-            if when_utc is None:
-                continue
-            try:
-                freq_mhz = float(str(freq_raw).strip())
-            except Exception:
-                freq_mhz = None
-            freq_txt = f"{freq_mhz:.3f}" if isinstance(freq_mhz, float) else str(freq_raw).strip()
-            when = self._format_display_time(when_utc, include_day, tz)
-            if search and search not in grp and search not in (band + freq_txt).upper() and search not in "HF":
-                continue
-            rows_out.append(
-                {
-                    "when_text": when,
-                    "when_utc": when_utc,
-                    "type": "HF",
-                    "group": grp,
-                    "band_freq": f"{band} {freq_txt}".strip(),
-                    "band": band,
-                    "freq_mhz": freq_mhz,
-                    "action": "QSY + Hold" if isinstance(freq_mhz, float) else "",
-                    "action_kind": "qsy" if isinstance(freq_mhz, float) else "",
-                }
-            )
-        return rows_out
 
     def _scheduled_group_freqs(
         self, window_minutes: int
@@ -9591,178 +9470,15 @@ class ControlFreqTab(QWidget):
                 continue
         return sched_freqs, sched_bands
 
-    def _load_net_schedule(
-        self,
-        start: dt.datetime,
-        end: dt.datetime,
-        include_day: bool,
-        tz: dt.tzinfo,
-        *,
-        scan_multi_day: bool = False,
-    ) -> List[Dict[str, Any]]:
-        rows_out: List[Dict[str, Any]] = []
-        rows = self._net_schedule_rows()
-        if not rows:
-            return rows_out
-        group_filter = self.group_combo.currentData() or ""
-        search = (self.search_edit.text() or "").strip().upper()
-        for r in rows:
-            row = r
-            day = (row.get("day") or row.get("day_utc") or "").strip()
-            grp = (row.get("group_name") or row.get("group") or "").strip().upper()
-            if group_filter and grp != group_filter:
-                continue
-            start_hm = (row.get("start") or row.get("start_utc") or "").strip()
-            band = (row.get("band") or "").strip().upper()
-            freq_raw = row.get("frequency") or row.get("freq") or ""
-            net_name = (row.get("net_name") or "").strip()
-            recurrence = row.get("recurrence") or "Weekly"
-            month_weeks = row.get("month_weeks") or ""
-            when_utc = self._resolve_schedule_time_utc(
-                start,
-                end,
-                day or "ALL",
-                start_hm,
-                scan_multi_day,
-                recurrence,
-                month_weeks,
-            )
-            if when_utc is None:
-                continue
-            try:
-                freq_mhz = float(str(freq_raw).strip())
-            except Exception:
-                freq_mhz = None
-            freq_txt = f"{freq_mhz:.3f}" if isinstance(freq_mhz, float) else str(freq_raw).strip()
-            when = self._format_display_time(when_utc, include_day, tz)
-            if search and search not in grp and search not in net_name.upper() and search not in "NET":
-                continue
-            rows_out.append(
-                {
-                    "when_text": when,
-                    "when_utc": when_utc,
-                    "type": "NET",
-                    "group": net_name or grp,
-                    "band_freq": f"{band} {freq_txt}".strip(),
-                    "band": band,
-                    "freq_mhz": freq_mhz,
-                    "action": "Open Net",
-                    "action_kind": "open_net",
-                }
-            )
-        return rows_out
 
-    def _resolve_schedule_time_utc(
-        self,
-        start_utc: dt.datetime,
-        end_utc: dt.datetime,
-        day_value: str,
-        hhmm: str,
-        include_day: bool,
-        recurrence_value: str = "Weekly",
-        month_weeks_value: str = "",
-    ) -> Optional[dt.datetime]:
-        hm = self._parse_hhmm(hhmm)
-        if not hm:
-            return None
-        recurrence = self._normalize_recurrence(recurrence_value)
-        month_weeks = self._parse_month_weeks(month_weeks_value)
-        day_norm = (day_value or "ALL").strip().upper()
-        day_span = max(0, (end_utc.date() - start_utc.date()).days)
-        for i in range(day_span + 1):
-            day_dt = start_utc + dt.timedelta(days=i)
-            candidate = day_dt.replace(hour=hm[0], minute=hm[1], second=0, microsecond=0)
-            if candidate < start_utc or candidate > end_utc:
-                continue
-            if self._row_applies_on_date(day_norm, candidate, recurrence, month_weeks):
-                return candidate
-            if not include_day:
-                break
-        return None
 
-    def _normalize_recurrence(self, value: object) -> str:
-        recurrence = str(value or "Weekly").strip().upper()
-        if recurrence == "MONTHLY":
-            recurrence = "PERIODIC"
-        if recurrence not in {"WEEKLY", "DAILY", "PERIODIC", "BI-WEEKLY"}:
-            return "WEEKLY"
-        return recurrence
 
-    def _parse_month_weeks(self, txt: object) -> List[int]:
-        weeks: List[int] = []
-        for token in str(txt or "").split(","):
-            token = token.strip()
-            if not token:
-                continue
-            try:
-                val = int(token)
-            except Exception:
-                continue
-            if 1 <= val <= 5:
-                weeks.append(val)
-        return sorted(set(weeks))
 
-    def _month_week_index(self, date_val: dt.date) -> int:
-        return 1 + ((date_val.day - 1) // 7)
 
-    def _day_matches(self, day_norm: str, candidate_utc: dt.datetime) -> bool:
-        if day_norm in {"", "ALL", "DAILY"}:
-            return True
-        day_name = candidate_utc.strftime("%A").upper()
-        day_key = day_norm[:3]
-        return day_name.startswith(day_key) or day_norm.startswith(day_name[:3])
 
-    def _row_applies_on_date(
-        self,
-        day_norm: str,
-        candidate_utc: dt.datetime,
-        recurrence: str,
-        month_weeks: List[int],
-    ) -> bool:
-        if recurrence == "DAILY":
-            return True
-        if not self._day_matches(day_norm, candidate_utc):
-            return False
-        if recurrence == "PERIODIC":
-            weeks = month_weeks or [1]
-            return self._month_week_index(candidate_utc.date()) in weeks
-        return True
 
-    def _get_display_tz(self) -> dt.tzinfo:
-        if not self._show_local:
-            return dt.timezone.utc
-        try:
-            tz_name = self.settings.get("timezone", "UTC") or "UTC"
-            return get_timezone(tz_name)
-        except Exception:
-            return dt.timezone.utc
 
-    def _format_display_time(
-        self, utc_dt: dt.datetime, include_day: bool, tz: dt.tzinfo
-    ) -> str:
-        if not isinstance(utc_dt, dt.datetime):
-            return "--:--"
-        if utc_dt.tzinfo is None:
-            utc_dt = utc_dt.replace(tzinfo=dt.timezone.utc)
-        local_dt = utc_dt.astimezone(tz) if self._show_local else utc_dt.astimezone(dt.timezone.utc)
-        return local_dt.strftime("%a %H:%M") if include_day else local_dt.strftime("%H:%M")
 
-    def _parse_hhmm(self, value: str) -> Optional[Tuple[int, int]]:
-        txt = (value or "").strip()
-        if not txt:
-            return None
-        parts = txt.split(":")
-        if len(parts) == 1 and txt.isdigit() and len(txt) in (3, 4):
-            h = int(txt[:-2])
-            m = int(txt[-2:])
-        elif len(parts) == 2:
-            h = int(parts[0])
-            m = int(parts[1])
-        else:
-            return None
-        if h < 0 or h > 23 or m < 0 or m > 59:
-            return None
-        return h, m
 
     def _format_hhmm_display(
         self, base_utc: dt.datetime, hhmm: str, include_day: bool, tz: dt.tzinfo
@@ -10661,7 +10377,12 @@ class ControlFreqTab(QWidget):
         night_end = dawn_local + dt.timedelta(days=1) if dawn_local <= sunset_local else dawn_local
         self._set_prop_window_headers(dawn_local, day_start_local, sunset_local, night_end)
 
-        schedule_entries = self._load_today_schedule_local(now_local, tz)
+        publication = self._outlook.publication
+        if not self._outlook.raw_current():
+            self.prop_hint.setText("Schedule inputs unavailable or being checked; previous forecast is retained.")
+            self._outlook.request()
+            return
+        schedule_entries = publication.propagation
         band_rows: Dict[str, List[Tuple[dt.datetime, str]]] = {}
         for when_local, band, label in schedule_entries:
             if not band:
@@ -11016,73 +10737,6 @@ class ControlFreqTab(QWidget):
                 return callsign, [STATE_CENTERS[state_abbr]], "OPERATOR", callsign
         return fallback_label, fallback_points, fallback_type, fallback_id
 
-    def _load_today_schedule_local(
-        self, now_local: dt.datetime, tz: dt.tzinfo
-    ) -> List[Tuple[dt.datetime, str, str]]:
-        entries: List[Tuple[dt.datetime, str, str]] = []
-        today_local = now_local.date()
-        now_utc = now_local.astimezone(dt.timezone.utc)
-        today_utc_name = now_utc.strftime("%A")
-        group_filter = self.group_combo.currentData() or ""
-        search = (self.search_edit.text() or "").strip().upper()
-
-        def parse_hhmm(value: str) -> Optional[Tuple[int, int]]:
-            txt = (value or "").strip()
-            if not txt:
-                return None
-            parts = txt.split(":")
-            if len(parts) == 1 and txt.isdigit() and len(txt) in (3, 4):
-                h = int(txt[:-2])
-                m = int(txt[-2:])
-            elif len(parts) == 2:
-                h = int(parts[0])
-                m = int(parts[1])
-            else:
-                return None
-            if h < 0 or h > 23 or m < 0 or m > 59:
-                return None
-            return h, m
-
-        # HF schedule from settings DB
-        for row in self._daily_schedule_rows():
-            day = (row.get("day_utc") or row.get("day") or "ALL").strip().upper()
-            if day not in {"ALL", today_utc_name.upper()}:
-                continue
-            start_hm = row.get("start_utc") or row.get("start") or ""
-            hm = parse_hhmm(str(start_hm))
-            if not hm:
-                continue
-            band = (row.get("band") or "").strip().upper()
-            label = (row.get("group_name") or row.get("group") or "").strip().upper()
-            if group_filter and label != group_filter:
-                continue
-            if search and search not in label and search not in band:
-                continue
-            start_utc = now_utc.replace(hour=hm[0], minute=hm[1], second=0, microsecond=0)
-            start_local = start_utc.astimezone(tz)
-            if start_local.date() == today_local:
-                entries.append((start_local, band, label))
-
-        # Net schedule from nets DB
-        for row in self._net_schedule_rows():
-            day = (row.get("day_utc") or row.get("day") or "ALL").strip().upper()
-            if day not in {"ALL", today_utc_name.upper()}:
-                continue
-            start_hm = row.get("start_utc") or row.get("start") or ""
-            hm = parse_hhmm(str(start_hm))
-            if not hm:
-                continue
-            band = (row.get("band") or "").strip().upper()
-            label = (row.get("net_name") or row.get("group_name") or "").strip().upper()
-            if group_filter and label != group_filter:
-                continue
-            if search and search not in label and search not in band:
-                continue
-            start_utc = now_utc.replace(hour=hm[0], minute=hm[1], second=0, microsecond=0)
-            start_local = start_utc.astimezone(tz)
-            if start_local.date() == today_local:
-                entries.append((start_local, band, label))
-        return entries
 
     def _top_bands_modeled(
         self,
@@ -11357,9 +11011,11 @@ class ControlFreqTab(QWidget):
         min_rows: int = 1,
         max_rows: int = 8,
         empty_rows: int | None = None,
+        resize_rows: bool = True,
     ) -> None:
         try:
-            table.resizeRowsToContents()
+            if resize_rows:
+                table.resizeRowsToContents()
             actual_rows = int(table.rowCount() or 0)
             if actual_rows <= 0:
                 reserve_rows = int(empty_rows if empty_rows is not None else min_rows)
@@ -11447,3 +11103,79 @@ class ControlFreqTab(QWidget):
                 item.setToolTip(text)
             else:
                 item.setToolTip("")
+
+    def _outlook_context(self):
+        # Capture immutable published identities only. Never discover a missing
+        # target by opening a store from this UI path.
+        manager = getattr(self.window(), "station_runtime_manager", None)
+        target = (None, None)
+        target_error = ''
+        if manager is not None:
+            try:
+                runtime = manager.get_primary_runtime() if hasattr(manager, "get_primary_runtime") else None
+            except Exception as exc:
+                runtime, target_error = None, str(exc)
+            if runtime is not None:
+                profile = runtime.profile if isinstance(runtime.profile, dict) else {}
+                assignment = runtime.assignment if isinstance(runtime.assignment, dict) else {}
+                target = (profile.get("id") or None, assignment.get("operating_profile_id") or None)
+        return dict(target=target, target_error=target_error,
+                    config_root=str(Path(self.settings.db_path).parent), show_local=bool(self._show_local),
+                    timezone=str(self.settings.get("timezone", "UTC") or "UTC"),
+                    group=self.group_combo.currentData() or "",
+                    search=(self.search_edit.text() or "").strip().upper(),
+                    card=self._dashboard_card_enabled("schedule"),
+                    propagation=self._dashboard_card_enabled("propagation"))
+
+    def hideEvent(self, event):
+        if hasattr(self, "_outlook"):
+            self._outlook.deactivate()
+        self._active = False
+        super().hideEvent(event)
+
+    def closeEvent(self, event):
+        self._shutdown_background_executors()
+        super().closeEvent(event)
+
+    def _outlook_status_changed(self):
+        outlook = self._outlook
+        ready = outlook.current()
+        if not ready:
+            if hasattr(self, "prop_hint") and not outlook.raw_current():
+                self.prop_hint.setText("Schedule inputs unavailable or being checked; previous forecast is retained.")
+            self._next_schedule_outlook_preview = None
+            if hasattr(self, "dashboard"):
+                prior = self._outlook.card_publication or self._outlook.publication
+                rows = prior.today + prior.tomorrow if prior is not None else ()
+                self.dashboard.set_upcoming(rows, published=False, status_text=(
+                    ("Inputs unavailable; previous rows." if rows else "Schedule inputs unavailable.")
+                    if outlook.state == "unavailable" else "Checking schedule inputs…"))
+            if hasattr(self, "awareness_sop_label"):
+                self.awareness_sop_label.setText("SOP: schedule inputs need checking.")
+        if hasattr(self, "schedule_input_status"):
+            text = {"ready": "Schedule inputs checked.",
+                    "checking": "Checking schedule inputs…",
+                    "stale": "Checking schedule inputs; previous rows are retained. Actions wait for validation.",
+                    "unavailable": "Schedule inputs unavailable. Previous rows are retained; retry after repairing the source."}[outlook.state]
+            if outlook.state == "unavailable" and outlook.publication is None:
+                text = "Schedule inputs unavailable. Repair the source and Retry."
+            self.schedule_input_status.setText(text)
+            self.schedule_input_status.setToolTip(outlook.error)
+            self.schedule_input_retry.setVisible(outlook.state == "unavailable")
+        for root in (getattr(self, "schedule_timeline_container", None), getattr(self, "schedule_table", None)):
+            if root is not None:
+                for button in root.findChildren(QPushButton):
+                    button.setEnabled(ready)
+
+    def _outlook_raw_published(self):
+        if self._active and self._dashboard_card_enabled("propagation"):
+            QTimer.singleShot(0, self._refresh_propagation_snapshot)
+
+    def on_schedule_sources_changed(self):
+        self._outlook.invalidate()
+
+    def _load_today_schedule_local(self, now_local, tz):
+        if not hasattr(self, "_outlook"):
+            return OutlookRules._load_today_schedule_local(self, now_local, tz)
+        pub = self._outlook.publication
+        return pub.propagation if self._outlook.raw_current() else ()

@@ -42,9 +42,13 @@ class SnapshotCompletion:
     error: Exception | None = None
 
 
-def load_resource_catalog_snapshot(store: ResourceCatalogStore) -> ResourceCatalogSnapshot:
+def load_resource_catalog_snapshot(store: ResourceCatalogStore, *, frequency_search: str = "",
+                                   frequency_service: str | None = None,
+                                   frequency_active: bool | None = None,
+                                   frequency_offset: int = 0) -> ResourceCatalogSnapshot:
     """Load one bounded, coherent Resources presentation snapshot off the GUI thread."""
-    frequencies = tuple(store.list_frequencies(active=None, limit=MAX_RESULTS))
+    frequencies = tuple(store.list_frequencies(search=frequency_search, service=frequency_service,
+                        active=frequency_active, offset=frequency_offset, limit=MAX_RESULTS))
     entries = tuple(store.list_net_entries(active=None, limit=MAX_RESULTS))
     sources = {source.source_key: source for source in store.list_sources(enabled=None, limit=MAX_RESULTS)}
     sessions_by_entry: dict[str, tuple[NetDirectorySession, ...]] = {}
@@ -77,7 +81,7 @@ class ResourceCatalogSnapshotService:
     def generation(self) -> int:
         return self._generation
 
-    def request(self) -> int:
+    def request(self, *, loader=None) -> int:
         self._generation += 1
         generation = self._generation
         # Coalesce generations that have not started.  An already-running
@@ -86,7 +90,7 @@ class ResourceCatalogSnapshotService:
         for prior_generation, prior_future in tuple(self._pending.items()):
             if prior_future.cancel():
                 del self._pending[prior_generation]
-        self._pending[generation] = _RESOURCE_SNAPSHOT_WORKERS.submit(self._loader, self._store)
+        self._pending[generation] = _RESOURCE_SNAPSHOT_WORKERS.submit(loader or self._loader, self._store)
         return generation
 
     def take_latest(self) -> SnapshotCompletion | None:
@@ -104,7 +108,10 @@ class ResourceCatalogSnapshotService:
         return None
 
     def has_pending(self) -> bool:
-        return any(not future.done() for future in self._pending.values())
+        # A completed future still owns work until take_latest consumes it.
+        # Completion can happen between a caller's poll and this idle check;
+        # looking only for running futures would strand that result forever.
+        return bool(self._pending)
 
 
 def filter_frequencies(snapshot: ResourceCatalogSnapshot, *, search: str, service: str | None, active: bool | None) -> tuple[FrequencyResource, ...]:
@@ -112,6 +119,10 @@ def filter_frequencies(snapshot: ResourceCatalogSnapshot, *, search: str, servic
     values = []
     for item in snapshot.frequencies:
         haystack = " ".join(str(getattr(item, name) or "") for name in ("label", "band", "channel", "locality", "coverage", "notes")).casefold()
+        for hz in (item.receive_hz, item.transmit_hz, item.center_hz):
+            if hz is not None:
+                mhz = f"{hz / 1000000:.6f}".rstrip("0").rstrip(".")
+                haystack += f" {hz} {mhz} mhz {hz} hz"
         if needle and needle not in haystack:
             continue
         if service and item.service != str(service).strip().upper():

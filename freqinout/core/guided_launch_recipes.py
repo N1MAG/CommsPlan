@@ -1119,19 +1119,19 @@ def recipe_draft_updates(resolution: GuidedLaunchRecipeResolution) -> dict[str, 
             "flrig": (("flrig_configuration", 0, True),),
             "fldigi": (
                 ("fldigi_configuration", 0, True),
-                ("fldigi_logs", 0, True),
-                ("fldigi_checkins", 1, True),
+                ("fldigi_logs", 0, False),
+                ("fldigi_checkins", 1, False),
             ),
             "flmsg": (
                 ("flmsg_root", 0, True),
-                ("flmsg_messages", 0, True),
-                ("flmsg_templates", 1, True),
-                ("flmsg_auto", 2, True),
+                ("flmsg_messages", 0, False),
+                ("flmsg_templates", 1, False),
+                ("flmsg_auto", 2, False),
             ),
             "flamp": (
                 ("flamp_root", 0, True),
-                ("flamp_receive", 0, True),
-                ("flamp_outgoing", 1, True),
+                ("flamp_receive", 0, False),
+                ("flamp_outgoing", 1, False),
             ),
         }
         for component_key, component in by_key.items():

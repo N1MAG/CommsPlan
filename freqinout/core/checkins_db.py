@@ -282,7 +282,7 @@ def _ensure_table(conn: sqlite3.Connection):
     ensure_operator_checkins_schema(conn)
 
 
-def lookup_operator_identity(callsign: str) -> Dict[str, str]:
+def lookup_operator_identity(callsign: str, *, db_path: Path | None = None) -> Dict[str, str]:
     """
     Return the canonical operator identity from operator_checkins only.
 
@@ -293,7 +293,7 @@ def lookup_operator_identity(callsign: str) -> Dict[str, str]:
     if not cs:
         return {}
 
-    db_path = _db_path()
+    db_path = Path(db_path) if db_path is not None else _db_path()
     if not db_path.exists():
         return {}
 
@@ -318,7 +318,7 @@ def lookup_operator_identity(callsign: str) -> Dict[str, str]:
     }
 
 
-def upsert_checkins(entries: List[Dict[str, Any]]):
+def upsert_checkins(entries: List[Dict[str, Any]], *, db_path: Path | None = None, raise_on_error: bool = False, already_counted: frozenset[str] | None = None):
     """
     Inserts or updates operator check-ins.
 
@@ -328,10 +328,12 @@ def upsert_checkins(entries: List[Dict[str, Any]]):
     checkin_count is incremented if the callsign already exists.
     """
     if not entries:
-        return
+        return frozenset()
 
-    db_path = _db_path()
+    db_path = Path(db_path) if db_path is not None else _db_path()
 
+    conn = None
+    committed_calls = set()
     try:
         conn = sqlite3.connect(db_path)
         _ensure_table(conn)
@@ -419,7 +421,8 @@ def upsert_checkins(entries: List[Dict[str, Any]]):
             g2_out = group2 or normalize_group_name(existing_g2)
             g3_out = group3 or normalize_group_name(existing_g3)
             role_out = group_role or existing_role
-            insert_count = int(existing_count or 0) + 1
+            insert_count = int(existing_count or 0) + (0 if already_counted is not None and (cs in already_counted or cs in committed_calls) else 1)
+            committed_calls.add(cs)
 
             cur.execute(
                 """
@@ -440,7 +443,7 @@ def upsert_checkins(entries: List[Dict[str, Any]]):
                     last_seen_utc=excluded.last_seen_utc,
                     last_net=excluded.last_net,
                     last_role=excluded.last_role,
-                    checkin_count=operator_checkins.checkin_count + 1,
+                    checkin_count=excluded.checkin_count,
                     groups_json=COALESCE(excluded.groups_json, operator_checkins.groups_json),
                     trusted=COALESCE(operator_checkins.trusted, excluded.trusted),
                     operator_id=COALESCE(operator_checkins.operator_id, excluded.operator_id)
@@ -472,9 +475,15 @@ def upsert_checkins(entries: List[Dict[str, Any]]):
         conn.commit()
         conn.close()
         log.info("checkin_db: saved %d check-in entries.", len(entries))
+        return frozenset(committed_calls)
 
     except Exception as e:
         log.error("checkin_db: upsert failed: %s", e)
+        if raise_on_error:
+            raise
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def upsert_operator_metadata(

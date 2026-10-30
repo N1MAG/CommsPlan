@@ -1,9 +1,27 @@
 # Changelog
 
+## [2.0.9]
+- Added: Preview-first CHIRP, RepeaterBook, BTECH and generic CSV/TSV frequency imports with header detection, explicit column mapping, per-record selection, validation, duplicate skipping and retained programming/source details. CP catalog-exchange JSON remains separate; radio programming JSON, binary images and Excel workbooks are not supported.
+- Added: Frequency Catalog selection for new and existing Local Comms Groups, live search, multiple saved programming references, explicit catalog-change review and group-scoped Local SOP insertion. Saved SOP text remains a snapshot; no automatic radio programming or scheduling.
+- Fixed: Fast Light component discovery, explicit Find again refresh and unfinished-editor navigation; reviewed JS8Call and VarAC storage values retain their intended fields. Intentional sharing of Fast Light message/ICS and RX/TX data folders does not block configuration.
+- Fixed: Newly started JS8 NCS sessions retain the selected radio's canonical application source and show durable send outcomes. Relevant direct and relayed reports appear with decoded Details; generic relayed protocol exchanges remain filtered.
+- Added: Local RX SNR in the NCS station table, with measurement context and relay-link attribution when applicable.
+- Added: JS8 NCS station intelligence with decoded Spotter/CommStat summaries, topics, state/region and multigroup filters, source-aware View, local review/notes/follow-up and reversible Exclude/Restore actions.
+- Added: Dynamic group/station Expect and utility queries, query-related acknowledgements, in-workspace Compose, reusable saved-message administration and factual Sent activity. Submission to JS8Call does not establish RF transmission or delivery.
+- Changed: Spotter form mappings use direct checkboxes, optional group relevance and Use for nets, with clear save confirmation and separate traffic routing.
+- Added: Ops net preparation checks the exact occurrence, radio and service, retains drafts and supports repair/return before explicit Start. Concurrent net context remains radio-scoped.
+- Fixed: Assigned-plan outlook separates current windows from next transitions, retains rows during background refresh, respects saved recurrence offsets and exposes source recovery without silently substituting another schedule. Plan Builder loads source inputs in the background and preserves edits during recovery.
+- Fixed: Manual QSY uses the current exact Operating Group configuration's Auto-Tune setting. Radio apply verifies frequency/VFO/mode, performs optional antenna tuning once, waits for receive and then verifies required FLDigi settings. Repeated modem-only corrections do not rerun antenna tuning.
+- Changed: Operating Group edits are protected until Edit Configuration or Add Configuration, with scoped save/cancel and actionable warnings. Added standard VarAC choices and expanded MAGNET/AMRRON frequency presets.
+- Added: Subspace reported-hearing awareness and protected received-file review, with source evidence, capture/export controls and explicit uncertainty about transfer completion.
+- Changed: Removed the obsolete global Controls button and updated Help for current net, tuning and preparation workflows.
+- Qualification: Platform package availability and build/upgrade checks are reported on this release page. Automated checks do not establish live RF performance, physical Mesh/Bluetooth reliability, every display configuration or successful message delivery. Automatic bridging and mesh mailbox/notification workflows are not added by this release. Production-size Linux Local Nets performance, populated interactive shutdown and the new Plan Builder/Ops two-radio and soak matrix remain unqualified.
+
 ## [2.0.8.1]
 - Fixed: Saving Fast Light application folders now keeps the reviewed folder, saved resource claims and radio settings consistent. This fixes FLMsg and FLAmp message-folder readback errors after enabling an application.
 - Fixed: The same save correction covers all four Fast Light settings folders and FLDigi log/check-in folders, including changes, intentional clearing and reopening existing configurations. Failed readback still rolls back the save.
 - Qualification: Automated configuration and package checks do not establish a native Linux operator pass or live radio readiness. Existing 2.0.8 hardware, transport and macOS limitations remain unchanged.
+
 
 ## [2.0.8]
 - Fixed: Assigned schedules follow automatically after validation, without a separate enablement step. Schedule reads remain isolated to the assigned radio and source; Quick QSY stays until its next eligible transition, and gaps retain current tuning.
@@ -15,7 +33,7 @@
 - Changed: Hidden Compose work and optional startup work are deferred until needed. Process inventories are shared across routine consumers, FLDigi log reads are bounded, and repeated unchanged warning/widget work is reduced.
 - Fixed: Linux MeshCore Bluetooth helper allocation, cancellation and cleanup retain exclusive ownership until a child has stopped. Uncertain failures keep reconnect paused for operator action. Diagnostics now publish complete reports with bounded retention and clearer launch/heartbeat details.
 - Changed: Help and startup wording match assignment-driven scheduling, the cleaner Plan Builder and reviewed forwarding workflow.
-- Known limitations: High process CPU remains under investigation despite improved responsiveness. The previously recorded macOS/PySide Compose comments crash remains unresolved. Automated package checks do not establish live RF, physical Mesh/Bluetooth reliability, every display configuration or successful message delivery. The full Linux two-radio restart/readback/soak and Bluetooth hardware/24-hour soak matrices remain unverified; the maintainer reports improved responsiveness, working scheduling and a successful Bluetooth session. Automatic cross-transport bridging/mailbox workflows and the complete worker-published Plan Builder input catalog remain deferred.
+- Known limitations: High process CPU remains under investigation despite improved responsiveness. Automated package checks do not establish live RF, physical Mesh/Bluetooth reliability, every display configuration or successful message delivery. The full Linux two-radio restart/readback/soak and Bluetooth hardware/24-hour soak matrices remain unverified; the maintainer reports improved responsiveness, working scheduling and a successful Bluetooth session. Automatic cross-transport bridging/mailbox workflows and the complete worker-published Plan Builder input catalog remain deferred.
 
 ## [2.0.7]
 - Added: Offline Station Traffic Summaries with independently editable RF Brief and Detailed reports, evidence review, group/source/path/geographic filters, paired draft persistence, export and Compose staging.
@@ -26,7 +44,6 @@
 - Fixed: Component discovery fills the selected application's path and collapses duplicate installation suggestions while preserving distinct native profiles. Message-file browsing remains available independently of application startup choices.
 - Fixed: Radio setup actions and supported bands wrap for compact windows and larger fonts; validation and draft guidance scroll with the active section. Keyboard traversal reaches the form and save actions.
 - Changed: Help contents sit beside the guide with search; operator documentation covers 2.0.7 traffic summaries, review tools, tuning and accumulated setup fixes.
-- Known limitation: The previously recorded macOS/PySide Compose comments crash remains unresolved; see the README qualification notes.
 - Qualification: Package install/startup/upgrade checks and platform qualification are recorded with this release. Automated checks do not establish physical-radio/Mesh/filter/transfer behavior or every display/DPI combination. Outbound PIN broadcast, active peer-query automation and cross-transport relay are not implemented by this update.
 
 
@@ -47,7 +64,7 @@
 - Fixed: Mainland geometry remains visible in the bundled map, recovered JS8 endpoints clear obsolete health warnings, and saved Radio/Software status uses consistent scoped checks and correction routes.
 - Fixed: Map Paths exposes Off, My Station, and All in the main filter strip. All includes links between other stations within current filters, and layer off/on retains the chosen scope.
 - Changed: The Help guide, README and website cover these workflows under the CommsPlan name. A branded cross-platform source-installer entry point delegates to the existing verified installer.
-- Known qualification gaps: A recorded macOS/PySide Compose comments crash remains unresolved. Native packages undergo automated build, startup, install/upgrade and rollback checks; these checks do not establish physical-radio or every operating-system/display configuration. An earlier combined-run world-grid test failed despite passing separately; the fresh combined release check now passes all 192 tests, including that grid test, although the earlier cause is unconfirmed.
+- Known qualification gaps: Native packages undergo automated build, startup, install/upgrade and rollback checks; these checks do not establish physical-radio or every operating-system/display configuration. An earlier combined-run world-grid test failed despite passing separately; the fresh combined release check now passes all 192 tests, including that grid test, although the earlier cause is unconfirmed.
 
 ## [2.0.5]
 - Release note: This entry covers the CommsPlan 2.0.5 scope. Native package upgrade, uninstall, recovery, and hardware behavior remain subject to their platform procedures and operator checks; the complete Plan Builder input catalog remains deferred beyond 2.0.5.
@@ -149,7 +166,7 @@
 ## [1.2.5.5]
 - Fixed: JS8Call API/live-queue messages are now normalized before listener fan-out so malformed queue entries, non-dictionary params, null bytes, and oversized fields cannot reach Map or JS8 NCS listeners in unsafe shapes.
 - Fixed: JS8 inbox DB ingest now validates and bounds each new row before it enters FIO's local message cache. Unreadable rows are quarantined in `js8_bad_records` and included in the ingest checkpoint so one bad JS8 row is not retried forever.
-- Fixed: Messages now skips malformed local JS8 cache rows and guards table-model row access, preserving currently supported JS8 message display while reducing native Qt crash exposure from corrupt or unexpected data.
+- Fixed: Messages now skips malformed local JS8 cache rows and guards table-model row access, preserving currently supported JS8 message display while reducing failures from corrupt or unexpected data.
 
 ## [1.2.5.4]
 - Added: FLDigi Net Control roster rows now carry a stable check-in sequence number so operators can sort or report stations in the order they were added.

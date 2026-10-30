@@ -92,32 +92,76 @@ class JS8ApiMessage:
     @classmethod
     def from_raw(cls, raw: object) -> "JS8ApiMessage":
         received_ts = time.time()
-        raw_text = _safe_text(raw).strip()
-        if not raw_text:
-            return cls(received_ts=received_ts, malformed=True, quarantine_reason="empty_frame")
+
+        def quarantine(reason: str, text: str = "") -> "JS8ApiMessage":
+            return cls(raw_json=text, received_ts=received_ts, malformed=True,
+                       quarantine_reason=reason)
+
+        if isinstance(raw, (bytes, bytearray)):
+            if len(raw) > _VALUE_LIMIT * 2:
+                return quarantine("frame_too_large")
+            try:
+                raw_text = bytes(raw).decode("utf-8", errors="strict")
+            except UnicodeDecodeError:
+                return quarantine("invalid_utf8")
+        elif isinstance(raw, str):
+            raw_text = raw
+        else:
+            return quarantine("invalid_frame_type")
+        if len(raw_text) > _VALUE_LIMIT:
+            return quarantine("raw_text_too_large")
+        if not raw_text.strip():
+            return quarantine("empty_frame", raw_text)
+
+        def unique_object(pairs: list) -> dict:
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate JSON key")
+                result[key] = value
+            return result
+
+        def reject_constant(value: str) -> None:
+            raise ValueError("invalid JSON constant")
+
         try:
-            parsed = json.loads(raw_text)
-        except Exception as exc:
-            return cls(
-                raw_json=raw_text,
-                received_ts=received_ts,
-                malformed=True,
-                quarantine_reason=f"json_parse_error:{exc.__class__.__name__}",
-            )
+            parsed = json.loads(raw_text, object_pairs_hook=unique_object,
+                                parse_constant=reject_constant)
+        except (ValueError, RecursionError) as exc:
+            return quarantine(f"json_parse_error:{exc.__class__.__name__}", raw_text)
         if not isinstance(parsed, Mapping):
-            return cls(
-                raw_json=raw_text,
-                received_ts=received_ts,
-                malformed=True,
-                quarantine_reason="json_not_object",
-            )
-        return cls(
-            type=_safe_text(parsed.get("type"), limit=_FIELD_LIMIT).strip(),
-            value=_safe_text(parsed.get("value")),
-            params=_safe_params(parsed.get("params")),
-            raw_json=raw_text,
-            received_ts=received_ts,
-        )
+            return quarantine("json_not_object", raw_text)
+        # Refuse any input that the legacy field sanitizer would silently change.
+        # Nested parameter values remain intact for consumers to validate.
+        message_type = parsed.get("type")
+        message_value = parsed.get("value")
+        params = parsed.get("params")
+        if message_type is None:
+            message_type = ""
+        if message_value is None:
+            message_value = ""
+        if not isinstance(message_type, str) or _safe_text(message_type, limit=_FIELD_LIMIT).strip() != message_type:
+            return quarantine("invalid_type_field", raw_text)
+        if not isinstance(message_value, str) or _safe_text(message_value) != message_value:
+            return quarantine("invalid_value_field", raw_text)
+        if params is None:
+            params = {}
+        if not isinstance(params, Mapping):
+            return quarantine("invalid_params", raw_text)
+        if len(params) > 256:
+            return quarantine("too_many_params", raw_text)
+        for key in params:
+            if not key or _safe_text(key, limit=_FIELD_LIMIT).strip() != key:
+                return quarantine("invalid_param_key", raw_text)
+        # Lone surrogate escapes are not valid Unicode scalar values and cannot
+        # be passed losslessly to downstream UTF-8 consumers.
+        try:
+            raw_text.encode("utf-8", errors="strict")
+            json.dumps(parsed, ensure_ascii=False).encode("utf-8", errors="strict")
+        except UnicodeEncodeError:
+            return quarantine("invalid_unicode", raw_text)
+        return cls(type=message_type, value=message_value, params=dict(params),
+                   raw_json=raw_text, received_ts=received_ts)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -154,6 +198,7 @@ class JS8ApiClientStatus:
     listener_count: int = 0
     pending_request_count: int = 0
     queued_event_count: int = 0
+    event_drop_count: int = 0
     last_connected_ts: float = 0.0
     last_message_ts: float = 0.0
     last_error: str = ""
@@ -175,6 +220,7 @@ class JS8ApiClientStatus:
             "listener_count": self.listener_count,
             "pending_request_count": self.pending_request_count,
             "queued_event_count": self.queued_event_count,
+            "event_drop_count": self.event_drop_count,
             "last_connected_ts": self.last_connected_ts,
             "last_message_ts": self.last_message_ts,
             "last_error": self.last_error,
@@ -221,6 +267,7 @@ class JS8ApiClient:
         self._connected = threading.Event()
         self._send_lock = threading.Lock()
         self._state_lock = threading.Lock()
+        self._lifecycle_lock = threading.Lock()
         self._reader_thread: Optional[threading.Thread] = None
         self._pending: Dict[str, "queue.Queue[JS8ApiMessage]"] = {}
         self._pending_expected: Dict[str, frozenset[str]] = {}
@@ -231,6 +278,7 @@ class JS8ApiClient:
         # each event immediately.  Dropping the oldest queued event prevents
         # an unattended consumer from growing memory without limit.
         self._events: "queue.Queue[JS8ApiMessage]" = queue.Queue(maxsize=_DEFAULT_EVENT_QUEUE_LIMIT)
+        self._event_drop_count = 0
         self._next_id = int(time.time() * 1000) % 1_000_000_000
         self.last_error: str = ""
         self.last_error_ts: float = 0.0
@@ -264,10 +312,11 @@ class JS8ApiClient:
         return self.is_connected
 
     def stop(self) -> None:
-        self._running.clear()
-        self._connected.clear()
-        self._close_socket()
-        self._drain_pending("Client stopped", detail="JS8Call client stopped")
+        with self._lifecycle_lock:
+            self._running.clear()
+            self._connected.clear()
+            self._drain_pending("Client stopped", detail="JS8Call client stopped")
+            self._close_socket()
         thread = self._reader_thread
         if thread and thread.is_alive():
             thread.join(timeout=1.0)
@@ -302,6 +351,7 @@ class JS8ApiClient:
         with self._state_lock:
             listener_count = len(self._listeners)
             pending_request_count = len(self._pending)
+            event_drop_count = self._event_drop_count
         try:
             queued_event_count = int(self._events.qsize())
         except Exception:
@@ -314,6 +364,7 @@ class JS8ApiClient:
             listener_count=listener_count,
             pending_request_count=pending_request_count,
             queued_event_count=queued_event_count,
+            event_drop_count=event_drop_count,
             last_connected_ts=float(self.last_connected_ts or 0.0),
             last_message_ts=float(self.last_message_ts or 0.0),
             last_error=str(self.last_error or ""),
@@ -495,6 +546,8 @@ class JS8ApiClient:
 
     def _read_socket_until_closed(self) -> None:
         buffer = b""
+        discarding_oversize = False
+        limit = _VALUE_LIMIT * 2
         while self._running.is_set() and self._socket is not None:
             try:
                 chunk = self._socket.recv(65536)
@@ -506,22 +559,43 @@ class JS8ApiClient:
             if not chunk:
                 self._record_error("connection_closed")
                 break
-            buffer += chunk
-            while b"\n" in buffer:
-                raw, buffer = buffer.split(b"\n", 1)
-                self._handle_raw_frame(raw)
-            if len(buffer) > _VALUE_LIMIT * 2:
-                self._handle_message(
-                    JS8ApiMessage(
-                        raw_json=_safe_text(buffer),
-                        received_ts=time.time(),
-                        malformed=True,
-                        quarantine_reason=f"frame_too_large:bytes={len(buffer)}",
-                    )
-                )
-                buffer = b""
+            # An oversized frame is discarded through its delimiter, including
+            # any tail that happens to look like a complete JSON object.
+            while chunk:
+                if discarding_oversize:
+                    delimiter = chunk.find(b"\n")
+                    if delimiter < 0:
+                        break
+                    chunk = chunk[delimiter + 1:]
+                    discarding_oversize = False
+                    continue
+                delimiter = chunk.find(b"\n")
+                part = chunk if delimiter < 0 else chunk[:delimiter]
+                if len(buffer) + len(part) > limit:
+                    self._handle_message(JS8ApiMessage(
+                        received_ts=time.time(), malformed=True,
+                        quarantine_reason="frame_too_large"))
+                    buffer = b""
+                    if delimiter < 0:
+                        discarding_oversize = True
+                        break
+                else:
+                    buffer += part
+                    if delimiter >= 0:
+                        self._handle_raw_frame(buffer)
+                        buffer = b""
+                if delimiter < 0:
+                    break
+                chunk = chunk[delimiter + 1:]
+        if buffer:
+            self._handle_message(JS8ApiMessage(
+                received_ts=time.time(), malformed=True,
+                quarantine_reason="incomplete_frame"))
         self._connected.clear()
         self._close_socket()
+        with self._lifecycle_lock:
+            if self._running.is_set():
+                self._drain_pending("Connection closed", detail="JS8Call API connection closed")
 
     def _handle_raw_frame(self, raw: bytes) -> None:
         message = JS8ApiMessage.from_raw(raw)
@@ -541,7 +615,7 @@ class JS8ApiClient:
         if message.type == "TX.SEND_MESSAGE" and bool(message.params.get("REFUSED")):
             reason = _safe_text(message.params.get("REASON") or message.value, limit=512).strip()
             self._record_error(f"tx_refused:{reason or 'JS8Call refused the send request'}")
-        msg_id = message.id
+        msg_id = None if message.malformed else message.id
         if msg_id:
             with self._state_lock:
                 waiter = self._pending.get(str(msg_id))
@@ -551,7 +625,7 @@ class JS8ApiClient:
                 except queue.Full:
                     pass
                 return
-        elif message.type:
+        elif message.type and not message.malformed:
             # Released JS8Call builds commonly omit the caller-provided _ID
             # from responses. Correlate the oldest pending request expecting
             # this response type. The client send lock preserves request order,
@@ -577,6 +651,8 @@ class JS8ApiClient:
         try:
             self._events.put_nowait(message)
         except queue.Full:
+            with self._state_lock:
+                self._event_drop_count += 1
             try:
                 self._events.get_nowait()
             except queue.Empty:

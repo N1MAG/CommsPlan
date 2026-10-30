@@ -114,6 +114,8 @@ class PeerEvidence:
     direction_known: bool = False
     claimed_reporter: str = ""
     relay_path: tuple[str, ...] = ()
+    source_session: str = ""
+    evidence_scope: str = ""
 
 
 
@@ -181,7 +183,10 @@ class PeerRelayCandidate:
     latest_observed_ts: Optional[float] = None
     verified: bool = False
     direction: str = "receiving"
-    detail: str = "Unverified receiving path; this is not a send route."
+    detail: str = "Unverified receiving path; this is not a send route. Passband compatibility is unverified."
+
+    source_session: str = ""
+    evidence_scope: str = ""
 
     @property
     def relay_calls(self) -> tuple[str, ...]:
@@ -534,6 +539,8 @@ def _dedupe(observations: Iterable[PeerEvidence]) -> tuple[PeerEvidence, ...]:
             obs.source_reference,
             obs.source_radio_id,
             obs.source_app,
+            obs.source_session,
+            obs.evidence_scope,
             None if (
                 obs.source_family == "js8_messages"
                 and obs.source_reference
@@ -645,7 +652,7 @@ def _summaries(observations: Sequence[PeerEvidence]) -> tuple[tuple[PeerFrequenc
     return frequencies, times
 
 
-def _relay_candidates(observations: Sequence[PeerEvidence], target: str, local_call: str, now_ts: float) -> tuple[PeerRelayCandidate, ...]:
+def _relay_candidates(observations: Sequence[PeerEvidence], target: str, local_call: str, now_ts: float, *, allow_band_only: bool = False, max_age_seconds: float = RELAY_FRESH_SECONDS) -> tuple[PeerRelayCandidate, ...]:
     if not local_call or not target:
         return ()
     eligible = [
@@ -653,16 +660,17 @@ def _relay_candidates(observations: Sequence[PeerEvidence], target: str, local_c
         if obs.classification in {CLASS_DIRECT, CLASS_REPORTED_HEARING}
         and obs.origin and obs.destination and obs.band and obs.source_radio_id
         and obs.direction_known
+        and (obs.frequency_hz is not None or (allow_band_only and obs.evidence_scope == "band_only"))
         and not (obs.relay_path and obs.claimed_reporter)
         and obs.observed_ts is not None
-        and 0 <= now_ts - obs.observed_ts <= RELAY_FRESH_SECONDS
+        and 0 <= now_ts - obs.observed_ts <= max_age_seconds
     ]
-    grouped: dict[tuple[str, str, str, Optional[float]], list[PeerEvidence]] = defaultdict(list)
+    grouped: dict[tuple, list[PeerEvidence]] = defaultdict(list)
     for obs in eligible:
-        grouped[(obs.band, obs.source_radio_id, obs.source_app, obs.frequency_hz)].append(obs)
+        grouped[(obs.band, obs.source_radio_id, obs.source_app, obs.frequency_hz, obs.source_session, obs.evidence_scope)].append(obs)
     candidates: list[PeerRelayCandidate] = []
     expansions = 0
-    for (band, radio, app, freq), edges in grouped.items():
+    for (band, radio, app, freq, session, scope), edges in grouped.items():
         graph: dict[str, list[PeerEvidence]] = defaultdict(list)
         for edge in edges:
             graph[edge.origin].append(edge)
@@ -685,6 +693,9 @@ def _relay_candidates(observations: Sequence[PeerEvidence], target: str, local_c
                         path=next_path, band=band, frequency_hz=freq,
                         source_radio_id=radio, source_app=app,
                         edges=len(next_used), latest_observed_ts=latest,
+                        source_session=session, evidence_scope=scope,
+                        detail=("Band-only unverified receiving path; exact frequency and passband unknown."
+                                if scope == "band_only" else PeerRelayCandidate().detail),
                     ))
                     if len(candidates) >= MAX_RELAY_RESULTS:
                         break
@@ -728,7 +739,9 @@ def load_peer_evidence(
     errors: list[str] = []
     truncated = False
     limits: list[tuple[str, int]] = []
-    observations: list[PeerEvidence] = []
+    from freqinout.core.subspace_hearing import peer_observations
+    native = peer_observations(now=now)
+    observations: list[PeerEvidence] = [e for e in native if _target_in_observation(e, target)]
     support_observations: list[PeerEvidence] = []
     relay_metadata_unavailable = False
     path = Path(db_path)
@@ -737,7 +750,7 @@ def load_peer_evidence(
             detail="No retained peer database is available.", errors=("database_missing",),
             truncated=False, source_limits=(),
         )
-        return PeerEvidenceSnapshot(target, coverage=coverage)
+        return PeerEvidenceSnapshot(target, observations=tuple(observations[:VISIBLE_OBSERVATION_LIMIT]), coverage=coverage)
     try:
         conn = _readonly_connection(path)
         conn.set_progress_handler(guard.check, 1000)

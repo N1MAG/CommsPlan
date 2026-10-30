@@ -173,6 +173,7 @@ _load_commstat_reporter_activity
 _load_fldigi_presence
 _load_js8_direct_contact_summary
 _load_js8_links
+_load_legacy_js8_links
 _load_js8_presence
 _load_message_metadata_operational_reports
 _load_my_active_schedule_freqs

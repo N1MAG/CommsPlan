@@ -359,6 +359,9 @@ PROGRAM_META: Dict[str, Dict[str, str]] = {
 }
 
 
+from freqinout.core.net_source_identity import net_source_identity
+
+
 class NetScheduleTab(QWidget):
     schedule_saved = Signal()
     """
@@ -2172,10 +2175,15 @@ class NetScheduleTab(QWidget):
         Convert a UTC row to current view (local if toggled), preserving other fields.
         """
         if not self._show_local:
-            return dict(row)
+            out = dict(row)
+            out["_source_identity"] = net_source_identity(row)
+            out["_source_snapshot"] = dict(row)
+            return out
         day, start_local = self._convert_day_time(row.get("day_utc", ""), row.get("start_utc", ""), to_local=True)
         _, end_local = self._convert_day_time(row.get("day_utc", ""), row.get("end_utc", ""), to_local=True)
         out = dict(row)
+        out["_source_identity"] = net_source_identity(row)
+        out["_source_snapshot"] = dict(row)
         out["day_utc"] = day
         out["start_utc"] = start_local
         out["end_utc"] = end_local
@@ -2260,6 +2268,8 @@ class NetScheduleTab(QWidget):
         except Exception:
             sel_wrap.setProperty("source_row_id", 0)
         sel_wrap.setProperty("source_key", str(row_data.get("source_key") or row_data.get("_source_key") or "").strip())
+        sel_wrap.setProperty("source_identity", row_data.get("_source_identity") or net_source_identity(row_data))
+        sel_wrap.setProperty("source_snapshot", json.dumps(row_data.get("_source_snapshot") or row_data, default=str))
         sel_wrap.setProperty("source_table", str(row_data.get("source_table") or "net_schedule_tab"))
         sel_wrap.setProperty("operating_group_frequency_key", str(row_data.get("operating_group_frequency_key") or ""))
         # Canonical directory subscription metadata is carried through the
@@ -5548,51 +5558,105 @@ class NetScheduleTab(QWidget):
         net_name = net_edit.text().strip() if isinstance(net_edit, QLineEdit) else ""
         return not (day or band or freq or start or end or net_name)
 
+    def focus_live_source_row(self, raw: Dict[str, Any]) -> str:
+        """Review an Ops row in the active schedule, respecting unsaved edits."""
+        from types import SimpleNamespace
+
+        try:
+            source_key = str(raw.get("source_key") or "").strip()
+            key_id = source_key[4:] if source_key.startswith("NET:") else ""
+            row_id = int(raw.get("source_row_id") or key_id or 0)
+        except (TypeError, ValueError):
+            row_id = 0
+        expected = raw.get("source_identity")
+        if row_id <= 0 or not isinstance(expected, (tuple, list)):
+            return "missing"
+        expected = tuple(expected)
+        combo = self.schedule_source_combo
+        if self._selected_freqplanner_source_id() != LIVE_SOURCE_SET_ID:
+            idx = combo.findData(LIVE_SOURCE_SET_ID)
+            if idx < 0:
+                return "missing"
+            combo.setCurrentIndex(idx)  # The existing handler owns the discard confirmation.
+            if self._selected_freqplanner_source_id() != LIVE_SOURCE_SET_ID:
+                return "cancelled"
+        try:
+            candidates = [r for r in range(self.table.rowCount())
+                          if isinstance(self.table.cellWidget(r, self.COL_SELECT), QWidget)
+                          and int(self.table.cellWidget(r, self.COL_SELECT).property("source_row_id") or 0) == row_id]
+            if len(candidates) != 1:
+                return "missing"
+            if bool(getattr(self, "_dirty", False)):
+                current_rows = self._collect_rows_by_ui_index()
+                marker = self.table.cellWidget(candidates[0], self.COL_SELECT)
+                saved = json.loads(str(marker.property("source_snapshot") or "{}"))
+                if not isinstance(saved, dict) or not saved:
+                    return "draft_changed"
+                editable_fields = ("net_name", "day_utc", "start_utc", "end_utc", "frequency",
+                                   "group_name", "band", "mode", "recurrence", "month_weeks",
+                                   "early_checkin", "target_scope", "target_device_profile_id",
+                                   "target_operating_profile_id", "auto_tune", "fldigi_mode",
+                                   "fldigi_offset", "fldigi_tuning_json")
+                edited = current_rows[candidates[0]]
+                for field in editable_fields:
+                    if field in edited:
+                        saved[field] = edited[field]
+                current_identity = net_source_identity(saved)
+            else:
+                marker = self.table.cellWidget(candidates[0], self.COL_SELECT)
+                current_identity = tuple(marker.property("source_identity") or ())
+            if current_identity != expected:
+                return "draft_changed" if bool(getattr(self, "_dirty", False)) else "missing"
+        except (KeyError, TypeError, ValueError):
+            return "draft_changed" if bool(getattr(self, "_dirty", False)) else "missing"
+        return "focused" if self.focus_source_segment(SimpleNamespace(raw=raw)) else "missing"
+
     def focus_source_segment(self, segment: Any) -> bool:
         raw = getattr(segment, "raw", {}) if segment is not None else {}
         try:
             target_row_id = int(raw.get("source_row_id") or 0)
-        except Exception:
+        except (TypeError, ValueError):
             target_row_id = 0
         target_key = str(raw.get("source_key") or "").strip()
-        target_resource_id = raw.get("resource_id")
         try:
-            target_resource_id_int = int(target_resource_id or 0)
-        except Exception:
-            target_resource_id_int = 0
+            target_resource_id = int(raw.get("resource_id") or 0)
+        except (TypeError, ValueError):
+            target_resource_id = 0
+        matches = []
         for r in range(self.table.rowCount()):
-            select_widget = self.table.cellWidget(r, self.COL_SELECT)
-            if isinstance(select_widget, QWidget):
-                try:
-                    row_id = int(select_widget.property("source_row_id") or 0)
-                except Exception:
-                    row_id = 0
-                row_key = str(select_widget.property("source_key") or "").strip()
-                try:
-                    resource_id = int(select_widget.property("resource_id") or 0)
-                except Exception:
-                    resource_id = 0
-                if (
-                    (target_row_id > 0 and row_id == target_row_id)
-                    or (target_key and row_key == target_key)
-                    or (target_resource_id_int > 0 and resource_id == target_resource_id_int)
-                ):
-                    self.table.selectRow(r)
-                    widget = self.table.cellWidget(r, self.COL_NETNAME)
-                    item = self.table.item(r, self.COL_FREQ)
-                    frequency_widget = self.table.cellWidget(r, self.COL_FREQ)
-                    if item is not None:
-                        self.table.scrollToItem(item)
-                        self.table.setCurrentItem(item)
-                    elif isinstance(frequency_widget, QWidget):
-                        frequency_widget.setFocus(Qt.TabFocusReason)
-                    if isinstance(widget, QLineEdit):
-                        widget.setFocus(Qt.TabFocusReason)
-                        widget.selectAll()
-                    else:
-                        self.table.setFocus(Qt.TabFocusReason)
-                    return True
-        return False
+            marker = self.table.cellWidget(r, self.COL_SELECT)
+            if not isinstance(marker, QWidget):
+                continue
+            try:
+                row_id = int(marker.property("source_row_id") or 0)
+                resource_id = int(marker.property("resource_id") or 0)
+            except (TypeError, ValueError):
+                continue
+            row_key = str(marker.property("source_key") or "").strip()
+            # A stronger supplied identity never falls through to a weaker one.
+            matched = (row_id == target_row_id if target_row_id > 0 else
+                       row_key == target_key if target_key else
+                       resource_id == target_resource_id if target_resource_id > 0 else False)
+            if matched:
+                matches.append(r)
+        if len(matches) != 1:
+            return False
+        r = matches[0]
+        self.table.selectRow(r)
+        widget = self.table.cellWidget(r, self.COL_NETNAME)
+        item = self.table.item(r, self.COL_FREQ)
+        frequency_widget = self.table.cellWidget(r, self.COL_FREQ)
+        if item is not None:
+            self.table.scrollToItem(item)
+            self.table.setCurrentItem(item)
+        elif isinstance(frequency_widget, QWidget):
+            frequency_widget.setFocus(Qt.TabFocusReason)
+        if isinstance(widget, QLineEdit):
+            widget.setFocus(Qt.TabFocusReason)
+            widget.selectAll()
+        else:
+            self.table.setFocus(Qt.TabFocusReason)
+        return True
 
     def _collect_rows_by_ui_index(
         self,

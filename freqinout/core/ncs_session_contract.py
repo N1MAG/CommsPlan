@@ -151,8 +151,6 @@ def clear_persisted_active_ncs_sessions(settings: Any, *, timing_state: str = "i
             continue
         updated = dict(snapshot.to_record())
         updated["timing_state"] = str(timing_state or "interrupted")
-        if not updated.get("ended_utc"):
-            updated["ended_utc"] = snapshot.started_utc
         store[str(key)] = updated
         changed += 1
     if changed:

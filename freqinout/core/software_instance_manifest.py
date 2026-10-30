@@ -38,6 +38,20 @@ PATH_RESOURCE_KINDS = frozenset(
 )
 
 
+# Message/traffic data may intentionally be shared between Fast Light radios.
+# Apply this policy when comparing older manifests too, without rewriting them.
+FAST_LIGHT_SHARED_DATA_KINDS = frozenset({
+    "fldigi_logs", "fldigi_checkins", "flmsg_messages", "flmsg_templates",
+    "flmsg_auto", "flamp_receive", "flamp_outgoing",
+})
+
+
+def _exclusive_resource(manifest, claim) -> bool:
+    return claim.exclusive and not (
+        manifest.family_key == "fast_light" and claim.kind in FAST_LIGHT_SHARED_DATA_KINDS
+    )
+
+
 @dataclass(frozen=True)
 class EndpointClaim:
     name: str
@@ -293,10 +307,10 @@ def find_manifest_conflicts(
                         other.instance_key,
                     )
                 )
-        other_resources = {claim.collision_key: claim for claim in other.resource_claims if claim.exclusive}
+        other_resources = {claim.collision_key: claim for claim in other.resource_claims if _exclusive_resource(other, claim)}
         for claim in proposed.resource_claims:
             matched = other_resources.get(claim.collision_key)
-            if claim.exclusive and matched is not None:
+            if _exclusive_resource(proposed, claim) and matched is not None:
                 issues.append(
                     ManifestIssue(
                         "error",

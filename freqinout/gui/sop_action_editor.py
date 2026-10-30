@@ -197,15 +197,87 @@ class SopActionEditorDialog(QDialog):
         self.band_frequency_controls = self._build_band_frequency_controls()
         self._add(grid, 2, 0, "Band · frequency", self.band_frequency_controls)
         self.band_frequency_controls.setVisible(self._category == "HF")
+        self.band_frequency_controls.parentWidget().setVisible(self._category == "HF")
         self.description_edit = self._line("description", placeholder="What should the operator do?")
         self._add(grid, 2, 1, "Procedure", self.description_edit)
-        grid.setRowStretch(3, 1)
+        assigned_picker = self._category == "LOCAL" and "local_frequency_profiles" in self._options
+        self.frequency_reference_combo = QComboBox(page)
+        self.frequency_reference_combo.setObjectName("localFrequencyReference")
+        self.frequency_reference_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.frequency_reference_combo.setMinimumContentsLength(20)
+        self.frequency_reference_combo.currentTextChanged.connect(self.frequency_reference_combo.setToolTip)
+        self._add(grid, 3, 0, "Assigned frequency", self.frequency_reference_combo)
+        self.frequency_reference_combo.parentWidget().layout().setRowWrapPolicy(QFormLayout.WrapAllRows)
+        self.frequency_reference_combo.parentWidget().setVisible(assigned_picker)
+        self.frequency_reference_btn = QPushButton("Insert frequency reference" if assigned_picker else "Insert frequency reference…", page)
+        self.frequency_reference_btn.setToolTip("Insert a programming-details snapshot into the procedure. Catalog changes do not change this snapshot.")
+        self.frequency_reference_btn.setVisible(self._category == "LOCAL" and (assigned_picker or callable(self._options.get("choose_frequency_reference"))))
+        self.frequency_reference_btn.clicked.connect(self._insert_frequency_reference)
+        grid.addWidget(self.frequency_reference_btn, 3, 1)
+        self.frequency_reference_hint = QLabel("No assigned frequencies. Configure them in Settings > Local Comms Groups.", page)
+        self.frequency_reference_hint.setWordWrap(True)
+        self.frequency_reference_hint.setStyleSheet(label_style("muted", active_app_theme()))
+        grid.addWidget(self.frequency_reference_hint, 4, 0)
+        self.browse_frequency_btn = QPushButton("Browse catalog…", page)
+        self.browse_frequency_btn.setVisible(assigned_picker and callable(self._options.get("choose_frequency_reference")))
+        self.browse_frequency_btn.clicked.connect(self._browse_frequency_reference)
+        grid.addWidget(self.browse_frequency_btn, 4, 1)
+        grid.setRowStretch(5, 1)
         self.pages.addWidget(page)
         self._what_grid = grid
         self._refresh_dependent_choices()
         self._field_widgets["group_name"].currentTextChanged.connect(self._refresh_dependent_choices)
+        self._field_widgets["group_name"].currentTextChanged.connect(self._refresh_local_frequencies)
+        self._refresh_local_frequencies()
         self._field_widgets["software"].currentTextChanged.connect(self._on_software_changed)
         self._field_widgets["band"].currentIndexChanged.connect(self._on_band_changed)
+
+    def _insert_frequency_reference(self) -> None:
+        if self._category == "LOCAL" and "local_frequency_profiles" in self._options:
+            resource = self._local_frequency_resources.get(self.frequency_reference_combo.currentData())
+            self._append_frequency_reference(resource)
+            return
+        self._browse_frequency_reference()
+
+    def _browse_frequency_reference(self) -> None:
+        chooser = self._options.get("choose_frequency_reference")
+        resource = chooser(self) if callable(chooser) else None
+        self._append_frequency_reference(resource)
+
+    def _append_frequency_reference(self, resource: Any) -> None:
+        from freqinout.gui.resource_picker import frequency_programming_text
+        if resource is not None:
+            text = frequency_programming_text(resource)
+            current = self.description_edit.text().strip()
+            if text not in current:
+                self.description_edit.setText(f"{current} | {text}" if current else text)
+                self.description_edit.setCursorPosition(0)
+
+    def _refresh_local_frequencies(self, *_args: Any) -> None:
+        from freqinout.core.local_group_frequency import snapshot_for_profile
+        from freqinout.gui.resource_picker import frequency_where_text
+
+        enabled = self._category == "LOCAL" and "local_frequency_profiles" in self._options
+        self._local_frequency_resources = {}
+        self.frequency_reference_combo.clear()
+        group = self._field_widgets["group_name"].currentText().strip().casefold()
+        if enabled and group:
+            for profile in self._options.get("local_frequency_profiles", ()):
+                if not isinstance(profile, dict) or str(profile.get("group") or "").strip().casefold() != group:
+                    continue
+                resource = snapshot_for_profile(profile)
+                if resource is None:
+                    continue
+                key = resource.frequency_resource_key
+                if key in self._local_frequency_resources:
+                    continue
+                self._local_frequency_resources[key] = resource
+                self.frequency_reference_combo.addItem(f"{resource.label} · {frequency_where_text(resource)}", key)
+        has_frequencies = bool(self._local_frequency_resources)
+        self.frequency_reference_hint.setVisible(enabled and not has_frequencies)
+        if enabled:
+            self.frequency_reference_combo.setEnabled(has_frequencies)
+            self.frequency_reference_btn.setEnabled(has_frequencies)
 
     def _build_band_frequency_controls(self) -> QWidget:
         container = QWidget()
@@ -298,6 +370,21 @@ class SopActionEditorDialog(QDialog):
         return group_map.get(software, {}) if isinstance(group_map, dict) and isinstance(group_map.get(software, {}), dict) else {}
 
     def _refresh_dependent_choices(self, *_args: Any) -> None:
+        if self._category == "LOCAL" and "local_group_resources" in self._options:
+            group_combo = self._field_widgets.get("group_name")
+            software_combo = self._field_widgets.get("software")
+            if isinstance(group_combo, QComboBox) and isinstance(software_combo, QComboBox):
+                current = self._combo_value(software_combo)
+                resources = self._options["local_group_resources"].get(group_combo.currentText().strip().upper(), [])
+                software_combo.blockSignals(True)
+                software_combo.clear()
+                for resource in resources:
+                    software_combo.addItem(resource, resource)
+                if current and software_combo.findData(current) < 0:
+                    software_combo.addItem(str(current), current)
+                if current:
+                    software_combo.setCurrentIndex(software_combo.findData(current))
+                software_combo.blockSignals(False)
         dependent = self._dependent_values()
         for field in ("mode", "action_key", "condition_levels", "contact_target"):
             combo = self._field_widgets.get(field)

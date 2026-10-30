@@ -1875,7 +1875,8 @@ class MessageIngestor:
         if utc_ts <= 0:
             utc_ts = time.time()
             utc_str = datetime.datetime.fromtimestamp(utc_ts, tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        from_call = str(params.get("FROM") or "").strip().upper()
+        transport_sender = str(params.get("FROM") or "").strip().upper()
+        from_call = transport_sender
         to_call = str(params.get("TO") or "").strip().upper()
         de_match = re.search(r"\*DE\*\s*([A-Z0-9/]+)", text_upper)
         if de_match:
@@ -1898,7 +1899,7 @@ class MessageIngestor:
             "form_id": normalize_form_code(form_match.group(0))[2:],
             "spotter_token": token_match.group(1) if token_match else "",
             "raw_form": raw_form,
-            "relay_via": str(params.get("FROM") or "").strip().upper(),
+            "relay_via": transport_sender if transport_sender != from_call else "",
         }
 
     @staticmethod

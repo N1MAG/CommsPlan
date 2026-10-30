@@ -186,7 +186,7 @@ jobs:
             throw "Windows uninstall removed operator profile data"
           }
 
-      - name: Qualify populated historical package upgrade and rollback
+      - name: Qualify populated historical and current-public upgrades and rollback
         env:
           GH_TOKEN: ${{ github.token }}
         run: >-
@@ -200,8 +200,8 @@ jobs:
         with:
           name: CommsPlan-${{ needs.verify.outputs.version }}-windows-x86_64-upgrade-evidence
           path: |
-            ${{ runner.temp }}/commsplan-native-upgrade/*.json
-            ${{ runner.temp }}/commsplan-native-upgrade/*.log
+            ${{ runner.temp }}/commsplan-native-upgrade/**/*.json
+            ${{ runner.temp }}/commsplan-native-upgrade/**/*.log
           if-no-files-found: warn
           retention-days: 3
 
@@ -403,7 +403,7 @@ jobs:
             throw "Windows uninstall removed operator profile data"
           }
 
-      - name: Qualify populated historical package upgrade and rollback
+      - name: Qualify populated historical and current-public upgrades and rollback
         env:
           GH_TOKEN: ${{ github.token }}
         run: >-
@@ -417,8 +417,8 @@ jobs:
         with:
           name: CommsPlan-${{ needs.verify.outputs.version }}-windows-x86_64-upgrade-evidence
           path: |
-            ${{ runner.temp }}/commsplan-native-upgrade/*.json
-            ${{ runner.temp }}/commsplan-native-upgrade/*.log
+            ${{ runner.temp }}/commsplan-native-upgrade/**/*.json
+            ${{ runner.temp }}/commsplan-native-upgrade/**/*.log
           if-no-files-found: warn
           retention-days: 3
 
@@ -522,7 +522,7 @@ jobs:
           test ! -e /usr/bin/freqinout
           test ! -e /usr/bin/commsplan
 
-      - name: Qualify populated historical package upgrade and rollback
+      - name: Qualify populated historical and current-public upgrades and rollback
         env:
           GH_TOKEN: ${{ github.token }}
         run: >-
@@ -536,8 +536,8 @@ jobs:
         with:
           name: CommsPlan-${{ needs.verify.outputs.version }}-linux-amd64-upgrade-evidence
           path: |
-            ${{ runner.temp }}/commsplan-native-upgrade/*.json
-            ${{ runner.temp }}/commsplan-native-upgrade/*.log
+            ${{ runner.temp }}/commsplan-native-upgrade/**/*.json
+            ${{ runner.temp }}/commsplan-native-upgrade/**/*.log
           if-no-files-found: warn
           retention-days: 3
 
@@ -655,7 +655,7 @@ jobs:
           hdiutil detach -quiet "$mount"
           trap - EXIT
 
-      - name: Qualify populated historical package upgrade and rollback
+      - name: Qualify populated historical and current-public upgrades and rollback
         env:
           GH_TOKEN: ${{ github.token }}
         run: >-
@@ -669,8 +669,8 @@ jobs:
         with:
           name: CommsPlan-${{ needs.verify.outputs.version }}-macos-${{ matrix.arch }}-upgrade-evidence
           path: |
-            ${{ runner.temp }}/commsplan-native-upgrade/*.json
-            ${{ runner.temp }}/commsplan-native-upgrade/*.log
+            ${{ runner.temp }}/commsplan-native-upgrade/**/*.json
+            ${{ runner.temp }}/commsplan-native-upgrade/**/*.log
           if-no-files-found: warn
           retention-days: 3
 
@@ -844,7 +844,7 @@ jobs:
           hdiutil detach -quiet "$mount"
           trap - EXIT
 
-      - name: Qualify populated historical package upgrade and rollback
+      - name: Qualify populated historical and current-public upgrades and rollback
         env:
           GH_TOKEN: ${{ github.token }}
         run: >-
@@ -858,8 +858,8 @@ jobs:
         with:
           name: CommsPlan-${{ needs.verify.outputs.version }}-macos-${{ matrix.arch }}-upgrade-evidence
           path: |
-            ${{ runner.temp }}/commsplan-native-upgrade/*.json
-            ${{ runner.temp }}/commsplan-native-upgrade/*.log
+            ${{ runner.temp }}/commsplan-native-upgrade/**/*.json
+            ${{ runner.temp }}/commsplan-native-upgrade/**/*.log
           if-no-files-found: warn
           retention-days: 3
 

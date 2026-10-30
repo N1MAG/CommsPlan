@@ -141,6 +141,11 @@ class DependencyHealthRegistry:
                 state.cooldown_until = max(state.cooldown_until, now + float(cooldown_sec))
             return state.snapshot()
 
+    def discard(self, key: str) -> None:
+        """Retire a lifecycle-owned optional source without retaining stale identity."""
+        with self._lock:
+            self._states.pop(str(key), None)
+
     def snapshot(self, key: Optional[str] = None) -> Dict[str, object]:
         with self._lock:
             if key is not None:
