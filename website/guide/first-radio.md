@@ -75,7 +75,10 @@ its own application instance settings and API connection. The rigctld control
 port is separate from FLDigi's XML-RPC port and JS8Call's TCP API port. Use a
 separate FLDigi settings folder and a distinct JS8Call native profile as needed,
 with endpoints configured to match those applications. Changing a port only in
-CommsPlan does not configure another native instance. If Save radio reports an
+CommsPlan does not configure another native instance. Fast Light message/ICS,
+templates, log/check-in and RX/TX data folders may be shared intentionally;
+sharing these data folders does not block configuration. Review which files will
+be common while keeping the correct native identities and endpoints. If Save radio reports an
 endpoint already assigned to another radio, the current entries remain a draft;
 choose Resume setup, correct the instance settings, and save before choosing
 Radio actions → Use Radio.
@@ -87,7 +90,8 @@ confirmed, keep the current entries open until that problem is resolved.
 
 On compact displays, actions and band choices wrap. Full validation and recovery
 guidance scroll with the selected section; scroll within it to reach the fields.
-The save/close actions stay outside that field scroll. These accumulated setup changes are covered in the [2.0.7 update](/guide/whats-new#commsplan-2-0-7-and-setup-fixes).
+The save/close actions stay outside that field scroll. These accumulated changes
+are covered in the [current setup guidance](/guide/whats-new#station-setup-and-scheduling).
 
 ## Cancel or recover unfinished setup
 
@@ -114,7 +118,13 @@ The save/close actions stay outside that field scroll. These accumulated setup c
 
 **Find installed…** highlights the search, detected, and selected states with
 text and shared theme colors. A component's Configure form suggests only that
-component. Selecting a suggestion fills that component's application path. Duplicate executable suggestions are collapsed; distinct native profiles remain separate. Selecting a detected path does not verify a radio connection.
+component. Selecting a suggestion fills that component's application path. Duplicate executable suggestions are collapsed; distinct native profiles remain separate. Selecting a detected path does not verify a radio connection. **Find again…**
+refreshes component discovery. JS8Call executable installations remain choices
+even when no native profile was found; select the intended executable and profile
+separately when there are several. Review suggested message and storage paths
+before applying them. Folder-only tasks use folder controls rather than an
+application search. Save or Cancel an unfinished software edit before changing
+tasks.
 
 If an endpoint is genuinely owned by another radio, review the named owner and
 configure the intended separate application instance and port. If FLRig-only
@@ -137,17 +147,16 @@ and review again.
   setup items.
 </div>
 
-## Assign a plan to follow its schedule
+## Assign a reviewed Frequency Plan
 
-Assign a valid Frequency Plan to the selected radio when you are ready for it to
-follow that schedule. CommsPlan validates the saved radio, application identity,
-plan, enabled sources, and readiness before issuing automatic commands; a
-separate enable action is not required. Use the radio card calendar to inspect
-or change the assignment. Pause holds schedule changes until you resume. RF
-Guard, endpoint checks, and transmit/busy protection still apply.
+Review the radio, its applications, the intended plan and source layers, and RF
+Guard before assignment. A valid assigned plan follows automatically after
+validation; there is no separate Enable scheduling step. Manual-only use needs
+no plan. Pause/Resume, Net ownership and per-radio source choices determine when
+scheduled changes may occur, and all transmit/busy and endpoint checks still apply.
 
 ## Continue
 
 - [Understand the operating picture](/guide/operating-picture)
-- [See what's new in CommsPlan 2.0.8](/guide/whats-new)
+- [See what's new in CommsPlan 2.0.9](/guide/whats-new)
 - [Install or upgrade](/install/)

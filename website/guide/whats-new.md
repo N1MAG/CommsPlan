@@ -1,21 +1,122 @@
 ---
-title: What's New in CommsPlan
-description: CommsPlan 2.0.8.1 folder-save hotfix, CommsPlan 2.0.8 workflows, CommsPlan 2.0.7 history, and the earlier 2.0.6 feature overview.
+title: What's New in CommsPlan 2.0.9
+description: JS8 net intelligence, flexible messaging, Ops net preparation, group tuning and clearer planning in CommsPlan 2.0.9.
 ---
 
-# What's new in CommsPlan
-
-<div class="doc-badge-row">
-  <span class="doc-badge">CommsPlan 2.0.8.1</span>
-  <span class="doc-badge">Operator overview</span>
-</div>
+# What's new in CommsPlan 2.0.9
 
 The [GitHub Releases page](https://github.com/N1MAG/CommsPlan/releases/latest)
-lists currently available packages, checksums, and release notes. Package
-availability can vary by platform, so use that page to confirm which native
-installers have been published.
+identifies published packages, checksums and platform availability. This page
+explains the 2.0.9 feature set; use the release page to confirm a download exists.
 
-For the current update, jump to [CommsPlan 2.0.8.1](#commsplan-2-0-8-1). The 2.0.8, 2.0.7 and 2.0.6 feature history remains below.
+## JS8 net intelligence
+
+The NCS station table brings decoded Spotter and CommStat summaries, topics,
+state, FEMA region and multigroup context together. Search and filter to handle
+a growing net; View opens the traffic behind the summary. Reviewed, Follow-up,
+notes and reversible Exclude/Restore actions support NCS decisions. Relevant direct
+and relayed reports show decoded Details, with author and relay separate. Generic
+protocol exchanges stay filtered. RX SNR adds the locally heard signal-to-noise
+reading and observation context, including a labeled relay link when appropriate.
+
+![JS8 NCS with synthetic regional exercise reports](/js8-ncs.png)
+
+*Fictional demonstration traffic and simulated RX SNR in the current application.
+No live radio or confirmed transmission/delivery is represented.*
+
+## Send what the net needs
+
+Choose a form and group or station when you need an Expect query. Use SNR? and
+QUERY MSGS intentionally as utility queries. Compose can reuse freeform text or a
+saved form; a dedicated editable **MSG_NAME | Message content** library keeps
+announcements reusable across nets. Sent activity reports exact destinations and
+submission outcomes, not assumed RF delivery. Newly started nets use the selected
+radio's application source, and the listening status retains the latest send
+outcome so a blocked or uncertain submission stays visible.
+
+Spotter form mappings use checkboxes and **Use for nets**, with optional group
+relevance. These guide tools without imposing response-based check-in rules.
+
+## Frequency files, catalog and Local Comms Groups
+
+Import CHIRP, RepeaterBook and BTECH CSV/TSV exports into Frequency Catalog.
+Detected headers and explicit generic column mapping support different layouts;
+review programming details, warnings and the selected count before import. Valid
+rows start selected, exact normalized duplicates are skipped, and original source
+values remain available. Radio programming JSON, binary images and Excel workbooks
+are outside this importer; CP catalog-exchange JSON remains a separate workflow.
+
+Add selected catalog frequencies from the Local Comms Groups configuration editor,
+including while creating a new group. Type to filter, select several entries,
+and save readable programming references for Local SOP actions. Saved references
+and SOP Procedure text do not change silently when the catalog changes; review
+source updates explicitly. No radio programming or scheduling is triggered.
+
+See [frequency import and group steps](/guide/operating-picture#import-frequencies-and-build-a-local-comms-group).
+
+## Software configuration corrections
+
+Component-specific Fast Light discovery and explicit Find again preserve the
+intended executable and task. JS8Call executable and native-profile choices remain
+separate. Reviewed message-file and VarAC storage paths reach the intended fields.
+Fast Light message/ICS and RX/TX data folders can be shared intentionally without
+blocking configuration; control endpoint and native identity checks remain.
+
+## Prepare a net from Ops
+
+**Prepare net** carries the exact schedule occurrence, radio and service into
+NCS. Check setup, repair a source and return without losing the prepared draft.
+Start remains explicit; preparation does not tune or transmit. Existing active
+nets and unfinished drafts stay visible instead of being silently replaced.
+
+## Planning and radio tuning
+
+Ops outlook distinguishes a current assigned-plan window from its next change.
+Background input loading and quiet refreshes retain the view, while Plan Builder
+recovery preserves edits and source identity. Overnight windows, recurrence
+choices and source failures remain explainable.
+
+Manual QSY uses the exact Operating Group configuration's saved **Auto-Tune on
+QSY** setting. FLRig and a supported radio provide antenna tuning; this can key
+the transmitter and is separate from a dial-frequency change or FLDigi receive
+filter adjustment. Protected editing and scoped Save/Cancel make configuration
+changes deliberate. Standard JS8Call/VarAC choices and expanded MAGNET/AMRRON
+presets are available to review before adding them to your station.
+
+## Subspace evidence
+
+Reported-hearing paths retain their source context. Protected received-file
+review supports captured text, export and source management without treating a
+found file as proof of completed delivery or a known sender.
+
+## Station setup and scheduling
+
+A valid reviewed Frequency Plan assignment follows after validation. There is no
+separate Enable scheduling action. Pause/Resume, Net ownership, source choices,
+endpoint readiness and transmit/RF checks still govern the named radio. Manual
+operation can use no assigned plan.
+
+Existing capabilities remain available: offline Call Finder, radio-scoped
+application setup, the shared Forms Library, traffic summaries, offline mapping,
+and reviewed manual Mesh ↔ JS8 forwarding. Automatic bridging and mesh mailbox or
+notification services are not added by this release.
+
+## Qualification limits
+
+Production-size Linux Local Nets performance, populated interactive shutdown and the new Plan Builder/Ops two-radio and soak matrix remain unqualified. Native package checks do not establish live RF, physical
+Mesh/Bluetooth reliability or successful message delivery.
+
+## Install and operate
+
+- [Install or upgrade](/install/)
+- [Configure the first radio](/guide/first-radio)
+- [Understand the operating picture](/guide/operating-picture)
+- [Support and diagnostics](/support)
+
+## Earlier releases
+
+The following sections preserve earlier release guidance and links. Follow the
+current version’s instructions above when a workflow has changed.
 
 ## CommsPlan 2.0.8.1
 

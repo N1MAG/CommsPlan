@@ -63,8 +63,18 @@ hero:
     <p class="section-link"><a href="./guide/operating-picture#plans-and-scheduling">Explore plans and scheduling →</a></p>
     <div class="home-assurance">
       <h3>You stay in control.</h3>
-      <p>Assign a frequency plan when you’re ready; CommsPlan validates the saved radio, application, and plan before following it automatically. Pause and Resume keep operator holds explicit, while readiness, busy checks, and RF Guard still apply.</p>
+      <p>Assign a reviewed Frequency Plan to follow its schedule. Holds, busy checks, and manual controls help you manage changes while you operate.</p>
     </div>
+  </section>
+  <section aria-labelledby="js8-net-control" class="home-section">
+    <p class="section-kicker">JS8 net control</p>
+    <h2 id="js8-net-control" class="home-heading">Collect the information. Direct the net.</h2>
+    <p class="home-lead">Scan decoded Spotter and CommStat summaries, filter stations by group, state or region, and follow up with the right station. Switch between Traffic and Compose while keeping your working context.</p>
+    <figure class="product-frame">
+      <a href="./js8-ncs.png" aria-label="Open full-size JS8 NCS screenshot"><img src="/js8-ncs.png" alt="CommsPlan 2.0.9 JS8 NCS with simulated RX SNR, decoded exercise reports and station filters" width="1699" height="785" loading="lazy"></a>
+      <figcaption>Fictional demonstration traffic and simulated RX SNR in the current JS8 NCS interface. Queries, saved announcements and submission history support operator decisions.</figcaption>
+    </figure>
+    <p class="section-link"><a href="./guide/operating-picture#js8-net-control">Explore JS8 net control →</a></p>
   </section>
   <section aria-labelledby="message-intelligence" class="home-section">
     <p class="section-kicker">Message Intelligence</p>
@@ -123,7 +133,7 @@ hero:
         <p>See how plans, messages, and the map help you work through a typical operating session.</p>
       </a>
     </div>
-    <p class="section-link"><a href="./guide/whats-new">See what’s new in CommsPlan 2.0.8.1 →</a></p>
+    <p class="section-link"><a href="./guide/whats-new">See what’s new in CommsPlan 2.0.9 →</a></p>
   </section>
   <div class="home-callout">
     <div>

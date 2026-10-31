@@ -6,25 +6,26 @@ description: Install CommsPlan from the latest published release or update an es
 # Install or upgrade CommsPlan
 
 <div class="doc-badge-row">
-  <span class="doc-badge">CommsPlan 2.0.8.1</span>
+  <span class="doc-badge">CommsPlan 2.0.9</span>
   <span class="doc-badge">Windows · Linux · macOS</span>
   <span class="doc-badge">Back up before upgrade</span>
 </div>
 
-CommsPlan 2.0.8.1 is the documented release version. The
-[CommsPlan 2.0.8.1 release page](https://github.com/N1MAG/CommsPlan/releases/tag/v2.0.8.1)
-is the authority for currently available packages, checksums, and release
-notes. Download a native package only when it is listed there.
+CommsPlan 2.0.9 is available for Windows x86-64, Linux amd64, Apple Silicon and
+Intel macOS. The [2.0.9 release page](https://github.com/N1MAG/CommsPlan/releases/tag/v2.0.9)
+contains the packages, checksums and release notes.
 
-The four 2.0.8.1 package filenames are:
+| Your computer | CommsPlan 2.0.9 download |
+| --- | --- |
+| Windows 10/11 x86-64 | [CommsPlan-2.0.9-windows-x86_64-setup-unsigned.exe](https://github.com/N1MAG/CommsPlan/releases/download/v2.0.9/CommsPlan-2.0.9-windows-x86_64-setup-unsigned.exe) |
+| Debian/Ubuntu-family Linux amd64 | [CommsPlan-2.0.9-linux-amd64.deb](https://github.com/N1MAG/CommsPlan/releases/download/v2.0.9/CommsPlan-2.0.9-linux-amd64.deb) |
+| Apple Silicon macOS | [CommsPlan-2.0.9-macos-arm64-unsigned.dmg](https://github.com/N1MAG/CommsPlan/releases/download/v2.0.9/CommsPlan-2.0.9-macos-arm64-unsigned.dmg) |
+| Intel macOS | [CommsPlan-2.0.9-macos-x86_64-unsigned.dmg](https://github.com/N1MAG/CommsPlan/releases/download/v2.0.9/CommsPlan-2.0.9-macos-x86_64-unsigned.dmg) |
 
-- Windows 10/11 x86-64: `CommsPlan-2.0.8.1-windows-x86_64-setup-unsigned.exe`
-- Debian/Ubuntu-family Linux amd64: `CommsPlan-2.0.8.1-linux-amd64.deb`
-- Apple Silicon macOS: `CommsPlan-2.0.8.1-macos-arm64-unsigned.dmg`
-- Intel macOS: `CommsPlan-2.0.8.1-macos-x86_64-unsigned.dmg`
+Verify your download against [SHA256SUMS.txt](https://github.com/N1MAG/CommsPlan/releases/download/v2.0.9/SHA256SUMS.txt).
+The Windows installer and macOS images are unsigned; macOS images are not
+Developer ID signed or notarized. Review the release signing notice before opening.
 
-Verify the downloaded package against [`SHA256SUMS.txt`](https://github.com/N1MAG/CommsPlan/releases/download/v2.0.8.1/SHA256SUMS.txt)
-before opening it.
 
 ## Choose an installation method
 
@@ -33,27 +34,27 @@ the release notes and verify the downloaded file against the published checksum
 before opening it. Windows or macOS may show an operating-system security
 prompt for an unsigned package; follow the release-specific instructions.
 
-The source commands below use the current CommsPlan installer entry points.
-When using a source checkout,
+The source commands below use the published CommsPlan 2.0.9 installer entry points. Use
+the 2.0.9 source tree for these instructions. When using a source checkout,
 install Git and Python 3.11 (3.10–3.13 are accepted; 3.11 is recommended).
 Close CommsPlan and companion applications before installing or updating.
 
-### Windows source installation — CommsPlan 2.0.8.1
+### Windows source installation — CommsPlan 2.0.9
 
 ```powershell
 git clone https://github.com/N1MAG/CommsPlan.git "$HOME\CommsPlan"
 Set-Location "$HOME\CommsPlan"
-git checkout v2.0.8.1
+git checkout v2.0.9
 py -3.11 install-commsplan.py
 .\start-commsplan.cmd
 ```
 
-### macOS source installation — CommsPlan 2.0.8.1
+### macOS source installation — CommsPlan 2.0.9
 
 ```bash
 git clone https://github.com/N1MAG/CommsPlan.git "$HOME/CommsPlan"
 cd "$HOME/CommsPlan"
-git checkout v2.0.8.1
+git checkout v2.0.9
 python3.11 install-commsplan.py
 ./start-commsplan.sh
 ```
@@ -63,7 +64,7 @@ python3.11 install-commsplan.py
 Install the Debian package offered by the release page, then launch CommsPlan
 from your applications menu or with the `commsplan` command when available.
 
-### Linux source installation and maintenance — CommsPlan 2.0.8.1
+### Linux source installation and maintenance — CommsPlan 2.0.9
 
 The guided installer supports setup, update, repair, and desktop launcher
 refresh. With no action supplied, it runs setup.
@@ -71,7 +72,7 @@ refresh. With no action supplied, it runs setup.
 ```bash
 git clone https://github.com/N1MAG/CommsPlan.git "$HOME/CommsPlan"
 cd "$HOME/CommsPlan"
-git checkout v2.0.8.1
+git checkout v2.0.9
 bash install-commsplan.sh setup
 ```
 
@@ -99,14 +100,13 @@ Keep the earlier application and verified backup available until the review is
 complete. Do not copy a database while CommsPlan is running. Restore a database
 backup as one unit with any journal sidecar files it contains.
 
-## Assignment-driven scheduling
+## Review the assigned plan
 
-Assigning a valid Frequency Plan means that radio should follow it. CommsPlan
-validates the saved radio, application identity, plan, enabled sources, and
-readiness before issuing automatic commands; there is no separate **Enable
-scheduling** action. Use the radio card calendar to review or change its plan.
-Pause holds automatic changes until you resume; RF Guard, endpoint checks, and
-transmit/busy protection still apply.
+Station Setup provides the saved checklist for the selected radio. Assign the
+reviewed Frequency Plan after RF Guard checks. A valid assignment follows after
+validation without a separate Enable scheduling action. Pause/Resume, Net control,
+and enabled source choices remain radio-specific; no action bypasses readiness,
+transmit/busy protection or RF Guard.
 
 ## Continue
 
