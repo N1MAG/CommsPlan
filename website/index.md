@@ -133,7 +133,7 @@ hero:
         <p>See how plans, messages, and the map help you work through a typical operating session.</p>
       </a>
     </div>
-    <p class="section-link"><a href="./guide/whats-new">See what’s new in CommsPlan 2.0.9 →</a></p>
+    <p class="section-link"><a href="./guide/whats-new">See what’s new in CommsPlan 2.0.10 →</a></p>
   </section>
   <div class="home-callout">
     <div>

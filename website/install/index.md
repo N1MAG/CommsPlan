@@ -6,23 +6,23 @@ description: Install CommsPlan from the latest published release or update an es
 # Install or upgrade CommsPlan
 
 <div class="doc-badge-row">
-  <span class="doc-badge">CommsPlan 2.0.9</span>
+  <span class="doc-badge">CommsPlan 2.0.10</span>
   <span class="doc-badge">Windows · Linux · macOS</span>
   <span class="doc-badge">Back up before upgrade</span>
 </div>
 
-CommsPlan 2.0.9 is available for Windows x86-64, Linux amd64, Apple Silicon and
-Intel macOS. The [2.0.9 release page](https://github.com/N1MAG/CommsPlan/releases/tag/v2.0.9)
+CommsPlan 2.0.10 is available for Windows x86-64, Linux amd64, Apple Silicon and
+Intel macOS. The [2.0.10 release page](https://github.com/N1MAG/CommsPlan/releases/tag/v2.0.10)
 contains the packages, checksums and release notes.
 
-| Your computer | CommsPlan 2.0.9 download |
+| Your computer | CommsPlan 2.0.10 download |
 | --- | --- |
-| Windows 10/11 x86-64 | [CommsPlan-2.0.9-windows-x86_64-setup-unsigned.exe](https://github.com/N1MAG/CommsPlan/releases/download/v2.0.9/CommsPlan-2.0.9-windows-x86_64-setup-unsigned.exe) |
-| Debian/Ubuntu-family Linux amd64 | [CommsPlan-2.0.9-linux-amd64.deb](https://github.com/N1MAG/CommsPlan/releases/download/v2.0.9/CommsPlan-2.0.9-linux-amd64.deb) |
-| Apple Silicon macOS | [CommsPlan-2.0.9-macos-arm64-unsigned.dmg](https://github.com/N1MAG/CommsPlan/releases/download/v2.0.9/CommsPlan-2.0.9-macos-arm64-unsigned.dmg) |
-| Intel macOS | [CommsPlan-2.0.9-macos-x86_64-unsigned.dmg](https://github.com/N1MAG/CommsPlan/releases/download/v2.0.9/CommsPlan-2.0.9-macos-x86_64-unsigned.dmg) |
+| Windows 10/11 x86-64 | [CommsPlan-2.0.10-windows-x86_64-setup-unsigned.exe](https://github.com/N1MAG/CommsPlan/releases/download/v2.0.10/CommsPlan-2.0.10-windows-x86_64-setup-unsigned.exe) |
+| Debian/Ubuntu-family Linux amd64 | [CommsPlan-2.0.10-linux-amd64.deb](https://github.com/N1MAG/CommsPlan/releases/download/v2.0.10/CommsPlan-2.0.10-linux-amd64.deb) |
+| Apple Silicon macOS | [CommsPlan-2.0.10-macos-arm64-unsigned.dmg](https://github.com/N1MAG/CommsPlan/releases/download/v2.0.10/CommsPlan-2.0.10-macos-arm64-unsigned.dmg) |
+| Intel macOS | [CommsPlan-2.0.10-macos-x86_64-unsigned.dmg](https://github.com/N1MAG/CommsPlan/releases/download/v2.0.10/CommsPlan-2.0.10-macos-x86_64-unsigned.dmg) |
 
-Verify your download against [SHA256SUMS.txt](https://github.com/N1MAG/CommsPlan/releases/download/v2.0.9/SHA256SUMS.txt).
+Verify your download against [SHA256SUMS.txt](https://github.com/N1MAG/CommsPlan/releases/download/v2.0.10/SHA256SUMS.txt).
 The Windows installer and macOS images are unsigned; macOS images are not
 Developer ID signed or notarized. Review the release signing notice before opening.
 
@@ -34,27 +34,27 @@ the release notes and verify the downloaded file against the published checksum
 before opening it. Windows or macOS may show an operating-system security
 prompt for an unsigned package; follow the release-specific instructions.
 
-The source commands below use the published CommsPlan 2.0.9 installer entry points. Use
-the 2.0.9 source tree for these instructions. When using a source checkout,
+The source commands below use the published CommsPlan 2.0.10 installer entry points. Use
+the 2.0.10 source tree for these instructions. When using a source checkout,
 install Git and Python 3.11 (3.10–3.13 are accepted; 3.11 is recommended).
 Close CommsPlan and companion applications before installing or updating.
 
-### Windows source installation — CommsPlan 2.0.9
+### Windows source installation — CommsPlan 2.0.10
 
 ```powershell
 git clone https://github.com/N1MAG/CommsPlan.git "$HOME\CommsPlan"
 Set-Location "$HOME\CommsPlan"
-git checkout v2.0.9
+git checkout v2.0.10
 py -3.11 install-commsplan.py
 .\start-commsplan.cmd
 ```
 
-### macOS source installation — CommsPlan 2.0.9
+### macOS source installation — CommsPlan 2.0.10
 
 ```bash
 git clone https://github.com/N1MAG/CommsPlan.git "$HOME/CommsPlan"
 cd "$HOME/CommsPlan"
-git checkout v2.0.9
+git checkout v2.0.10
 python3.11 install-commsplan.py
 ./start-commsplan.sh
 ```
@@ -64,7 +64,7 @@ python3.11 install-commsplan.py
 Install the Debian package offered by the release page, then launch CommsPlan
 from your applications menu or with the `commsplan` command when available.
 
-### Linux source installation and maintenance — CommsPlan 2.0.9
+### Linux source installation and maintenance — CommsPlan 2.0.10
 
 The guided installer supports setup, update, repair, and desktop launcher
 refresh. With no action supplied, it runs setup.
@@ -72,7 +72,7 @@ refresh. With no action supplied, it runs setup.
 ```bash
 git clone https://github.com/N1MAG/CommsPlan.git "$HOME/CommsPlan"
 cd "$HOME/CommsPlan"
-git checkout v2.0.9
+git checkout v2.0.10
 bash install-commsplan.sh setup
 ```
 

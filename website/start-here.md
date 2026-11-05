@@ -6,7 +6,7 @@ description: Choose the right CommsPlan setup path for a new station, an upgrade
 # Start here
 
 <div class="doc-badge-row">
-  <span class="doc-badge">CommsPlan 2.0.9</span>
+  <span class="doc-badge">CommsPlan 2.0.10</span>
   <span class="doc-badge">Windows · Linux · macOS</span>
   <span class="doc-badge">Choose the right path</span>
 </div>
@@ -30,8 +30,8 @@ Message Intelligence helps you find useful information in the traffic, with the
 original messages available when you need the details.
 
 The Station Setup checklist and workflow described below are part of CommsPlan
-2.0.9. Use the installation and upgrade guide to select a currently published
-package or source installation. Review the [2.0.9 feature overview](/guide/whats-new)
+2.0.10. Use the installation and upgrade guide to select a currently published
+package or source installation. Review the [2.0.10 feature overview](/guide/whats-new)
 for JS8 net intelligence, preparation and tuning changes. Existing reviewed manual
 Mesh ↔ JS8 forwarding remains available.
 

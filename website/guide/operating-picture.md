@@ -261,7 +261,7 @@ and age.
 **Call Finder** searches locally loaded US amateur and GMRS license records,
 plus Canadian amateur records. Optional postal data can help estimate a
 location. These estimates do not show where an operator is right now.
-See [What’s new in 2.0.9](/guide/whats-new) for data updates and details.
+See [What’s new in 2.0.10](/guide/whats-new) for data updates and details.
 
 Use the map to support your decisions. A marker or path does not guarantee
 that a station is reachable or that a message will be delivered.

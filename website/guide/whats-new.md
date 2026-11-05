@@ -1,15 +1,32 @@
 ---
-title: What's New in CommsPlan 2.0.9
-description: JS8 net intelligence, flexible messaging, Ops net preparation, group tuning and clearer planning in CommsPlan 2.0.9.
+title: What's New in CommsPlan 2.0.10
+description: Plan Builder, guided radio assignment, and scheduling reliability in CommsPlan 2.0.10.
 ---
 
-# What's new in CommsPlan 2.0.9
+# What's new in CommsPlan 2.0.10
 
-The [GitHub Releases page](https://github.com/N1MAG/CommsPlan/releases/latest)
-identifies published packages, checksums and platform availability. This page
-explains the 2.0.9 feature set; use the release page to confirm a download exists.
+Get the published packages and checksums from the [2.0.10 release page](https://github.com/N1MAG/CommsPlan/releases/tag/v2.0.10).
 
-## JS8 net intelligence
+## Build and assign a plan
+
+Start with **New Plan**, choose schedule sources, and click **Save Plan**.
+**Assign to radios…** opens the radio choices, followed by a review of each
+proposed change. Review RF Guard before confirming the assignment.
+
+The **Plan windows** strip gives direct access to Effective Windows, Pattern
+Summary, Radio Windows, Week Grid, and SOP Lanes. RF Guard warning and blocked
+badges go to the relevant finding, where you can open the named repair action.
+
+## Scheduling reliability
+
+Operating Model scheduling permissions survive restarts and unrelated settings
+saves. Daily, Net, and SOP saves run in the background. Existing schedule
+identities and radio assignments are preserved. Legacy plans can link to
+named sources after review.
+
+## From 2.0.9
+
+### JS8 net intelligence
 
 The NCS station table brings decoded Spotter and CommStat summaries, topics,
 state, FEMA region and multigroup context together. Search and filter to handle
