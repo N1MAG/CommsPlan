@@ -325,6 +325,12 @@ class SettingsManager:
         candidate = {**self._data, key: value}
         try:
             with self._conn:
+                if key == 'use_scheduler':
+                    if not self._conn.in_transaction:
+                        self._conn.execute('BEGIN IMMEDIATE')
+                    from freqinout.core.scheduler_permission import legacy_scheduler_output
+                    value = legacy_scheduler_output(self._conn, value)
+                    candidate[key] = value
                 self._conn.execute(
                     "INSERT OR REPLACE INTO kv(key,value) VALUES(?,?)",
                     (key, json.dumps(value)),
@@ -371,8 +377,14 @@ class SettingsManager:
             values["operating_groups"] = ensure_operating_group_frequency_keys(groups)
         candidate = {**self._data, **values}
         try:
-            payload = [(k, json.dumps(v)) for k, v in values.items()]
             with self._conn:
+                if 'use_scheduler' in values:
+                    if not self._conn.in_transaction:
+                        self._conn.execute('BEGIN IMMEDIATE')
+                    from freqinout.core.scheduler_permission import legacy_scheduler_output
+                    values['use_scheduler'] = legacy_scheduler_output(self._conn, values['use_scheduler'])
+                    candidate['use_scheduler'] = values['use_scheduler']
+                payload = [(k, json.dumps(v)) for k, v in values.items()]
                 self._conn.executemany(
                     "INSERT OR REPLACE INTO kv(key,value) VALUES(?,?)", payload
                 )

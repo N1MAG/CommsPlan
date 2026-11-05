@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import datetime
+from copy import deepcopy
+from types import SimpleNamespace
 import html
 import json
 import sqlite3
@@ -9,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
-from PySide6.QtCore import QEvent, QTimer, Qt, Signal
+from PySide6.QtCore import QEvent, QTimer, Qt, Signal, QObject, QRunnable, QThreadPool
 from PySide6.QtGui import QColor, QFontMetrics, QPageLayout, QPageSize, QTextDocument, QStandardItem, QStandardItemModel, QPdfWriter
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -18,6 +20,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QApplication,
     QFileDialog,
     QFormLayout,
     QGridLayout,
@@ -65,12 +68,169 @@ from freqinout.core.settings_manager import SettingsManager
 from freqinout.core.js8_spotter_forms import discover_spotter_forms, resolve_spotter_forms_dir
 from freqinout.core.sop_manager import SOPManager
 from freqinout.core.sop_action_model import SopActionDraftCollection
+from freqinout.gui.source_save_worker import SourceSaveWorker
 from freqinout.gui.sop_action_editor import SopActionEditorDialog
 from freqinout.gui.freq_planner_tab import FreqPlannerTab
 from freqinout.gui.help_registry import resolve_help_host
 from freqinout.gui.plan_context_label import PlanContextLabel
 from freqinout.gui.theme import apply_text_size_accessibility_guards, resolve_theme, button_style, label_style
 from freqinout.utils.timezones import get_timezone
+
+
+def _sop_worker_manager(config_dir, settings):
+    # Schema initialization belongs to startup, not a save preflight.
+    manager = SOPManager.__new__(SOPManager)
+    manager.db_path = Path(config_dir) / 'freqinout_nets.db'
+    manager.settings = settings
+    manager._active_hf_conflicts_cache = None
+    manager._active_hf_conflicts_cache_monotonic = 0.0
+    manager._active_hf_conflicts_cache_ttl_seconds = 3.0
+    return manager
+
+
+def _sop_save_prepare(config_dir, payload, actions, expected_revision=None):
+    """Compute save evidence with worker-owned settings and manager instances."""
+    from freqinout.core.source_save_revision import source_save_revision, require_source_save_revision
+    settings = SettingsManager(runtime_worker=True)
+    try:
+        if Path(settings.db_path).parent != Path(config_dir):
+            raise RuntimeError("The active configuration changed. Reopen this SOP before saving.")
+        manager = _sop_worker_manager(config_dir, settings)
+        if expected_revision is not None:
+            require_source_save_revision(config_dir, expected_revision)
+        revision = source_save_revision(config_dir)
+        prior = manager.get_profile(int(payload.get('id') or 0)) or {}
+        actions = deepcopy(actions)
+        conflicts = []
+        if manager._normalize_category(payload.get('category')) == manager.CATEGORY_HF and payload.get('active'):
+            peers = [row for row in actions if not manager._is_local_action(row) and bool(row.get('enabled', True))]
+            for index, action in enumerate(actions):
+                group = str(action.get('group_name') or '').strip().upper()
+                if not group:
+                    continue
+                diag = manager.detect_action_conflicts(action=action, operating_group=group,
+                    horizon_days=7, check_all_groups=True, peer_actions=peers)
+                action['daily_conflict_summary'] = str(diag.get('daily_summary') or '')
+                action['net_conflict_summary'] = str(diag.get('net_summary') or '')
+                policy = manager._normalize_conflict_policy(action.get('conflict_policy'))
+                action['conflict_policy'] = policy if policy in {manager.CONFLICT_POLICY_NET, manager.CONFLICT_POLICY_DAILY} and diag.get('has_conflict') else manager.CONFLICT_POLICY_SOP
+                manual = bool(diag.get('sop_conflicts')) or (action['conflict_policy'] in {manager.CONFLICT_POLICY_NET, manager.CONFLICT_POLICY_DAILY} and bool(diag.get('first_occurrence_conflict')))
+                if manual:
+                    suggestion = manager.suggest_non_conflicting_start(action=action, operating_group=group,
+                        check_all_groups=True, peer_actions=peers)
+                    conflicts.append({'row_index':index, 'group':group, 'diag':diag, 'suggested_utc':suggestion})
+        impacts = []
+        if manager._normalize_category(payload.get('category')) == manager.CATEGORY_HF and int(payload.get('id') or 0) > 0 and not conflicts:
+            helper = SimpleNamespace(manager=manager, CAT_LOCAL=manager.CATEGORY_LOCAL)
+            rows = SOPTab._pending_sop_schedule_layer_rows(helper, int(payload['id']), payload, actions)
+            impacts = assigned_plan_rf_guard_impacts_for_sop_update(int(payload['id']), rows, settings=settings)
+        require_source_save_revision(config_dir, revision)
+        return {'revision':revision, 'prior':prior, 'actions':actions, 'conflicts':conflicts, 'impacts':impacts}
+    finally:
+        settings.close()
+
+
+def _sop_save_commit(config_dir, payload, actions, revision, prior_profile, defaults):
+    from freqinout.core.source_save_revision import require_source_save_revision
+    from freqinout.core.sop_session_service import SOPSessionService
+    settings = SettingsManager(runtime_worker=True)
+    try:
+        if Path(settings.db_path).parent != Path(config_dir):
+            raise RuntimeError('The active configuration changed. Reopen this SOP before saving.')
+        manager = _sop_worker_manager(config_dir, settings)
+        require_source_save_revision(config_dir, revision)
+        profile_id = manager.save_profile(payload, actions, schedule_layer=None)
+        notes, journal = [], None
+        activated = manager._normalize_category(payload.get('category')) == manager.CATEGORY_HF and not bool(prior_profile.get('active')) and bool(payload.get('active'))
+        if activated:
+            session = SOPSessionService(Path(config_dir) / 'sop_hf_session_journal.json', manager)
+            try:
+                journal = session.register_activation(profile_id, str(payload.get('name') or ''))
+                explicit = any(manager._normalize_conflict_policy(row.get('conflict_policy')) in {manager.CONFLICT_POLICY_NET, manager.CONFLICT_POLICY_DAILY} for row in actions)
+                pending = [row for row in manager.collect_active_net_sop_conflicts(horizon_days=7, include_profile_ids={int(profile_id)}) if not row.get('has_policy')]
+                if pending and defaults.get('net_mode') == SOPTab.NET_CONFLICT_MODE_SOP_PRIORITY_TEMP and not explicit:
+                    helper = SimpleNamespace(manager=manager)
+                    decisions = SOPTab._build_sop_priority_net_policy_decisions(helper, pending, profile_id=int(profile_id))
+                    saved, updated = session.save_net_policy_decisions(decisions, origin='SOP Builder activation default (Net SOP Priority)',
+                        session_profile_hint={'id':int(profile_id),'name':str(payload.get('name') or ''),'active':True,'category':'HF'})
+                    if updated is not None:
+                        journal = updated
+                    if saved:
+                        notes.append(f'Net Schedule: applied temporary SOP Priority to {saved} overlap window(s) for this SOP session.')
+                    else:
+                        notes.append(f'Net Schedule: detected {len(pending)} overlap window(s); review them in Net Schedule.')
+                elif pending:
+                    notes.append(f'Net Schedule: review {len(pending)} overlap window(s) in Net Schedule to choose priority.')
+                else:
+                    notes.append('Net Schedule: no unresolved Net/SOP overlaps found for this SOP.')
+                conflicts = [row for row in manager.collect_active_hf_conflicts() if int(row.get('profile_id') or 0) == int(profile_id)]
+                if conflicts:
+                    notes.append('HF Schedule: review active SOP conflicts in Daily Schedule.')
+            except Exception as exc:
+                log.exception('SOP saved but activation follow-up failed')
+                notes.append(f'SOP saved, but activation follow-up could not complete: {exc}. Review the SOP session and schedule.')
+        try:
+            profiles = manager.list_profiles()
+            selected = manager.get_profile(int(profile_id))
+            if not selected:
+                raise RuntimeError('Saved SOP could not be read back')
+            return {'profile_id':profile_id,'profile':selected,'profiles':profiles,'notes':notes,'journal':journal}
+        except Exception as exc:
+            return {'profile_id':profile_id,'profile':None,'profiles':[],'notes':notes,
+                    'journal':journal,'readback_error':str(exc)}
+    finally:
+        settings.close()
+
+
+class _SOPDestinationSignals(QObject):
+    finished = Signal(object)
+
+    def __init__(self):
+        super().__init__(QApplication.instance())
+
+
+class _SOPDestinationTask(QRunnable):
+    def __init__(self, request: Dict[str, Any], loader):
+        super().__init__()
+        self.request, self.loader = request, loader
+        self.signals = _SOPDestinationSignals()
+        self.signals.finished.connect(self.signals.deleteLater)
+
+    def run(self):
+        try:
+            result = self.loader(self.request)
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+        try:
+            self.signals.finished.emit({**self.request, **result})
+        except RuntimeError:
+            pass  # QApplication exited while the worker was finishing.
+
+
+def _read_sop_destination_profile(request: Dict[str, Any]) -> Dict[str, Any]:
+    db_path = Path(request["db_path"])
+    if not db_path.exists():
+        return {"ok": False, "error": "The selected SOP profile database is unavailable."}
+    manager = object.__new__(SOPManager)
+    manager.db_path = db_path
+    class _ReadSettings:
+        def get(self, key: str, default: Any = None) -> Any:
+            return request.get("settings", {}).get(key, default)
+    manager.settings = _ReadSettings()
+    manager._connect = lambda: sqlite3.connect(f"file:{db_path.resolve()}?mode=ro", uri=True, timeout=1.0)
+    profile = SOPManager.get_profile(manager, int(request["profile_id"]))
+    if not profile:
+        return {"ok": False, "error": "The selected SOP profile is unavailable."}
+    conn = manager._connect()
+    try:
+        conn.row_factory = sqlite3.Row
+        profiles = [dict(row) for row in conn.execute(
+            "SELECT id,name,category FROM sop_profiles ORDER BY category,id"
+        ).fetchall()]
+    finally:
+        conn.close()
+    # SOP v2 exposes actions, not editable derived schedule-layer rows.
+    return {"ok": True, "profile": profile, "profiles": profiles, "target_found": False}
 
 
 def _contrast_text_hex(bg_hex: str) -> str:
@@ -343,13 +503,20 @@ class _LegacySOPTab(QWidget):
         # SOP is not part of the first visible shell.  MainWindow opts into a
         # deferred data projection so profile/schedule queries cannot hold up
         # the first paint.  Standalone/test construction remains eager.
+        self._source_save_worker = SourceSaveWorker(self)
         self._defer_initial_load = bool(defer_initial_load)
         self._initial_data_loaded = False
         self._initial_data_load_pending = False
+        self._destination_generation = 0
+        self._destination_request = None
+        self._destination_task = None
+        self._destination_focus_targets: Dict[str, Dict[str, Any]] = {}
+        self._plan_destination_loaded = False
         self.settings = settings_manager if settings_manager is not None else SettingsManager()
         self._summary_timezone = get_timezone(str(self.settings.all().get("timezone") or "UTC"))
         self.plan_context_service = plan_context_service or PlanContextService()
-        self.manager = SOPManager(settings=SettingsManager(initialized_source=self.settings))
+        self.manager = SOPManager(self.settings.db_path.parent / "freqinout_nets.db",
+                                 settings=SettingsManager(initialized_source=self.settings))
         self._profiles: List[Dict[str, Any]] = []
         self._selected_profile_id: int | None = None
         self._upcoming_rows: List[Dict[str, Any]] = []
@@ -4426,6 +4593,7 @@ class SOPTab(_LegacySOPTab):
     NET_CONFLICT_MODE_SOP_PRIORITY_TEMP = "SOP_PRIORITY_TEMP"
     NET_CONFLICT_MODE_REVIEW_NET = "REVIEW_NET"
     local_net_return_requested = Signal(object)
+    plan_destination_load_finished = Signal(object)
     WB_FILTER_ALL = "ALL"
     WB_FILTER_HF = "HF"
     WB_FILTER_NET = "NET"
@@ -7283,7 +7451,7 @@ class SOPTab(_LegacySOPTab):
         contact_rule = str(action.get("contact_rule", "")).strip().lower()
         return software == "LOCAL NET" or action_key.startswith("local_") or contact_rule in {"local_group", "local_profile"}
 
-    def _on_profile_selected(self, idx: int) -> None:
+    def _on_profile_selected(self, idx: int, loaded_profile=None) -> None:
         if idx < 0:
             return
         profile_id = int(self.profile_combo.itemData(idx) or 0)
@@ -7303,7 +7471,7 @@ class SOPTab(_LegacySOPTab):
                 self.category_combo.setCurrentIndex(0 if selected.get("category", self.CAT_HF) == self.CAT_HF else 1)
                 self.category_combo.blockSignals(False)
                 return
-        profile = self.manager.get_profile(profile_id)
+        profile = loaded_profile if loaded_profile is not None else self.manager.get_profile(profile_id)
         if not profile:
             return
         self._selected_profile_id = profile_id
@@ -8789,6 +8957,7 @@ class SOPTab(_LegacySOPTab):
         hf_peer_actions: List[Dict[str, Any]],
         *,
         total_conflict_count: int | None = None,
+        precomputed: bool = False,
     ) -> bool:
         dialog = QDialog(self)
         dialog.setWindowTitle("SOP Conflict Resolution")
@@ -8878,12 +9047,12 @@ class SOPTab(_LegacySOPTab):
                 policy in {self.manager.CONFLICT_POLICY_NET, self.manager.CONFLICT_POLICY_DAILY}
                 and bool(diag.get("first_occurrence_conflict"))
             ):
-                suggested_utc = self.manager.suggest_non_conflicting_start(
+                suggested_utc = (entry.get("suggested_utc") if precomputed else self.manager.suggest_non_conflicting_start(
                     action=action,
                     operating_group=group,
                     check_all_groups=True,
                     peer_actions=hf_peer_actions,
-                )
+                ))
                 suggested_display = self._display_start_hhmm_from_utc(suggested_utc, show_local=self._show_local)
                 start_edit.setText(suggested_display)
                 start_edit.setToolTip(f"Suggested non-conflicting start: {suggested_display}")
@@ -8930,6 +9099,8 @@ class SOPTab(_LegacySOPTab):
                 )
                 continue
 
+            if precomputed:
+                return True  # Worker rechecks all edited rows before any save.
             unresolved: List[str] = []
             for entry in conflicts:
                 action = entry["action"]
@@ -9148,78 +9319,101 @@ class SOPTab(_LegacySOPTab):
             return []
         return list(assigned_plan_rf_guard_impacts_for_sop_update(profile_id, rows) or [])
 
+    def closeEvent(self, event):
+        worker = getattr(self, '_source_save_worker', None)
+        if worker is not None:
+            worker.close()
+        super().closeEvent(event)
+
     def _save_profile(self) -> None:
+        if self._source_save_worker.busy:
+            return
         timer = getattr(self, "_realtime_conflict_timer", None)
         if timer is not None:
             timer.stop()
-        prev_suppress = getattr(self, "_suppress_realtime_conflict_checks", False)
-        self._suppress_realtime_conflict_checks = True
         try:
-            prior_profile = self.manager.get_profile(int(self._selected_profile_id or 0)) or {}
             payload, actions, _schedule_layer = self._collect_profile_payload()
-            if payload.get("category") == self.CAT_HF and bool(payload.get("active")):
-                self._ensure_summary_compatibility_projection()
-                if not self._resolve_hf_activation_conflicts(actions):
+        except Exception as exc:
+            QMessageBox.warning(self, "SOP", str(exc))
+            return
+        self._queue_sop_save_review(deepcopy(payload), deepcopy(actions), None, (deepcopy(payload), deepcopy(actions)))
+
+    def _queue_sop_save_review(self, payload, actions, expected_revision, editor_identity):
+        self.setEnabled(False)
+        config_dir = Path(self.settings.db_path).parent
+        def prepared(result, error):
+            self.setEnabled(True)
+            if error is not None:
+                QMessageBox.warning(self, 'SOP', f'SOP not saved. Review current inputs and try again.\n\n{error}')
+                return
+            reviewed_actions = result['actions']
+            if result['conflicts']:
+                peers = [row for row in reviewed_actions if not SOPManager._is_local_action(row) and bool(row.get('enabled', True))]
+                entries = [{**row, 'action':reviewed_actions[row['row_index']]} for row in result['conflicts']]
+                if not self._resolve_hf_conflicts_dialog(entries, peers, total_conflict_count=len(entries), precomputed=True):
                     return
-            if payload.get("category") == self.CAT_HF and int(payload.get("id") or 0) > 0:
-                pending_layer_rows = self._pending_sop_schedule_layer_rows(
-                    int(payload.get("id") or 0),
-                    payload,
-                    actions,
-                )
-                if not self._confirm_rf_guard_sop_update(
-                    int(payload.get("id") or 0),
-                    str(payload.get("name") or ""),
-                    pending_layer_rows,
-                ):
+                self._queue_sop_save_review(payload, reviewed_actions, result['revision'], editor_identity)
+                return
+            impacts = result['impacts']
+            blocked = [i for i in impacts if str((i.get('validation') or {}).get('state') or '').lower() == 'blocked']
+            warnings = [i for i in impacts if str((i.get('validation') or {}).get('state') or '').lower() == 'warning']
+            if blocked:
+                QMessageBox.warning(self, 'RF Guard Blocked Update', 'The SOP was not saved.\n\n' + '\n'.join(self._format_rf_guard_sop_impacts(blocked)))
+                return
+            if warnings:
+                response = QMessageBox.question(self, 'RF Guard Warning',
+                    'Updating this SOP affects assigned schedules.\n\n' + '\n'.join(self._format_rf_guard_sop_impacts(warnings)) + '\n\nSave this SOP?',
+                    QMessageBox.Save | QMessageBox.Cancel, QMessageBox.Cancel)
+                if response != QMessageBox.Save:
                     return
-            profile_id = self.manager.save_profile(payload, actions, schedule_layer=None)
-            self._reload_profiles(select_id=profile_id)
-            self._set_save_dirty(False)
-            self._emit_sop_data_changed()
-            post_save_notes: List[str] = []
             try:
-                category = self.manager._normalize_category(payload.get("category"))
-            except Exception:
-                category = str(payload.get("category") or "").strip().upper()
-            prior_active = bool(prior_profile.get("active"))
-            new_active = bool(payload.get("active"))
-            if category == self.CAT_HF:
-                win = self.window()
-                daily_tab = getattr(win, "daily_tab", None)
-                activated_now = (not prior_active) and new_active
-                if activated_now and daily_tab is not None and hasattr(daily_tab, "register_sop_session_activation"):
-                    try:
-                        daily_tab.register_sop_session_activation(profile_id, str(payload.get("name") or ""))
-                    except Exception:
-                        pass
-                if activated_now:
-                    try:
-                        notes, should_emit_refresh = self._apply_post_save_hf_activation_defaults(
-                            profile_id=int(profile_id or 0),
-                            profile_name=str(payload.get("name") or ""),
-                            actions=actions,
-                        )
-                        post_save_notes.extend([str(n).strip() for n in notes if str(n).strip()])
-                        if should_emit_refresh:
-                            self._emit_sop_data_changed()
-                    except Exception as e:
-                        log.debug("SOP Builder: post-save activation defaults failed: %s", e)
-                if prior_active and not new_active and daily_tab is not None and hasattr(daily_tab, "prompt_sop_return_to_normal_after_deactivation"):
-                    try:
-                        daily_tab.prompt_sop_return_to_normal_after_deactivation([int(profile_id or 0)], origin_label="SOP Builder")
-                    except Exception:
-                        pass
-            message_lines = ["SOP saved."]
-            if post_save_notes:
-                message_lines.append("")
-                message_lines.extend(post_save_notes)
-            self.refresh_traffic_suggestions()
-            QMessageBox.information(self, "SOP", "\n".join(message_lines))
-        except Exception as e:
-            QMessageBox.warning(self, "SOP", str(e))
+                current_payload, current_actions, _ = self._collect_profile_payload()
+            except Exception as exc:
+                QMessageBox.warning(self, 'SOP', f'Entered SOP changed during review. Review again.\n\n{exc}')
+                return
+            if (current_payload, current_actions) != editor_identity:
+                QMessageBox.warning(self, 'SOP', 'Entered SOP changed during review. Review it again before saving.')
+                return
+            self.setEnabled(False)
+            if not self._source_save_worker.submit(_sop_save_commit, (config_dir, deepcopy(payload), deepcopy(reviewed_actions), result['revision'], deepcopy(result['prior']), self._activation_conflict_defaults()),
+                    lambda saved, failure: self._finish_sop_save(saved, failure, payload, result['prior'])):
+                self.setEnabled(True)
+                QMessageBox.warning(self, 'SOP', 'A save is already in progress.')
+        if not self._source_save_worker.submit(_sop_save_prepare, (config_dir, deepcopy(payload), deepcopy(actions), expected_revision), prepared):
+            self.setEnabled(True)
+            QMessageBox.warning(self, 'SOP', 'A save is already in progress.')
+
+    def _finish_sop_save(self, saved, error, payload, prior_profile):
+        self.setEnabled(True)
+        if error is not None:
+            QMessageBox.warning(self, 'SOP', f'SOP not saved. Review current inputs and try again.\n\n{error}')
+            return
+        profile_id = int(saved['profile_id'])
+        daily_tab = getattr(self.window(), 'daily_tab', None) or getattr(self.window(), 'hf_schedule_tab', None)
+        if daily_tab is not None and saved.get('journal') is not None:
+            daily_tab._sop_session_journal_cache = deepcopy(saved['journal'])
+        self._emit_sop_data_changed()
+        if saved.get('readback_error'):
+            QMessageBox.warning(self, 'SOP', 'SOP was saved, but its current state could not be loaded. Refresh before editing again.\n\n' + saved['readback_error'])
+            return
+        self._profiles = list(saved['profiles'])
+        self._set_save_dirty(False)
+        self.profile_combo.blockSignals(True)
+        try:
+            idx = self.profile_combo.findData(profile_id)
+            if idx < 0:
+                self.profile_combo.addItem(self._category_display_label(saved['profile'].get('category')), profile_id)
+                idx = self.profile_combo.findData(profile_id)
+            self.profile_combo.setCurrentIndex(idx)
         finally:
-            self._suppress_realtime_conflict_checks = prev_suppress
+            self.profile_combo.blockSignals(False)
+        self._on_profile_selected(idx, loaded_profile=saved['profile'])
+        if SOPManager._normalize_category(payload.get('category')) == self.CAT_HF and bool(prior_profile.get('active')) and not bool(payload.get('active')) and daily_tab is not None and hasattr(daily_tab, 'prompt_sop_return_to_normal_after_deactivation'):
+            try:
+                daily_tab.prompt_sop_return_to_normal_after_deactivation([profile_id], origin_label='SOP Builder')
+            except Exception:
+                pass
+        QMessageBox.information(self, 'SOP', '\n'.join(['SOP saved.'] + ([''] + saved['notes'] if saved['notes'] else [])))
 
     def _delete_profile(self) -> None:
         if int(self._selected_profile_id or 0) <= 0:
@@ -9799,6 +9993,117 @@ class SOPTab(_LegacySOPTab):
             return False
         self._reload_profiles(select_id=target)
         return int(self._selected_profile_id or 0) == target
+
+    def request_plan_sop_load(self, request_id: str, profile_id: int,
+                              target: Optional[Dict[str, Any]] = None) -> bool:
+        request_id = str(request_id or "").strip()
+        try:
+            profile_id = int(profile_id or 0)
+        except (TypeError, ValueError):
+            return False
+        if not request_id or profile_id <= 0:
+            return False
+        if profile_id != int(self._selected_profile_id or 0) and self._dirty and not self._loading_ui:
+            answer = QMessageBox.question(self, "Unsaved SOP",
+                "Discard changes and open this SOP? Choose Cancel to keep editing or save first.",
+                QMessageBox.Discard | QMessageBox.Cancel, QMessageBox.Cancel)
+            if answer != QMessageBox.Discard:
+                self.plan_destination_load_finished.emit({"request_id": request_id, "profile_id": profile_id,
+                    "ok": False, "loaded": False, "cancelled": True, "target_found": False})
+                return False
+        self.cancel_plan_destination_load()
+        self._destination_generation += 1
+        try:
+            settings_snapshot = {"sop_frequency_variant_references": self.settings.get("sop_frequency_variant_references", {})}
+        except Exception:
+            settings_snapshot = {}
+        request = {"request_id": request_id, "profile_id": profile_id,
+                   "target": dict(target or {}), "generation": self._destination_generation,
+                   "db_path": str(self.manager.db_path), "settings": settings_snapshot}
+        task = _SOPDestinationTask(request, _read_sop_destination_profile)
+        task.signals.finished.connect(self._complete_plan_sop_load)
+        self._destination_request, self._destination_task = request, task
+        self.actions_table.setEnabled(False)
+        self.layer_table.setEnabled(False)
+        QThreadPool.globalInstance().start(task)
+        return True
+
+    def cancel_plan_destination_load(self, request_id: Optional[str] = None) -> bool:
+        pending = getattr(self, "_destination_request", None)
+        if pending is None or (request_id is not None and str(request_id) != str(pending.get("request_id"))):
+            return False
+        self._destination_generation = int(getattr(self, "_destination_generation", 0)) + 1
+        self._destination_request = self._destination_task = None
+        self.actions_table.setEnabled(True)
+        self.layer_table.setEnabled(True)
+        return True
+
+    def _complete_plan_sop_load(self, result: Dict[str, Any]) -> None:
+        pending = getattr(self, "_destination_request", None)
+        if not pending or result.get("generation") != self._destination_generation or result.get("request_id") != pending.get("request_id"):
+            return
+        self._destination_request = self._destination_task = None
+        self.actions_table.setEnabled(True)
+        self.layer_table.setEnabled(True)
+        if not result.get("ok"):
+            self.plan_destination_load_finished.emit({"request_id": result.get("request_id"), "profile_id": result.get("profile_id"),
+                "ok": False, "loaded": False, "target_found": False,
+                "error": result.get("error") or "The selected SOP profile is unavailable."})
+            return
+        profile = result.get("profile")
+        if not isinstance(profile, dict):
+            return
+        profile_id = int(profile.get("id") or 0)
+        self._selected_profile_id = profile_id
+        self._initial_data_loaded = True
+        self._initial_data_load_pending = False
+        self._plan_destination_loaded = True
+        category = SOPManager._normalize_category(profile.get("category"))
+        combo = getattr(self, "profile_combo", None)
+        if combo is not None:
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("New SOP", None)
+            self._profiles = [dict(row) for row in result.get("profiles", []) if isinstance(row, dict)]
+            for profile_row in self._profiles:
+                combo.addItem(str(profile_row.get("name") or "SOP"), int(profile_row.get("id") or 0))
+            idx = combo.findData(profile_id)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+            combo.blockSignals(False)
+        self._loading_ui = True
+        try:
+            self.name_edit.setText(str(profile.get("name") or ""))
+            self.active_cb.setChecked(bool(profile.get("active")))
+            actions = list(profile.get("actions") or [])
+            if category == self.CAT_HF:
+                actions = [a for a in actions if not self._is_local_action_dict(a)]
+            else:
+                actions = [a for a in actions if self._is_local_action_dict(a)]
+            category_prev_block = self.category_combo.blockSignals(True)
+            self.category_combo.setCurrentIndex(0 if category == self.CAT_HF else 1)
+            self.category_combo.blockSignals(category_prev_block)
+            self._populate_actions(actions)
+        finally:
+            self._loading_ui = False
+        self._apply_category_table_view()
+        self._set_save_dirty(False)
+        self._update_profile_action_styles()
+        request_id = str(result.get("request_id") or "")
+        target = dict(result.get("target") or {})
+        self._destination_focus_targets = getattr(self, "_destination_focus_targets", {})
+        self._destination_focus_targets[request_id] = {"profile_id": profile_id, "target": target}
+        # SOP v2 presents actions rather than the derived schedule-layer table.
+        # Keep the named profile open, but never claim a layer was focused.
+        found = bool(result.get("target_found"))
+        self.plan_destination_load_finished.emit({"request_id": request_id, "profile_id": profile_id,
+            "ok": True, "loaded": True, "target_found": found})
+
+    def focus_plan_destination_target(self, request_id: str) -> bool:
+        record = getattr(self, "_destination_focus_targets", {}).get(str(request_id or ""))
+        if not record or int(record.get("profile_id") or 0) != int(self._selected_profile_id or 0):
+            return False
+        return False
 
     def focus_source_segment(self, segment: Any) -> bool:
         raw = getattr(segment, "raw", {}) if segment is not None else {}

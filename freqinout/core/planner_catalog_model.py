@@ -13,14 +13,16 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from freqinout.core.planner_input_catalog import PlannerInputCatalog
-from freqinout.core.schedule_source_inputs import ScheduleSourceError
+from freqinout.core.schedule_source_inputs import (
+    ScheduleSourceError, normalize_active_daily_rows, normalize_active_net_rows,
+)
 from freqinout.core.multi_radio_store import MultiRadioStore, _GuidedTransactionConnection
 from freqinout.core.plan_context_service import PlanContextService, PlanContextSnapshot
 from freqinout.core.shared_state_persistence import SharedStatePersistenceAdapter
 from freqinout.core.schedule_source_sets import (
     NO_NET_SOURCE_SET_ID, NO_NET_SOURCE_SET_LABEL,
     SELECTED_HF_DAILY_SOURCE_SET_KEY, SELECTED_HF_NET_SOURCE_SET_KEY,
-    source_sets_for_category, plan_source_usage_summary,
+    source_sets_for_category, plan_source_usage_summary, describe_duplicate_schedule_choices,
     HF_DAILY_SOURCE_SETS_KEY, HF_NET_SOURCE_SETS_KEY,
     HF_DAILY_SOURCE_CATEGORY, HF_NET_SOURCE_CATEGORY,
 )
@@ -45,6 +47,8 @@ class DetachedSettings:
 
 
 class _MemoryStore(MultiRadioStore):
+    detached_configuration = True
+
     def __init__(self, connection):
         # No schema assurance, filesystem probes or live connection is owned by
         # this adapter. Shared helpers see only this worker's private copy.
@@ -232,37 +236,11 @@ class _SourceReader:
 
     def _load_hf_from_db(self) -> Optional[List[Dict]]:
         result = self.read_table("settings", ("daily_schedule_tab",))
-        if result is None:
-            return None
-        table, rows = result
-        return [dict(row, id=int(row.get("id") or 0), source_row_id=int(row.get("id") or 0), source_table=table,
-                     day_utc=row.get("day_utc") or "ALL", vfo=str(row.get("vfo") or "A").strip().upper() or "A",
-                     frequency=str(row.get("frequency") or ""), group_name=row.get("group_name") or "",
-                     band=row.get("band") or "", mode=row.get("mode") or "",
-                     start_utc=row.get("start_utc") or "", end_utc=row.get("end_utc") or "",
-                     auto_tune=bool(row.get("auto_tune"))) for row in rows]
-
+        return normalize_active_daily_rows(*result) if result is not None else None
 
     def _load_net_from_db(self) -> Optional[List[Dict]]:
         result = self.read_table("nets", ("net_schedule_tab", "net_schedule"))
-        if result is None:
-            return None
-        table, rows = result
-        return [dict(row, id=int(row.get("id") or 0), source_row_id=int(row.get("id") or 0), source_table=table,
-                     day_utc=row.get("day_utc") or "ALL", recurrence=row.get("recurrence") or "Weekly",
-                     biweekly_offset_weeks=row.get("biweekly_offset_weeks") or 0,
-                     month_weeks=row.get("month_weeks") or "", vfo=str(row.get("vfo") or "A").strip().upper() or "A",
-                     frequency=str(row.get("frequency") or ""), early_checkin=int(row.get("early_checkin") or 0),
-                     group_name=row.get("group_name") or row.get("primary_js8call_group") or "",
-                     band=row.get("band") or "", mode=row.get("mode") or "",
-                     start_utc=row.get("start_utc") or "", end_utc=row.get("end_utc") or "",
-                     resource_id=int(row["resource_id"]) if row.get("resource_id") not in (None, "") else None,
-                     primary_js8call_group=row.get("primary_js8call_group") or "",
-                     comment=row.get("comment") or "", net_name=row.get("net_name") or "",
-                     target_device_profile_id=row.get("target_device_profile_id"),
-                     target_operating_profile_id=row.get("target_operating_profile_id"),
-                     target_scope=row.get("target_scope") or "station") for row in rows]
-
+        return normalize_active_net_rows(*result) if result is not None else None
 
     def _load_net_resources_from_db(self) -> Optional[List[Dict[str, Any]]]:
         """
@@ -639,6 +617,8 @@ class PlannerModelCompiler:
                     warnings=shared.warnings,
                 )
                 devices = tuple(store.list_device_profiles())
+                for key, category in ((HF_DAILY_SOURCE_SETS_KEY,HF_DAILY_SOURCE_CATEGORY),(HF_NET_SOURCE_SETS_KEY,HF_NET_SOURCE_CATEGORY)):
+                    sources[key] = describe_duplicate_schedule_choices(sources[key],category,plans,assignments,devices)
                 choices = {
                     "plans": tuple((str(row.get("name") or f"Frequency Plan #{row['id']}")
                                      + (" (draft)" if str(row.get("status") or "saved").lower() == "draft" else ""), int(row["id"]))
@@ -651,7 +631,7 @@ class PlannerModelCompiler:
                 for key, label in ((HF_DAILY_SOURCE_SETS_KEY, "Active Daily Schedule"),
                                    (HF_NET_SOURCE_SETS_KEY, "Active Net Schedule")):
                     choices[key] = ((label, "__live__"),) + (((NO_NET_SOURCE_SET_LABEL, NO_NET_SOURCE_SET_ID),) if key == HF_NET_SOURCE_SETS_KEY else ()) + tuple(
-                        (str(row.get("name") or row["id"]), str(row["id"])) for row in sources[key])
+                        (str(row.get("choice_label") or row.get("name") or row["id"]), str(row["id"])) for row in sources[key])
                 choice_indices = {key: {identity: index for index, (_, identity) in enumerate(rows)}
                                   for key, rows in choices.items()}
                 self._base = PlannerCatalogModel(

@@ -1,4 +1,4 @@
-"""One worker's input reader and compatibility model; no widgets or live writes."""
+"""Plan Builder input preparation and verified plan saves on a worker."""
 from __future__ import annotations
 
 import datetime
@@ -8,13 +8,40 @@ from pathlib import Path
 from freqinout.core.config_paths import get_config_dir
 from freqinout.core.multi_radio_store import (
     FIO_EXISTING_USE_IGNORED_KEYS, MULTI_RIG_MIGRATION_COMPLETED_AT_KEY,
-    MULTI_RIG_MIGRATION_SUMMARY_PREFIX,
+    MULTI_RIG_MIGRATION_SUMMARY_PREFIX, MultiRadioStore,
 )
 from freqinout.core.multi_rig_runtime_status import build_multi_rig_runtime_status
 from freqinout.core.planner_catalog_model import PlannerModelCompiler, _MemoryStore
 from freqinout.core.schedule_configuration_cache import ConfigurationChanged
 from freqinout.core.schedule_source_inputs import ScheduleSourceError
 from freqinout.core.sqlite_utils import connect_sqlite_readonly
+
+
+def same_authoring_inputs(before, after):
+    """Proof refreshes do not edit a draft; all unknown/config fields still count.
+
+    This is presentation/action-input equivalence, never a dispatch permission.
+    The worker still rechecks the latest complete revision and RF/source state.
+    """
+    if before is None or after is None or before.absent != after.absent or before.columns != after.columns:
+        return False
+    if before.config_dir != after.config_dir:
+        return False
+    def identities(catalog):
+        return tuple(part[:-1] if isinstance(part,tuple) and len(part)==4 else part for part in catalog.revision)
+    if identities(before) != identities(after):
+        return False
+    ignored = {
+        'settings:operator_schedule_authorizations': {'fingerprint','approval_token','reviewed_utc','reason','source_evidence_json','binding_evidence_json'},
+        'settings:assigned_plans': {'validation_status_json'},
+    }
+    for table in before.tables.keys() | after.tables.keys():
+        def rows(catalog):
+            return tuple({key:value for key,value in row.items() if key not in ignored.get(table,())}
+                         for row in catalog.tables.get(table,()))
+        if rows(before) != rows(after):
+            return False
+    return True
 
 
 class PlannerCatalogWorker:
@@ -82,9 +109,9 @@ class PlannerCatalogWorker:
         self.compiler.close()
         self.reader.close()
 
-    def verify_action(self, *, expected_revision, plan_id=0, source_update=None, **kwargs):
+    def verify_action(self, *, expected_revision, plan_id=0, source_update=None, expected_catalog=None, **kwargs):
         model = self.load(force=True, **kwargs)
-        if model.catalog.revision != expected_revision:
+        if model.catalog.revision != expected_revision and not same_authoring_inputs(expected_catalog,model.catalog):
             raise ConfigurationChanged('Inputs changed since this draft was reviewed. Review current inputs, then choose the action again.')
         if source_update is not None:
             from dataclasses import replace
@@ -105,9 +132,32 @@ class PlannerCatalogWorker:
                 conn.close()
             if expected is None:
                 raise ConfigurationChanged('The selected plan no longer exists. Review current inputs before saving.')
-        if self.reader.revision() != expected_revision:
+        if self.reader.revision() != model.catalog.revision:
             raise ConfigurationChanged('Inputs changed during action verification; review and try again')
         return model, expected
+
+    def save_plan(self, payload, *, catalog, guard_context, guard_review, runtime_status, cancelled):
+        from freqinout.core.planner_guard_rules import guard_key
+
+        plan_id = int(payload.get("id") or 0)
+        model, expected = self.verify_action(
+            expected_revision=catalog.revision, expected_catalog=catalog,
+            plan_id=plan_id, guard_context=guard_context, guard_payloads=(payload,),
+            runtime_status=runtime_status,
+        )
+        if model.guard_reviews.get(guard_key(payload, *guard_context)) != guard_review:
+            raise ConfigurationChanged("RF Guard results changed. Review them before saving again.")
+        clean = {key: value for key, value in payload.items() if not key.startswith("_catalog_")}
+        store = MultiRadioStore(model.catalog.config_dir / "freqinout.db")
+        with store.configuration_save_transaction(prepared_schema=True) as transaction:
+            self._check_root()
+            if cancelled.is_set():
+                raise ConfigurationChanged("The editor changed while verifying the save. Choose Save Plan again.")
+            if self.reader.revision(install=False) != model.catalog.revision:
+                raise ConfigurationChanged("Schedule inputs changed before the save. Review current inputs and retry.")
+            result = store.save_frequency_plan(clean, expected=expected)
+            transaction.complete()
+        return result
 
 
 def only_expected_mutations(before, after, mutations):

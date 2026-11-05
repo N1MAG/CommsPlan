@@ -208,4 +208,8 @@ class PlanContextService:
             return "Runtime policy unavailable."
         if policy.operator_suppressed:
             return "Radio is suppressed from runtime participation."
+        if policy.scheduler_control == 'paused':
+            return 'Scheduling paused — operator. Use Resume for this radio.'
+        if not policy.scheduler_enabled:
+            return 'The assigned Operating Model does not allow scheduling.'
         return ""

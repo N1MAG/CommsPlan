@@ -7,6 +7,7 @@ import time
 from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from freqinout.core.logger import log
+from freqinout.core.scheduler_permission import model_allows_scheduling, permission_blocker
 from freqinout.core.multi_radio_store import (
     MultiRadioStore,
     normalize_ptt_group,
@@ -713,7 +714,8 @@ class DeviceRuntime:
         return {
             "operating_profile_name": str(operating.get("name", "") or "").strip(),
             "assignment_state": str(assignment.get("assignment_state", "") or "").strip().lower() or "unassigned",
-            "scheduler_enabled": _row_bool(operating.get("scheduler_enabled", 1), True),
+            "scheduler_enabled": model_allows_scheduling(operating),
+            "scheduler_permission_reason": permission_blocker(operating),
             "scheduler_mode": scheduler_mode,
             "use_messages": _row_bool(operating.get("use_messages", 1), True),
             "use_map": _row_bool(operating.get("use_map", 1), True),

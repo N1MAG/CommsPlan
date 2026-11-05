@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
+from uuid import uuid4
 
 from freqinout.core.multi_radio_store import (
     EFFECTIVE_ASSIGNMENT_STATES,
     MultiRadioStore,
+    _effective_assignment_for_device,
     project_runtime_active_device_to_legacy_settings_if_single_active,
 )
 from freqinout.core.multi_rig_runtime_status import (
@@ -17,6 +19,10 @@ from freqinout.core.multi_rig_runtime_status import (
     radio_shared_state_id,
 )
 from freqinout.core.shared_state import RuntimePolicy, RuntimeSelectionState, SelectionWriteError
+from freqinout.core.scheduler_permission import (
+    PERMISSION_VERSION, model_allows_scheduling, pause_state, record_pause,
+    reconcile_permission, needs_reconciliation, audit_change, pause_from_rows,
+)
 
 
 SOURCE_SETTINGS = "settings"
@@ -86,6 +92,7 @@ def _policy_from_row(row: Mapping[str, Any]) -> RuntimePolicy:
     launch_enabled = _bool(row.get("launch_enabled"), False)
     return RuntimePolicy(
         radio_profile_id=radio_shared_state_id(row.get("radio_profile_id")),
+        scheduler_control=str(row.get("scheduler_control") or "enabled"),
         scheduler_enabled=_bool(row.get("scheduler_enabled"), True),
         background_ingest_enabled=_bool(row.get("background_ingest_enabled"), True),
         messages_enabled=_bool(row.get("messages_enabled"), True),
@@ -116,19 +123,12 @@ class DurableRuntimePolicyStore:
         return dict(row) if row is not None else None
 
     def _effective_operating_row(self, conn, device_id: int) -> Dict[str, Any]:
-        placeholders = ", ".join("?" for _ in EFFECTIVE_ASSIGNMENT_STATES)
+        assignment = _effective_assignment_for_device(conn, int(device_id))
+        if not assignment:
+            return {}
         row = conn.execute(
-            f"""
-            SELECT op.*
-              FROM operating_profile_assignments a
-              JOIN operating_profiles op ON op.id=a.operating_profile_id
-             WHERE a.device_profile_id=?
-               AND a.assignment_state IN ({placeholders})
-          ORDER BY CASE a.assignment_state WHEN 'temporary_override' THEN 0 ELSE 1 END,
-                   a.id DESC
-             LIMIT 1
-            """,
-            (int(device_id), *tuple(EFFECTIVE_ASSIGNMENT_STATES)),
+            'SELECT * FROM operating_profiles WHERE id=?',
+            (int(assignment['operating_profile_id']),),
         ).fetchone()
         return dict(row) if row is not None else {}
 
@@ -136,7 +136,7 @@ class DurableRuntimePolicyStore:
         operating = self._effective_operating_row(conn, int(device_row.get("id", 0) or 0))
         launch_enabled = _bool(operating.get("use_launch_control"), False) and _bool(device_row.get("launch_enabled"), False)
         return {
-            "scheduler_enabled": 1 if _bool(operating.get("scheduler_enabled"), True) else 0,
+            "scheduler_enabled": int(model_allows_scheduling(operating)),
             "background_ingest_enabled": 1 if _bool(operating.get("use_background_ingest"), True) else 0,
             "messages_enabled": 1 if _bool(operating.get("use_messages"), True) else 0,
             "map_enabled": 1 if _bool(operating.get("use_map"), True) else 0,
@@ -156,7 +156,8 @@ class DurableRuntimePolicyStore:
             raise KeyError(f"Unknown device profile id: {device_id}")
         row = conn.execute("SELECT * FROM runtime_policies WHERE radio_profile_id=?", (int(device_id),)).fetchone()
         if row is not None:
-            return dict(row)
+            reconcile_permission(conn, device_id, self._effective_operating_row(conn, device_id), source='runtime policy')
+            return self._resolved_policy_row(conn, device_id)
         values = self._seed_policy_values(conn, device)
         now = _utc_now_iso()
         conn.execute(
@@ -164,6 +165,7 @@ class DurableRuntimePolicyStore:
             INSERT INTO runtime_policies (
                 radio_profile_id,
                 scheduler_enabled,
+                scheduler_permission_version,
                 background_ingest_enabled,
                 messages_enabled,
                 map_enabled,
@@ -172,11 +174,12 @@ class DurableRuntimePolicyStore:
                 operator_suppressed,
                 created_utc,
                 updated_utc
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(device_id),
                 values["scheduler_enabled"],
+                PERMISSION_VERSION,
                 values["background_ingest_enabled"],
                 values["messages_enabled"],
                 values["map_enabled"],
@@ -187,29 +190,73 @@ class DurableRuntimePolicyStore:
                 now,
             ),
         )
-        row = conn.execute("SELECT * FROM runtime_policies WHERE radio_profile_id=?", (int(device_id),)).fetchone()
-        return dict(row) if row is not None else {"radio_profile_id": int(device_id), **values}
+        return self._resolved_policy_row(conn, device_id)
+
+    def _resolved_policy_row(self, conn, device_id: int) -> Dict[str, Any]:
+        row = dict(conn.execute('SELECT * FROM runtime_policies WHERE radio_profile_id=?', (int(device_id),)).fetchone())
+        paused = pause_state(conn, device_id)['operator_paused']
+        row['scheduler_control'] = 'paused' if paused else 'enabled' if row['scheduler_enabled'] else 'model_prohibited'
+        row['scheduler_enabled'] = bool(row['scheduler_enabled'] and not paused)
+        return row
+
+    def _detached_policy_row(self, conn, device_id: int) -> Dict[str, Any]:
+        """A private catalogue is a projection, never a migration/save owner."""
+        device = self._device_row(conn, device_id)
+        if device is None:
+            raise KeyError(f'Unknown device profile id: {device_id}')
+        cursor = conn.execute('SELECT * FROM runtime_policies WHERE radio_profile_id=?', (device_id,))
+        row = cursor.fetchone()
+        policy = dict(row) if row is not None else {}
+        present = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='operator_schedule_authorizations'").fetchone()
+        approval = conn.execute('SELECT * FROM operator_schedule_authorizations WHERE radio_id=?', (device_id,)).fetchone() if present else None
+        paused = pause_from_rows(dict(approval) if approval is not None else {}, policy)['operator_paused']
+        allowed = model_allows_scheduling(self._effective_operating_row(conn, device_id))
+        return {**self._seed_policy_values(conn, device), **policy, 'radio_profile_id': device_id,
+                'scheduler_enabled': allowed and not paused,
+                'scheduler_control': 'paused' if paused else 'enabled' if allowed else 'model_prohibited'}
 
     def get_policy(self, radio_profile_id: str, runtime_status: Optional[MultiRigRuntimeStatus] = None) -> RuntimePolicy:
         status = self._ensure_ready(runtime_status)
         device_id = device_profile_id_from_radio_id(radio_profile_id)
         if not _runtime_ready(status):
             return RuntimePolicy(radio_profile_id=radio_shared_state_id(device_id), operator_suppressed=True)
-        with self.store.connect() as conn:
-            row = self._ensure_policy_row(conn, device_id)
-            conn.commit()
+        if getattr(self.store, 'detached_configuration', False):
+            with self.store.connect_readonly() as conn:
+                return _policy_from_row(self._detached_policy_row(conn, device_id))
+        with self.store.configuration_read_transaction():
+            with self.store.connect_readonly() as conn:
+                present = conn.execute('SELECT 1 FROM runtime_policies WHERE radio_profile_id=?', (device_id,)).fetchone()
+                if present and not needs_reconciliation(conn, device_id, self._effective_operating_row(conn, device_id)):
+                    return _policy_from_row(self._resolved_policy_row(conn, device_id))
+        with self.store.configuration_save_transaction() as transaction:
+            with self.store.connect() as conn:
+                row = self._ensure_policy_row(conn, device_id)
+            transaction.complete()
         return _policy_from_row(row)
 
     def list_policies(self, runtime_status: Optional[MultiRigRuntimeStatus] = None) -> tuple[RuntimePolicy, ...]:
         status = self._ensure_ready(runtime_status)
         if not _runtime_ready(status):
             return ()
+        if getattr(self.store, 'detached_configuration', False):
+            with self.store.connect_readonly() as conn:
+                ids = [int(row[0]) for row in conn.execute('SELECT id FROM device_profiles ORDER BY display_order ASC,id ASC')]
+                return tuple(_policy_from_row(self._detached_policy_row(conn, device_id)) for device_id in ids)
+        with self.store.configuration_read_transaction():
+            with self.store.connect_readonly() as conn:
+                ids = [int(row[0]) for row in conn.execute('SELECT id FROM device_profiles ORDER BY display_order ASC,id ASC')]
+                ready = all(conn.execute('SELECT 1 FROM runtime_policies WHERE radio_profile_id=?', (device_id,)).fetchone()
+                            and not needs_reconciliation(conn, device_id, self._effective_operating_row(conn, device_id))
+                            for device_id in ids)
+                if ready:
+                    return tuple(_policy_from_row(self._resolved_policy_row(conn, device_id)) for device_id in ids)
         policies: list[RuntimePolicy] = []
-        with self.store.connect() as conn:
-            rows = conn.execute("SELECT id FROM device_profiles ORDER BY display_order ASC, id ASC").fetchall()
-            for row in rows:
-                policies.append(_policy_from_row(self._ensure_policy_row(conn, int(row[0]))))
-            conn.commit()
+        with self.store.configuration_save_transaction() as transaction:
+            with self.store.connect() as conn:
+                rows = conn.execute("SELECT id FROM device_profiles ORDER BY display_order ASC, id ASC").fetchall()
+                for row in rows:
+                    policies.append(_policy_from_row(self._ensure_policy_row(conn, int(row[0]))))
+            transaction.complete()
         return tuple(policies)
 
     def is_radio_allowed(
@@ -247,16 +294,17 @@ class DurableRuntimePolicyStore:
         return tuple(allowed)
 
     def _set_policy_value(self, device_id: int, column: str, enabled: bool) -> RuntimePolicy:
-        with self.store.connect() as conn:
-            self._ensure_policy_row(conn, int(device_id))
-            now = _utc_now_iso()
-            conn.execute(
-                f"UPDATE runtime_policies SET {column}=?, updated_utc=? WHERE radio_profile_id=?",
-                (1 if enabled else 0, now, int(device_id)),
-            )
-            row = conn.execute("SELECT * FROM runtime_policies WHERE radio_profile_id=?", (int(device_id),)).fetchone()
-            conn.commit()
-        return _policy_from_row(dict(row))
+        with self.store.configuration_save_transaction() as transaction:
+            with self.store.connect() as conn:
+                self._ensure_policy_row(conn, int(device_id))
+                now = _utc_now_iso()
+                conn.execute(
+                    f"UPDATE runtime_policies SET {column}=?, updated_utc=? WHERE radio_profile_id=?",
+                    (1 if enabled else 0, now, int(device_id)),
+                )
+                row = self._resolved_policy_row(conn, int(device_id))
+            transaction.complete()
+        return _policy_from_row(row)
 
     def set_capability(
         self,
@@ -266,12 +314,32 @@ class DurableRuntimePolicyStore:
         *,
         source: str,
         runtime_status: Optional[MultiRigRuntimeStatus] = None,
+        expected_pause_token: str = "",
     ) -> RuntimePolicy:
         _check_source(f"set_capability({capability})", source, _POLICY_WRITE_SOURCES)
         self._ensure_ready(runtime_status, write=True)
         capability = str(capability or "").strip().lower()
         if capability not in CAPABILITIES:
             raise ValueError(f"Unknown runtime policy capability: {capability}")
+        if capability == CAPABILITY_SCHEDULER:
+            device_id = device_profile_id_from_radio_id(radio_profile_id)
+            with self.store.configuration_save_transaction() as transaction:
+                with self.store.connect() as conn:
+                    self._ensure_policy_row(conn, device_id)
+                    if not enabled:
+                        record_pause(conn, device_id, source=source)
+                    else:
+                        pause = pause_state(conn, device_id)
+                        if pause['operator_paused']:
+                            if not expected_pause_token or expected_pause_token != pause['operator_pause_token']:
+                                raise SelectionWriteError('Scheduling pause changed; refresh before Resume.')
+                            token = uuid4().hex
+                            conn.execute("UPDATE operator_schedule_authorizations SET reason='resume requested',approval_token=? WHERE radio_id=? AND reason='operator disabled' AND approval_token=?", (token, device_id, expected_pause_token))
+                            audit_change(conn, source=source, property='operator pause', old=True, new=False,
+                                         radio_id=device_id, model_id=self._effective_operating_row(conn, device_id).get('id'), correlation=token)
+                    row = self._resolved_policy_row(conn, device_id)
+                transaction.complete()
+            return _policy_from_row(row)
         return self._set_policy_value(device_profile_id_from_radio_id(radio_profile_id), _POLICY_COLUMNS[capability], bool(enabled))
 
     def set_operator_suppressed(
@@ -310,12 +378,15 @@ class DurableRuntimePolicyStore:
             return ()
         health = dict(flrig_health or {})
         candidates: list[str] = []
-        with self.store.connect() as conn:
+        policies = {policy.radio_profile_id: policy for policy in self.list_policies(runtime_status=status)}
+        with self.store.connect_readonly() as conn:
             rows = conn.execute("SELECT * FROM device_profiles ORDER BY display_order ASC, id ASC").fetchall()
             for raw in rows:
                 row = dict(raw)
                 radio_id = radio_shared_state_id(row.get("id"))
-                policy = _policy_from_row(self._ensure_policy_row(conn, int(row["id"])))
+                policy = policies.get(radio_id)
+                if policy is None:
+                    continue
                 if policy.operator_suppressed or not _bool(row.get("enabled"), True):
                     continue
                 if str(row.get("control_backend", "") or "").strip().lower() != "flrig":
@@ -325,7 +396,6 @@ class DurableRuntimePolicyStore:
                     healthy = _bool(row.get("runtime_active"), False)
                 if healthy:
                     candidates.append(radio_id)
-            conn.commit()
         return tuple(candidates)
 
 

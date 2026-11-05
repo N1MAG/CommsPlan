@@ -134,7 +134,9 @@ def save_operator_radio(store,payload):
     if not invalid_bands and 'antenna_supported_bands' in proposed:
         proposed['antenna_supported_bands'] = ', '.join(band_tokens)
     proposed['_operating_profile_id'] = int(payload.get('operating_profile_id',base.get('_operating_profile_id',0)) or 0)
-    proposed['_schedule_plan_id'] = int(payload.get('schedule_plan_id',base.get('_schedule_plan_id',0)) or 0)
+    proposed['_schedule_plan_id'] = int(base.get('_schedule_plan_id',0) or 0)
+    if int(payload.get('schedule_plan_id', proposed['_schedule_plan_id']) or 0) != proposed['_schedule_plan_id']:
+        raise ValueError('Assign or change Frequency Plans in Plan Builder after saving the radio.')
     proposed['_identity_generation'] = base.get('_identity_generation',0)
     selection = payload.get('receiver_launch')
     if selection is not None:
@@ -276,11 +278,8 @@ def save_operator_radio(store,payload):
                 conn.execute("UPDATE operating_profile_assignments SET assignment_state='superseded' WHERE device_profile_id=? AND assignment_state IN ('active','temporary_override')",(radio_id,))
         old_plan=int(base.get('_schedule_plan_id') or 0)
         plan=int(values['_schedule_plan_id'])
-        if plan != old_plan:
-            if plan:
-                store.set_assigned_plan(radio_id,plan,reason='Selected explicitly in radio setup; scheduling requires Review & enable.')
-            else:
-                conn.execute("UPDATE assigned_plans SET assignment_state='superseded' WHERE device_profile_id=? AND assignment_state IN ('active','temporary_override')",(radio_id,))
+        # Radio configuration preserves the current plan. Plan Builder owns the
+        # reviewed assignment transaction, including unassignment and swaps.
         for family,draft in drafts.items():
             request={**draft,'radio_id':radio_id,'family_key':family}
             # Other family writes in this one outer transaction increment the

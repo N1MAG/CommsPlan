@@ -37,17 +37,16 @@ REPOSITORY_ID = 1117899300
 BASELINES = {
     "2.0.4": {"commit": HISTORICAL_COMMIT, "release_id": RELEASE_ID,
               "pins": PINS, "sizes": SIZES, "product": "FreqInOut"},
-    "2.0.8.1": {
-        "commit": "e991370a24c0a8cb913ab7f5eeed319efbb0a204",
-        "release_id": 425573452, "product": "CommsPlan",
+    "2.0.9": {
+        "commit": "7cbe6b150e0426c4babee6fec2c8588363568383",
+        "release_id": 429619701, "product": "CommsPlan",
         "pins": {
-            "windows": ("CommsPlan-2.0.8.1-windows-x86_64-setup-unsigned.exe", "c46631e25687ddcdd99c6d88951ff77e5f2afe5d1e4d1ba4aa6462df9b149b38", 681849828),
-            "linux": ("CommsPlan-2.0.8.1-linux-amd64.deb", "25453d8f5971313a42b887462bf0f93ecaa23f0a1abf3cf5ea0e8312815e6b7e", 681849825),
-            "macos-arm64": ("CommsPlan-2.0.8.1-macos-arm64-unsigned.dmg", "f60c30bbe1d0d8261d6a63388d50caf44f22d8f73d4ab6236d5298c463620546", 681849833),
-            "macos-x86_64": ("CommsPlan-2.0.8.1-macos-x86_64-unsigned.dmg", "b04b02b0389090a67ca9d1f531dc511a932cc2c99a281a64521795a0cc852f34", 681849829),
+            "windows": ("CommsPlan-2.0.9-windows-x86_64-setup-unsigned.exe", "b4fe4c5d1a36234beeaaa5128d3012f6f02a929f08ec4a022fb2f019162b978e", 693893865),
+            "linux": ("CommsPlan-2.0.9-linux-amd64.deb", "97c62aafd1da343fa351477d31a2a914844e8db50635fe24ae4189013f185cf5", 693893869),
+            "macos-arm64": ("CommsPlan-2.0.9-macos-arm64-unsigned.dmg", "98ddeaae1930ef41251cae3e5d40f67742ebae25d5463fcf2e0aabef1c06cd4a", 693893864),
+            "macos-x86_64": ("CommsPlan-2.0.9-macos-x86_64-unsigned.dmg", "85a6b4460872a2f2f98888cb4b2d603c6dfc127a12f0d307781aa43277bfbbc1", 693893870),
         },
-        "sizes": {681849828: 129739388, 681849825: 292410742,
-                  681849833: 223709483, 681849829: 229832268},
+        "sizes": {693893865: 130452568, 693893869: 293182980, 693893864: 211544927, 693893870: 230579488},
     },
 }
 PROTECTED = {"freqinout.db": ("device_profiles", "js8_instances", "fast_light_configs"),

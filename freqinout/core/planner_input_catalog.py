@@ -96,11 +96,11 @@ class PlannerCatalogReader:
         if self._closed:
             raise RuntimeError("Planner catalogue reader is closed")
 
-    def revision(self) -> tuple:
+    def revision(self, *, install=True) -> tuple:
         self._check_owner()
         if self._tracker is None:
             self._tracker = ScheduleRevisionTracker(self.config_dir, allow_missing=True)
-        return self._tracker.key()
+        return self._tracker.key(install=install)
 
     def read(self, *, force: bool = False) -> PlannerInputCatalog:
         self._check_owner()

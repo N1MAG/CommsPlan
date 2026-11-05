@@ -1832,9 +1832,14 @@ class SettingsTab(QWidget):
             self._initial_settings_loaded = True
             self._initial_settings_load_pending = False
             QTimer.singleShot(0, self._maybe_backfill_js8_geo)
+            repair = getattr(self, "_pending_assignment_readiness_repair", None)
+            self._pending_assignment_readiness_repair = None
+            if repair is not None:
+                self.open_plan_assignment_repair(context=repair[0], return_context=repair[1])
             self.on_tab_activated()
         except Exception as exc:
             self._initial_settings_load_pending = False
+            self._pending_assignment_readiness_repair = None
             log.exception("SettingsTab: initial deferred settings load failed: %s", exc)
 
     # ---------- station setup overview ---------------------------------
@@ -2007,10 +2012,14 @@ class SettingsTab(QWidget):
                 return
             QTimer.singleShot(0, self.on_tab_activated)
             return
+        self._pending_assignment_readiness_repair = None
+        self._saved_readiness_activation = False
         if self.status_timer.isActive():
             self.status_timer.stop()
 
     def on_tab_activated(self) -> None:
+        saved_readiness = getattr(self, "_saved_readiness_activation", False)
+        self._saved_readiness_activation = False
         with perf_span("settings.on_tab_activated", settings=self.settings, min_ms=10.0):
             now_ts = time.time()
             if (now_ts - float(self._last_activation_refresh_ts or 0.0)) < float(
@@ -2019,7 +2028,8 @@ class SettingsTab(QWidget):
                 return
             self._last_activation_refresh_ts = now_ts
             self._reload_varac_bbs_operator_lookup()
-            self._refresh_running_status()
+            if not saved_readiness:
+                self._refresh_running_status()
 
     # ---------- UI ---------- #
 
@@ -4354,7 +4364,7 @@ class SettingsTab(QWidget):
         self.control_combo.addItems(["FLRig", "RIGCTLD", "JS8Call", "Manual"])
         top_preferences_grid.addWidget(self.control_combo, 1, 1)
         self.use_scheduler_chk = QCheckBox("Use CommsPlan Scheduler")
-        self.use_scheduler_chk.setToolTip("Scheduling enablement is reviewed per radio in Station setup.")
+        self.use_scheduler_chk.setToolTip("Scheduling permission is set on each assigned Operating Model.")
         self.use_scheduler_chk.hide()
         top_preferences_grid.addWidget(self.use_scheduler_chk, 1, 2, 1, 2)
         top_preferences_grid.addWidget(QLabel("Radio Apps Base Folder:"), 2, 0)
@@ -5323,12 +5333,20 @@ class SettingsTab(QWidget):
         radio_profile_frequency_layout.addRow("JS8 offset:", self.radio_profile_frequency_js8_offset_label)
         radio_profile_frequency_layout.addRow("Timer source:", self.radio_profile_frequency_timer_source_label)
 
-        self.radio_profile_timer_scheduler_chk = QCheckBox("Scheduler automation for this radio")
-        self.radio_profile_timer_scheduler_chk.setToolTip("Enable or disable scheduler automation for the selected radio.")
-        self.radio_profile_timer_scheduler_chk.stateChanged.connect(self._on_radio_profile_timer_policy_changed)
-        radio_profile_frequency_layout.addRow("", self.radio_profile_timer_scheduler_chk)
-        self._radio_profile_timer_policy_controls["scheduler_enabled"] = self.radio_profile_timer_scheduler_chk
-        radio_profile_frequency_layout.setRowVisible(self.radio_profile_timer_scheduler_chk,False)
+        self.radio_profile_model_scheduler_label = QLabel("Select a radio to view its assigned model permission.")
+        self.radio_profile_model_scheduler_label.setWordWrap(True)
+        self.radio_profile_model_scheduler_label.setToolTip(
+            "This permission belongs to the assigned Operating Model. Other runtime checks can still block scheduled operation."
+        )
+        self.radio_profile_edit_model_btn = QPushButton("Edit Operating Model…")
+        self.radio_profile_edit_model_btn.setAccessibleName("Edit assigned Operating Model scheduling permission")
+        self.radio_profile_edit_model_btn.clicked.connect(self._edit_selected_radio_operating_model)
+        scheduler_permission_row = QWidget()
+        scheduler_permission_layout = QHBoxLayout(scheduler_permission_row)
+        scheduler_permission_layout.setContentsMargins(0, 0, 0, 0)
+        scheduler_permission_layout.addWidget(self.radio_profile_model_scheduler_label, 1)
+        scheduler_permission_layout.addWidget(self.radio_profile_edit_model_btn)
+        radio_profile_frequency_layout.addRow("Scheduling permission:", scheduler_permission_row)
 
         def _make_radio_profile_timer_combo(items: Sequence[str], *, minimum: int) -> QComboBox:
             combo = QComboBox()
@@ -5595,6 +5613,10 @@ class SettingsTab(QWidget):
         device_actions.addWidget(self.assign_radio_schedule_btn, 2, 1)
         device_actions.addWidget(self.restore_radio_schedule_btn, 2, 2)
         device_actions.addWidget(self.delete_device_profile_btn, 2, 3)
+        self.return_to_plan_assignment_radio_btn = QPushButton("Return to assignment review")
+        self.return_to_plan_assignment_radio_btn.clicked.connect(self._return_to_plan_assignment_review)
+        self.return_to_plan_assignment_radio_btn.setVisible(False)
+        device_actions.addWidget(self.return_to_plan_assignment_radio_btn, 3, 1, 1, 3)
         device_actions.setColumnStretch(4, 1)
         radio_profile_actions_content = QWidget()
         radio_profile_actions_content.setLayout(device_actions)
@@ -5775,11 +5797,15 @@ class SettingsTab(QWidget):
         self.add_operating_profile_btn.clicked.connect(self._add_operating_profile)
         self.edit_operating_profile_btn = QPushButton("Edit Selected")
         self.edit_operating_profile_btn.clicked.connect(self._edit_operating_profile)
+        self.return_to_plan_assignment_model_btn = QPushButton("Return to assignment review")
+        self.return_to_plan_assignment_model_btn.clicked.connect(self._return_to_plan_assignment_review)
+        self.return_to_plan_assignment_model_btn.setVisible(False)
         self.delete_operating_profile_btn = QPushButton("Delete Selected")
         self.delete_operating_profile_btn.clicked.connect(self._delete_operating_profiles)
         operating_actions.addStretch()
         operating_actions.addWidget(self.add_operating_profile_btn)
         operating_actions.addWidget(self.edit_operating_profile_btn)
+        operating_actions.addWidget(self.return_to_plan_assignment_model_btn)
         operating_actions.addWidget(self.delete_operating_profile_btn)
         operating_layout.addLayout(operating_actions)
 
@@ -5789,7 +5815,7 @@ class SettingsTab(QWidget):
                 "Selected",
                 "Enabled",
                 "Model",
-                "Scheduler",
+                "Scheduling permission",
                 "CommsPlan Features",
                 "Description",
             ]
@@ -5969,7 +5995,7 @@ class SettingsTab(QWidget):
         schedule_assignments_layout = QVBoxLayout(schedule_assignments_container)
         schedule_assignments_layout.setSpacing(8)
         schedule_assignments_hint = QLabel(
-            "Assign one built Frequency Plan to a radio and review the RF Guard result. Assignment selects the active schedule; CommsPlan follows it when saved schedule, connection, PTT, and RF checks permit. Hold/Resume pauses automatic changes, and schedule gaps keep the current frequency. Restore Plan returns a temporary assignment to its prior plan; Restore Default Plan returns a radio to its default assigned plan."
+            "Review each radio's assigned Frequency Plan and RF Guard status here. Manage assignments and swaps in Plan Builder."
         )
         schedule_assignments_hint.setWordWrap(True)
         schedule_assignments_layout.addWidget(schedule_assignments_hint)
@@ -5983,21 +6009,30 @@ class SettingsTab(QWidget):
             self.schedule_assignments_guidance_status_label,
             title="Schedule Assignment",
             text=(
-                "Choose a radio and Frequency Plan, then save with RF Guard. This records the active assignment; CommsPlan follows it when saved schedule, connection, PTT, and RF checks permit. Hold/Resume pauses automatic changes, and schedule gaps keep the current frequency."
+                "This is a read-only summary. Open Plan Builder to assign or swap Frequency Plans."
             ),
             level="info",
         )
         schedule_assignments_layout.addWidget(self.schedule_assignments_guidance_card)
 
         schedule_actions = QHBoxLayout()
+        self.manage_plan_assignments_btn = QPushButton("Manage in Plan Builder")
+        self.manage_plan_assignments_btn.clicked.connect(self._open_plan_assignment_manager)
+        schedule_actions.addWidget(self.manage_plan_assignments_btn)
+        self.return_to_plan_assignment_btn = QPushButton("Return to assignment review")
+        self.return_to_plan_assignment_btn.clicked.connect(self._return_to_plan_assignment_review)
+        self.return_to_plan_assignment_btn.setVisible(False)
+        schedule_actions.addWidget(self.return_to_plan_assignment_btn)
         self.assign_schedule_btn = QPushButton("Assign with RF Guard")
         self.assign_schedule_btn.clicked.connect(self._assign_frequency_plan_to_selected_radios)
         self.swap_schedule_plans_btn = QPushButton("Swap Plans with RF Guard")
         self.swap_schedule_plans_btn.clicked.connect(self._swap_selected_schedule_assignments)
         self.refresh_schedule_assignments_btn = QPushButton("Refresh")
         self.refresh_schedule_assignments_btn.clicked.connect(self._refresh_schedule_assignments_table)
-        schedule_actions.addWidget(self.assign_schedule_btn)
-        schedule_actions.addWidget(self.swap_schedule_plans_btn)
+        # Retain legacy widget attributes for compatibility, but keep the old
+        # Configuration assignment editor out of the operator-facing UI.
+        self.assign_schedule_btn.setVisible(False)
+        self.swap_schedule_plans_btn.setVisible(False)
         schedule_actions.addWidget(self.refresh_schedule_assignments_btn)
         schedule_actions.addStretch(1)
         schedule_assignments_layout.addLayout(schedule_actions)
@@ -6046,7 +6081,6 @@ class SettingsTab(QWidget):
         editor_buttons.addWidget(self.schedule_assignment_editor_save_btn)
         editor_layout.addLayout(editor_buttons, 4, 0, 1, 6)
         self.schedule_assignment_editor_panel.setVisible(False)
-        schedule_assignments_layout.addWidget(self.schedule_assignment_editor_panel)
 
         self.schedule_assignments_table = QTableWidget(0, 7)
         self.schedule_assignments_table.setObjectName("scheduleAssignmentsTable")
@@ -6074,6 +6108,7 @@ class SettingsTab(QWidget):
         for idx in range(6):
             schedule_header.setSectionResizeMode(idx, QHeaderView.ResizeToContents)
         schedule_header.setSectionResizeMode(6, QHeaderView.Stretch)
+        self.schedule_assignments_table.setColumnHidden(0, True)
         schedule_assignments_layout.addWidget(self.schedule_assignments_table)
         schedule_assignments_group = self._make_collapsible_group(
             "Schedule Assignment",
@@ -13295,6 +13330,7 @@ class SettingsTab(QWidget):
         *,
         health_key: str | None = None,
         radio_id: int | None = None,
+        focus_radio: bool = True,
     ) -> bool:
         requested_context = str(context or "").strip().lower()
         scope = (
@@ -13312,7 +13348,7 @@ class SettingsTab(QWidget):
                 ident = int(focused.get("id") or 0) or None
                 workspace.select_context(workspace.selected_family_key(), ident, workspace.selected_task_key())
         self._settings_nav_context = "software" if scope == "software" else "main" if scope == "global" else "radios"
-        if scope != "global" and radio_id:
+        if focus_radio and scope != "global" and radio_id:
             self._set_settings_radio_focus(int(radio_id))
         if scope == "global":
             if hasattr(self, "global_settings_toggle_btn"):
@@ -13331,7 +13367,7 @@ class SettingsTab(QWidget):
         target_group = self._settings_section_group_by_health_key(target_key)
         if target_group is not None:
             self._select_settings_section_group(target_group)
-            if target_key == "radio_profiles" and radio_id:
+            if focus_radio and target_key == "radio_profiles" and radio_id:
                 self._queue_settings_callback(lambda ident=int(radio_id): self.focus_radio_profile(ident))
             return True
 
@@ -16119,8 +16155,7 @@ class SettingsTab(QWidget):
 
     def _summary_freqinout_settings(self) -> str:
         ctrl = self.control_combo.currentText().strip() if hasattr(self, "control_combo") else "FLRig"
-        scheduler = "on" if (hasattr(self, "use_scheduler_chk") and self.use_scheduler_chk.isChecked()) else "off"
-        return f"Control {ctrl}, Scheduler {scheduler}"
+        return f"Control {ctrl}"
 
     def _summary_logging_settings(self) -> str:
         log_level = self.log_level_combo.currentText().strip() if hasattr(self, "log_level_combo") else "DISABLED"
@@ -16712,7 +16747,7 @@ class SettingsTab(QWidget):
             return True
         return False
 
-    def focus_radio_profile(self, radio_id: int) -> bool:
+    def focus_radio_profile(self, radio_id: int, *, probe_launch_status: bool = True) -> bool:
         if int(radio_id or 0) <= 0 or not hasattr(self, "device_profiles_table"):
             return False
         table = self.device_profiles_table
@@ -16727,7 +16762,7 @@ class SettingsTab(QWidget):
             if item_radio_id != int(radio_id):
                 continue
             table.scrollToItem(item, QAbstractItemView.PositionAtCenter)
-            self._set_settings_radio_focus(int(radio_id))
+            self._set_settings_radio_focus(int(radio_id), probe_launch_status=probe_launch_status)
             table.setFocus(Qt.OtherFocusReason)
             return True
         return False
@@ -18131,7 +18166,6 @@ class SettingsTab(QWidget):
         data["log_level"] = (
             self.log_level_combo.currentText().strip().upper() if hasattr(self, "log_level_combo") else "DISABLED"
         )
-        data["use_scheduler"] = bool(self.use_scheduler_chk.isChecked())
         freq_mode = self.freq_enforce_combo.currentText().strip()
         fldigi_mode = self.fldigi_enforce_combo.currentText().strip()
         js8_mode = self.js8_enforce_combo.currentText().strip()
@@ -18565,7 +18599,6 @@ class SettingsTab(QWidget):
             "wefax_station_override": data.get("wefax_station_override", ""),
             "timezone": data["timezone"],
             "log_level": data.get("log_level", "DISABLED"),
-            "use_scheduler": data["use_scheduler"],
             "freq_enforcement_mode": data.get("freq_enforcement_mode", "On Schedule Change"),
             "freq_prompt_interval": data.get("freq_prompt_interval", "Hourly"),
             "fldigi_enforcement_mode": data.get("fldigi_enforcement_mode", "On Schedule Change"),
@@ -19107,7 +19140,6 @@ class SettingsTab(QWidget):
             combo.currentIndexChanged.connect(self._mark_settings_dirty)
 
         checks = [
-            self.use_scheduler_chk,
             self.js8_mark_retrieved_chk,
             self.varac_bbs_auto_archive_chk,
             self.launch_all_with_startup_chk,
@@ -20104,7 +20136,9 @@ class SettingsTab(QWidget):
             return
         self._set_settings_radio_focus(radio_id, sync_table=False)
 
-    def _set_settings_radio_focus(self, radio_id: int, *, sync_table: bool = True) -> None:
+    def _set_settings_radio_focus(
+        self, radio_id: int, *, sync_table: bool = True, probe_launch_status: bool = True,
+    ) -> None:
         radio_id = int(radio_id or 0)
         if radio_id <= 0 or not self._device_profile_by_id(radio_id):
             return
@@ -20126,7 +20160,7 @@ class SettingsTab(QWidget):
         self._refresh_radio_settings_nav_label()
         self._refresh_radio_context_labels()
         self._load_selected_launch_radio_state()
-        self._refresh_launch_control_table()
+        self._refresh_launch_control_table(probe_status=probe_launch_status)
         self._update_device_profiles_hint()
         self._refresh_multi_rig_status_card()
 
@@ -21125,9 +21159,7 @@ class SettingsTab(QWidget):
         operating = self._operating_profile_by_id(int(assignment.get("operating_profile_id", 0) or 0))
         if isinstance(operating, dict):
             scheduler_mode = self._scheduler_mode_label(operating.get("scheduler_mode", "full"))
-            scheduler = (
-                f"{'Enabled' if int(operating.get('scheduler_enabled', 1) or 0) == 1 else 'Off'} / {scheduler_mode}"
-            )
+            scheduler = f"{self._scheduler_permission_text(operating)} / {scheduler_mode}"
         elif assignment_name != "Unassigned":
             scheduler = str(assignment.get("shell_summary", "") or "Assigned plan")
         else:
@@ -21137,7 +21169,15 @@ class SettingsTab(QWidget):
         except Exception:
             offset = 0
         js8_offset = f"{offset} Hz"
-        timer_source = self._selected_radio_timer_policy_summary(profile)
+        timer_source = self._selected_radio_timer_policy_summary(
+            profile,
+            scheduler_allowed=(
+                self._scheduler_permission_value(operating)
+                if isinstance(operating, dict)
+                else None
+            ),
+            has_assigned_model=isinstance(operating, dict),
+        )
         return (
             ("schedule", schedule),
             ("scheduler", scheduler),
@@ -21146,12 +21186,25 @@ class SettingsTab(QWidget):
         )
 
     @staticmethod
-    def _selected_radio_timer_policy_summary(profile: Mapping[str, Any]) -> str:
+    def _selected_radio_timer_policy_summary(
+        profile: Mapping[str, Any],
+        *,
+        scheduler_allowed: Optional[bool] = None,
+        has_assigned_model: bool = False,
+    ) -> str:
         def _value(key: str, default: str) -> str:
             value = str(profile.get(key, default) or default).strip()
             return value or default
 
-        scheduler = "On" if int(profile.get("scheduler_enabled", 1) or 0) == 1 else "Off"
+        scheduler = (
+            "Scheduling allowed"
+            if scheduler_allowed is True
+            else "Scheduling not allowed"
+            if scheduler_allowed is False
+            else "Scheduling permission unavailable"
+            if has_assigned_model
+            else "No assigned Operating Model"
+        )
         hold_minutes = SettingsTab._radio_profile_hold_duration_minutes(profile)
         freq_mode = _value("freq_enforcement_mode", "On Schedule Change")
         fldigi_mode = _value("fldigi_enforcement_mode", "On Schedule Change")
@@ -21160,12 +21213,65 @@ class SettingsTab(QWidget):
         fldigi_prompt = _value("fldigi_prompt_interval", "Hourly")
         js8_prompt = _value("js8_prompt_interval", "Hourly")
         return (
-            f"Radio policy: scheduler {scheduler}; "
+            f"Assigned model: {scheduler}; "
             f"Hold {hold_minutes} min; "
             f"Freq {freq_mode} ({freq_prompt}); "
             f"FLDigi {fldigi_mode} ({fldigi_prompt}); "
             f"JS8 {js8_mode} ({js8_prompt})"
         )
+
+    @staticmethod
+    def _scheduler_permission_value(operating_profile: Mapping[str, Any]) -> Optional[bool]:
+        if "scheduler_enabled" not in operating_profile or operating_profile.get("scheduler_enabled") in (None, ""):
+            return None
+        from freqinout.core.scheduler_permission import model_allows_scheduling
+
+        return model_allows_scheduling(operating_profile)
+
+    @staticmethod
+    def _scheduler_permission_text(operating_profile: Optional[Mapping[str, Any]]) -> str:
+        if not isinstance(operating_profile, Mapping):
+            return "No assigned Operating Model"
+        allowed = SettingsTab._scheduler_permission_value(operating_profile)
+        if allowed is None:
+            return "Scheduling permission unavailable"
+        return "Scheduling allowed" if allowed else "Scheduling not allowed"
+
+    def _assigned_operating_model_for_radio(
+        self,
+        profile: Optional[Mapping[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(profile, Mapping):
+            return None
+        radio_id = int(profile.get("id", 0) or 0)
+        if radio_id <= 0:
+            return None
+        assignment = self._effective_assignment_map().get(radio_id, {})
+        operating_id = int(assignment.get("operating_profile_id", 0) or 0)
+        if operating_id <= 0:
+            return None
+        return self._operating_profile_by_id(operating_id)
+
+    def _effective_operating_model_consumers(self, operating_profile_id: int) -> List[Dict[str, Any]]:
+        """Resolve review names from the current assignment and radio snapshots."""
+        assignments = self._effective_assignment_map()
+        profiles = getattr(self, "device_profiles", [])
+        names = {
+            int(profile.get("id", 0) or 0): str(profile.get("name", "") or "").strip()
+            for profile in profiles
+            if isinstance(profile, dict) and int(profile.get("id", 0) or 0) > 0
+        }
+        consumers: List[Dict[str, Any]] = []
+        for radio_id, assignment in sorted(assignments.items()):
+            if int(assignment.get("operating_profile_id", 0) or 0) != int(operating_profile_id):
+                continue
+            consumers.append(
+                {
+                    "id": int(radio_id),
+                    "name": names.get(int(radio_id)) or f"Radio {int(radio_id)}",
+                }
+            )
+        return consumers
 
     def _refresh_radio_profile_frequency_timer_details(self, profile: Optional[Dict[str, Any]]) -> None:
         rows = dict(self._selected_radio_frequency_timer_rows(profile))
@@ -21207,8 +21313,19 @@ class SettingsTab(QWidget):
         has_profile = isinstance(profile, dict)
         mode_choices = ("On Schedule Change", "Prompt")
         prompt_choices = ("Hourly", "Every 5 minutes", "Every 10 minutes", "Every 15 minutes", "Every 30 minutes")
+        operating = self._assigned_operating_model_for_radio(profile)
+        scheduler_label = getattr(self, "radio_profile_model_scheduler_label", None)
+        if isinstance(scheduler_label, QLabel):
+            scheduler_label.setText(self._scheduler_permission_text(operating))
+        edit_model_btn = getattr(self, "radio_profile_edit_model_btn", None)
+        if isinstance(edit_model_btn, QPushButton):
+            edit_model_btn.setEnabled(isinstance(operating, dict))
+            edit_model_btn.setToolTip(
+                "Edit the assigned Operating Model to change its scheduling permission."
+                if isinstance(operating, dict)
+                else "Assign an Operating Model before editing its scheduling permission."
+            )
         values = {
-            "scheduler_enabled": bool(has_profile and int(profile.get("scheduler_enabled", 1) or 0) == 1),
             "schedule_hold_minutes_default": self._radio_profile_hold_duration_minutes(profile or {}),
             "freq_enforcement_mode": self._radio_profile_timer_policy_text(
                 profile or {}, "freq_enforcement_mode", "On Schedule Change", mode_choices
@@ -21227,17 +21344,6 @@ class SettingsTab(QWidget):
         }
         self._refreshing_radio_profile_timer_policy = True
         try:
-            scheduler_chk = controls.get("scheduler_enabled")
-            if isinstance(scheduler_chk, QCheckBox):
-                was_blocked = scheduler_chk.blockSignals(True)
-                scheduler_chk.setChecked(bool(values["scheduler_enabled"]))
-                scheduler_chk.blockSignals(was_blocked)
-                scheduler_chk.setEnabled(has_profile)
-                scheduler_chk.setToolTip(
-                    "Enable or disable scheduler automation for the selected radio."
-                    if has_profile
-                    else "Select a radio before changing timer behavior."
-                )
             hold_combo = controls.get("schedule_hold_minutes_default")
             if isinstance(hold_combo, QComboBox):
                 was_blocked = hold_combo.blockSignals(True)
@@ -21282,7 +21388,6 @@ class SettingsTab(QWidget):
 
     def _radio_profile_timer_policy_control_values(self) -> Dict[str, Any]:
         controls = getattr(self, "_radio_profile_timer_policy_controls", {})
-        scheduler_chk = controls.get("scheduler_enabled")
 
         def combo_text(key: str, default: str) -> str:
             combo = controls.get(key)
@@ -21307,7 +21412,6 @@ class SettingsTab(QWidget):
             return combo_text(key, "Hourly")
 
         return {
-            "scheduler_enabled": bool(scheduler_chk.isChecked()) if isinstance(scheduler_chk, QCheckBox) else False,
             "schedule_hold_minutes_default": (
                 hold_minutes if hold_minutes in SUPPORTED_HOLD_DURATION_MINUTES else DEFAULT_HOLD_DURATION_MINUTES
             ),
@@ -21335,16 +21439,35 @@ class SettingsTab(QWidget):
         self._update_device_profile_readiness_detail()
         self._publish_radio_profile_timer_policy_feedback(refreshed)
 
+    def _edit_selected_radio_operating_model(self) -> None:
+        profile = self._selected_settings_radio_profile()
+        operating = self._assigned_operating_model_for_radio(profile)
+        if not isinstance(operating, dict):
+            QMessageBox.information(
+                self,
+                "Scheduling permission",
+                "Assign an Operating Model before editing its scheduling permission.",
+            )
+            return
+        updated = self._open_operating_profile_dialog(existing=operating)
+        if updated:
+            self._persist_operating_profile(updated, expected=operating)
+
     def _publish_radio_profile_timer_policy_feedback(self, profile: Optional[Dict[str, Any]]) -> None:
         name = self._profile_display_name(profile) if isinstance(profile, dict) else "selected radio"
         radio_id = None
         if isinstance(profile, dict):
             profile_id = int(profile.get("id", 0) or 0)
             radio_id = str(profile_id) if profile_id > 0 else None
+        operating = self._assigned_operating_model_for_radio(profile)
         self._publish_settings_action_feedback(
             status="succeeded",
             summary=f"Updated timer policy for {name}.",
-            detail=self._selected_radio_timer_policy_summary(profile or {}),
+            detail=self._selected_radio_timer_policy_summary(
+                profile or {},
+                scheduler_allowed=(self._scheduler_permission_value(operating) if operating else None),
+                has_assigned_model=isinstance(operating, dict),
+            ),
             action_type="timer_policy",
             radio_profile_id=radio_id,
             target_label=name,
@@ -25806,7 +25929,7 @@ class SettingsTab(QWidget):
         if int(profile.get("receive_only", 0) or 0) == 1:
             bits.append("Receive-only")
         if int(profile.get("scheduler_enabled", 1) or 0) != 1:
-            bits.append("Scheduler Off")
+            bits.append("Scheduling not allowed")
         if int(profile.get("use_messages", 1) or 0) != 1:
             bits.append("Messages Off")
         if int(profile.get("use_map", 1) or 0) != 1:
@@ -26054,7 +26177,11 @@ class SettingsTab(QWidget):
                 name_item = QTableWidgetItem(str(profile.get("name", "") or ""))
                 name_item.setData(Qt.UserRole, profile_id)
                 table.setItem(row, 2, name_item)
-                table.setItem(row, 3, QTableWidgetItem("On" if int(profile.get("scheduler_enabled", 1) or 0) == 1 else "Off"))
+                table.setItem(
+                    row,
+                    3,
+                    QTableWidgetItem(self._scheduler_permission_text(profile)),
+                )
                 table.setItem(row, 4, QTableWidgetItem(self._operating_profile_shell_summary(profile)))
                 table.setItem(row, 5, QTableWidgetItem(str(profile.get("description", "") or "")))
         finally:
@@ -26687,25 +26814,191 @@ class SettingsTab(QWidget):
         self._refresh_fit_content_section_height(getattr(self, "schedule_assignments_section_group", None))
 
     def open_schedule_assignment_editor(self, *, plan_id: int = 0, device_profile_id: int = 0) -> bool:
-        if not hasattr(self, "schedule_assignments_table"):
+        """Compatibility route for older callers; schedule edits live in Plan Builder."""
+        opener = getattr(self.window(), "open_plan_assignment", None)
+        if not callable(opener):
             return False
-        group = getattr(self, "schedule_assignments_section_group", None)
-        if group is not None:
-            self._select_settings_section_group(group)
-        self._refresh_schedule_assignments_table(refresh_section_titles=False)
-        selected_device_id = int(device_profile_id or 0)
-        if selected_device_id <= 0:
-            selected_device_id = self._default_schedule_assignment_radio_id()
-        selected = []
-        row = self._schedule_assignment_row_for_device_id(selected_device_id)
-        if row is not None:
-            selected = [row]
-        self._show_schedule_assignment_editor(
-            selected,
-            preferred_plan_id=int(plan_id or 0),
-            preferred_device_profile_id=selected_device_id,
-        )
+        opener(device_profile_id=device_profile_id or None, frequency_plan_id=plan_id or None)
         return True
+
+    def _open_plan_assignment_manager(self) -> None:
+        device_id = plan_id = None
+        table = getattr(self, "schedule_assignments_table", None)
+        row = table.currentRow() if table is not None else -1
+        if row >= 0:
+            device_item = table.item(row, 3)
+            try:
+                device_id = int(device_item.data(Qt.UserRole) or 0) if device_item is not None else None
+            except (TypeError, ValueError):
+                device_id = None
+            if 0 <= row < len(getattr(self, "schedule_assignments", [])):
+                try:
+                    plan_id = int(self.schedule_assignments[row].get("frequency_plan_id") or 0) or None
+                except (TypeError, ValueError):
+                    plan_id = None
+        opener = getattr(self.window(), "open_plan_assignment", None)
+        if callable(opener):
+            opener(device_profile_id=device_id, frequency_plan_id=plan_id)
+
+    def open_plan_assignment_repair(
+        self,
+        *,
+        context: Mapping[str, Any],
+        return_context: Mapping[str, Any],
+    ) -> bool:
+        """Focus the requested radio repair and expose a route back to Plan Builder."""
+        if not isinstance(context, Mapping):
+            return False
+        self._plan_assignment_return_context = dict(return_context)
+        for name in (
+            "return_to_plan_assignment_btn",
+            "return_to_plan_assignment_radio_btn",
+            "return_to_plan_assignment_model_btn",
+        ):
+            button = getattr(self, name, None)
+            if button is not None:
+                button.setVisible(True)
+        section = str(context.get("health_key", context.get("settings_section", "radio_profiles")) or "radio_profiles")
+        try:
+            radio_id = int(context.get("device_profile_id", 0) or 0) or None
+        except (TypeError, ValueError):
+            radio_id = None
+        target = str(context.get("target") or "radio").strip().lower()
+        readiness = target == "readiness"
+        if readiness and getattr(self, "_initial_settings_load_pending", False):
+            self._pending_assignment_readiness_repair = (dict(context), dict(return_context))
+            return True
+        if readiness and getattr(self, "_active", False):
+            self._saved_readiness_activation = True
+        focus_options = {"probe_launch_status": False} if readiness else {}
+        if radio_id is None or not self.focus_radio_profile(radio_id, **focus_options):
+            status = getattr(self, "radio_profile_guided_task_status_label", None)
+            if status is not None:
+                status.setText(
+                    f"Radio {radio_id or 'from this review'} is not available in Configuration. Refresh the radio list, then return to the assignment review. No settings were changed."
+                )
+            return False
+        navigation_options = {"focus_radio": False} if readiness else {}
+        self.show_settings_context("radios", health_key=section, radio_id=radio_id, **navigation_options)
+        task = "advanced" if target == "rf_guard" else "review" if target == "readiness" else "radio"
+        self._select_settings_section_group(getattr(self, "radio_profile_section_group", None))
+        self._select_radio_profile_guided_task(task, scroll=False)
+        field = str(context.get("field") or "").strip()
+        field_widgets = {
+            "antenna_group": "radio_profile_advanced_antenna_edit",
+            "antenna_band_guard_mode": "radio_profile_advanced_antenna_band_mode_combo",
+            "band_overlap_guard_group": "radio_profile_advanced_band_overlap_edit",
+            "band_overlap_guard_mode": "radio_profile_advanced_band_overlap_mode_combo",
+            "advanced_frequency_guard_group": "radio_profile_advanced_frequency_group_edit",
+            "advanced_frequency_guard_mode": "radio_profile_advanced_frequency_mode_combo",
+            "advanced_frequency_guard_window_hz": "radio_profile_advanced_frequency_window_spin",
+            "ptt_group": "radio_profile_advanced_ptt_edit",
+            "frontend_group": "radio_profile_advanced_frontend_edit",
+            "amplifier_group": "radio_profile_advanced_amplifier_edit",
+        }
+        target_widget = getattr(self, field_widgets.get(field, ""), None) if field else None
+        if field == "antenna_supported_bands":
+            window = context.get("window") if isinstance(context.get("window"), Mapping) else {}
+            band = str(window.get("band") or context.get("band") or "").strip().upper()
+            target_widget = getattr(self, "radio_profile_advanced_band_checks", {}).get(band)
+        if target_widget is not None:
+            target_widget.setFocus(Qt.OtherFocusReason)
+        elif target == "rf_guard" and field:
+            status = getattr(self, "radio_profile_guided_task_status_label", None)
+            if status is not None:
+                status.setText(
+                    f"The RF Guard field '{field}' is not available in this Configuration view. Review the visible Advanced Guard fields, then return to assignment review. No setting was changed."
+                )
+        elif target == "readiness":
+            status = getattr(self, "radio_profile_guided_task_status_label", None)
+            if status is not None:
+                status.setText("Saved radio setup review is open. Use Station Health for live connection status. Return to assignment review when finished.")
+        return True
+
+    @staticmethod
+    def _operating_model_repair_lookup(model_id: object, profiles: Sequence[Mapping[str, Any]]) -> Tuple[Optional[Dict[str, Any]], str]:
+        try:
+            target_id = int(model_id or 0)
+        except (TypeError, ValueError):
+            target_id = 0
+        if target_id <= 0:
+            return None, "The Plan Builder review did not include an Operating Model ID. Select the model in Configuration to review it."
+        for profile in profiles:
+            if not isinstance(profile, Mapping):
+                continue
+            try:
+                matches = int(profile.get("id", 0) or 0) == target_id
+            except (TypeError, ValueError):
+                matches = False
+            if matches:
+                return dict(profile), ""
+        return None, f"Operating Model {target_id} is not available in Configuration. Refresh the model list, then return to the Plan Builder review."
+
+    def open_operating_model_repair(self, *, model_id: int, device_profile_id: int = 0) -> bool:
+        """Focus a reusable Operating Model without opening a blocking editor dialog."""
+        self._plan_assignment_return_context = dict(
+            getattr(self, "_plan_assignment_return_context", {}) or {}
+        )
+        self.show_settings_context(
+            "radios",
+            health_key="operating_model_assignments",
+            radio_id=int(device_profile_id or 0) or None,
+        )
+        self._select_settings_section_group(
+            getattr(self, "operating_profiles_section_group", None)
+        )
+        return_button = getattr(self, "return_to_plan_assignment_model_btn", None)
+        if return_button is not None:
+            return_button.setVisible(True)
+        target, message = self._operating_model_repair_lookup(
+            model_id,
+            getattr(self, "operating_profiles", ()),
+        )
+        if target is None or not hasattr(self, "operating_profiles_table"):
+            if not message:
+                message = "Operating Models are not available in this Configuration view. Return to the Plan Builder review."
+            if hasattr(self, "operating_profiles_guidance_card"):
+                self._set_guidance_card_state(
+                    self.operating_profiles_guidance_card,
+                    self.operating_profiles_guidance_title_label,
+                    self.operating_profiles_guidance_status_label,
+                    title="Operating Model repair unavailable",
+                    text=message,
+                    level="warning",
+                )
+            return False
+        target_id = int(target.get("id", 0) or 0)
+        found = False
+        for row in range(self.operating_profiles_table.rowCount()):
+            wrapper = self.operating_profiles_table.cellWidget(row, 0)
+            checkbox = wrapper.findChild(QCheckBox) if wrapper is not None else None
+            if checkbox is None:
+                continue
+            try:
+                matches = int(checkbox.property("operating_profile_id") or 0) == target_id
+            except (TypeError, ValueError):
+                matches = False
+            checkbox.setChecked(matches)
+            if matches:
+                self.operating_profiles_table.selectRow(row)
+                found = True
+        if not found:
+            if hasattr(self, "operating_profiles_guidance_card"):
+                self._set_guidance_card_state(
+                    self.operating_profiles_guidance_card,
+                    self.operating_profiles_guidance_title_label,
+                    self.operating_profiles_guidance_status_label,
+                    title="Operating Model repair unavailable",
+                    text=f"Operating Model {target_id} is not visible in the current model table. Refresh the model list, then return to the Plan Builder review.",
+                    level="warning",
+                )
+            return False
+        return True
+
+    def _return_to_plan_assignment_review(self) -> None:
+        opener = getattr(self.window(), "return_to_plan_assignment_review", None)
+        if callable(opener):
+            opener()
 
     def _save_schedule_assignment_editor(self) -> None:
         selected = [row for row in getattr(self, "schedule_assignment_editor_rows", []) if isinstance(row, dict)]
@@ -26970,7 +27263,7 @@ class SettingsTab(QWidget):
         else:
             self._set_schedule_assignment_guidance(
                 "Schedule Assignment",
-                "Assign built Frequency Plans to radios here. Save with RF Guard checks the selected radio and records the active schedule assignment. Hold/Resume pauses automatic changes; schedule gaps keep the current frequency.",
+                "Read-only assignment summary. Use Manage in Plan Builder to assign or swap Frequency Plans.",
                 "info",
             )
         if refresh_section_titles:
@@ -26998,7 +27291,7 @@ class SettingsTab(QWidget):
         )
         form.addRow("Description:", description_edit)
 
-        scheduler_enabled_chk = QCheckBox("Allow CP scheduling for this operating behavior")
+        scheduler_enabled_chk = QCheckBox("Allow scheduled operation for radios using this model")
         scheduler_enabled_chk.setChecked(bool((existing or {}).get("scheduler_enabled", 1)))
         form.addRow("", scheduler_enabled_chk)
 
@@ -27060,7 +27353,7 @@ class SettingsTab(QWidget):
         def _update_hint() -> None:
             disabled: List[str] = []
             if not scheduler_enabled_chk.isChecked():
-                disabled.append("scheduler automation")
+                disabled.append("scheduled operation")
             if not use_messages_chk.isChecked():
                 disabled.append("Messages")
             if not use_map_chk.isChecked():
@@ -27138,9 +27431,52 @@ class SettingsTab(QWidget):
             return None
         return out if out else None
 
-    def _persist_operating_profile(self, values: Dict[str, Any]) -> None:
+    def _persist_operating_profile(
+        self,
+        values: Dict[str, Any],
+        *,
+        expected: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        expected_consumers: Optional[List[int]] = None
+        permission_changed = False
+        if expected is not None:
+            from freqinout.core.scheduler_permission import model_allows_scheduling
+
+            proposed_model = {**dict(expected), **values}
+            permission_changed = model_allows_scheduling(expected) != model_allows_scheduling(proposed_model)
+            if permission_changed:
+                model_id = int(expected.get("id", 0) or 0)
+                consumers = self._effective_operating_model_consumers(model_id)
+                expected_consumers = sorted(int(item["id"]) for item in consumers)
+                if consumers:
+                    radio_names = "\n".join(f"• {item['name']}" for item in consumers)
+                    if model_allows_scheduling(proposed_model):
+                        effect = (
+                            "Allowing scheduling can cause valid assigned plans on these radios to follow automatically, "
+                            "unless an operator hold or pause or a live safety gate blocks the change."
+                        )
+                    else:
+                        effect = "Disabling scheduling permission stops automatic following on these radios; their assignments remain saved."
+                    answer = QMessageBox.question(
+                        self,
+                        "Review Operating Model scheduling change",
+                        f"This shared Operating Model affects:\n{radio_names}\n\n{effect}\n\nApply this change?",
+                        QMessageBox.Apply | QMessageBox.Cancel,
+                        QMessageBox.Cancel,
+                    )
+                    if answer != QMessageBox.Apply:
+                        return
         try:
-            self.multi_radio_store.save_operating_profile(values)
+            if expected is None:
+                self.multi_radio_store.save_operating_profile(values)
+            elif permission_changed:
+                self.multi_radio_store.save_operating_profile(
+                    values,
+                    expected=expected,
+                    expected_consumers=expected_consumers or [],
+                )
+            else:
+                self.multi_radio_store.save_operating_profile(values, expected=expected)
         except ValueError as exc:
             QMessageBox.warning(self, "Operating Models", str(exc))
             return
@@ -27169,7 +27505,7 @@ class SettingsTab(QWidget):
         updated = self._open_operating_profile_dialog(existing=selected[0])
         if not updated:
             return
-        self._persist_operating_profile(updated)
+        self._persist_operating_profile(updated, expected=selected[0])
 
     def _delete_operating_profiles(self) -> None:
         selected = self._selected_operating_profiles()
@@ -31432,6 +31768,8 @@ class SettingsTab(QWidget):
         return "Running"
 
     def _launch_control_status_snapshot(self) -> Dict[str, Dict[str, object]]:
+        if getattr(self, "_pending_assignment_readiness_repair", None) is not None:
+            return {}
         selected_radio_id = None
         try:
             selected_radio_id = self._selected_launch_radio_id()
@@ -31560,7 +31898,7 @@ class SettingsTab(QWidget):
         )
         self._update_launch_control_buttons()
 
-    def _refresh_launch_control_table(self) -> None:
+    def _refresh_launch_control_table(self, *, probe_status: bool = True) -> None:
         _perf_t0 = time.perf_counter()
         if not hasattr(self, "launch_control_table"):
             emit_span(
@@ -31611,7 +31949,7 @@ class SettingsTab(QWidget):
         self._launch_table_loading = True
         self.launch_control_table.blockSignals(True)
         self.launch_control_table.setRowCount(len(visible_items))
-        snapshot = self._launch_control_status_snapshot()
+        snapshot = self._launch_control_status_snapshot() if probe_status else {}
         for row, item in enumerate(visible_items):
             name = str(item.get("name", "")).strip()
             app_item = QTableWidgetItem(name)

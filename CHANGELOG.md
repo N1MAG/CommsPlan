@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.0.10]
+- Fixed: Scheduling permission stays consistent across restarts and unrelated settings saves. The status identifies the setting that blocks a radio from following its plan.
+- Changed: New Plan starts with blank source choices. Save Plan saves the plan, and the guided radio assignment flow shows each proposed change before confirmation. Existing assignments can be swapped or removed from Plan Builder.
+- Changed: RF Guard review names the affected radios, schedules, and windows. Warning and blocked badges jump to the related finding, and repair buttons open the relevant settings or source editor. Saved radio readiness is available from review. Runtime safety checks still apply.
+- Changed: All five Plan windows views appear directly above the table. Pending changes show schedule differences, and legacy plans can link to named sources after review while keeping their assignments.
+- Fixed: Daily, Net, and SOP schedule saves run in the background. Daily and Net deletion prompts work again, schedule names cannot be duplicated by new saves, and existing same-name schedules and their links are preserved.
+- Qualification: Automated source and package checks do not establish live RF performance, physical isolation, or field soak results. See the release assets for verified package availability.
+
 ## [2.0.9]
 - Added: Preview-first CHIRP, RepeaterBook, BTECH and generic CSV/TSV frequency imports with header detection, explicit column mapping, per-record selection, validation, duplicate skipping and retained programming/source details. CP catalog-exchange JSON remains separate; radio programming JSON, binary images and Excel workbooks are not supported.
 - Added: Frequency Catalog selection for new and existing Local Comms Groups, live search, multiple saved programming references, explicit catalog-change review and group-scoped Local SOP insertion. Saved SOP text remains a snapshot; no automatic radio programming or scheduling.

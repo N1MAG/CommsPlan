@@ -9,9 +9,10 @@ import subprocess
 import datetime
 import json
 import re
+from types import MethodType
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, Signal, QRegularExpression, QItemSelectionModel, QEvent
+from PySide6.QtCore import Qt, QTimer, Signal, QRegularExpression, QItemSelectionModel, QEvent, QObject, QRunnable, QThreadPool
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -37,6 +38,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QScrollArea,
     QSizePolicy,
+    QApplication,
 )
 from PySide6.QtGui import QRegularExpressionValidator, QAction, QColor
 
@@ -59,6 +61,8 @@ from freqinout.core.operating_group_frequency import (
 )
 from freqinout.core.settings_manager import SettingsManager
 from freqinout.core.resource_catalog_store import ResourceCatalogStore
+from freqinout.core.fldigi_tuning import normalize_tuning_preset, tuning_preset_json
+from freqinout.core.schedule_source_inputs import normalize_active_net_rows, read_plan_schedule_table
 from freqinout.core.schedule_source_sets import (
     LIVE_SOURCE_SET_ID,
     HF_NET_SOURCE_CATEGORY,
@@ -69,11 +73,18 @@ from freqinout.core.schedule_source_sets import (
     rename_source_schedule,
     reproject_frequency_plans_for_source_update,
     save_source_schedule,
+    resolve_source_schedule_save_target,
+    describe_duplicate_schedule_choices,
     plan_source_usage_summary,
     selected_source_set_id,
     source_set_row_by_id_for_category,
     source_sets_for_category,
 )
+from freqinout.core.named_source_save import prepare_named_schedule_save, commit_named_schedule_save
+from freqinout.core.source_save_revision import (
+    require_locked_source_save_revision, require_source_save_revision, source_save_revision,
+)
+from freqinout.gui.source_save_worker import SourceSaveWorker
 from freqinout.core.plan_context_service import PlanContextService
 from freqinout.core.software_status_service import SoftwareStatusService
 from freqinout.core.sop_manager import SOPManager
@@ -93,7 +104,276 @@ from freqinout.gui.theme import (
     font_derived_widget_height, control_height_for_font, fit_combo_box_to_contents,
 )
 
-from freqinout.core.fldigi_tuning import normalize_tuning_preset, tuning_preset_json
+
+class _NetScheduleStorageContext:
+    """Detached storage-only receiver for NetScheduleTab persistence methods."""
+    def __init__(self, settings, operating_groups):
+        self.settings = settings
+        self.operating_groups = operating_groups
+
+    def __getattr__(self, name):
+        descriptor = NetScheduleTab.__dict__.get(name)
+        if isinstance(descriptor, staticmethod):
+            return descriptor.__func__
+        if callable(descriptor):
+            return MethodType(descriptor, self)
+        raise AttributeError(name)
+
+    def _save_to_db(self, rows):
+        db_path = self._db_path()
+        conn = sqlite3.connect(db_path)
+        try:
+            tables = {str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if "net_resources" in tables:
+                return MethodType(NetScheduleTab.__dict__["_save_to_db"], self)(rows)
+            # A lazy guided editor can be opened against an older active table
+            # before the resource catalog has been bootstrapped. Persist the
+            # active schedule to whichever legacy schedule tables already exist.
+            targets = tables.intersection({"net_schedule_tab", "net_schedule"})
+            if not targets:
+                raise RuntimeError("No active HF Net schedule table is available in this profile.")
+            for table in targets:
+                conn.execute(f"DELETE FROM {table}")
+            self._insert_rows_inner(conn, rows)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+
+def _net_source_save_preflight(config_dir, rows, expected_revision=None):
+    from freqinout.core.settings_manager import SettingsManager
+    from freqinout.core.schedule_source_sets import assigned_plan_rf_guard_impacts_for_source_update
+    root = Path(config_dir)
+    revision = source_save_revision(root)
+    if expected_revision is not None and revision != expected_revision:
+        raise RuntimeError("Net schedule or SOP policy changed after conflict review. Retry Save to review conflicts again.")
+    settings = SettingsManager(runtime_worker=True)
+    try:
+        if Path(settings.config_dir) != root:
+            raise RuntimeError("The active configuration changed. Reopen the schedule before saving.")
+        impacts = assigned_plan_rf_guard_impacts_for_source_update(settings, HF_NET_SOURCE_CATEGORY, LIVE_SOURCE_SET_ID, rows)
+    finally:
+        settings.close()
+    require_source_save_revision(root, revision)
+    return revision, impacts
+
+
+def _net_priority_conflict_preflight(config_dir, rows):
+    from freqinout.core.config_paths import get_config_dir
+    from freqinout.core.settings_manager import SettingsManager
+    from freqinout.core.sop_manager import SOPManager
+    root = Path(config_dir)
+    if get_config_dir() / "config" != root:
+        raise RuntimeError("The active configuration changed. Reopen the schedule before saving.")
+    settings = SettingsManager(runtime_worker=True)
+    try:
+        if Path(settings.config_dir) != root:
+            raise RuntimeError("The active configuration changed. Reopen the schedule before saving.")
+        manager = SOPManager(root / "freqinout_nets.db", settings=settings)
+        revision = source_save_revision(root)
+        conflicts = manager.collect_active_net_sop_conflicts(horizon_days=35, net_rows_override=rows)
+        blocking = [dict(item) for item in conflicts if isinstance(item, dict) and
+                    str(item.get("resolved_policy") or "").strip().upper() != "NET_PRIORITY"]
+        require_source_save_revision(root, revision)
+        return revision, conflicts, blocking
+    finally:
+        settings.close()
+
+
+def _net_priority_policy_save_and_recheck(config_dir, rows, revision, decisions, daily_session_active):
+    from freqinout.core.settings_manager import SettingsManager
+    from freqinout.core.sop_manager import SOPManager
+    from freqinout.core.sop_session_service import SOPSessionService
+    root = Path(config_dir)
+    require_source_save_revision(root, revision)
+    settings = SettingsManager(runtime_worker=True)
+    try:
+        manager = SOPManager(root / "freqinout_nets.db", settings=settings)
+        journal = None
+        if daily_session_active:
+            service = SOPSessionService(root / "sop_hf_session_journal.json", manager)
+            saved, journal = service.save_net_policy_decisions(
+                decisions, origin="Net Schedule save-blocking conflict resolution"
+            )
+        else:
+            saved = manager.save_net_sop_conflict_policies(decisions)
+        conflicts = manager.collect_active_net_sop_conflicts(horizon_days=35, net_rows_override=rows)
+        blocking = [dict(item) for item in conflicts if isinstance(item, dict) and
+                    str(item.get("resolved_policy") or "").strip().upper() != "NET_PRIORITY"]
+        next_revision = source_save_revision(root)
+        return next_revision, conflicts, blocking, int(saved or 0), journal
+    finally:
+        settings.close()
+
+
+def _net_source_save_commit(config_dir, rows, review, operating_groups):
+    from freqinout.core.settings_manager import SettingsManager
+    from freqinout.core.schedule_source_sets import (
+        assigned_plan_rf_guard_impacts_for_source_update,
+        reproject_frequency_plans_for_source_update,
+    )
+    root = Path(config_dir)
+    revision, reviewed_impacts = review
+    if any(str(item.get("validation", {}).get("state") or "").lower() == "blocked" for item in reviewed_impacts):
+        raise ValueError("RF Guard blocked this active schedule update.")
+    require_source_save_revision(root, revision)
+    settings = SettingsManager(runtime_worker=True)
+    try:
+        current_impacts = assigned_plan_rf_guard_impacts_for_source_update(settings, HF_NET_SOURCE_CATEGORY, LIVE_SOURCE_SET_ID, rows)
+        if current_impacts != reviewed_impacts:
+            raise RuntimeError("Assigned plan or RF Guard data changed during review. Review the save again.")
+        require_source_save_revision(root, revision)
+        clean_rows = [NetScheduleTab._strip_internal_row(dict(row)) for row in rows]
+        storage = _NetScheduleStorageContext(settings, operating_groups)
+        store = MultiRadioStore(settings.db_path)
+        with store.configuration_save_transaction(prepared_schema=True) as transaction:
+            require_locked_source_save_revision(root, revision)
+            updated = reproject_frequency_plans_for_source_update(
+                settings, HF_NET_SOURCE_CATEGORY, LIVE_SOURCE_SET_ID, clean_rows, store=store,
+            )
+            with store.connect() as connection:
+                connection.execute("INSERT OR REPLACE INTO kv(key,value) VALUES(?,?)",
+                                   ("net_schedule", json.dumps(clean_rows)))
+            require_locked_source_save_revision(root, revision)
+            storage._save_to_db(clean_rows)
+            transaction.complete()
+        try:
+            loaded_rows = storage._load_from_db()
+        except Exception:
+            log.exception("HF Net was saved but its row identities could not be refreshed")
+            loaded_rows = clean_rows
+        loaded_rows = reattach_schedule_frequency_keys(loaded_rows or clean_rows, clean_rows)
+        loaded_rows = [NetScheduleTab._normalize_loaded_schedule_row(row) for row in loaded_rows if isinstance(row, dict)]
+        return loaded_rows or clean_rows, updated
+    finally:
+        settings.close()
+
+
+class _NetDestinationSignals(QObject):
+    finished = Signal(object)
+
+    def __init__(self):
+        super().__init__(QApplication.instance())
+
+
+class _NetDestinationTask(QRunnable):
+    def __init__(self, request: Dict[str, Any], loader):
+        super().__init__()
+        self.request, self.loader = request, loader
+        self.signals = _NetDestinationSignals()
+        self.signals.finished.connect(self.signals.deleteLater)
+
+    def run(self):
+        try:
+            result = self.loader(self.request)
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+        try:
+            self.signals.finished.emit({**self.request, **result})
+        except RuntimeError:
+            pass  # QApplication exited while the worker was finishing.
+
+
+class _DeferredSOPManager:
+    def __init__(self, settings: SettingsManager):
+        self._settings = settings
+        self._manager = None
+
+    def __getattr__(self, name: str):
+        if self._manager is None:
+            self._manager = SOPManager(Path(self._settings.db_path).parent / "freqinout_nets.db",
+                                       settings=SettingsManager(initialized_source=self._settings))
+        return getattr(self._manager, name)
+
+
+def _net_directory_status(rows: List[Dict[str, Any]], db_path: Path) -> Dict[str, Any]:
+    from freqinout.core.hf_net_subscription import subscription_update_status
+    from freqinout.core.resource_catalog_store import ResourceCatalogStore
+
+    notices = []
+    try:
+        store = ResourceCatalogStore(db_path)
+        for row in rows[:200]:
+            key = str(row.get("net_session_key") or "").strip()
+            if not key:
+                continue
+            status = subscription_update_status(store, row)
+            if status.state not in {"current", "unlinked"}:
+                fields = ", ".join(str(getattr(diff, "field_name", "change")) for diff in status.diffs[:4])
+                notices.append(f"{key}: {status.warning}{' Fields: ' + fields if fields else ''}")
+        if notices:
+            return {"text": "Directory review required — " + " | ".join(notices[:4]) + ". Apply changes only through normal HF Save Schedule review.",
+                    "visible": True}
+        return {"text": "", "visible": False}
+    except Exception as exc:
+        return {"text": f"Directory status unavailable: {exc}", "visible": True}
+
+
+def _read_net_plan_source(request: Dict[str, Any]) -> Dict[str, Any]:
+    source_id = str(request.get("source_id") or "").strip()
+    db_path = Path(request["db_path"])
+    catalog = [dict(row) for row in (request.get("settings") or {}).get(HF_NET_SOURCE_SETS_KEY, []) if isinstance(row, dict)]
+    primary_db = Path(request.get("primary_db_path") or db_path)
+    if primary_db.exists():
+        try:
+            conn = sqlite3.connect(f"file:{primary_db.resolve()}?mode=ro", uri=True, timeout=1.0)
+            try:
+                tables = {str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                conn.row_factory = sqlite3.Row
+                plans = conn.execute("SELECT * FROM frequency_plans").fetchall() if "frequency_plans" in tables else []
+            finally:
+                conn.close()
+            for plan in plans:
+                plan_data = dict(plan)
+                plan_id = plan_data.get("id")
+                if str(plan_data.get("category") or "").lower() != HF_NET_SOURCE_CATEGORY or str(plan_data.get("status") or "") != "saved" or not bool(plan_data.get("enabled")):
+                    continue
+                try:
+                    parsed_refs = json.loads(plan_data.get("schedule_refs_json") or "[]")
+                except (TypeError, ValueError):
+                    parsed_refs = []
+                catalog.append({"id": f"plan:{int(plan_id)}", "db_id": int(plan_id), "name": str(plan_data.get("name") or ""),
+                    "rows": [NetScheduleTab._normalize_loaded_schedule_row(dict(item)) for item in parsed_refs if isinstance(item, dict)],
+                    "created_utc": str(plan_data.get("created_utc") or ""), "updated_utc": str(plan_data.get("updated_utc") or ""), "storage": "db"})
+            target_conn = sqlite3.connect(f"file:{primary_db.resolve()}?mode=ro", uri=True, timeout=1.0)
+            try:
+                target_conn.row_factory = sqlite3.Row
+                target_tables = {str(row[0]) for row in target_conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                device_profiles = [dict(row) for row in target_conn.execute("SELECT id,name FROM device_profiles ORDER BY display_order,id").fetchall()] if "device_profiles" in target_tables else []
+                operating_profiles = [dict(row) for row in target_conn.execute("SELECT id,name FROM operating_profiles ORDER BY id").fetchall()] if "operating_profiles" in target_tables else []
+            finally:
+                target_conn.close()
+        except sqlite3.Error as exc:
+            return {"ok": False, "error": f"Cannot read the HF Net source catalog: {exc}"}
+    else:
+        device_profiles, operating_profiles = [], []
+    if source_id == LIVE_SOURCE_SET_ID:
+        active = read_plan_schedule_table(db_path, ("net_schedule_tab", "net_schedule"))
+        if active is None:
+            snapshot = request.get("settings") or {}
+            raw_rows = [dict(row) for row in snapshot.get("net_schedule", []) if isinstance(row, dict)]
+        else:
+            raw_rows = normalize_active_net_rows(*active)
+            for row in raw_rows:
+                if row["source_row_id"] > 0:
+                    row.setdefault("source_key", f"NET:{row['source_row_id']}")
+        rows = [NetScheduleTab._normalize_loaded_schedule_row(row) for row in raw_rows]
+        return {"ok": True, "rows": rows, "directory_status": _net_directory_status(rows, db_path),
+                "target_found": NetScheduleTab._plan_destination_target_row(rows, request.get("target")) is not None,
+                "catalog": catalog,
+                "device_profiles": device_profiles, "operating_profiles": operating_profiles}
+    selected = next((row for row in catalog if str(row.get("id") or "").strip() == source_id), None)
+    if selected is None:
+        return {"ok": False, "error": "The selected HF Net source is unavailable."}
+    rows = [NetScheduleTab._normalize_loaded_schedule_row(dict(item)) for item in selected.get("rows", []) if isinstance(item, dict)]
+    return {"ok": True, "rows": rows, "directory_status": _net_directory_status(rows, db_path),
+            "target_found": NetScheduleTab._plan_destination_target_row(rows, request.get("target")) is not None,
+            "catalog": catalog,
+            "device_profiles": device_profiles, "operating_profiles": operating_profiles}
+
 
 
 def _normalized_fldigi_tuning_json(value: Any, *, strict: bool = False) -> str:
@@ -363,6 +643,7 @@ from freqinout.core.net_source_identity import net_source_identity
 
 
 class NetScheduleTab(QWidget):
+    plan_destination_load_finished = Signal(object)
     schedule_saved = Signal()
     """
     Net Schedules GUI.
@@ -443,12 +724,22 @@ class NetScheduleTab(QWidget):
     RES_COL_UPDATED = 17
     RES_COL_FLDIGI_TUNING = 18
 
-    def __init__(self, parent=None, *, plan_context_service: Optional[PlanContextService] = None):
+    def __init__(self, parent=None, *, plan_context_service: Optional[PlanContextService] = None,
+                 defer_initial_load: bool = False, settings_manager: Optional[SettingsManager] = None):
         super().__init__(parent)
-        self.settings = SettingsManager()
+        self._defer_initial_load = bool(defer_initial_load)
+        self._initial_load_complete = False
+        self._destination_request = None
+        self._destination_generation = 0
+        self._destination_task = None
+        self._destination_focus_targets: Dict[str, Dict[str, Any]] = {}
+        self._plan_destination_loaded = False
+        self.settings = settings_manager if settings_manager is not None else SettingsManager()
+        self._source_save_worker = SourceSaveWorker(self)
+        self._pending_source_save = None
         self.plan_context_service = plan_context_service or PlanContextService()
         self._status_service = SoftwareStatusService(self.settings)
-        self._sop_manager = SOPManager()
+        self._sop_manager = _DeferredSOPManager(self.settings) if self._defer_initial_load else SOPManager()
         self._net_name_history: List[str] = []
         self.operating_groups: List[Dict[str, str]] = []
         self._clock_timer: QTimer | None = None
@@ -458,7 +749,8 @@ class NetScheduleTab(QWidget):
         self._raw_rows: List[Dict] = []
         self.device_profiles: List[Dict[str, Any]] = []
         self.operating_profiles: List[Dict[str, Any]] = []
-        self._refresh_schedule_target_catalogs()
+        if not self._defer_initial_load:
+            self._refresh_schedule_target_catalogs()
         self._resource_rows: List[Dict[str, Any]] = []
         self._resource_view_rows: List[Dict[str, Any]] = []
         self._dirty: bool = False
@@ -481,7 +773,9 @@ class NetScheduleTab(QWidget):
         self._net_geometry_timer.timeout.connect(self._refresh_net_geometry)
 
         self._build_ui()
-        self._load()
+        if not self._defer_initial_load:
+            self._load()
+            self._initial_load_complete = True
         self._setup_clock_timer()
         self._suppress_autostart = False
 
@@ -741,7 +1035,14 @@ class NetScheduleTab(QWidget):
         self._resize_table_columns()
         self._update_delete_button_state()
         self._update_resource_action_state()
-        self._refresh_freqplanner_source_combo()
+        if self._defer_initial_load:
+            self.schedule_source_combo.blockSignals(True)
+            self.schedule_source_combo.clear()
+            self.schedule_source_combo.addItem("Active Net Schedule", LIVE_SOURCE_SET_ID)
+            self.schedule_source_combo.blockSignals(False)
+            self._editing_freqplanner_source_id = LIVE_SOURCE_SET_ID
+        else:
+            self._refresh_freqplanner_source_combo()
         self._conflict_refresh_timer = QTimer(self)
         self._conflict_refresh_timer.setSingleShot(True)
         self._conflict_refresh_timer.setInterval(180)
@@ -907,10 +1208,24 @@ class NetScheduleTab(QWidget):
         self.schedule_source_combo.blockSignals(True)
         self.schedule_source_combo.clear()
         self.schedule_source_combo.addItem("Active Net Schedule", LIVE_SOURCE_SET_ID)
-        for row in source_sets_for_category(self.settings, HF_NET_SOURCE_SETS_KEY, HF_NET_SOURCE_CATEGORY):
+        rows = source_sets_for_category(self.settings, HF_NET_SOURCE_SETS_KEY, HF_NET_SOURCE_CATEGORY)
+        if len({str(row.get('name') or '').strip().casefold() for row in rows}) < len(rows):
+            store = self.plan_context_service.store
+            rows = describe_duplicate_schedule_choices(rows, HF_NET_SOURCE_CATEGORY,
+                store.list_frequency_plans(), store.list_effective_assigned_plans(), store.list_device_profiles())
+        for row in rows:
             set_id = str(row.get("id") or "").strip()
             if set_id:
-                self.schedule_source_combo.addItem(str(row.get("name") or set_id), set_id)
+                self.schedule_source_combo.addItem(str(row.get("choice_label") or row.get("name") or set_id), set_id)
+                index = self.schedule_source_combo.count()-1
+                self.schedule_source_combo.setItemData(index, str(row.get('name') or set_id), Qt.UserRole+1)
+                self.schedule_source_combo.setItemData(index, str(row.get('choice_tooltip') or ''), Qt.ToolTipRole)
+        if any(row.get('choice_label') for row in rows):
+            metrics = self.schedule_source_combo.fontMetrics()
+            padding = metrics.horizontalAdvance('MMMM')
+            desired = max(metrics.horizontalAdvance(str(row.get('choice_label') or row.get('name') or '')) for row in rows) + padding
+            available = self.schedule_source_combo.screen().availableGeometry().width() - padding
+            self.schedule_source_combo.view().setMinimumWidth(min(desired, available))
         idx = self.schedule_source_combo.findData(selected)
         self.schedule_source_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self._editing_freqplanner_source_id = str(self.schedule_source_combo.currentData() or LIVE_SOURCE_SET_ID)
@@ -1008,7 +1323,7 @@ class NetScheduleTab(QWidget):
             return
         if not self._confirm_discard_unsaved_source_load():
             return
-        current_name = str(self.schedule_source_combo.currentText() or "").strip()
+        current_name = self._current_freqplanner_source_name()
         current_index = self.schedule_source_combo.currentIndex()
         selected_label = (
             str(self.schedule_source_combo.itemText(current_index) or "").strip()
@@ -1138,6 +1453,9 @@ class NetScheduleTab(QWidget):
         if not hasattr(self, "schedule_source_combo"):
             return ""
         text = str(self.schedule_source_combo.currentText() or "").strip()
+        index = self.schedule_source_combo.currentIndex()
+        if index >= 0 and text == self.schedule_source_combo.itemText(index):
+            text = str(self.schedule_source_combo.itemData(index, Qt.UserRole+1) or text)
         if text == "Active Net Schedule":
             return ""
         return text
@@ -1182,7 +1500,7 @@ class NetScheduleTab(QWidget):
         years = max(1, days // 365)
         return f"{years} yr" if years == 1 else f"{years} yrs"
 
-    def _load_source_rows_into_table(self, rows: List[Dict[str, Any]]) -> None:
+    def _load_source_rows_into_table(self, rows: List[Dict[str, Any]], *, refresh_directory: bool = True) -> None:
         rows = [normalize_schedule_target_fields(dict(row)) for row in rows if isinstance(row, dict)]
         self._suspend_dirty_tracking = True
         try:
@@ -1198,7 +1516,8 @@ class NetScheduleTab(QWidget):
             self._saved_rows_signature = self._rows_signature(self._raw_rows)
             self._set_dirty(False)
             self._schedule_net_sop_conflict_refresh(force=True)
-            self._refresh_directory_subscription_status()
+            if refresh_directory:
+                self._refresh_directory_subscription_status()
         finally:
             self._suspend_dirty_tracking = False
         self._apply_schedule_table_height_hints()
@@ -1209,6 +1528,142 @@ class NetScheduleTab(QWidget):
             self._load()
             return
         self._load_source_rows_into_table([dict(item) for item in row.get("rows", []) if isinstance(item, dict)])
+
+    def request_plan_source_load(self, request_id: str, source_id: str,
+                                 target: Optional[Dict[str, Any]] = None) -> bool:
+        request_id, source_id = str(request_id or "").strip(), str(source_id or "").strip()
+        if not request_id or not source_id:
+            return False
+        if not self._confirm_discard_unsaved_source_load():
+            self.plan_destination_load_finished.emit({"request_id": request_id, "source_id": source_id,
+                "ok": False, "loaded": False, "cancelled": True, "target_found": False})
+            return False
+        self.cancel_plan_destination_load()
+        self._destination_focus_targets.clear()
+        self._destination_generation += 1
+        try:
+            settings_data = self.settings.all()
+        except Exception:
+            settings_data = {}
+        request = {"request_id": request_id, "source_id": source_id, "target": dict(target or {}),
+                   "generation": self._destination_generation, "db_path": str(self._db_path()),
+                   "primary_db_path": str(getattr(self.settings, "_config_path", None) or settings_db_path()),
+                   "settings": settings_data}
+        task = _NetDestinationTask(request, _read_net_plan_source)
+        task.signals.finished.connect(self._complete_plan_source_load)
+        self._destination_request, self._destination_task = request, task
+        self.table.setEnabled(False)
+        if hasattr(self, "schedule_source_combo"):
+            self.schedule_source_combo.setEnabled(False)
+        QThreadPool.globalInstance().start(task)
+        return True
+
+    def cancel_plan_destination_load(self, request_id: Optional[str] = None) -> bool:
+        pending = self._destination_request
+        if pending is None or (request_id is not None and str(request_id) != str(pending.get("request_id"))):
+            return False
+        self._destination_generation += 1
+        self._destination_request = self._destination_task = None
+        self.table.setEnabled(True)
+        if hasattr(self, "schedule_source_combo"):
+            self.schedule_source_combo.setEnabled(True)
+        return True
+
+    def _complete_plan_source_load(self, result: Dict[str, Any]) -> None:
+        pending = self._destination_request
+        if not pending or result.get("generation") != self._destination_generation or result.get("request_id") != pending.get("request_id"):
+            return
+        self._destination_request = self._destination_task = None
+        self.table.setEnabled(True)
+        if hasattr(self, "schedule_source_combo"):
+            self.schedule_source_combo.setEnabled(True)
+        if not result.get("ok"):
+            self.plan_destination_load_finished.emit({"request_id": result.get("request_id"), "source_id": result.get("source_id"),
+                "ok": False, "loaded": False, "target_found": False, "error": result.get("error") or "The selected HF Net source is unavailable."})
+            return
+        rows = [dict(row) for row in result.get("rows", []) if isinstance(row, dict)]
+        self._load_source_rows_into_table(rows, refresh_directory=False)
+        status = result.get("directory_status") or {"text": "", "visible": False}
+        if hasattr(self, "subscription_status_label"):
+            self.subscription_status_label.setText(str(status.get("text") or ""))
+            self.subscription_status_label.setVisible(bool(status.get("visible")))
+        self._initial_load_complete = True
+        self._plan_destination_loaded = True
+        source_id = str(result.get("source_id") or "")
+        self._editing_freqplanner_source_id = source_id
+        if hasattr(self, "schedule_source_combo"):
+            self.schedule_source_combo.blockSignals(True)
+            self.schedule_source_combo.clear()
+            self.schedule_source_combo.addItem("Active Net Schedule", LIVE_SOURCE_SET_ID)
+            catalog = [row for row in result.get("catalog", []) if isinstance(row, dict)]
+            name_counts: Dict[str, int] = {}
+            for row in catalog:
+                name = str(row.get("name") or row.get("id") or "Schedule").strip()
+                name_counts[name.casefold()] = name_counts.get(name.casefold(), 0) + 1
+            for row in catalog:
+                row_id = str(row.get("id") or "").strip()
+                if not row_id:
+                    continue
+                name = str(row.get("name") or row_id).strip()
+                label = name if name_counts.get(name.casefold(), 0) == 1 else f"{name} · {row_id}"
+                self.schedule_source_combo.addItem(label, row_id)
+                idx = self.schedule_source_combo.count() - 1
+                self.schedule_source_combo.setItemData(idx, name, Qt.UserRole + 1)
+                self.schedule_source_combo.setItemData(idx, label, Qt.ToolTipRole)
+            index = self.schedule_source_combo.findData(source_id)
+            if index >= 0:
+                self.schedule_source_combo.setCurrentIndex(index)
+            self.schedule_source_combo.blockSignals(False)
+            self._update_source_action_state()
+            source_label = str(self.schedule_source_combo.currentText() or "Active Net Schedule")
+            if hasattr(self, "source_usage_label"):
+                self.source_usage_label.setText(f"<b>Editing:</b> {source_label} | Usage: --")
+        request_id = str(result.get("request_id") or "")
+        target = dict(result.get("target") or {})
+        self._destination_focus_targets[request_id] = {"source_id": source_id, "target": target}
+        found = bool(result.get("target_found"))
+        self.plan_destination_load_finished.emit({"request_id": request_id, "source_id": source_id,
+            "ok": True, "loaded": True, "target_found": found})
+
+    @staticmethod
+    def _plan_destination_target_row(rows: List[Dict[str, Any]], target: Any) -> Optional[int]:
+        if not isinstance(target, dict):
+            return None
+        row_id, key, resource_id = (target.get("source_row_id"),
+                                    str(target.get("source_key") or "").strip(),
+                                    target.get("resource_id"))
+        if row_id in (None, "") and not key and resource_id in (None, ""):
+            return None
+        matches = []
+        for index, row in enumerate(rows):
+            try:
+                id_match = row_id in (None, "") or int(row.get("source_row_id") or 0) == int(row_id)
+            except (TypeError, ValueError):
+                id_match = False
+            try:
+                resource_match = resource_id in (None, "") or int(row.get("resource_id") or 0) == int(resource_id)
+            except (TypeError, ValueError):
+                resource_match = False
+            if id_match and resource_match and (not key or str(row.get("source_key") or "").strip() == key):
+                matches.append(index)
+        return matches[0] if len(matches) == 1 else None
+
+    def focus_plan_destination_target(self, request_id: str) -> bool:
+        record = self._destination_focus_targets.pop(str(request_id or ""), None)
+        if not record or record.get("source_id") != self._selected_freqplanner_source_id():
+            return False
+        index = self._plan_destination_target_row(self._raw_rows, record.get("target"))
+        if index is None or index >= self.table.rowCount():
+            return False
+        # This table normally suppresses row selection because checkboxes own
+        # bulk selection. A guided exact-source handoff needs a visible focus.
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.selectRow(index)
+        item = self.table.item(index, self.COL_FREQ)
+        if item is not None:
+            self.table.scrollToItem(item)
+        return True
 
     def _sync_selected_freqplanner_source_table(self) -> None:
         if bool(getattr(self, "_dirty", False)):
@@ -1266,101 +1721,317 @@ class NetScheduleTab(QWidget):
         return [self._strip_internal_row(dict(row)) for row in self._collect_rows()]
 
     def _on_save_freqplanner_source_clicked(self) -> None:
+        if self._source_save_worker.busy:
+            return
         try:
             rows = self._source_rows_for_freqplanner_snapshot()
         except ValueError as exc:
             QMessageBox.warning(self, "Invalid Net Schedule", str(exc))
             return
         if not rows:
+            QMessageBox.warning(self, "No HF Net Rows", "Add at least one HF Net row before saving this schedule.")
+            return
+        name = self._current_freqplanner_source_name().strip() or self._default_net_schedule_name()
+        selected_id = self._selected_freqplanner_source_id()
+        if getattr(self, "_plan_destination_loaded", False) and selected_id == LIVE_SOURCE_SET_ID:
+            self._begin_active_net_source_save(rows, name)
+            return
+        if hasattr(self, "schedule_source_combo") and not self._current_freqplanner_source_name().strip():
+            self.schedule_source_combo.setEditText(name)
+        self._pending_source_save = {"kind": "named", "rows": rows, "name": name, "selected_id": selected_id}
+        self._set_source_save_busy(True)
+        args = (Path(self.settings.config_dir), HF_NET_SOURCE_CATEGORY, name, selected_id, rows)
+        if not self._source_save_worker.submit(prepare_named_schedule_save, args, self._on_named_source_save_prepared):
+            self._finish_source_save_cancelled()
+
+    def _begin_active_net_source_save(self, rows: List[Dict[str, Any]], name: str = "Active Net Schedule") -> None:
+        self._pending_source_save = {"kind": "active", "rows": rows, "name": name}
+        self._set_source_save_busy(True)
+        if not self._source_save_worker.submit(
+            _net_priority_conflict_preflight,
+            (Path(self.settings.config_dir), rows),
+            self._on_net_priority_conflict_prepared,
+        ):
+            self._finish_source_save_cancelled()
+
+    def _on_net_priority_conflict_prepared(self, result, error) -> None:
+        pending = self._pending_source_save
+        if not pending:
+            return
+        if error:
+            self._finish_source_save_error("Net/SOP Check Unavailable", str(error))
+            return
+        revision, _conflicts, blocking = result
+        pending["conflict_revision"] = revision
+        if not blocking:
+            self._begin_active_net_rf_guard_review()
+            return
+
+        grouped = self._coalesce_net_sop_conflicts(blocking)
+        lines = [self._conflict_summary_line(group) for group in grouped[:10]]
+        if len(grouped) > 10:
+            lines.append(f"...and {len(grouped) - 10} more blocking conflict pair(s).")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Net/SOP Conflicts Block Save")
+        box.setText(
+            "Conflicting Net rows are blocked until overlap windows are set to Net Priority before save.\n"
+            "Saved overlap decisions are temporary for the current SOP session when an HF SOP session is active."
+        )
+        box.setInformativeText("\n".join(lines))
+        net_all = box.addButton("Set Net Priority for All", QMessageBox.AcceptRole)
+        review = box.addButton("Review Each Conflict", QMessageBox.ActionRole)
+        deactivate = box.addButton("Deactivate Active HF SOPs", QMessageBox.DestructiveRole)
+        box.addButton("Cancel Save", QMessageBox.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is deactivate:
+            self._deactivate_active_hf_sops()
+            self._finish_source_save_cancelled()
+            QMessageBox.information(self, "Retry Save", "HF SOP deactivation is a separate operation. Review the schedule and retry Save after it completes.")
+            return
+        if clicked is net_all:
+            decisions = self._build_net_sop_policy_decisions(blocking, "NET_PRIORITY")
+        elif clicked is review:
+            decisions = self._review_each_net_sop_conflict(blocking, allow_sop_priority=False)
+        else:
+            self._finish_source_save_cancelled()
+            return
+        if not decisions:
+            self._finish_source_save_cancelled()
+            return
+        win = self.window()
+        daily_session_active = (getattr(win, "daily_tab", None) is not None
+                                or getattr(win, "hf_schedule_tab", None) is not None)
+        args = (Path(self.settings.config_dir), pending["rows"], revision, decisions, daily_session_active)
+        if not self._source_save_worker.submit(_net_priority_policy_save_and_recheck, args, self._on_net_priority_policy_saved):
+            self._finish_source_save_error("Net/SOP Check Failed", "Could not queue the Net Priority policy update.")
+
+    def _on_net_priority_policy_saved(self, result, error) -> None:
+        pending = self._pending_source_save
+        if not pending:
+            return
+        if error:
+            self._finish_source_save_error("Net/SOP Check Failed", str(error))
+            return
+        revision, _conflicts, blocking, saved, journal = result
+        pending["conflict_revision"] = revision
+        if blocking:
+            grouped = self._coalesce_net_sop_conflicts(blocking)
+            lines = [self._conflict_summary_line(group) for group in grouped[:10]]
             QMessageBox.warning(
                 self,
-                "No HF Net Rows",
-                "Add at least one HF Net row before saving this schedule.",
+                "Net Priority Required",
+                f"{len(blocking)} conflicting Net row window(s) remain unresolved. No schedule was saved.\n\n" + "\n".join(lines),
             )
+            self._finish_source_save_cancelled()
             return
-        selected = self._selected_freqplanner_source_row()
-        existing_id = int(selected.get("db_id", 0) or 0) if selected else 0
-        name = self._current_freqplanner_source_name()
-        if not name:
-            name = self._default_net_schedule_name()
-            if hasattr(self, "schedule_source_combo"):
-                self.schedule_source_combo.setEditText(name)
-        if selected:
-            selected_name = str(selected.get("name") or "").strip()
-            existing_rows_signature = self._rows_signature([dict(item) for item in selected.get("rows", []) if isinstance(item, dict)])
-            new_rows_signature = self._rows_signature(rows)
-            if name and selected_name and name != selected_name and existing_rows_signature == new_rows_signature:
-                QMessageBox.information(
-                    self,
-                    "Rename Schedule",
-                    "Use Rename Schedule to change the HF Net schedule name without updating row data.",
-                )
-                return
-        if not selected:
-            existing_id = 0
-        if existing_id and not self._confirm_rf_guard_source_update(
-            HF_NET_SOURCE_CATEGORY,
-            f"plan:{existing_id}",
-            rows,
-            name,
+        if saved:
+            self._notify_sop_data_changed()
+        if journal:
+            win = self.window()
+            daily = getattr(win, "daily_tab", None) or getattr(win, "hf_schedule_tab", None)
+            if daily is not None:
+                daily._sop_session_journal_cache = journal
+        self._begin_active_net_rf_guard_review()
+
+    def _begin_active_net_rf_guard_review(self) -> None:
+        pending = self._pending_source_save
+        if not pending:
+            return
+        if not self._source_save_worker.submit(
+            _net_source_save_preflight,
+            (Path(self.settings.config_dir), pending["rows"], pending.get("conflict_revision")),
+            self._on_active_source_save_prepared,
         ):
+            self._finish_source_save_error("Save Failed", "Could not queue RF Guard review.")
+
+    def _set_source_save_busy(self, busy: bool) -> None:
+        save_button = getattr(self, "save_source_btn", None)
+        if busy:
+            self._save_busy_control_states = []
+            if save_button is not None:
+                self._source_save_button_text = save_button.text()
+                save_button.setText("Checking and saving…")
+        elif save_button is not None and hasattr(self, "_source_save_button_text"):
+            save_button.setText(self._source_save_button_text)
+            del self._source_save_button_text
+        names = (
+            "save_source_btn", "save_btn", "new_source_btn", "rename_source_btn", "delete_source_btn",
+            "add_btn", "add_hf_net_btn", "del_btn", "move_to_resources_btn", "time_toggle_btn",
+            "_plan_assignment_return_btn",
+        )
+        for name in names:
+            button = getattr(self, name, None)
+            if button is not None:
+                if busy:
+                    self._save_busy_control_states.append((button, button.isEnabled()))
+                    button.setEnabled(False)
+        if not busy:
+            for button, was_enabled in getattr(self, "_save_busy_control_states", []):
+                try:
+                    button.setEnabled(was_enabled)
+                except RuntimeError:
+                    pass
+            self._save_busy_control_states = []
+        for name in ("table", "schedule_source_combo"):
+            control = getattr(self, name, None)
+            if control is not None:
+                control.setEnabled(not busy)
+
+    def _on_named_source_save_prepared(self, result, error) -> None:
+        pending = self._pending_source_save
+        if not pending:
             return
-        try:
-            saved = save_source_schedule(
-                self.settings,
-                HF_NET_SOURCE_CATEGORY,
-                SELECTED_HF_NET_SOURCE_SET_KEY,
-                name,
-                rows,
-                existing_plan_id=existing_id or None,
-            )
-        except Exception as exc:
-            QMessageBox.critical(self, "Save Failed", f"Could not save HF Net schedule:\n{exc}")
+        if error:
+            self._finish_source_save_error("Schedule Review Failed", str(error))
             return
-        updated_plans: List[Dict[str, Any]] = []
-        saved_id = str(saved.get("id") or "").strip()
-        if saved_id:
+        revision, target, impacts = result
+        if target is not None and str(pending["selected_id"] or "") != str(target.get("id") or ""):
+            box = QMessageBox(QMessageBox.Question, "Update Existing Schedule",
+                f"A schedule named '{target['name']}' already exists. Update its rows with the rows shown here? Its identity and plan links will be kept. RF Guard will check affected plans before saving.",
+                QMessageBox.Cancel, self)
+            update_button = box.addButton("Update Existing Schedule", QMessageBox.AcceptRole)
+            box.setDefaultButton(QMessageBox.Cancel)
+            box.exec()
+            if box.clickedButton() is not update_button:
+                self._finish_source_save_cancelled()
+                return
+        if target:
+            old_name = str(target.get("name") or "").strip()
+            old_sig = self._rows_signature([dict(row) for row in target.get("rows", []) if isinstance(row, dict)])
+            if old_name.casefold() != pending["name"].casefold() and old_sig == self._rows_signature(pending["rows"]):
+                self._finish_source_save_cancelled()
+                QMessageBox.information(self, "Rename Schedule", "Use Rename Schedule to change the HF Net schedule name without updating row data.")
+                return
+            if not self._confirm_rf_guard_impacts(impacts, pending["name"]):
+                self._finish_source_save_cancelled()
+                return
+        review = (revision, target, impacts)
+        args = (Path(self.settings.config_dir), HF_NET_SOURCE_CATEGORY, SELECTED_HF_NET_SOURCE_SET_KEY, pending["name"], pending["rows"], review)
+        if not self._source_save_worker.submit(commit_named_schedule_save, args, self._on_named_source_save_committed):
+            self._finish_source_save_error("Save Failed", "A schedule save is already in progress.")
+
+    def _on_active_source_save_prepared(self, result, error) -> None:
+        pending = self._pending_source_save
+        if not pending:
+            return
+        if error:
+            self._finish_source_save_error("RF Guard Check Unavailable", str(error))
+            return
+        review = result
+        if not self._confirm_rf_guard_impacts(review[1], pending.get("name", "Active Net Schedule")):
+            self._finish_source_save_cancelled()
+            return
+        pending["review"] = review
+        args = (Path(self.settings.config_dir), pending["rows"], review, [dict(row) for row in self.operating_groups])
+        if not self._source_save_worker.submit(_net_source_save_commit, args, self._on_active_source_save_committed):
+            self._finish_source_save_error("Save Failed", "A schedule save is already in progress.")
+
+    def _confirm_rf_guard_impacts(self, impacts: List[Dict[str, Any]], name: str) -> bool:
+        lines = []
+        blocked = False
+        for impact in impacts:
+            validation = impact.get("validation", {})
+            blocked = blocked or str(validation.get("state") or "").lower() == "blocked"
+            plan, device = impact.get("plan", {}), impact.get("device", {})
+            radio = str(device.get("name") or f"Radio {impact.get('assignment', {}).get('device_profile_id')}")
+            plan_name = str(plan.get("name") or "assigned Frequency Plan")
+            messages = [str(value) for value in validation.get("messages", []) if str(value or "").strip()]
+            lines.append(f"- {radio} / {plan_name}: {messages[0] if messages else 'RF Guard reported a schedule conflict.'}")
+        body = f"Updating '{name}' affects one or more master schedules assigned to radios.\n\n" + "\n".join(lines[:6])
+        if len(lines) > 6:
+            body += f"\n- +{len(lines) - 6} more"
+        if blocked:
+            QMessageBox.warning(self, "RF Guard Blocked Update", body + "\n\nFix the conflict before saving this update.")
+            return False
+        if not impacts:
+            return True
+        return QMessageBox.question(self, "RF Guard Warning", body + "\n\nSave this HF Net schedule update anyway?", QMessageBox.Save | QMessageBox.Cancel, QMessageBox.Cancel) == QMessageBox.Save
+
+    def _on_named_source_save_committed(self, result, error) -> None:
+        if error:
+            self._finish_source_save_error("Save Failed", f"Could not save HF Net schedule:\n{error}")
+            return
+        saved, updated, warning = result
+        pending = self._pending_source_save
+        if pending is None:
+            return
+        rows = pending["rows"]
+        self._set_source_save_busy(False)
+        saved_id = str(saved.get("id") or "")
+        if hasattr(self, "schedule_source_combo") and saved_id:
+            idx = self.schedule_source_combo.findData(saved_id)
+            if idx < 0:
+                self.schedule_source_combo.addItem(str(saved.get("name") or "Schedule"), saved_id)
+                idx = self.schedule_source_combo.count() - 1
+            self.schedule_source_combo.blockSignals(True)
+            self.schedule_source_combo.setCurrentIndex(idx)
+            self.schedule_source_combo.blockSignals(False)
+            self._editing_freqplanner_source_id = saved_id
+            self._update_source_action_state()
+            if hasattr(self, "source_usage_label"):
+                self.source_usage_label.setText(f"<b>Editing:</b> {self.schedule_source_combo.currentText()} | Usage: --")
+        self._load_source_rows_into_table(rows, refresh_directory=False)
+        self._pending_source_save = None
+        self._complete_source_save_notification(saved, rows, updated, warning)
+
+    def _on_active_source_save_committed(self, result, error) -> None:
+        if error:
+            self._finish_source_save_error("Save Failed", f"Could not save active HF Net schedule:\n{error}")
+            return
+        rows, updated = result
+        pending = self._pending_source_save
+        if pending is None:
+            return
+        self._set_source_save_busy(False)
+        self.settings._data["net_schedule"] = [dict(row) for row in rows]
+        if pending.get("origin") == "active_editor":
+            self._suspend_dirty_tracking = True
             try:
-                updated_plans = reproject_frequency_plans_for_source_update(
-                    self.settings,
-                    HF_NET_SOURCE_CATEGORY,
-                    saved_id,
-                    rows,
-                )
-            except Exception as exc:
-                log.exception("HF Nets: failed refreshing dependent Frequency Plans.")
-                QMessageBox.warning(
-                    self,
-                    "Plan Refresh Warning",
-                    "The HF Net schedule was saved, but CommsPlan could not refresh dependent Frequency Plans.\n\n"
-                    f"{exc}",
-                )
+                self.table.setRowCount(0)
+                self._raw_rows = [dict(row) for row in rows]
+                for row in self._raw_rows:
+                    self._add_row(self._to_view_row(row))
+                self._net_name_history = sorted({str(row.get("net_name") or "") for row in rows if row.get("net_name")})
+                self._saved_rows_signature = self._rows_signature(self._raw_rows)
+                self._set_dirty(False)
+                self._update_clock_labels()
+                self._resize_table_columns()
+            finally:
+                self._suspend_dirty_tracking = False
+            self._pending_source_save = None
+            self._complete_source_save_notification({"name": pending.get("name", "Active Net Schedule")}, rows, updated, "", active=True)
+            return
+        self._load_source_rows_into_table(rows, refresh_directory=False)
+        self._pending_source_save = None
+        self._complete_source_save_notification({"name": pending.get("name", "Active Net Schedule")}, rows, updated, "", active=True)
+
+    def _complete_source_save_notification(self, saved, rows, updated, warning, *, active=False) -> None:
         try:
             self.plan_context_service.invalidate()
         except Exception:
             pass
-        if hasattr(self, "schedule_source_combo"):
-            self._refresh_freqplanner_source_combo()
-            if saved_id:
-                idx = self.schedule_source_combo.findData(saved_id)
-                if idx >= 0:
-                    self.schedule_source_combo.blockSignals(True)
-                    self.schedule_source_combo.setCurrentIndex(idx)
-                    self.schedule_source_combo.blockSignals(False)
-                    self._editing_freqplanner_source_id = saved_id
-        if hasattr(self, "table"):
-            try:
-                self._load_source_rows_into_table(rows)
-            except Exception:
-                pass
+        if active:
+            self._refresh_net_sop_conflict_after_schedule_change()
+        self.schedule_saved.emit()
         self._refresh_freq_planner()
-        verb = "Updated" if existing_id else "Saved"
-        plan_note = f" Refreshed {len(updated_plans)} dependent Frequency Plan(s)." if updated_plans else ""
-        QMessageBox.information(
-            self,
-            f"HF Net Schedule {verb}",
-            f"{verb} '{saved['name']}' with {len(rows)} HF Net row(s).{plan_note} Select it in Plan Builder.",
-        )
+        plan_note = f" Refreshed {len(updated or [])} dependent Frequency Plan(s)." if updated else ""
+        title = "Active HF Net Schedule Saved" if active else "HF Net Schedule Saved"
+        QMessageBox.information(self, title, f"Saved '{saved.get('name')}' with {len(rows)} HF Net row(s).{plan_note}{warning or ''}")
+
+    def _finish_source_save_error(self, title: str, message: str) -> None:
+        self._pending_source_save = None
+        self._set_source_save_busy(False)
+        QMessageBox.warning(self, title, message)
+
+    def _finish_source_save_cancelled(self) -> None:
+        self._pending_source_save = None
+        self._set_source_save_busy(False)
+
+    def _refresh_net_sop_conflict_after_schedule_change(self) -> None:
+        self._bump_net_sop_conflict_scan_epoch()
+        self._schedule_net_sop_conflict_refresh(force=True)
 
     def _on_rename_freqplanner_source_clicked(self) -> None:
         row = self._selected_freqplanner_source_row()
@@ -1446,16 +2117,23 @@ class NetScheduleTab(QWidget):
     def _on_delete_freqplanner_source_clicked(self) -> None:
         row = self._selected_freqplanner_source_row()
         if row is None:
+            QMessageBox.information(
+                self, "Schedule Unavailable",
+                "Select a saved HF Net schedule again, then choose Delete Schedule. No schedule was deleted.",
+            )
             return
         name = str(row.get("name") or "selected HF Net schedule")
-        response = QMessageBox.question(
-            self,
+        confirmation = QMessageBox(
+            QMessageBox.Warning,
             "Delete HF Net Schedule",
             f"Delete '{name}'? This removes the named schedule but does not change the live HF Net schedule.",
-            QMessageBox.Delete | QMessageBox.Cancel,
             QMessageBox.Cancel,
+            self,
         )
-        if response != QMessageBox.Delete:
+        delete_button = confirmation.addButton("Delete Schedule", QMessageBox.DestructiveRole)
+        confirmation.setDefaultButton(QMessageBox.Cancel)
+        confirmation.exec()
+        if confirmation.clickedButton() is not delete_button:
             return
         try:
             delete_source_schedule(
@@ -1764,6 +2442,12 @@ class NetScheduleTab(QWidget):
         self._schedule_net_sop_conflict_refresh(force=True)
 
     def on_tab_activated(self) -> None:
+        if self._destination_request is not None:
+            return
+        if self._plan_destination_loaded:
+            return
+        if self._defer_initial_load and not self._initial_load_complete:
+            return
         with perf_span(
             "net_schedule.on_tab_activated",
             settings=self.settings,
@@ -3714,6 +4398,8 @@ class NetScheduleTab(QWidget):
             self._suspend_dirty_tracking = False
 
     def _save(self):
+        if self._source_save_worker.busy:
+            return
         try:
             rows = self._collect_rows()
         except ValueError as e:
@@ -3721,36 +4407,9 @@ class NetScheduleTab(QWidget):
             return
         clean_rows = [self._strip_internal_row(r) for r in rows]
         self._raw_rows = rows
-        if not self._enforce_net_priority_for_conflicts(rows):
-            self._schedule_net_sop_conflict_refresh(force=True)
-            return
-
-        # Save to JSON config
-        self.settings.set("net_schedule", clean_rows)
-        self.settings.save()
-        log.info("Net schedule saved to config: %d entries", len(clean_rows))
-
-        # Also mirror to SQLite DB (new table plus legacy table)
-        try:
-            self._save_to_db(clean_rows)
-        except Exception as e:
-            log.error("Failed to save net schedule to DB: %s", e)
-            QMessageBox.warning(
-                self,
-                "DB Save Error",
-                f"Net schedule saved to config.json, but DB save failed:\n{e}",
-            )
-            return
-        self._bump_net_sop_conflict_scan_epoch()
-
-        try:
-            self.schedule_saved.emit()
-        except Exception:
-            pass
-
-        self._load()
-        self._schedule_net_sop_conflict_refresh(force=True)
-        QMessageBox.information(self, "Saved", "Net Schedule saved.")
+        self._begin_active_net_source_save(clean_rows)
+        if self._pending_source_save is not None:
+            self._pending_source_save["origin"] = "active_editor"
 
     @staticmethod
     def _format_conflict_span(start_utc: Any, end_utc: Any) -> str:
@@ -4406,15 +5065,17 @@ class NetScheduleTab(QWidget):
                 values.append(_normalized_fldigi_tuning_json(normalized.get("fldigi_tuning_json", "{}"), strict=True))
             new_fields = [field for field in fields if field in new_columns]
             new_values = [value for field, value in zip(fields, values) if field in new_columns]
-            marks = ", ".join("?" for _ in new_fields)
-            conn.execute(f"INSERT INTO net_schedule_tab ({', '.join(new_fields)}) VALUES ({marks})", tuple(new_values))
+            if new_fields:
+                marks = ", ".join("?" for _ in new_fields)
+                conn.execute(f"INSERT INTO net_schedule_tab ({', '.join(new_fields)}) VALUES ({marks})", tuple(new_values))
             legacy_fields = [field for field in fields if field in legacy_columns and field not in {"vfo", "resource_id"}]
             legacy_values = [value for field, value in zip(fields, values) if field in legacy_columns and field not in {"vfo", "resource_id"}]
             if "fldigi_tuning_json" in legacy_columns and "fldigi_tuning_json" not in legacy_fields:
                 legacy_fields.append("fldigi_tuning_json")
                 legacy_values.append(_normalized_fldigi_tuning_json(normalized.get("fldigi_tuning_json", "{}"), strict=True))
-            marks = ", ".join("?" for _ in legacy_fields)
-            conn.execute(f"INSERT INTO net_schedule ({', '.join(legacy_fields)}) VALUES ({marks})", tuple(legacy_values))
+            if legacy_fields:
+                marks = ", ".join("?" for _ in legacy_fields)
+                conn.execute(f"INSERT INTO net_schedule ({', '.join(legacy_fields)}) VALUES ({marks})", tuple(legacy_values))
         return
 
     # --------- Net resources --------- #

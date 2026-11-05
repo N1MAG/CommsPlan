@@ -205,6 +205,8 @@ class OperatorRadioEditor(QDialog):
         self._status_before_busy = "Ready to review"
         self._selected_operating_profile_id: Any = None
         self._selected_schedule_plan_id: Any = None
+        self._plan_assignment_route_after_close = False
+        self._plan_assignment_route_radio_id: int | None = None
         self._nested_dialogs: list[_ApplicationPage] = []
         self._unfinished_envelope: dict[str, Any] | None = None
         self._conflict_review_context: dict[str, Any] | None = None
@@ -267,6 +269,13 @@ class OperatorRadioEditor(QDialog):
         message = result.get("message") if isinstance(result, Mapping) else getattr(result, "message", None)
         draft_revision = result.get("draft_revision") if isinstance(result, Mapping) else getattr(result, "draft_revision", None)
         issues = result.get("issues") if isinstance(result, Mapping) else getattr(result, "issues", ())
+        if self._plan_assignment_route_after_close and isinstance(result, Mapping):
+            saved_profile = result.get("profile")
+            if isinstance(saved_profile, Mapping):
+                try:
+                    self._plan_assignment_route_radio_id = int(saved_profile.get("id") or 0) or None
+                except (TypeError, ValueError):
+                    self._plan_assignment_route_radio_id = None
         if draft_revision is not None:
             self._operator_draft_revision = draft_revision
         previous_warning = getattr(self, "_save_failure_box", None)
@@ -397,21 +406,14 @@ class OperatorRadioEditor(QDialog):
 
     def _repopulate_selection_combos(self) -> None:
         operating_id = _first(self._values, "_operating_profile_id", "operating_profile_id", "operating_model_id")
-        schedule_id = _first(self._values, "_schedule_plan_id", "schedule_plan_id", "sop_schedule_plan_id")
         self.operating_profile_combo.blockSignals(True)
         self.operating_profile_combo.clear()
         self.operating_profile_combo.addItem("No operating model selected", None)
         for row in self._operating_profiles:
             self.operating_profile_combo.addItem(_row_label(row, "Unnamed operating model"), _row_id(row))
         self.operating_profile_combo.blockSignals(False)
-        self.schedule_plan_combo.blockSignals(True)
-        self.schedule_plan_combo.clear()
-        self.schedule_plan_combo.addItem("No schedule plan selected", None)
-        for row in self._schedule_plans:
-            self.schedule_plan_combo.addItem(_row_label(row, "Unnamed schedule plan"), _row_id(row))
-        self.schedule_plan_combo.blockSignals(False)
         self._select_combo(self.operating_profile_combo, operating_id)
-        self._select_combo(self.schedule_plan_combo, schedule_id)
+        self._refresh_schedule_plan_summary()
 
     def set_unfinished(self, envelope: Mapping[str, Any] | None) -> None:
         self._unfinished_envelope = deepcopy(dict(envelope or {})) if envelope else None
@@ -1153,20 +1155,83 @@ class OperatorRadioEditor(QDialog):
 
     def _build_schedule_tab(self) -> None:
         _content, layout = self._scroll_page("Schedule")
-        form = QFormLayout()
-        form.setRowWrapPolicy(QFormLayout.WrapLongRows)
-        self.schedule_plan_combo = QComboBox()
-        self.schedule_plan_combo.setObjectName("operatorRadioSchedulePlan")
-        self.schedule_plan_combo.addItem("No schedule plan selected", None)
-        for row in self._schedule_plans:
-            self.schedule_plan_combo.addItem(_row_label(row, "Unnamed schedule plan"), _row_id(row))
-        self.schedule_plan_combo.currentIndexChanged.connect(self._schedule_plan_changed)
-        form.addRow("Schedule plan", self.schedule_plan_combo)
-        layout.addLayout(form)
-        hint = QLabel("Select the schedule plan this radio should follow. Assignment is published with the saved radio configuration.")
+        self.schedule_plan_summary_label = QLabel()
+        self.schedule_plan_summary_label.setObjectName("operatorRadioAssignedPlanSummary")
+        self.schedule_plan_summary_label.setWordWrap(True)
+        layout.addWidget(self.schedule_plan_summary_label)
+        self.schedule_plan_manage_btn = QPushButton("Manage in Plan Builder")
+        self.schedule_plan_manage_btn.setObjectName("operatorRadioManagePlanBuilder")
+        self.schedule_plan_manage_btn.clicked.connect(self._request_plan_assignment)
+        layout.addWidget(self.schedule_plan_manage_btn)
+        hint = QLabel(
+            "Radio setup does not assign Frequency Plans. Save a new radio first, then manage its plan in Plan Builder."
+        )
         hint.setWordWrap(True)
         layout.addWidget(hint)
         layout.addStretch(1)
+
+    def _refresh_schedule_plan_summary(self) -> None:
+        if not hasattr(self, "schedule_plan_summary_label"):
+            return
+        try:
+            plan_id = int(self._selected_schedule_plan_id or 0)
+        except (TypeError, ValueError):
+            plan_id = 0
+        plan = next(
+            (row for row in self._schedule_plans if _row_id(row) == plan_id),
+            None,
+        ) if plan_id > 0 else None
+        if plan_id <= 0:
+            plan_name = "No Frequency Plan assigned"
+        elif plan is None:
+            plan_name = f"Unavailable plan (ID {plan_id})"
+        else:
+            plan_name = _row_label(plan, f"Plan {plan_id}")
+        self.schedule_plan_summary_label.setText(f"Assigned Frequency Plan: {plan_name}")
+        if self._profile_radio_id() in (None, ""):
+            self.schedule_plan_manage_btn.setText("Save radio, then Assign in Plan Builder")
+            self.schedule_plan_manage_btn.setToolTip(
+                "Save this radio first. Radio setup does not create a plan assignment."
+            )
+        else:
+            self.schedule_plan_manage_btn.setText("Manage in Plan Builder")
+            self.schedule_plan_manage_btn.setToolTip(
+                "Open Plan Builder to assign, swap, or remove this radio's Frequency Plan."
+            )
+
+    def _request_plan_assignment(self) -> None:
+        if self._busy:
+            return
+        if self._profile_radio_id() in (None, ""):
+            self._plan_assignment_route_after_close = True
+            self._emit_save()
+            return
+        if not self._dirty:
+            self._plan_assignment_route_after_close = True
+            self.cancelled.emit()
+            self._allow_close = True
+            self.reject()
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("Continue to Plan Builder?")
+        box.setText("This radio has unsaved changes.")
+        box.setInformativeText(
+            "Save or explicitly discard these entries before leaving radio setup."
+        )
+        save = box.addButton("Save changes and open Plan Builder", QMessageBox.ButtonRole.AcceptRole)
+        discard = box.addButton("Discard changes and open Plan Builder", QMessageBox.ButtonRole.DestructiveRole)
+        keep = box.addButton("Keep editing", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(keep)
+        box.exec()
+        if box.clickedButton() is save:
+            self._plan_assignment_route_after_close = True
+            self._emit_save()
+        elif box.clickedButton() is discard:
+            self._plan_assignment_route_after_close = True
+            self._dirty = False
+            self.cancelled.emit()
+            self._allow_close = True
+            self.reject()
 
     def _build_review_tab(self) -> None:
         _content, layout = self._scroll_page("Review")
@@ -1292,16 +1357,13 @@ class OperatorRadioEditor(QDialog):
             operating_id = _first(self._values, "_operating_profile_id", "operating_profile_id", "operating_model_id")
             schedule_id = _first(self._values, "_schedule_plan_id", "schedule_plan_id", "sop_schedule_plan_id")
             self._select_combo(self.operating_profile_combo, operating_id)
-            self._select_combo(self.schedule_plan_combo, schedule_id)
             self._selected_operating_profile_id = (
                 self.operating_profile_combo.currentData()
                 if self.operating_profile_combo.findData(operating_id) >= 0
                 else operating_id
             )
             self._selected_schedule_plan_id = (
-                self.schedule_plan_combo.currentData()
-                if self.schedule_plan_combo.findData(schedule_id) >= 0
-                else schedule_id
+                schedule_id
             )
         finally:
             if blocked:
@@ -1321,6 +1383,7 @@ class OperatorRadioEditor(QDialog):
         self._refresh_receiver_setup()
         self._refresh_summaries()
         self._refresh_application_identity_labels()
+        self._refresh_schedule_plan_summary()
 
     @staticmethod
     def _select_combo(combo: QComboBox, value: Any) -> None:
@@ -1361,11 +1424,8 @@ class OperatorRadioEditor(QDialog):
                 if alias in self._base:
                     self._values[alias] = value
         self._values["_operating_profile_id"] = self._selected_operating_profile_id
-        self._values["_schedule_plan_id"] = self._selected_schedule_plan_id
         if "operating_profile_id" in self._base or "operating_profile_id" in self._values:
             self._values["operating_profile_id"] = self._selected_operating_profile_id
-        if "schedule_plan_id" in self._base or "schedule_plan_id" in self._values:
-            self._values["schedule_plan_id"] = self._selected_schedule_plan_id
         self._values["application_drafts"] = deepcopy(self._application_drafts)
 
     def _set_value(self, key: str, value: Any) -> None:
@@ -1428,11 +1488,6 @@ class OperatorRadioEditor(QDialog):
         self._selected_operating_profile_id = self.operating_profile_combo.currentData()
         self._set_value("_operating_profile_id", self._selected_operating_profile_id)
         self._values["operating_profile_id"] = self._selected_operating_profile_id
-
-    def _schedule_plan_changed(self, _index: int) -> None:
-        self._selected_schedule_plan_id = self.schedule_plan_combo.currentData()
-        self._set_value("_schedule_plan_id", self._selected_schedule_plan_id)
-        self._values["schedule_plan_id"] = self._selected_schedule_plan_id
 
     def _refresh_dirty_state(self) -> None:
         if self._dirty:
@@ -1811,7 +1866,6 @@ class OperatorRadioEditor(QDialog):
             "values": {**deepcopy(self._values), '__edited_fields__': sorted(self._review_edited_fields)},
             "application_drafts": deepcopy(self._application_drafts),
             "operating_profile_id": self._selected_operating_profile_id,
-            "schedule_plan_id": self._selected_schedule_plan_id,
             "receiver_launch": (
                 self._receiver_launch_selection()
                 if _text(self._values.get("device_class")).lower() == "observer"
@@ -1843,6 +1897,34 @@ class OperatorRadioEditor(QDialog):
             self._allow_close = True
             self.reject()
 
+    def _queue_plan_assignment_route(self) -> None:
+        if not self._plan_assignment_route_after_close:
+            return
+        self._plan_assignment_route_after_close = False
+        radio_id = self._plan_assignment_route_radio_id or self._profile_radio_id()
+        try:
+            radio_id = int(radio_id or 0)
+        except (TypeError, ValueError):
+            radio_id = 0
+        if radio_id <= 0:
+            return
+        try:
+            plan_id = int(self._selected_schedule_plan_id or 0)
+        except (TypeError, ValueError):
+            plan_id = 0
+        host = self.parentWidget()
+        while host is not None and not callable(getattr(host, "open_plan_assignment", None)):
+            host = host.parentWidget()
+        opener = getattr(host, "open_plan_assignment", None) if host is not None else None
+        if callable(opener):
+            QTimer.singleShot(
+                0,
+                lambda target=host, rid=radio_id, pid=plan_id: target.open_plan_assignment(
+                    device_profile_id=rid,
+                    frequency_plan_id=pid or None,
+                ),
+            )
+
     def _dirty_close_action(self) -> str:
         box = QMessageBox(self)
         box.setWindowTitle("Close radio setup?")
@@ -1870,6 +1952,7 @@ class OperatorRadioEditor(QDialog):
             self._receiver_closed = True
             self._receiver_pending = None
             super().reject()
+            self._queue_plan_assignment_route()
         elif self._busy:
             return
         else:
@@ -1879,6 +1962,7 @@ class OperatorRadioEditor(QDialog):
         self._receiver_closed = True
         self._receiver_pending = None
         super().accept()
+        self._queue_plan_assignment_route()
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self._nested_dialogs:

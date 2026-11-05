@@ -36,7 +36,7 @@ from freqinout.core.software_instance_manifest import (
     manifest_from_mapping,
     manifest_to_record,
 )
-from freqinout.core.sqlite_utils import connect_sqlite_readonly
+from freqinout.core.sqlite_utils import connect_sqlite_readonly, connect_sqlite_runtime_write
 from freqinout.core.multi_rig_guardrails import (
     collect_multi_rig_guardrail_warnings,
     format_multi_rig_guardrail_warnings,
@@ -480,6 +480,7 @@ SETTINGS_TABLE_SPECS: Dict[str, Dict[str, object]] = {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             radio_profile_id INTEGER NOT NULL UNIQUE,
             scheduler_enabled INTEGER NOT NULL DEFAULT 1,
+            scheduler_permission_version INTEGER NOT NULL DEFAULT 0,
             background_ingest_enabled INTEGER NOT NULL DEFAULT 1,
             messages_enabled INTEGER NOT NULL DEFAULT 1,
             map_enabled INTEGER NOT NULL DEFAULT 1,
@@ -494,6 +495,7 @@ SETTINGS_TABLE_SPECS: Dict[str, Dict[str, object]] = {
         "columns": {
             "radio_profile_id": "INTEGER NOT NULL UNIQUE",
             "scheduler_enabled": "INTEGER NOT NULL DEFAULT 1",
+            "scheduler_permission_version": "INTEGER NOT NULL DEFAULT 0",
             "background_ingest_enabled": "INTEGER NOT NULL DEFAULT 1",
             "messages_enabled": "INTEGER NOT NULL DEFAULT 1",
             "map_enabled": "INTEGER NOT NULL DEFAULT 1",
@@ -507,6 +509,29 @@ SETTINGS_TABLE_SPECS: Dict[str, Dict[str, object]] = {
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_policies_radio_profile_id ON runtime_policies(radio_profile_id)",
             "CREATE INDEX IF NOT EXISTS idx_runtime_policies_operator_suppressed ON runtime_policies(operator_suppressed)",
         ),
+    },
+    "frequency_plan_drafts": {
+        "ddl": """CREATE TABLE IF NOT EXISTS frequency_plan_drafts (
+            plan_id INTEGER PRIMARY KEY,
+            version INTEGER NOT NULL DEFAULT 1,
+            payload_json TEXT NOT NULL,
+            expected_plan_json TEXT NOT NULL,
+            saved_utc TEXT NOT NULL,
+            FOREIGN KEY(plan_id) REFERENCES frequency_plans(id) ON DELETE CASCADE
+        )""",
+        "columns": {},
+        "indexes": (),
+    },
+    "scheduler_permission_audit": {
+        "ddl": """CREATE TABLE IF NOT EXISTS scheduler_permission_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            at_utc TEXT NOT NULL, source TEXT NOT NULL,
+            radio_profile_id INTEGER, operating_profile_id INTEGER,
+            property TEXT NOT NULL, old_value TEXT NOT NULL, new_value TEXT NOT NULL,
+            configuration_revision INTEGER, correlation_id TEXT NOT NULL
+        )""",
+        "columns": {},
+        "indexes": (),
     },
     "scheduler_manual_control_states": {
         "ddl": """
@@ -1847,7 +1872,8 @@ def _validate_assignment_plan_compatibility(device: Mapping[str, Any], operating
 
 
 def _validate_schedule_assignment_compatibility(device: Mapping[str, Any], frequency_plan: Mapping[str, Any]) -> None:
-    if _is_observer_device_class(device) and not _is_receive_only_frequency_plan(frequency_plan):
+    from freqinout.core.plan_conflict_issues import compatibility_issues
+    if compatibility_issues(device, frequency_plan):
         raise ValueError("Observer / SDR radios can only be assigned receive-only schedule plans.")
 
 
@@ -2217,6 +2243,7 @@ def _schedule_assignment_validation_status_conn(
     frequency_plan: Mapping[str, Any],
     *,
     emit_events: bool = True,
+    include_issues: bool = False,
     assignment_plan_overrides: Optional[Mapping[int, int]] = None,
 ) -> Dict[str, Any]:
     plan_bands = _frequency_plan_bands(frequency_plan)
@@ -2424,7 +2451,23 @@ def _schedule_assignment_validation_status_conn(
     else:
         state = "ok"
         messages.append("RF guard validation completed.")
+    from freqinout.core.plan_conflict_issues import rf_issue
+    findings = []
+    def windows(plan):
+        return [dict(band=w.band, day_utc=w.day, start_minute=w.start_minute, end_minute=w.end_minute)
+                for w in _frequency_plan_schedule_windows(plan)][:40]
+    for event in events if include_issues else ():
+        peer_id = int(event.get('peer_device_profile_id') or 0)
+        peer = _record_by_id(conn, 'device_profiles', peer_id) if peer_id else {}
+        assigned = _effective_assigned_plan_for_device(conn, peer_id) if peer_id else {}
+        peer_plan_id = int(plan_overrides.get(peer_id, (assigned or {}).get('frequency_plan_id') or 0))
+        peer_plan = _record_by_id(conn, 'frequency_plans', peer_plan_id) if peer_plan_id else {}
+        findings.append(rf_issue(event, device, frequency_plan, peer, peer_plan,
+                                 windows=windows(frequency_plan), peer_windows=windows(peer_plan or {}),
+                                 frequencies=_frequency_plan_frequency_hz_values(frequency_plan),
+                                 peer_frequencies=_frequency_plan_frequency_hz_values(peer_plan or {})))
     return {
+        "issues": findings,
         "state": state,
         "rf_guard_validation": "enforced",
         "plan_bands": plan_bands,
@@ -3372,6 +3415,10 @@ def ensure_multi_radio_settings_schema(conn: sqlite3.Connection) -> None:
     ensure_schedule_authorization_schema(conn)
     from freqinout.core.schedule_approval_sources import install_source_revisions
     install_source_revisions(conn)
+    # Startup schema ownership installs the same revision infrastructure as the
+    # worker tracker, so model/pause audit records have revisions before polling.
+    from freqinout.core.schedule_configuration_cache import SETTINGS_TABLES, install_revision_triggers
+    install_revision_triggers(conn, SETTINGS_TABLES)
     conn.commit()
 
 
@@ -4364,6 +4411,8 @@ def _activate_software_application_conn(
 
 
 def _save_operating_profile_conn(conn: sqlite3.Connection, values: Mapping[str, Any]) -> Dict[str, Any]:
+    if not conn.in_transaction:
+        conn.execute('BEGIN IMMEDIATE')
     payload = dict(values)
     record_id = _coerce_optional_int(payload.get("id"))
     existing = _record_by_id(conn, "operating_profiles", record_id) if record_id is not None else None
@@ -4420,11 +4469,23 @@ def _save_operating_profile_conn(conn: sqlite3.Connection, values: Mapping[str, 
     }
     columns = list(record.keys())
     if existing:
+        from freqinout.core.scheduler_permission import assigned_model, reconcile_permission
+        consumers = [int(row[0]) for row in conn.execute(
+            'SELECT DISTINCT device_profile_id FROM operating_profile_assignments WHERE operating_profile_id=?', (int(record_id),))
+            if assigned_model(conn, int(row[0])).get('id') == int(record_id)]
+        for radio_id in consumers:
+            reconcile_permission(conn, radio_id, existing, source='before model save')
         assignments = ", ".join(f"{name}=?" for name in columns)
         conn.execute(
             f"UPDATE operating_profiles SET {assignments} WHERE id=?",
             [record[name] for name in columns] + [int(record_id)],
         )
+        for radio_id in consumers:
+            reconcile_permission(conn, radio_id, {**record, 'id': record_id}, source='model save')
+        if existing.get('scheduler_enabled') != record['scheduler_enabled']:
+            from freqinout.core.scheduler_permission import audit_change
+            audit_change(conn, source='model save', model_id=record_id,
+                         property='model permission', old=existing.get('scheduler_enabled'), new=record['scheduler_enabled'])
         conn.commit()
         return _record_by_id(conn, "operating_profiles", int(record_id)) or {}
     conn.execute(
@@ -4435,10 +4496,40 @@ def _save_operating_profile_conn(conn: sqlite3.Connection, values: Mapping[str, 
     return _record_by_system_key(conn, "operating_profiles", system_key) or {}
 
 
+def schedule_name_key(value: Any) -> str:
+    """Schedule names ignore surrounding whitespace and letter case."""
+    return str(value or "").strip().casefold()
+
+
+def _assert_schedule_name_available(conn, name, category, *, record_id=None, legacy_id=None, existing=None):
+    # Existing duplicate identities stay usable. Only a create/rename/category
+    # change can introduce another collision; never merge or delete old records.
+    key = schedule_name_key(name)
+    if existing and schedule_name_key(existing.get('name')) == key and existing.get('category', category) == category:
+        return
+    for row in conn.execute('SELECT id,name FROM frequency_plans WHERE category=?', (category,)):
+        if int(row['id']) != int(record_id or 0) and schedule_name_key(row['name']) == key:
+            raise ValueError(f"A schedule named '{str(name).strip()}' already exists. Select it to update, or choose a different name.")
+    legacy_key = {'hf_daily_schedule':'freqplanner_hf_daily_schedule_sets',
+                  'hf_net_schedule':'freqplanner_hf_net_schedule_sets'}.get(category)
+    if legacy_key:
+        saved = conn.execute('SELECT value FROM kv WHERE key=?', (legacy_key,)).fetchone()
+        rows = json.loads(saved[0]) if saved else []
+        if not isinstance(rows, list):
+            raise ValueError('Saved schedule names could not be verified. Reload before saving.')
+        for row in rows:
+            if isinstance(row, dict) and str(row.get('id') or '') != str(legacy_id or '') and schedule_name_key(row.get('name')) == key:
+                raise ValueError(f"A schedule named '{str(name).strip()}' already exists. Select it to update, or choose a different name.")
+
+
 def _save_frequency_plan_conn(conn: sqlite3.Connection, values: Mapping[str, Any]) -> Dict[str, Any]:
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
     payload = dict(values)
     record_id = _coerce_optional_int(payload.get("id"))
     existing = _record_by_id(conn, "frequency_plans", record_id) if record_id is not None else None
+    if record_id is not None and existing is None:
+        raise ValueError("The selected Frequency Plan no longer exists. Reload before saving.")
     now_iso = _utc_now_iso()
     system_key = _next_system_key(
         conn,
@@ -4474,6 +4565,7 @@ def _save_frequency_plan_conn(conn: sqlite3.Connection, values: Mapping[str, Any
         "created_utc": (existing or {}).get("created_utc", now_iso),
         "updated_utc": now_iso,
     }
+    _assert_schedule_name_available(conn, record['name'], record['category'], record_id=record_id, existing=existing)
     columns = list(record.keys())
     if existing:
         assignments = ", ".join(f"{name}=?" for name in columns)
@@ -4652,7 +4744,7 @@ def _effective_assignment_for_device(conn: sqlite3.Connection, device_profile_id
           JOIN operating_profiles o ON o.id=a.operating_profile_id
          WHERE a.device_profile_id=?
            AND a.assignment_state IN ({placeholders})
-      ORDER BY a.id ASC
+      ORDER BY CASE a.assignment_state WHEN 'temporary_override' THEN 0 ELSE 1 END, a.id DESC
          LIMIT 1
         """,
         (int(device_profile_id), *tuple(EFFECTIVE_ASSIGNMENT_STATES)),
@@ -5032,8 +5124,10 @@ def _resolve_device_profile_links_conn(conn: sqlite3.Connection, profile: Mappin
         if operating:
             data["operating_profile_id"] = operating["id"]
             data["operating_scheduler_enabled"] = _coerce_bool_int(operating.get("scheduler_enabled", 1), True)
-            if data.get("scheduler_enabled") is None:
-                data["scheduler_enabled"] = data["operating_scheduler_enabled"]
+            # This is a detached compatibility projection, never a second
+            # permission owner. An old radio flag cannot override its model.
+            from freqinout.core.scheduler_permission import model_allows_scheduling
+            data["scheduler_enabled"] = int(model_allows_scheduling(operating))
             data["use_launch_control"] = _coerce_bool_int(operating.get("use_launch_control", 0), False)
     if data.get('use_external_js8spotter') is None:
         data['use_external_js8spotter'] = int(bool(str(data.get('spotter_launch_path') or '').strip()))
@@ -6483,8 +6577,14 @@ def mirror_legacy_settings_into_runtime_active_device(
 
     assignment = _effective_assignment_for_device(conn, active_id)
     operating_updates = {}
-    if "use_scheduler" in changed:
-        operating_updates["scheduler_enabled"] = updates["scheduler_enabled"]
+    if assignment and "use_scheduler" in changed:
+        updates.pop("scheduler_enabled", None)
+        from freqinout.core.scheduler_permission import assigned_model, audit_change, bool_value, model_allows_scheduling
+        allowed = model_allows_scheduling(assigned_model(conn, active_id))
+        if bool_value(settings_values.get('use_scheduler')) != allowed:
+            audit_change(conn, source='legacy mirror rejected', property='compatibility permission',
+                         old=settings_values.get('use_scheduler'), new=allowed, radio_id=active_id,
+                         model_id=assignment['operating_profile_id'])
     if "launch_control_enabled" in changed:
         operating_updates["use_launch_control"] = updates["launch_enabled"]
 
@@ -6572,16 +6672,25 @@ class _GuidedTransactionConnection:
 class GuidedSaveTransaction:
     """Outer transaction for one reviewed Add/Edit Radio activation."""
 
-    def __init__(self, store: "MultiRadioStore") -> None:
+    def __init__(self, store: "MultiRadioStore", *, prepared_schema=False) -> None:
         self._store = store
+        self._prepared_schema = prepared_schema
         self._connection: sqlite3.Connection | None = None
         self._complete = False
 
     def __enter__(self) -> "GuidedSaveTransaction":
         if getattr(self._store._transaction_local, "connection", None) is not None:
             raise RuntimeError("A guided radio save transaction is already active on this thread.")
-        connection = self._store._open_connection()
-        connection.execute("BEGIN IMMEDIATE")
+        if self._prepared_schema:
+            connection = connect_sqlite_runtime_write(self._store.db_path, row_factory=sqlite3.Row)
+        else:
+            connection = self._store._open_connection()
+        try:
+            connection.execute("PRAGMA foreign_keys=ON")
+            connection.execute("BEGIN IMMEDIATE")
+        except Exception:
+            connection.close()
+            raise
         self._connection = connection
         self._store._transaction_local.connection = connection
         return self
@@ -6735,10 +6844,11 @@ class MultiRadioStore:
             self._transaction_local.connection = None
             connection.close()
 
-    def configuration_save_transaction(self):
-        """Compose operator app/radio saves under one existing atomic owner."""
+    def configuration_save_transaction(self, *, prepared_schema=False):
+        """Compose configuration saves, reusing the caller's atomic boundary."""
         active = getattr(self._transaction_local, 'connection', None)
-        return _ConfigurationSavepoint(active) if active is not None else self.guided_save_transaction()
+        return (_ConfigurationSavepoint(active) if active is not None else
+                GuidedSaveTransaction(self, prepared_schema=prepared_schema))
 
     def guided_save_transaction(self) -> GuidedSaveTransaction:
         """Return the atomic boundary for one reviewed guided radio save.
@@ -7674,11 +7784,23 @@ class MultiRadioStore:
         with self._connect() as conn:
             return _ensure_receive_only_operating_profile_conn(conn)
 
-    def save_operating_profile(self, values: Mapping[str, Any]) -> Dict[str, Any]:
+    def save_operating_profile(self, values: Mapping[str, Any], *, expected: Optional[Mapping[str, Any]] = None,
+                               expected_consumers: Optional[Iterable[int]] = None) -> Dict[str, Any]:
         payload = dict(values)
         requested_id = _coerce_optional_int(payload.get("id"))
         with self._connect() as conn:
+            if not conn.in_transaction:
+                conn.execute('BEGIN IMMEDIATE')
             existing = _record_by_id(conn, "operating_profiles", int(requested_id)) if requested_id is not None else None
+            if expected is not None and existing != dict(expected):
+                raise ValueError('Operating Model changed while editing. Reopen it and review the current settings.')
+            if expected_consumers is not None:
+                from freqinout.core.scheduler_permission import assigned_model
+                consumers = {int(row[0]) for row in conn.execute(
+                    'SELECT DISTINCT device_profile_id FROM operating_profile_assignments WHERE operating_profile_id=?', (requested_id,))
+                    if assigned_model(conn, int(row[0])).get('id') == requested_id}
+                if consumers != {int(value) for value in expected_consumers}:
+                    raise ValueError('Radios using this Operating Model changed. Refresh and review the affected radios again.')
             active_swap = _active_profile_swap_policy_conn(conn)
             enabled = _coerce_bool_int(payload.get("enabled", (existing or {}).get("enabled", 1)), True)
             if existing and str(existing.get("system_key", "") or "").strip() == DEFAULT_OPERATING_SYSTEM_KEY and enabled != 1:
@@ -11736,6 +11858,8 @@ class MultiRadioStore:
             conn.execute("DELETE FROM assigned_plans WHERE device_profile_id=?", (int(device_profile_id),))
             conn.execute("DELETE FROM varac_cluster_members WHERE device_profile_id=?", (int(device_profile_id),))
             conn.execute("DELETE FROM runtime_policies WHERE radio_profile_id=?", (int(device_profile_id),))
+            conn.execute("DELETE FROM operator_schedule_authorizations WHERE radio_id=?", (int(device_profile_id),))
+            conn.execute("DELETE FROM scheduler_manual_control_states WHERE radio_profile_id=?", (int(device_profile_id),))
             conn.execute(
                 "DELETE FROM station_coordination_policies WHERE source_device_id=? OR target_device_id=?",
                 (int(device_profile_id), int(device_profile_id)),

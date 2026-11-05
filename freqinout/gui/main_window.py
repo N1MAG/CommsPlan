@@ -1279,19 +1279,10 @@ class MainWindow(QMainWindow):
         )
         self._runtime_client_signature = self._runtime_client_signature_for_settings()
         try:
-            if hasattr(self.scheduler, "set_runtime_scheduler_enabled"):
-                self.scheduler.set_runtime_scheduler_enabled(bool(startup_policy.get("scheduler_enabled", True)))
-        except Exception:
-            pass
-        try:
             if hasattr(self.scheduler, "set_runtime_timer_policy"):
                 self.scheduler.set_runtime_timer_policy(self._runtime_timer_policy_for(self._active_runtime_profile))
         except Exception as e:
             log.debug("MainWindow: failed to apply startup runtime timer policy: %s", e)
-        try:
-            set_scheduler_enabled_override(bool(startup_policy.get("scheduler_enabled", True)))
-        except Exception:
-            pass
         self._notify_startup_status("Preparing schedule services…")
         self.scheduler.start()
         self.receiver_qualification = ReceiverQualificationCoordinator(
@@ -4969,6 +4960,7 @@ class MainWindow(QMainWindow):
         radio_id: int | None = None,
         *,
         settings_nav_context: str | None = None,
+        defer_context_focus: bool = True,
     ) -> None:
         idx = self._screen_index_by_label.get("Settings", -1)
         if idx < 0:
@@ -4991,6 +4983,8 @@ class MainWindow(QMainWindow):
         else:
             self._settings_nav_context = "main" if context == "main" else "radios"
         self._set_screen(idx)
+        if not defer_context_focus:
+            return
         navigation_epoch = int(getattr(self, "_navigation_epoch", 0))
         if hasattr(self.settings_tab, "show_settings_context"):
             QTimer.singleShot(
@@ -5014,6 +5008,134 @@ class MainWindow(QMainWindow):
                     lambda: self.settings_tab.focus_section_by_health_key(key, ident),
                 ),
             )
+
+    def open_plan_assignment(
+        self,
+        *,
+        device_profile_id: int | None = None,
+        frequency_plan_id: int | None = None,
+        repair_context: Mapping[str, object] | None = None,
+    ) -> bool:
+        """Open Plan Builder's single radio-assignment workspace in context."""
+        request: dict[str, object] = {}
+        for key, value in (
+            ("device_profile_id", device_profile_id),
+            ("frequency_plan_id", frequency_plan_id),
+        ):
+            try:
+                ident = int(value or 0)
+            except (TypeError, ValueError):
+                ident = 0
+            if ident > 0:
+                request[key] = ident
+        if isinstance(repair_context, Mapping):
+            request["repair_context"] = dict(repair_context)
+        self._pending_plan_assignment_request = request
+        self._plan_assignment_return_context = dict(request)
+        index = self._screen_index_by_label.get("FreqPlanner", -1)
+        if index < 0:
+            return False
+        self._set_screen(index)
+        delivered = self._deliver_plan_assignment_request()
+        if not delivered:
+            QTimer.singleShot(0, self._deliver_plan_assignment_request)
+        return delivered
+
+    def _deliver_plan_assignment_request(self) -> bool:
+        request = getattr(self, "_pending_plan_assignment_request", None)
+        if not isinstance(request, dict):
+            return False
+        tab = getattr(self, "freq_planner_tab", None)
+        opener = getattr(tab, "open_radio_assignments", None)
+        if not callable(opener):
+            return False
+        try:
+            opener(**dict(request))
+        except Exception:
+            log.exception("Unable to open Plan Builder radio assignments.")
+            return False
+        self._pending_plan_assignment_request = None
+        return True
+
+    def open_plan_assignment_repair(self, context: Mapping[str, object]) -> bool:
+        """Open the requested Configuration repair while retaining Plan Builder context."""
+        if not isinstance(context, Mapping):
+            return False
+        target = str(context.get("target", context.get("repair_target", "")) or "").strip().lower()
+        try:
+            device_id = int(context.get("device_profile_id", 0) or 0)
+        except (TypeError, ValueError):
+            device_id = 0
+        try:
+            plan_id = int(context.get("frequency_plan_id", 0) or 0)
+        except (TypeError, ValueError):
+            plan_id = 0
+        request = {"device_profile_id": device_id, "frequency_plan_id": plan_id}
+        previous_request = getattr(self, "_plan_assignment_return_context", None)
+        if isinstance(previous_request, dict):
+            request = dict(previous_request)
+        else:
+            self._plan_assignment_return_context = request
+        if target in {"operating_model", "model", "operating_profile"}:
+            try:
+                model_id = int(context.get("operating_profile_id", context.get("operating_model_id", context.get("model_id", 0))) or 0)
+            except (TypeError, ValueError):
+                model_id = 0
+            self.open_settings_section("operating_model_assignments", radio_id=device_id or None, settings_nav_context="radios")
+            settings_tab = getattr(self, "settings_tab", None)
+            opener = getattr(settings_tab, "open_operating_model_repair", None)
+            if callable(opener):
+                return bool(opener(model_id=model_id, device_profile_id=device_id))
+            return False
+        if target == "operator_controls":
+            return self._open_plan_assignment_operator_controls(device_id)
+        if target in {"radio", "rf_guard", "rf", "radio_profile", "readiness"}:
+            health_key = str(context.get("health_key", "radio_profiles") or "radio_profiles")
+            navigation = {"defer_context_focus": False} if target == "readiness" else {}
+            self.open_settings_section(health_key, radio_id=device_id or None, settings_nav_context="radios", **navigation)
+            settings_tab = getattr(self, "settings_tab", None)
+            opener = getattr(settings_tab, "open_plan_assignment_repair", None)
+            if callable(opener):
+                return bool(opener(context=dict(context), return_context=request))
+        return False
+
+    def _open_plan_assignment_operator_controls(self, device_profile_id: int) -> bool:
+        """Show the named radio's controls without invoking any control action."""
+        ident = int(device_profile_id or 0)
+        if ident <= 0:
+            return False
+        profile = next(
+            (dict(item) for item in getattr(self, "_station_command_profile_cache", ())
+             if int(self._station_command_snapshot_id(item) or 0) == ident),
+            None,
+        )
+        if profile is None or not self._station_command_bool(profile.get("runtime_active"), default=False):
+            return False
+        if str(profile.get("device_class") or "").strip().lower() == "observer":
+            return False
+        # Selection and expansion affect presentation only. No QSY, hold,
+        # Resume, readiness probe, or endpoint command is issued here.
+        self._active_runtime_profile = profile
+        self._station_command_selected_profile_id = ident
+        self._station_command_explicit_profile_id = ident
+        self._station_command_minimized = False
+        self._station_command_controls_expanded = True
+        self._station_command_radio_summary_signature = None
+        self._refresh_station_command_bar(force=False)
+        return True
+
+    def return_to_plan_assignment_review(self) -> bool:
+        request = getattr(self, "_plan_assignment_return_context", None)
+        if not isinstance(request, dict):
+            return False
+        repair_context = request.get("repair_context")
+        repair_context = dict(repair_context) if isinstance(repair_context, Mapping) else {}
+        repair_context["returning_to_review"] = True
+        return self.open_plan_assignment(
+            device_profile_id=request.get("device_profile_id"),
+            frequency_plan_id=request.get("frequency_plan_id"),
+            repair_context=repair_context,
+        )
 
     def open_guided_add_radio(self) -> None:
         """Open the existing first-radio workflow from any operator surface."""
@@ -5271,6 +5393,12 @@ class MainWindow(QMainWindow):
         health_key = str(payload.get("health_key", "") or "radio_profiles").strip().lower()
         context = str(payload.get("settings_nav_context", "") or "radios").strip().lower()
         radio_id = self._station_health_runtime_payload_radio_id(payload)
+        if health_key == "schedule_assignments":
+            self.open_plan_assignment(
+                device_profile_id=radio_id,
+                frequency_plan_id=payload.get("frequency_plan_id"),
+            )
+            return
         self.open_settings_section(
             health_key=health_key,
             radio_id=radio_id,
@@ -6480,9 +6608,12 @@ class MainWindow(QMainWindow):
         if tab is not None and hasattr(tab, "on_schedule_sources_changed"):
             tab.on_schedule_sources_changed()
 
-    def _create_hf_schedule_tab(self) -> QWidget:
+    def _create_hf_schedule_tab(self, *, defer_initial_load=False) -> QWidget:
         with perf_span("main_window.create_hf_schedule_tab", settings=self.settings, min_ms=5.0):
-            tab = DailyScheduleTab(self, plan_context_service=self.plan_context_service)
+            tab = DailyScheduleTab(
+                self, plan_context_service=self.plan_context_service, defer_initial_load=defer_initial_load,
+                settings_manager=SettingsManager(initialized_source=self.settings) if defer_initial_load else None,
+            )
             self.hf_schedule_tab = tab
             self._connect_lazy_screen_signal(
                 "settings_saved.hf_schedule",
@@ -6511,9 +6642,12 @@ class MainWindow(QMainWindow):
             )
             return tab
 
-    def _create_net_schedule_tab(self) -> QWidget:
+    def _create_net_schedule_tab(self, *, defer_initial_load=False) -> QWidget:
         with perf_span("main_window.create_net_schedule_tab", settings=self.settings, min_ms=5.0):
-            tab = NetScheduleTab(self, plan_context_service=self.plan_context_service)
+            tab = NetScheduleTab(
+                self, plan_context_service=self.plan_context_service, defer_initial_load=defer_initial_load,
+                settings_manager=SettingsManager(initialized_source=self.settings) if defer_initial_load else None,
+            )
             self.net_tab = tab
             self._connect_lazy_screen_signal(
                 "settings_saved.net_schedule",
@@ -7001,7 +7135,17 @@ class MainWindow(QMainWindow):
             except Exception:
                 continue
 
-    def _ensure_lazy_tab_loaded(self, label: str, index: int) -> None:
+    def prepare_plan_source_destination(self, label: str):
+        """Construct the editor shell while keeping Plan Builder visible."""
+        if label not in {"HF Schedule", "Net Schedule", "SOP"}:
+            return None
+        index = self._screen_index_by_label.get(label, -1)
+        if index < 0:
+            return None
+        self._ensure_lazy_tab_loaded(label, index, defer_schedule_load=True)
+        return self._get_tab_by_label(label)
+
+    def _ensure_lazy_tab_loaded(self, label: str, index: int, *, defer_schedule_load=False) -> None:
         with perf_span(
             "main_window.ensure_lazy_tab_loaded",
             settings=self.settings,
@@ -7015,7 +7159,10 @@ class MainWindow(QMainWindow):
                 return
             factory = self._lazy_factories[label]
             try:
-                new_widget = factory()
+                if defer_schedule_load and label in {"HF Schedule", "Net Schedule"}:
+                    new_widget = factory(defer_initial_load=True)
+                else:
+                    new_widget = factory()
             except Exception:
                 log.exception("MainWindow: failed to create deferred screen %r", label)
                 return
@@ -7351,6 +7498,7 @@ class MainWindow(QMainWindow):
             "operating_profile_name": str(data.get("operating_profile_name", "") or "").strip(),
             "assignment_state": str(data.get("assignment_state", "unassigned") or "unassigned").strip().lower(),
             "scheduler_enabled": self._runtime_policy_enabled(data, "scheduler_enabled", True),
+            "scheduler_permission_reason": str(data.get("scheduler_permission_reason") or ""),
             "scheduler_mode": str(data.get("scheduler_mode", "full") or "full").strip().lower() or "full",
             "use_messages": self._runtime_policy_enabled(data, "use_messages", True),
             "use_map": self._runtime_policy_enabled(data, "use_map", True),
@@ -7673,7 +7821,8 @@ class MainWindow(QMainWindow):
 
         restrictions: list[str] = []
         if not MainWindow._runtime_policy_enabled(policy, "scheduler_enabled", True):
-            restrictions.append("scheduler automation off")
+            reason = str(policy.get('scheduler_permission_reason') or '') if isinstance(policy, dict) else ''
+            restrictions.append(reason or f'Operating Model “{operating_name or "assigned model"}” does not allow scheduling')
         if not MainWindow._runtime_policy_enabled(policy, "use_map", True):
             restrictions.append("Map hidden")
         if not MainWindow._runtime_policy_enabled(policy, "use_messages", True):
@@ -7788,21 +7937,12 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         try:
-            if hasattr(self, "scheduler") and self.scheduler is not None and hasattr(self.scheduler, "set_runtime_scheduler_enabled"):
-                self.scheduler.set_runtime_scheduler_enabled(bool(policy.get("scheduler_enabled", True)))
-        except Exception:
-            pass
-        try:
             if hasattr(self, "scheduler") and self.scheduler is not None and hasattr(self.scheduler, "set_runtime_timer_policy"):
                 self.scheduler.set_runtime_timer_policy(self._runtime_timer_policy_for(profile))
         except Exception as e:
             log.debug("MainWindow: failed to apply runtime timer policy: %s", e)
         try:
             self._sync_hold_duration_combos()
-        except Exception:
-            pass
-        try:
-            set_scheduler_enabled_override(bool(policy.get("scheduler_enabled", True)))
         except Exception:
             pass
         self._lazy_prewarm_labels = self._runtime_lazy_prewarm_labels(self._suppressed_screen_labels)
@@ -14572,15 +14712,12 @@ class MainWindow(QMainWindow):
         ident = int(device_profile_id or 0)
         if ident <= 0:
             return
-        self.open_settings_section("schedule_assignments", radio_id=ident, settings_nav_context="radios")
-        settings_tab = getattr(self, "settings_tab", None)
-        opener = getattr(settings_tab, "open_schedule_assignment_editor", None)
-        if callable(opener):
-            expected = self._screen_index_by_label.get("Settings", -1)
-            epoch = int(getattr(self, "_navigation_epoch", 0))
-            QTimer.singleShot(0, lambda profile_id=ident: self._run_if_screen_current(
-                expected, epoch, lambda: opener(device_profile_id=profile_id)
-            ))
+        assigned_plan = self._station_command_assigned_plan_for_radio(ident)
+        try:
+            plan_id = int(assigned_plan.get("id") or 0) if isinstance(assigned_plan, Mapping) else 0
+        except (TypeError, ValueError):
+            plan_id = 0
+        self.open_plan_assignment(device_profile_id=ident, frequency_plan_id=plan_id or None)
 
     def _on_station_command_summary_radio_clicked(self, device_profile_id: int) -> None:
         ident = int(device_profile_id or 0)

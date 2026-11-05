@@ -47,6 +47,32 @@ def read_plan_schedule_table(path: Path, tables: tuple[str, ...]) -> tuple[str, 
             conn.close()
 
 
+def normalize_active_daily_rows(table, rows):
+    return [dict(row, id=int(row.get("id") or 0), source_row_id=int(row.get("id") or 0), source_table=table,
+                 day_utc=row.get("day_utc") or "ALL", vfo=str(row.get("vfo") or "A").strip().upper() or "A",
+                 frequency=str(row.get("frequency") or ""), group_name=row.get("group_name") or "",
+                 band=row.get("band") or "", mode=row.get("mode") or "",
+                 start_utc=row.get("start_utc") or "", end_utc=row.get("end_utc") or "",
+                 auto_tune=bool(row.get("auto_tune"))) for row in rows]
+
+
+def normalize_active_net_rows(table, rows):
+    return [dict(row, id=int(row.get("id") or 0), source_row_id=int(row.get("id") or 0), source_table=table,
+                 day_utc=row.get("day_utc") or "ALL", recurrence=row.get("recurrence") or "Weekly",
+                 biweekly_offset_weeks=row.get("biweekly_offset_weeks") or 0,
+                 month_weeks=row.get("month_weeks") or "", vfo=str(row.get("vfo") or "A").strip().upper() or "A",
+                 frequency=str(row.get("frequency") or ""), early_checkin=int(row.get("early_checkin") or 0),
+                 group_name=row.get("group_name") or row.get("primary_js8call_group") or "",
+                 band=row.get("band") or "", mode=row.get("mode") or "",
+                 start_utc=row.get("start_utc") or "", end_utc=row.get("end_utc") or "",
+                 resource_id=int(row["resource_id"]) if row.get("resource_id") not in (None, "") else None,
+                 primary_js8call_group=row.get("primary_js8call_group") or "",
+                 comment=row.get("comment") or "", net_name=row.get("net_name") or "",
+                 target_device_profile_id=row.get("target_device_profile_id"),
+                 target_operating_profile_id=row.get("target_operating_profile_id"),
+                 target_scope=row.get("target_scope") or "station") for row in rows]
+
+
 def load_sop_projection_sources(settings: Any, profile_ids: set[int]) -> tuple[list[dict], list[dict]]:
     """Return canonical rows and arbitration policies for declared SOP profiles.
 

@@ -6,11 +6,10 @@ import platform
 import subprocess
 import json
 import time
-import uuid
 from pathlib import Path
 from typing import Any, List, Dict, Optional, Set, Tuple
 
-from PySide6.QtCore import Qt, QTimer, Signal, QEvent
+from PySide6.QtCore import Qt, QTimer, Signal, QEvent, QObject, QRunnable, QThreadPool
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QWidget,
@@ -49,6 +48,7 @@ from freqinout.core.operating_group_frequency import (
     resolve_operating_group_frequency,
 )
 from freqinout.core.plan_context_service import PlanContextService
+from freqinout.core.schedule_source_inputs import normalize_active_daily_rows, read_plan_schedule_table
 from freqinout.core.schedule_source_sets import (
     LIVE_SOURCE_SET_ID,
     HF_DAILY_SOURCE_CATEGORY,
@@ -59,11 +59,18 @@ from freqinout.core.schedule_source_sets import (
     rename_source_schedule,
     reproject_frequency_plans_for_source_update,
     save_source_schedule,
+    resolve_source_schedule_save_target,
+    describe_duplicate_schedule_choices,
     plan_source_usage_summary,
     selected_source_set_id,
     source_set_row_by_id_for_category,
     source_sets_for_category,
 )
+from freqinout.core.named_source_save import prepare_named_schedule_save, commit_named_schedule_save
+from freqinout.core.source_save_revision import (
+    require_locked_source_save_revision, require_source_save_revision, source_save_revision,
+)
+from freqinout.gui.source_save_worker import SourceSaveWorker
 from freqinout.core.software_status_service import SoftwareStatusService
 from freqinout.core.logger import log
 from freqinout.core.multi_radio_store import MultiRadioStore, settings_db_path
@@ -79,6 +86,7 @@ from freqinout.core.schedule_targeting import (
     schedule_targets_may_overlap,
 )
 from freqinout.core.sop_manager import SOPManager
+from freqinout.core.sop_session_service import SOPSessionService
 from freqinout.utils.timezones import get_timezone
 from freqinout.gui.help_registry import resolve_help_host
 from freqinout.gui.plan_context_label import PlanContextLabel
@@ -126,6 +134,172 @@ DAY_OPTIONS = [
     "Friday",
     "Saturday",
 ]
+
+
+def _daily_source_save_preflight(config_dir, rows):
+    from freqinout.core.settings_manager import SettingsManager
+    from freqinout.core.schedule_source_sets import assigned_plan_rf_guard_impacts_for_source_update
+    root = Path(config_dir)
+    revision = source_save_revision(root)
+    settings = SettingsManager(runtime_worker=True)
+    try:
+        if Path(settings.config_dir) != root:
+            raise RuntimeError("The active configuration changed. Reopen the schedule before saving.")
+        impacts = assigned_plan_rf_guard_impacts_for_source_update(
+            settings, HF_DAILY_SOURCE_CATEGORY, LIVE_SOURCE_SET_ID, rows
+        )
+    finally:
+        settings.close()
+    require_source_save_revision(root, revision)
+    return revision, impacts
+
+
+def _daily_source_save_commit(config_dir, rows, review):
+    from freqinout.core.settings_manager import SettingsManager
+    from freqinout.core.schedule_source_sets import (
+        assigned_plan_rf_guard_impacts_for_source_update,
+        reproject_frequency_plans_for_source_update,
+    )
+    root = Path(config_dir)
+    revision, reviewed_impacts = review
+    if any(str(item.get("validation", {}).get("state") or "").lower() == "blocked" for item in reviewed_impacts):
+        raise ValueError("RF Guard blocked this active schedule update.")
+    require_source_save_revision(root, revision)
+    settings = SettingsManager(runtime_worker=True)
+    try:
+        current_impacts = assigned_plan_rf_guard_impacts_for_source_update(
+            settings, HF_DAILY_SOURCE_CATEGORY, LIVE_SOURCE_SET_ID, rows
+        )
+        if current_impacts != reviewed_impacts:
+            raise RuntimeError("Assigned plan or RF Guard data changed during review. Review the save again.")
+        require_source_save_revision(root, revision)
+        store = MultiRadioStore(settings.db_path)
+        with store.configuration_save_transaction(prepared_schema=True) as transaction:
+            require_locked_source_save_revision(root, revision)
+            with store.connect() as connection:
+                values = json.dumps(rows)
+                connection.executemany("INSERT OR REPLACE INTO kv(key,value) VALUES(?,?)",
+                                       (("hf_schedule", values), ("daily_schedule", values)))
+                DailyScheduleTab._write_schedule_to_db(settings.db_path, rows, connection=connection)
+            updated = reproject_frequency_plans_for_source_update(
+                settings, HF_DAILY_SOURCE_CATEGORY, LIVE_SOURCE_SET_ID, rows, store=store,
+            )
+            require_locked_source_save_revision(root, revision)
+            transaction.complete()
+        try:
+            loaded_rows = DailyScheduleTab._read_schedule_from_db(settings.db_path)
+        except Exception:
+            log.exception("HF Daily was saved but its row identities could not be refreshed")
+            loaded_rows = rows
+        loaded_rows = reattach_schedule_frequency_keys(loaded_rows or rows, rows)
+        try:
+            settings.reload()
+            manager = SOPManager(settings.db_path.parent / "freqinout_nets.db", settings=settings)
+            conflicts = manager.collect_active_hf_conflicts(force_refresh=True)
+        except Exception:
+            log.exception("HF Daily was saved but the post-save SOP conflict scan failed")
+            conflicts = []
+        return loaded_rows, updated, conflicts
+    finally:
+        settings.close()
+
+
+class _DailyDestinationSignals(QObject):
+    finished = Signal(object)
+
+    def __init__(self):
+        super().__init__(QApplication.instance())
+
+
+class _DailyDestinationTask(QRunnable):
+    def __init__(self, request: Dict[str, Any], loader):
+        super().__init__()
+        self.request = request
+        self.loader = loader
+        self.signals = _DailyDestinationSignals()
+        self.signals.finished.connect(self.signals.deleteLater)
+
+    def run(self):
+        try:
+            result = self.loader(self.request)
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+        try:
+            self.signals.finished.emit({**self.request, **result})
+        except RuntimeError:
+            pass  # QApplication exited while the worker was finishing.
+
+
+class _DeferredSOPManager:
+    """Avoid SOP schema/profile work until a non-guided SOP action needs it."""
+    def __init__(self, settings: SettingsManager):
+        self._settings = settings
+        self._manager = None
+
+    def __getattr__(self, name: str):
+        if self._manager is None:
+            self._manager = SOPManager(Path(self._settings.db_path).parent / "freqinout_nets.db",
+                                       settings=SettingsManager(initialized_source=self._settings))
+        return getattr(self._manager, name)
+
+
+def _read_daily_plan_source(request: Dict[str, Any]) -> Dict[str, Any]:
+    source_id = str(request.get("source_id") or "").strip()
+    db_path = Path(request["db_path"])
+    catalog = [dict(row) for row in (request.get("settings") or {}).get(HF_DAILY_SOURCE_SETS_KEY, []) if isinstance(row, dict)]
+    primary_db = Path(request.get("primary_db_path") or db_path)
+    if primary_db.exists():
+        try:
+            conn = sqlite3.connect(f"file:{primary_db.resolve()}?mode=ro", uri=True, timeout=1.0)
+            try:
+                tables = {str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                conn.row_factory = sqlite3.Row
+                plans = conn.execute("SELECT * FROM frequency_plans").fetchall() if "frequency_plans" in tables else []
+            finally:
+                conn.close()
+            for plan in plans:
+                plan_data = dict(plan)
+                plan_id = plan_data.get("id")
+                if str(plan_data.get("category") or "").lower() != HF_DAILY_SOURCE_CATEGORY or str(plan_data.get("status") or "") != "saved" or not bool(plan_data.get("enabled")):
+                    continue
+                try:
+                    parsed_refs = json.loads(plan_data.get("schedule_refs_json") or "[]")
+                except (TypeError, ValueError):
+                    parsed_refs = []
+                catalog.append({"id": f"plan:{int(plan_id)}", "db_id": int(plan_id), "name": str(plan_data.get("name") or ""),
+                    "rows": [dict(item) for item in parsed_refs if isinstance(item, dict)], "created_utc": str(plan_data.get("created_utc") or ""),
+                    "updated_utc": str(plan_data.get("updated_utc") or ""), "storage": "db"})
+            target_conn = sqlite3.connect(f"file:{primary_db.resolve()}?mode=ro", uri=True, timeout=1.0)
+            try:
+                target_conn.row_factory = sqlite3.Row
+                target_tables = {str(row[0]) for row in target_conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                device_profiles = [dict(row) for row in target_conn.execute("SELECT id,name FROM device_profiles ORDER BY id").fetchall()] if "device_profiles" in target_tables else []
+                operating_profiles = [dict(row) for row in target_conn.execute("SELECT id,name FROM operating_profiles ORDER BY id").fetchall()] if "operating_profiles" in target_tables else []
+            finally:
+                target_conn.close()
+        except sqlite3.Error as exc:
+            return {"ok": False, "error": f"Cannot read the HF Daily source catalog: {exc}"}
+    else:
+        device_profiles, operating_profiles = [], []
+    if source_id == LIVE_SOURCE_SET_ID:
+        active = read_plan_schedule_table(db_path, ("daily_schedule_tab",))
+        if active is None:
+            settings = request.get("settings") or {}
+            rows = [dict(row) for row in (settings.get("hf_schedule") or settings.get("daily_schedule") or [])
+                    if isinstance(row, dict)]
+        else:
+            rows = normalize_active_daily_rows(*active)
+            for row in rows:
+                if row["source_row_id"] > 0:
+                    row.setdefault("source_key", f"HF:{row['source_row_id']}")
+        return {"ok": True, "rows": rows or [], "target_found": DailyScheduleTab._plan_destination_target_row(rows or [], request.get("target")) is not None, "catalog": catalog,
+                "device_profiles": device_profiles, "operating_profiles": operating_profiles}
+    selected = next((row for row in catalog if str(row.get("id") or "").strip() == source_id), None)
+    if selected is None:
+        return {"ok": False, "error": "The selected HF Daily source is unavailable."}
+    rows = [dict(item) for item in selected.get("rows", []) if isinstance(item, dict)]
+    return {"ok": True, "rows": rows, "target_found": DailyScheduleTab._plan_destination_target_row(rows, request.get("target")) is not None, "catalog": catalog,
+            "device_profiles": device_profiles, "operating_profiles": operating_profiles}
 DAY_CANON = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
 DAY_INDEX = {name: idx for idx, name in enumerate(DAY_CANON)}
 
@@ -201,6 +375,7 @@ PROGRAMS = {
 
 
 class DailyScheduleTab(QWidget):
+    plan_destination_load_finished = Signal(object)
     schedule_saved = Signal()
     """
     HF Frequency Schedule tab.
@@ -256,20 +431,32 @@ class DailyScheduleTab(QWidget):
     RES_COL_UPDATED = 10
     RES_COL_CONFLICT = 11
 
-    def __init__(self, parent=None, *, plan_context_service: Optional[PlanContextService] = None):
+    def __init__(self, parent=None, *, plan_context_service: Optional[PlanContextService] = None,
+                 defer_initial_load: bool = False, settings_manager: Optional[SettingsManager] = None):
         super().__init__(parent)
-        self.settings = SettingsManager()
+        self._defer_initial_load = bool(defer_initial_load)
+        self._initial_load_complete = False
+        self._destination_request = None
+        self._destination_generation = 0
+        self._destination_task = None
+        self._destination_focus_targets: Dict[str, Dict[str, Any]] = {}
+        self._plan_destination_loaded = False
+        self.settings = settings_manager if settings_manager is not None else SettingsManager()
+        self._source_save_worker = SourceSaveWorker(self)
+        self._pending_source_save = None
         self.plan_context_service = plan_context_service or PlanContextService()
         self._status_service = SoftwareStatusService(self.settings)
-        try:
-            self.settings.reload()
-        except Exception:
-            pass
+        if settings_manager is None:
+            try:
+                self.settings.reload()
+            except Exception:
+                pass
         self.operating_groups: List[Dict] = self._load_operating_groups()
         self._operating_groups_sig = self._snapshot_operating_groups(self.operating_groups)
         self.device_profiles: List[Dict[str, Any]] = []
         self.operating_profiles: List[Dict[str, Any]] = []
-        self._refresh_schedule_target_catalogs()
+        if not self._defer_initial_load:
+            self._refresh_schedule_target_catalogs()
         default_mode = (self.settings.get("display_time_mode", "LOCAL") or "LOCAL").upper()
         self._show_local: bool = default_mode != "UTC"
         self._raw_schedule: List[Dict] = []
@@ -282,7 +469,7 @@ class DailyScheduleTab(QWidget):
         self._sop_panel_timer: Optional[QTimer] = None
         self._suppress_autostart: bool = True  # avoid auto-start during initial load
         self._qsy_options: Dict[str, Dict] = {}
-        self._sop_manager = SOPManager()
+        self._sop_manager = _DeferredSOPManager(self.settings) if self._defer_initial_load else SOPManager()
         self._last_sop_panel_refresh_ts: float = 0.0
         self._schedule_resource_rows: List[Dict[str, Any]] = []
         self._resource_view_rows: List[Dict[str, Any]] = []
@@ -317,7 +504,9 @@ class DailyScheduleTab(QWidget):
 
         self._build_ui()
         self._refresh_qsy_options()
-        self._load_schedule()
+        if not self._defer_initial_load:
+            self._load_schedule()
+            self._initial_load_complete = True
         self._setup_clock_timer()
         self._setup_sop_panel_timer()
         self._suppress_autostart = False
@@ -807,8 +996,15 @@ class DailyScheduleTab(QWidget):
         self._apply_compact_schedule_view(False)
         self._update_delete_button_state()
         self._update_resource_action_state()
-        self._refresh_freqplanner_source_combo()
-        self._sync_selected_freqplanner_source_table()
+        if self._defer_initial_load:
+            self.schedule_source_combo.blockSignals(True)
+            self.schedule_source_combo.clear()
+            self.schedule_source_combo.addItem("Active Daily Schedule", LIVE_SOURCE_SET_ID)
+            self.schedule_source_combo.blockSignals(False)
+            self._editing_freqplanner_source_id = LIVE_SOURCE_SET_ID
+        else:
+            self._refresh_freqplanner_source_combo()
+            self._sync_selected_freqplanner_source_table()
         self._update_header_title()
         self._update_daily_responsive_layout()
         self._update_source_action_state()
@@ -1052,10 +1248,24 @@ class DailyScheduleTab(QWidget):
         self.schedule_source_combo.blockSignals(True)
         self.schedule_source_combo.clear()
         self.schedule_source_combo.addItem("Active Daily Schedule", LIVE_SOURCE_SET_ID)
-        for row in source_sets_for_category(self.settings, HF_DAILY_SOURCE_SETS_KEY, HF_DAILY_SOURCE_CATEGORY):
+        rows = source_sets_for_category(self.settings, HF_DAILY_SOURCE_SETS_KEY, HF_DAILY_SOURCE_CATEGORY)
+        if len({str(row.get('name') or '').strip().casefold() for row in rows}) < len(rows):
+            store = self.plan_context_service.store
+            rows = describe_duplicate_schedule_choices(rows, HF_DAILY_SOURCE_CATEGORY,
+                store.list_frequency_plans(), store.list_effective_assigned_plans(), store.list_device_profiles())
+        for row in rows:
             set_id = str(row.get("id") or "").strip()
             if set_id:
-                self.schedule_source_combo.addItem(str(row.get("name") or set_id), set_id)
+                self.schedule_source_combo.addItem(str(row.get("choice_label") or row.get("name") or set_id), set_id)
+                index = self.schedule_source_combo.count()-1
+                self.schedule_source_combo.setItemData(index, str(row.get('name') or set_id), Qt.UserRole+1)
+                self.schedule_source_combo.setItemData(index, str(row.get('choice_tooltip') or ''), Qt.ToolTipRole)
+        if any(row.get('choice_label') for row in rows):
+            metrics = self.schedule_source_combo.fontMetrics()
+            padding = metrics.horizontalAdvance('MMMM')
+            desired = max(metrics.horizontalAdvance(str(row.get('choice_label') or row.get('name') or '')) for row in rows) + padding
+            available = self.schedule_source_combo.screen().availableGeometry().width() - padding
+            self.schedule_source_combo.view().setMinimumWidth(min(desired, available))
         idx = self.schedule_source_combo.findData(selected)
         self.schedule_source_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self._editing_freqplanner_source_id = str(self.schedule_source_combo.currentData() or LIVE_SOURCE_SET_ID)
@@ -1103,7 +1313,7 @@ class DailyScheduleTab(QWidget):
             return
         if not self._confirm_discard_unsaved_source_load():
             return
-        current_name = str(self.schedule_source_combo.currentText() or "").strip()
+        current_name = self._current_freqplanner_source_name()
         current_index = self.schedule_source_combo.currentIndex()
         selected_label = (
             str(self.schedule_source_combo.itemText(current_index) or "").strip()
@@ -1175,6 +1385,9 @@ class DailyScheduleTab(QWidget):
         if not hasattr(self, "schedule_source_combo"):
             return ""
         text = str(self.schedule_source_combo.currentText() or "").strip()
+        index = self.schedule_source_combo.currentIndex()
+        if index >= 0 and text == self.schedule_source_combo.itemText(index):
+            text = str(self.schedule_source_combo.itemData(index, Qt.UserRole+1) or text)
         if text == "Active Daily Schedule":
             return ""
         return text
@@ -1262,6 +1475,158 @@ class DailyScheduleTab(QWidget):
             self._load_schedule()
             return
         self._load_source_rows_into_table([dict(item) for item in row.get("rows", []) if isinstance(item, dict)])
+
+    def request_plan_source_load(
+        self, request_id: str, source_id: str, target: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Load an exact Plan Builder source asynchronously without persisting selection."""
+        request_id = str(request_id or "").strip()
+        source_id = str(source_id or "").strip()
+        if not request_id or not source_id:
+            return False
+        if not self._confirm_discard_unsaved_source_load():
+            self.plan_destination_load_finished.emit({
+                "request_id": request_id, "source_id": source_id, "ok": False,
+                "loaded": False, "cancelled": True, "target_found": False,
+            })
+            return False
+        self.cancel_plan_destination_load()
+        self._destination_focus_targets.clear()
+        self._destination_generation += 1
+        generation = self._destination_generation
+        try:
+            settings_data = self.settings.all()
+        except Exception:
+            settings_data = {}
+        db_path = self._db_path()
+        request = {
+            "request_id": request_id, "source_id": source_id,
+            "target": dict(target or {}), "generation": generation,
+            "db_path": str(db_path), "settings": settings_data,
+            "primary_db_path": str(getattr(self.settings, "_config_path", None) or settings_db_path()),
+        }
+        task = _DailyDestinationTask(request, _read_daily_plan_source)
+        task.signals.finished.connect(self._complete_plan_source_load)
+        self._destination_request = request
+        self._destination_task = task
+        self.table.setEnabled(False)
+        if hasattr(self, "schedule_source_combo"):
+            self.schedule_source_combo.setEnabled(False)
+        QThreadPool.globalInstance().start(task)
+        return True
+
+    def cancel_plan_destination_load(self, request_id: Optional[str] = None) -> bool:
+        pending = self._destination_request
+        if pending is None:
+            return False
+        if request_id is not None and str(request_id) != str(pending.get("request_id")):
+            return False
+        self._destination_generation += 1
+        self._destination_request = None
+        self._destination_task = None
+        self.table.setEnabled(True)
+        if hasattr(self, "schedule_source_combo"):
+            self.schedule_source_combo.setEnabled(True)
+        return True
+
+    def _complete_plan_source_load(self, result: Dict[str, Any]) -> None:
+        pending = self._destination_request
+        if not pending or result.get("generation") != self._destination_generation:
+            return
+        if str(result.get("request_id")) != str(pending.get("request_id")):
+            return
+        self._destination_request = None
+        self._destination_task = None
+        self.table.setEnabled(True)
+        if hasattr(self, "schedule_source_combo"):
+            self.schedule_source_combo.setEnabled(True)
+        if not result.get("ok"):
+            self.plan_destination_load_finished.emit({
+                "request_id": result.get("request_id"), "source_id": result.get("source_id"),
+                "ok": False, "loaded": False, "target_found": False,
+                "error": str(result.get("error") or "The selected HF Daily source is unavailable."),
+            })
+            return
+        self.device_profiles = [dict(row) for row in result.get("device_profiles", []) if isinstance(row, dict)]
+        self.operating_profiles = [dict(row) for row in result.get("operating_profiles", []) if isinstance(row, dict)]
+        rows = [dict(row) for row in result.get("rows", []) if isinstance(row, dict)]
+        self._load_source_rows_into_table(rows)
+        self._initial_load_complete = True
+        self._plan_destination_loaded = True
+        source_id = str(result.get("source_id") or "")
+        self._editing_freqplanner_source_id = source_id
+        if hasattr(self, "schedule_source_combo"):
+            self.schedule_source_combo.blockSignals(True)
+            self.schedule_source_combo.clear()
+            self.schedule_source_combo.addItem("Active Daily Schedule", LIVE_SOURCE_SET_ID)
+            catalog = [row for row in result.get("catalog", []) if isinstance(row, dict)]
+            name_counts: Dict[str, int] = {}
+            for row in catalog:
+                name = str(row.get("name") or row.get("id") or "Schedule").strip()
+                name_counts[name.casefold()] = name_counts.get(name.casefold(), 0) + 1
+            for row in catalog:
+                row_id = str(row.get("id") or "").strip()
+                if not row_id:
+                    continue
+                name = str(row.get("name") or row_id).strip()
+                label = name if name_counts.get(name.casefold(), 0) == 1 else f"{name} · {row_id}"
+                self.schedule_source_combo.addItem(label, row_id)
+                idx = self.schedule_source_combo.count() - 1
+                self.schedule_source_combo.setItemData(idx, name, Qt.UserRole + 1)
+                self.schedule_source_combo.setItemData(idx, label, Qt.ToolTipRole)
+            index = self.schedule_source_combo.findData(source_id)
+            if index >= 0:
+                self.schedule_source_combo.setCurrentIndex(index)
+            self.schedule_source_combo.blockSignals(False)
+            self._update_source_action_state()
+            source_label = str(self.schedule_source_combo.currentText() or "Active Daily Schedule")
+            if hasattr(self, "source_usage_label"):
+                self.source_usage_label.setText(f"<b>Editing:</b> {source_label} | Usage: --")
+        request_id = str(result.get("request_id") or "")
+        self._destination_focus_targets[request_id] = {
+            "target": dict(result.get("target") or {}),
+            "source_id": source_id,
+        }
+        target_found = bool(result.get("target_found"))
+        self.plan_destination_load_finished.emit({
+            "request_id": request_id, "source_id": source_id, "ok": True,
+            "loaded": True, "target_found": target_found,
+        })
+
+    @staticmethod
+    def _plan_destination_target_row(rows: List[Dict[str, Any]], target: Any) -> Optional[int]:
+        if not isinstance(target, dict):
+            return None
+        row_id = target.get("source_row_id")
+        source_key = str(target.get("source_key") or "").strip()
+        resource_id = target.get("resource_id")
+        if row_id in (None, "") and not source_key and resource_id in (None, ""):
+            return None
+        matches = []
+        for index, row in enumerate(rows):
+            try:
+                id_match = row_id in (None, "") or int(row.get("source_row_id") or 0) == int(row_id)
+            except (TypeError, ValueError):
+                id_match = False
+            try:
+                resource_match = resource_id in (None, "") or int(row.get("resource_id") or 0) == int(resource_id)
+            except (TypeError, ValueError):
+                resource_match = False
+            key_match = not source_key or str(row.get("source_key") or "").strip() == source_key
+            if id_match and resource_match and key_match:
+                matches.append(index)
+        return matches[0] if len(matches) == 1 else None
+
+    def focus_plan_destination_target(self, request_id: str) -> bool:
+        record = self._destination_focus_targets.pop(str(request_id or ""), None)
+        if not record or record.get("source_id") != self._selected_freqplanner_source_id():
+            return False
+        index = self._plan_destination_target_row(self._raw_schedule, record.get("target"))
+        if index is None or index >= self.table.rowCount():
+            return False
+        self.table.selectRow(index)
+        self.table.scrollToItem(self.table.item(index, 0))
+        return True
 
     def _sync_selected_freqplanner_source_table(self) -> None:
         if bool(getattr(self, "_dirty", False)):
@@ -1359,12 +1724,15 @@ class DailyScheduleTab(QWidget):
             auto_tune = self._get_checkbox_value(r, self.COL_AUTOTUNE)
             target_scope, target_device_profile_id, target_operating_profile_id = self._selected_schedule_target(r)
 
+            if (start_val or end_val) and not all((group_name, band, mode)):
+                format_errors.append(f'Row {r+1}: Choose a group, band and mode before saving this timed row.')
+                continue
             if group_name and band and mode and not freq_text:
                 resolution = resolve_operating_group_frequency(
                     self.operating_groups, group=group_name, band=band, mode=mode
                 )
-                if resolution.state == "ambiguous":
-                    format_errors.append(f"Row {r+1}: Select a frequency for {group_name} {band}.")
+                if resolution.state == "ambiguous" or start_val or end_val or self._frequency_key(r):
+                    format_errors.append(f"Row {r+1}: Choose a frequency for {group_name} on {band}. If none are listed, choose another group/band or add one in HF Operating Groups.")
                     continue
             if not group_name or not band or not freq_text or not start_val or not end_val:
                 continue
@@ -1376,7 +1744,7 @@ class DailyScheduleTab(QWidget):
                 continue
             if not self._validate_frequency(band, mode, freq_text):
                 return []
-            freq_text = self._format_freq(freq_text)
+            freq_text = str(freq_text).strip()
             start_val = self._normalize_hhmm(start_val)
             end_val = self._normalize_hhmm(end_val)
             if not self._validate_time(start_val) or not self._validate_time(end_val):
@@ -1399,6 +1767,7 @@ class DailyScheduleTab(QWidget):
                         "mode": mode,
                         "vfo": "A",
                         "frequency": freq_text,
+                        "operating_group_frequency_key": self._frequency_key(r),
                         "start_utc": start_utc,
                         "end_utc": end_utc,
                         "group_name": group_name,
@@ -1418,100 +1787,233 @@ class DailyScheduleTab(QWidget):
         return hf_rows
 
     def _on_save_freqplanner_source_clicked(self) -> None:
+        if self._source_save_worker.busy:
+            return
         try:
             rows = self._source_rows_for_freqplanner_snapshot()
         except ValueError as exc:
             QMessageBox.warning(self, "Save Blocked", str(exc))
             return
         if not rows:
-            QMessageBox.warning(
-                self,
-                "No HF Daily Rows",
-                "Add at least one HF Daily row before saving this schedule.",
-            )
+            QMessageBox.warning(self, "No HF Daily Rows", "Add at least one HF Daily row before saving this schedule.")
             return
-        selected = self._selected_freqplanner_source_row()
-        existing_id = int(selected.get("db_id", 0) or 0) if selected else 0
-        name = self._current_freqplanner_source_name()
-        if not name:
-            name = self._default_daily_schedule_name()
-            if hasattr(self, "schedule_source_combo"):
-                self.schedule_source_combo.setEditText(name)
-        if selected:
-            selected_name = str(selected.get("name") or "").strip()
-            existing_rows_signature = self._rows_signature([dict(item) for item in selected.get("rows", []) if isinstance(item, dict)])
-            new_rows_signature = self._rows_signature(rows)
-            if name and selected_name and name != selected_name and existing_rows_signature == new_rows_signature:
-                QMessageBox.information(
-                    self,
-                    "Rename Schedule",
-                    "Use Rename Schedule to change the HF Daily schedule name without updating row data.",
-                )
+        name = self._current_freqplanner_source_name().strip() or self._default_daily_schedule_name()
+        selected_id = self._selected_freqplanner_source_id()
+        if getattr(self, "_plan_destination_loaded", False) and selected_id == LIVE_SOURCE_SET_ID:
+            self._begin_active_source_save(rows, HF_DAILY_SOURCE_CATEGORY, name)
+            return
+        if hasattr(self, "schedule_source_combo") and not self._current_freqplanner_source_name().strip():
+            self.schedule_source_combo.setEditText(name)
+        self._pending_source_save = {"kind": "named", "rows": rows, "name": name, "selected_id": selected_id}
+        self._set_source_save_busy(True)
+        args = (Path(self.settings.config_dir), HF_DAILY_SOURCE_CATEGORY, name, selected_id, rows)
+        if not self._source_save_worker.submit(prepare_named_schedule_save, args, self._on_named_source_save_prepared):
+            self._finish_source_save_cancelled()
+
+    def _begin_active_source_save(self, rows: List[Dict[str, Any]], category: str, name: str = "Active Daily Schedule") -> None:
+        self._pending_source_save = {"kind": "active", "rows": rows, "name": name, "category": category}
+        self._set_source_save_busy(True)
+        if not self._source_save_worker.submit(_daily_source_save_preflight, (Path(self.settings.config_dir), rows), self._on_active_source_save_prepared):
+            self._finish_source_save_cancelled()
+
+    def _set_source_save_busy(self, busy: bool) -> None:
+        save_button = getattr(self, "save_source_btn", None)
+        if busy:
+            self._save_busy_control_states = []
+            if save_button is not None:
+                self._source_save_button_text = save_button.text()
+                save_button.setText("Checking and saving…")
+        elif save_button is not None and hasattr(self, "_source_save_button_text"):
+            save_button.setText(self._source_save_button_text)
+            del self._source_save_button_text
+        names = (
+            "save_source_btn", "save_btn", "new_source_btn", "rename_source_btn", "delete_source_btn",
+            "add_row_btn", "del_row_btn", "move_to_resources_btn", "resources_resolve_btn", "time_toggle_btn",
+            "_plan_assignment_return_btn",
+        )
+        for name in names:
+            button = getattr(self, name, None)
+            if button is not None:
+                if busy:
+                    self._save_busy_control_states.append((button, button.isEnabled()))
+                    button.setEnabled(False)
+        if not busy:
+            for button, was_enabled in getattr(self, "_save_busy_control_states", []):
+                try:
+                    button.setEnabled(was_enabled)
+                except RuntimeError:
+                    pass
+            self._save_busy_control_states = []
+        for name in ("table", "schedule_source_combo"):
+            control = getattr(self, name, None)
+            if control is not None:
+                control.setEnabled(not busy)
+
+    def _on_named_source_save_prepared(self, result, error) -> None:
+        pending = self._pending_source_save
+        if not pending:
+            return
+        if error:
+            self._finish_source_save_error("Schedule Review Failed", str(error))
+            return
+        revision, target, impacts = result
+        selected_id = str(pending["selected_id"] or "")
+        if target is not None and selected_id != str(target.get("id") or ""):
+            box = QMessageBox(QMessageBox.Question, "Update Existing Schedule",
+                f"A schedule named '{target['name']}' already exists. Update its rows with the rows shown here? Its identity and plan links will be kept. RF Guard will check affected plans before saving.",
+                QMessageBox.Cancel, self)
+            update_button = box.addButton("Update Existing Schedule", QMessageBox.AcceptRole)
+            box.setDefaultButton(QMessageBox.Cancel)
+            box.exec()
+            if box.clickedButton() is not update_button:
+                self._finish_source_save_cancelled()
                 return
-        if not selected:
-            existing_id = 0
-        if existing_id and not self._confirm_rf_guard_source_update(
-            HF_DAILY_SOURCE_CATEGORY,
-            f"plan:{existing_id}",
-            rows,
-            name,
-        ):
+        if target:
+            old_name = str(target.get("name") or "").strip()
+            old_sig = self._rows_signature([dict(row) for row in target.get("rows", []) if isinstance(row, dict)])
+            if old_name.casefold() != pending["name"].casefold() and old_sig == self._rows_signature(pending["rows"]):
+                self._finish_source_save_cancelled()
+                QMessageBox.information(self, "Rename Schedule", "Use Rename Schedule to change the HF Daily schedule name without updating row data.")
+                return
+            if not self._confirm_rf_guard_impacts(impacts, pending["name"]):
+                self._finish_source_save_cancelled()
+                return
+        review = (revision, target, impacts)
+        args = (Path(self.settings.config_dir), HF_DAILY_SOURCE_CATEGORY, SELECTED_HF_DAILY_SOURCE_SET_KEY, pending["name"], pending["rows"], review)
+        if not self._source_save_worker.submit(commit_named_schedule_save, args, self._on_named_source_save_committed):
+            self._finish_source_save_error("Save Failed", "A schedule save is already in progress.")
+
+    def _on_active_source_save_prepared(self, result, error) -> None:
+        pending = self._pending_source_save
+        if not pending:
             return
-        try:
-            saved = save_source_schedule(
-                self.settings,
-                HF_DAILY_SOURCE_CATEGORY,
-                SELECTED_HF_DAILY_SOURCE_SET_KEY,
-                name,
-                rows,
-                existing_plan_id=existing_id or None,
-            )
-        except Exception as exc:
-            QMessageBox.critical(self, "Save Failed", f"Could not save HF Daily schedule:\n{exc}")
+        if error:
+            self._finish_source_save_error("RF Guard Check Unavailable", str(error))
             return
-        updated_plans: List[Dict[str, Any]] = []
-        saved_id = str(saved.get("id") or "").strip()
-        if saved_id:
+        review = result
+        if not self._confirm_rf_guard_impacts(review[1], pending.get("name", "Active Daily Schedule")):
+            self._finish_source_save_cancelled()
+            return
+        pending["review"] = review
+        if not self._source_save_worker.submit(_daily_source_save_commit, (Path(self.settings.config_dir), pending["rows"], review), self._on_active_source_save_committed):
+            self._finish_source_save_error("Save Failed", "A schedule save is already in progress.")
+
+    def _confirm_rf_guard_impacts(self, impacts: List[Dict[str, Any]], name: str) -> bool:
+        if any(str(item.get("validation", {}).get("state") or "").lower() == "blocked" for item in impacts):
+            lines = self._rf_guard_impact_lines(impacts)
+            QMessageBox.warning(self, "RF Guard Blocked Update", f"Updating '{name}' affects assigned schedules. Fix the conflict before saving.\n\n" + "\n".join(lines[:6]))
+            return False
+        if not impacts:
+            return True
+        lines = self._rf_guard_impact_lines(impacts)
+        response = QMessageBox.question(self, "RF Guard Warning",
+            f"Updating '{name}' affects one or more master schedules assigned to radios.\n\n" + "\n".join(lines[:6]) + "\n\nSave this HF Daily schedule update anyway?",
+            QMessageBox.Save | QMessageBox.Cancel, QMessageBox.Cancel)
+        return response == QMessageBox.Save
+
+    @staticmethod
+    def _rf_guard_impact_lines(impacts: List[Dict[str, Any]]) -> List[str]:
+        lines = []
+        for impact in impacts:
+            validation = impact.get("validation", {})
+            plan, device = impact.get("plan", {}), impact.get("device", {})
+            radio = str(device.get("name") or f"Radio {impact.get('assignment', {}).get('device_profile_id')}")
+            plan_name = str(plan.get("name") or "assigned Frequency Plan")
+            messages = [str(value) for value in validation.get("messages", []) if str(value or "").strip()]
+            lines.append(f"- {radio} / {plan_name}: {messages[0] if messages else 'RF Guard reported a schedule conflict.'}")
+        return lines
+
+    def _on_named_source_save_committed(self, result, error) -> None:
+        if error:
+            self._finish_source_save_error("Save Failed", f"Could not save HF Daily schedule:\n{error}")
+            return
+        saved, updated, warning = result
+        pending = self._pending_source_save
+        if pending is None:
+            return
+        rows = pending["rows"]
+        self._finish_source_save_ui()
+        saved_id = str(saved.get("id") or "")
+        if hasattr(self, "schedule_source_combo") and saved_id:
+            idx = self.schedule_source_combo.findData(saved_id)
+            if idx < 0:
+                self.schedule_source_combo.addItem(str(saved.get("name") or "Schedule"), saved_id)
+                idx = self.schedule_source_combo.count() - 1
+            self.schedule_source_combo.blockSignals(True)
+            self.schedule_source_combo.setCurrentIndex(idx)
+            self.schedule_source_combo.blockSignals(False)
+            self._editing_freqplanner_source_id = saved_id
+            self._update_source_action_state()
+            if hasattr(self, "source_usage_label"):
+                self.source_usage_label.setText(f"<b>Editing:</b> {self.schedule_source_combo.currentText()} | Usage: --")
+        self._load_source_rows_into_table(rows)
+        self._pending_source_save = None
+        self._complete_source_save_notification(saved, rows, updated, warning)
+
+    def _on_active_source_save_committed(self, result, error) -> None:
+        if error:
+            self._finish_source_save_error("Save Failed", f"Could not save HF Daily schedule:\n{error}")
+            return
+        rows, updated, conflicts = result
+        pending = self._pending_source_save
+        if pending is None:
+            return
+        self._finish_source_save_ui()
+        self.settings._data["hf_schedule"] = [dict(row) for row in rows]
+        self.settings._data["daily_schedule"] = [dict(row) for row in rows]
+        if pending.get("origin") == "active_editor":
+            self._raw_schedule = [dict(row) for row in rows]
+            self._suspend_dirty_tracking = True
             try:
-                updated_plans = reproject_frequency_plans_for_source_update(
-                    self.settings,
-                    HF_DAILY_SOURCE_CATEGORY,
-                    saved_id,
-                    rows,
-                )
-            except Exception as exc:
-                log.exception("HF Daily Schedule: failed refreshing dependent Frequency Plans.")
-                QMessageBox.warning(
-                    self,
-                    "Plan Refresh Warning",
-                    "The HF Daily schedule was saved, but CommsPlan could not refresh dependent Frequency Plans.\n\n"
-                    f"{exc}",
-                )
+                self.table.setRowCount(0)
+                for row in rows:
+                    self._append_entry_row(self._entry_for_display(row))
+                if self.table.rowCount() == 0:
+                    self._add_row()
+            finally:
+                self._suspend_dirty_tracking = False
+            self._set_headers()
+            self._apply_compact_schedule_view()
+            self._update_clock_labels()
+            self.table.clearSelection()
+            self._invalidate_active_schedule_views()
+            self._highlight_time_conflicts()
+            self._saved_rows_signature = self._rows_signature(self._collect_rows_for_signature())
+            self._set_dirty(False)
+            self._effective_projection_cache_token = None
+            self._effective_projection_cache_rows = []
+            self._refresh_freq_planner()
+            self.schedule_saved.emit()
+            self._pending_source_save = None
+            log.info("HF Frequency Schedule saved asynchronously: %d rows", len(rows))
+            QMessageBox.information(self, "Saved", f"HF Schedule saved. HF rows: {len(rows)} | SOP rows updated: 0.")
+            self._prompt_active_sop_conflicts_after_schedule_change(conflicts)
+            return
+        self._load_source_rows_into_table(rows)
+        self._pending_source_save = None
+        self._complete_source_save_notification({"name": pending.get("name", "Active Daily Schedule")}, rows, updated, "", active=True)
+
+    def _complete_source_save_notification(self, saved, rows, updated, warning, *, active=False) -> None:
         try:
             self.plan_context_service.invalidate()
         except Exception:
             pass
-        if hasattr(self, "schedule_source_combo"):
-            self._refresh_freqplanner_source_combo()
-            if saved_id:
-                idx = self.schedule_source_combo.findData(saved_id)
-                if idx >= 0:
-                    self.schedule_source_combo.blockSignals(True)
-                    self.schedule_source_combo.setCurrentIndex(idx)
-                    self.schedule_source_combo.blockSignals(False)
-                    self._editing_freqplanner_source_id = saved_id
-        if hasattr(self, "table"):
-            self._load_source_rows_into_table(rows)
-        if hasattr(self, "resources_set_combo"):
-            self._refresh_schedule_resources(force=True)
         self._refresh_freq_planner()
-        verb = "Updated" if existing_id else "Saved"
-        plan_note = f" Refreshed {len(updated_plans)} dependent Frequency Plan(s)." if updated_plans else ""
-        QMessageBox.information(
-            self,
-            f"HF Daily Schedule {verb}",
-            f"{verb} '{saved['name']}' with {len(rows)} HF Daily row(s).{plan_note} Select it in Plan Builder.",
-        )
+        plan_note = f" Refreshed {len(updated or [])} dependent Frequency Plan(s)." if updated else ""
+        title = "Active HF Daily Schedule Saved" if active else "HF Daily Schedule Saved"
+        QMessageBox.information(self, title, f"Saved '{saved.get('name')}' with {len(rows)} HF Daily row(s).{plan_note}{warning or ''}")
+
+    def _finish_source_save_error(self, title: str, message: str) -> None:
+        self._pending_source_save = None
+        self._set_source_save_busy(False)
+        QMessageBox.warning(self, title, message)
+
+    def _finish_source_save_cancelled(self) -> None:
+        self._pending_source_save = None
+        self._set_source_save_busy(False)
+
+    def _finish_source_save_ui(self) -> None:
+        self._set_source_save_busy(False)
 
     def _confirm_rf_guard_source_update(
         self,
@@ -1569,16 +2071,23 @@ class DailyScheduleTab(QWidget):
     def _on_delete_freqplanner_source_clicked(self) -> None:
         row = self._selected_freqplanner_source_row()
         if row is None:
+            QMessageBox.information(
+                self, "Schedule Unavailable",
+                "Select a saved HF Daily schedule again, then choose Delete Schedule. No schedule was deleted.",
+            )
             return
         name = str(row.get("name") or "selected HF Daily schedule")
-        response = QMessageBox.question(
-            self,
+        confirmation = QMessageBox(
+            QMessageBox.Warning,
             "Delete HF Daily Schedule",
             f"Delete '{name}'? This removes the saved HF Daily schedule but does not change the live HF Daily schedule.",
-            QMessageBox.Delete | QMessageBox.Cancel,
             QMessageBox.Cancel,
+            self,
         )
-        if response != QMessageBox.Delete:
+        delete_button = confirmation.addButton("Delete Schedule", QMessageBox.DestructiveRole)
+        confirmation.setDefaultButton(QMessageBox.Cancel)
+        confirmation.exec()
+        if confirmation.clickedButton() is not delete_button:
             return
         try:
             delete_source_schedule(
@@ -1717,15 +2226,25 @@ class DailyScheduleTab(QWidget):
                 group_combo.clear()
                 group_names = sorted({g.get("group", "") for g in self.operating_groups if g.get("group")})
                 group_combo.addItems(group_names)
-                if current_group in group_names:
+                if current_group:
+                    if current_group not in group_names:
+                        group_combo.addItem(current_group)
+                        group_combo.setToolTip('Saved group is no longer configured. Choose a configured group to continue.')
                     group_combo.setCurrentText(current_group)
                 group_combo.blockSignals(False)
             # repopulate band options based on selected group
             if isinstance(band_combo, QComboBox):
                 current_band = band_combo.currentText()
-                self._populate_band_combo(band_combo, self._get_combo_value(r, self.COL_GROUP, ""))
-                if current_band and band_combo.findText(current_band) >= 0:
-                    band_combo.setCurrentText(current_band)
+                was_blocked = band_combo.blockSignals(True)
+                try:
+                    self._populate_band_combo(band_combo, self._get_combo_value(r, self.COL_GROUP, ""))
+                    if current_band:
+                        if band_combo.findText(current_band) < 0:
+                            band_combo.addItem(current_band)
+                            band_combo.setToolTip('Saved band is no longer configured for this group. Choose another band or group.')
+                        band_combo.setCurrentText(current_band)
+                finally:
+                    band_combo.blockSignals(was_blocked)
             # refresh mode/freq cells
             self._update_mode_freq(r)
         self._update_clock_labels()
@@ -1981,77 +2500,19 @@ class DailyScheduleTab(QWidget):
 
             return get_config_dir() / "config" / "sop_hf_session_journal.json"
 
-    def _empty_sop_session_journal(self) -> Dict[str, Any]:
-        now_iso = self._utc_now_iso()
-        return {
-            "version": 1,
-            "session_id": "",
-            "status": "idle",
-            "started_utc": "",
-            "updated_utc": now_iso,
-            "active_profile_ids": [],
-            "profile_names": {},
-            "hf_restore": {
-                "available": False,
-                "captured_utc": "",
-                "pre_adjust_signature": "",
-                "post_adjust_signature": "",
-                "hf_rows_before": [],
-                "restored_utc": "",
-            },
-            "temp_net_sop_policies": [],
-        }
+    def _sop_session_service(self) -> SOPSessionService:
+        return SOPSessionService(self._sop_session_journal_path(), self._sop_manager)
 
     def _load_sop_session_journal(self, *, force: bool = False) -> Dict[str, Any]:
-        if not force and isinstance(self._sop_session_journal_cache, dict):
-            return dict(self._sop_session_journal_cache)
-
-        path = self._sop_session_journal_path()
-        out = self._empty_sop_session_journal()
-        if path.exists():
-            try:
-                raw = json.loads(path.read_text(encoding="utf-8"))
-                if isinstance(raw, dict):
-                    out.update(raw)
-            except Exception as e:
-                log.debug("HF Schedule: failed loading SOP session journal %s: %s", path, e)
-
-        hf_restore = out.get("hf_restore")
-        if not isinstance(hf_restore, dict):
-            hf_restore = {}
-        base_restore = dict(self._empty_sop_session_journal().get("hf_restore") or {})
-        base_restore.update(hf_restore)
-        base_restore["available"] = bool(base_restore.get("available"))
-        if not isinstance(base_restore.get("hf_rows_before"), list):
-            base_restore["hf_rows_before"] = []
-        out["hf_restore"] = base_restore
-
-        if not isinstance(out.get("active_profile_ids"), list):
-            out["active_profile_ids"] = []
-        out["active_profile_ids"] = [
-            int(v) for v in out.get("active_profile_ids", []) if str(v).strip().lstrip("-").isdigit() and int(v) > 0
-        ]
-        if not isinstance(out.get("profile_names"), dict):
-            out["profile_names"] = {}
-        if not isinstance(out.get("temp_net_sop_policies"), list):
-            out["temp_net_sop_policies"] = []
-        out["version"] = 1
-        out["updated_utc"] = str(out.get("updated_utc") or "") or self._utc_now_iso()
-
-        self._sop_session_journal_cache = dict(out)
-        return dict(out)
+        if force or not isinstance(self._sop_session_journal_cache, dict):
+            self._sop_session_journal_cache = self._sop_session_service().load_journal()
+        return dict(self._sop_session_journal_cache)
 
     def _save_sop_session_journal(self, journal: Dict[str, Any]) -> None:
-        data = dict(journal or {})
-        data["version"] = 1
-        data["updated_utc"] = self._utc_now_iso()
-        path = self._sop_session_journal_path()
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
-            self._sop_session_journal_cache = dict(data)
-        except Exception as e:
-            log.debug("HF Schedule: failed saving SOP session journal %s: %s", path, e)
+            self._sop_session_journal_cache = self._sop_session_service().save_journal(journal)
+        except OSError as exc:
+            log.debug("HF Schedule: failed saving SOP session journal: %s", exc)
 
     def _active_hf_sop_profiles(self) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
@@ -2145,50 +2606,13 @@ class DailyScheduleTab(QWidget):
 
     def _start_or_refresh_sop_session(self, profiles: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
         active_profiles = profiles if isinstance(profiles, list) else self._active_hf_sop_profiles()
-        active_ids = sorted({int(p.get("id") or 0) for p in active_profiles if int(p.get("id") or 0) > 0})
-        profile_names = {
-            str(int(p.get("id") or 0)): str(p.get("name") or "").strip()
-            for p in active_profiles
-            if int(p.get("id") or 0) > 0
-        }
-        now_iso = self._utc_now_iso()
-
-        journal = self._load_sop_session_journal()
-        status = str(journal.get("status") or "idle").strip().lower()
-        existing_ids = sorted({int(v) for v in (journal.get("active_profile_ids") or []) if int(v) > 0})
-        if status == "active" and existing_ids and existing_ids == active_ids:
-            journal["profile_names"] = dict(journal.get("profile_names") or {})
-            journal["profile_names"].update(profile_names)
-            journal["updated_utc"] = now_iso
-            self._save_sop_session_journal(journal)
-            return journal
-
-        if active_ids:
-            journal = self._empty_sop_session_journal()
-            journal["session_id"] = uuid.uuid4().hex
-            journal["status"] = "active"
-            journal["started_utc"] = now_iso
-            journal["active_profile_ids"] = list(active_ids)
-            journal["profile_names"] = dict(profile_names)
-            self._save_sop_session_journal(journal)
-        return journal
+        self._sop_session_journal_cache = self._sop_session_service().start_or_refresh(active_profiles)
+        return dict(self._sop_session_journal_cache)
 
     def register_sop_session_activation(self, profile_id: int, profile_name: str = "") -> None:
-        pid = int(profile_id or 0)
-        if pid <= 0:
-            return
-        profiles = self._active_hf_sop_profiles()
-        known = {int(p.get("id") or 0) for p in profiles}
-        if pid not in known:
-            profiles.append({"id": pid, "name": profile_name, "active": True, "category": "HF"})
-        journal = self._start_or_refresh_sop_session(profiles)
-        if str(profile_name or "").strip():
-            names = dict(journal.get("profile_names") or {})
-            names[str(pid)] = str(profile_name or "").strip()
-            journal["profile_names"] = names
-            journal["status"] = "active"
-            journal["active_profile_ids"] = sorted({int(v) for v in (journal.get("active_profile_ids") or []) if int(v) > 0} | {pid})
-            self._save_sop_session_journal(journal)
+        journal = self._sop_session_service().register_activation(profile_id, profile_name)
+        if journal is not None:
+            self._sop_session_journal_cache = journal
 
     def _record_sop_auto_adjust_snapshot_before(self) -> None:
         active_profiles = self._active_hf_sop_profiles()
@@ -2245,86 +2669,6 @@ class DailyScheduleTab(QWidget):
                 out[key] = row
         return out
 
-    def _record_temp_session_net_sop_policy_decisions(
-        self,
-        decisions: List[Dict[str, Any]],
-        *,
-        before_by_key: Dict[str, Dict[str, Any]],
-        origin: str,
-        profiles_hint: Optional[List[Dict[str, Any]]] = None,
-    ) -> None:
-        active_profiles = self._active_hf_sop_profiles()
-        if isinstance(profiles_hint, list):
-            known_ids = {int(p.get("id") or 0) for p in active_profiles if int(p.get("id") or 0) > 0}
-            for p in profiles_hint:
-                if not isinstance(p, dict):
-                    continue
-                pid = int(p.get("id") or 0)
-                if pid <= 0 or pid in known_ids:
-                    continue
-                active_profiles.append(dict(p))
-                known_ids.add(pid)
-        if not active_profiles:
-            return
-        journal = self._start_or_refresh_sop_session(active_profiles)
-        after_by_key = self._active_net_sop_policy_rows_by_key()
-        rows = list(journal.get("temp_net_sop_policies") or [])
-        row_map: Dict[str, Dict[str, Any]] = {}
-        for item in rows:
-            if not isinstance(item, dict):
-                continue
-            key = str(item.get("conflict_key") or "").strip()
-            if key and key not in row_map:
-                row_map[key] = item
-
-        changed = False
-        for decision in decisions:
-            if not isinstance(decision, dict):
-                continue
-            key = self._policy_conflict_key_for_row(decision)
-            if not key:
-                continue
-            before = before_by_key.get(key) or {}
-            after = after_by_key.get(key) or {}
-            expected_policy = str(after.get("policy") or decision.get("policy") or "").strip().upper()
-            if expected_policy not in {"SOP_PRIORITY", "NET_PRIORITY"}:
-                continue
-            item = row_map.get(key)
-            if not isinstance(item, dict):
-                item = {
-                    "conflict_key": key,
-                    "net_row_signature": str(decision.get("net_row_signature") or "").strip(),
-                    "sop_row_signature": str(decision.get("sop_row_signature") or "").strip(),
-                    "window_start_utc": str(decision.get("window_start_utc") or "").strip(),
-                    "window_end_utc": str(decision.get("window_end_utc") or "").strip(),
-                    "sop_profile_id": int(decision.get("sop_profile_id") or 0),
-                    "sop_layer_id": int(decision.get("sop_layer_id") or 0),
-                    "prev_exists": bool(before),
-                    "prev_policy": str(before.get("policy") or "").strip().upper(),
-                    "prev_policy_id": int(before.get("id") or 0),
-                    "prev_updated_utc": str(before.get("updated_utc") or "").strip(),
-                    "expected_policy": expected_policy,
-                    "expected_updated_utc": str(after.get("updated_utc") or "").strip(),
-                    "origin": str(origin or "").strip(),
-                    "saved_utc": self._utc_now_iso(),
-                    "reverted": False,
-                    "reverted_utc": "",
-                }
-                rows.append(item)
-                row_map[key] = item
-            else:
-                item["expected_policy"] = expected_policy
-                item["expected_updated_utc"] = str(after.get("updated_utc") or "").strip()
-                item["origin"] = str(origin or item.get("origin") or "").strip()
-                item["saved_utc"] = self._utc_now_iso()
-                item["reverted"] = False
-                item["reverted_utc"] = ""
-            changed = True
-
-        if changed:
-            journal["temp_net_sop_policies"] = rows
-            self._save_sop_session_journal(journal)
-
     def save_net_sop_conflict_policies_with_session_tracking(
         self,
         decisions: List[Dict[str, Any]],
@@ -2332,21 +2676,11 @@ class DailyScheduleTab(QWidget):
         origin: str = "",
         session_profile_hint: Optional[Dict[str, Any]] = None,
     ) -> int:
-        valid_decisions = [d for d in (decisions or []) if isinstance(d, dict)]
-        if not valid_decisions:
-            return 0
-        before_by_key = self._active_net_sop_policy_rows_by_key()
-        saved = int(self._sop_manager.save_net_sop_conflict_policies(valid_decisions) or 0)
-        if saved > 0:
-            try:
-                self._record_temp_session_net_sop_policy_decisions(
-                    valid_decisions,
-                    before_by_key=before_by_key,
-                    origin=origin or "Net/SOP conflict decision",
-                    profiles_hint=[dict(session_profile_hint)] if isinstance(session_profile_hint, dict) else None,
-                )
-            except Exception as e:
-                log.debug("HF Schedule: failed recording temp Net/SOP policy decisions: %s", e)
+        saved, journal = self._sop_session_service().save_net_policy_decisions(
+            decisions, origin=origin, session_profile_hint=session_profile_hint,
+        )
+        if journal is not None:
+            self._sop_session_journal_cache = journal
         return saved
 
     def _session_pending_temp_policy_entries(
@@ -5286,14 +5620,18 @@ class DailyScheduleTab(QWidget):
         return get_config_dir() / "config" / "freqinout.db"
 
     def _load_schedule_from_db(self) -> List[Dict]:
+        return self._read_schedule_from_db(self._db_path())
+
+    @staticmethod
+    def _read_schedule_from_db(db_path: Path) -> List[Dict]:
         """
         Load HF schedule rows from SQLite table daily_schedule_tab, if present.
         """
-        db_path = self._db_path()
+        db_path = Path(db_path)
         if not db_path.exists():
             return []
 
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(f"file:{db_path.resolve()}?mode=ro", uri=True, timeout=1.0)
         try:
             cur = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='daily_schedule_tab'"
@@ -5463,8 +5801,11 @@ class DailyScheduleTab(QWidget):
         """
         Persist HF schedule rows to SQLite table daily_schedule_tab.
         """
-        db_path = self._db_path()
-        conn = sqlite3.connect(db_path)
+        self._write_schedule_to_db(self._db_path(), rows)
+
+    @staticmethod
+    def _write_schedule_to_db(db_path: Path, rows: List[Dict], *, connection=None) -> None:
+        conn = sqlite3.connect(db_path) if connection is None else connection
         try:
             conn.execute("DROP TABLE IF EXISTS daily_schedule_tab")
             conn.execute(
@@ -5515,7 +5856,8 @@ class DailyScheduleTab(QWidget):
             conn.commit()
             log.info("HF schedule mirrored to DB at %s (%d entries).", db_path, len(rows))
         finally:
-            conn.close()
+            if connection is None:
+                conn.close()
 
     def _persist_hf_schedule_rows(
         self,
@@ -6188,12 +6530,15 @@ class DailyScheduleTab(QWidget):
             auto_tune = self._get_checkbox_value(r, self.COL_AUTOTUNE)
             target_scope, target_device_profile_id, target_operating_profile_id = self._selected_schedule_target(r)
 
+            if (start_val or end_val) and not all((group_name, band, mode)):
+                format_errors.append(f'Row {r+1}: Choose a group, band and mode before saving this timed row.')
+                continue
             if group_name and band and mode and not freq_text:
                 resolution = resolve_operating_group_frequency(
                     self.operating_groups, group=group_name, band=band, mode=mode
                 )
-                if resolution.state == "ambiguous":
-                    format_errors.append(f"Row {r+1}: Select a frequency for {group_name} {band}.")
+                if resolution.state == "ambiguous" or start_val or end_val or self._frequency_key(r):
+                    format_errors.append(f"Row {r+1}: Choose a frequency for {group_name} on {band}. If none are listed, choose another group/band or add one in HF Operating Groups.")
                     continue
             if not group_name or not band or not freq_text or not start_val or not end_val:
                 continue
@@ -6265,44 +6610,21 @@ class DailyScheduleTab(QWidget):
                 "Some rows were skipped:\n" + "\n".join(save_warnings),
             )
 
-        saved, save_detail = self._persist_hf_schedule_rows(hf_rows, prompt_after_save=False)
-        if not saved:
-            QMessageBox.critical(self, "Save Failed", save_detail)
+        if self._source_save_worker.busy:
             return
+        self._begin_active_source_save(hf_rows, HF_DAILY_SOURCE_CATEGORY, "Active Daily Schedule")
+        if self._pending_source_save is not None:
+            self._pending_source_save["origin"] = "active_editor"
+            self._pending_source_save["sop_updates"] = sop_updates
+        return
 
-        sop_changed = 0
-        sop_failures: List[str] = []
-        for profile_id, layer_rows in sop_updates.items():
+    def _prompt_active_sop_conflicts_after_schedule_change(self, conflicts=None) -> None:
+        if conflicts is None:
             try:
-                sop_changed += int(self._sop_manager.upsert_schedule_layer_rows(profile_id, layer_rows) or 0)
+                conflicts = self._sop_manager.collect_active_hf_conflicts(force_refresh=True)
             except Exception as e:
-                sop_failures.append(f"Profile {profile_id}: {e}")
-
-        if sop_updates:
-            self._dispatch_sop_schedule_change()
-
-        if sop_failures:
-            QMessageBox.warning(
-                self,
-                "SOP Save Warning",
-                "Some SOP rows could not be updated:\n" + "\n".join(sop_failures[:12]),
-            )
-
-        self._load_schedule()
-        log.info("HF Frequency Schedule saved: %d HF rows, %d SOP rows updated", len(hf_rows), sop_changed)
-        QMessageBox.information(
-            self,
-            "Saved",
-            f"HF Schedule saved. HF rows: {len(hf_rows)} | SOP rows updated: {sop_changed}.",
-        )
-        self._prompt_active_sop_conflicts_after_schedule_change()
-
-    def _prompt_active_sop_conflicts_after_schedule_change(self) -> None:
-        try:
-            conflicts = self._sop_manager.collect_active_hf_conflicts(force_refresh=True)
-        except Exception as e:
-            log.debug("HF Schedule: active SOP conflict scan failed: %s", e)
-            return
+                log.debug("HF Schedule: active SOP conflict scan failed: %s", e)
+                return
         if not conflicts:
             return
         lines: List[str] = []
@@ -6782,6 +7104,12 @@ class DailyScheduleTab(QWidget):
         self._refresh_schedule_resources(force=True)
 
     def on_tab_activated(self) -> None:
+        if self._destination_request is not None:
+            return
+        if self._plan_destination_loaded:
+            return
+        if self._defer_initial_load and not self._initial_load_complete:
+            return
         with perf_span(
             "daily_schedule.on_tab_activated",
             settings=self.settings,
@@ -7099,7 +7427,10 @@ class DailyScheduleTab(QWidget):
         else:
             group_names = sorted({g.get("group", "") for g in self.operating_groups if g.get("group")})
             group_combo.addItems(group_names)
-            if group_val and group_val in group_names:
+            if group_val:
+                if group_val not in group_names:
+                    group_combo.addItem(group_val)
+                    group_combo.setToolTip('Saved group is no longer configured. Choose a configured group to continue.')
                 group_combo.setCurrentText(group_val)
             group_combo.currentTextChanged.connect(self._mark_dirty)
         self.table.setCellWidget(row, self.COL_GROUP, group_combo)
@@ -7115,7 +7446,10 @@ class DailyScheduleTab(QWidget):
                 band_combo.setToolTip(overlay_tip)
         else:
             self._populate_band_combo(band_combo, group_combo.currentText())
-            if band_val and band_combo.findText(band_val) >= 0:
+            if band_val:
+                if band_combo.findText(band_val) < 0:
+                    band_combo.addItem(band_val)
+                    band_combo.setToolTip('Saved band is no longer configured for this group. Choose another band or group.')
                 band_combo.setCurrentText(band_val)
             band_combo.currentTextChanged.connect(self._mark_dirty)
         self.table.setCellWidget(row, self.COL_BAND, band_combo)
@@ -7129,6 +7463,10 @@ class DailyScheduleTab(QWidget):
                 mode_combo.setToolTip(overlay_tip)
             self.table.setCellWidget(row, self.COL_MODE, mode_combo)
 
+        if not is_sop_overlay and entry.get('mode'):
+            mode_seed = QComboBox()
+            mode_seed.addItem(str(entry['mode']))
+            self.table.setCellWidget(row, self.COL_MODE, mode_seed)
         freq_item = QTableWidgetItem()
         freq_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
         freq_item.setText(str(entry.get("frequency") or ""))
@@ -7225,10 +7563,10 @@ class DailyScheduleTab(QWidget):
             # auto-select first band
             if band_combo.count() > 0:
                 band_combo.setCurrentIndex(0)
-            self._update_mode_freq(row)
+            self._update_mode_freq(row, selection_changed=True)
 
         def on_band_changed(text: str, self=self, row=row):
-            self._update_mode_freq(row)
+            self._update_mode_freq(row, selection_changed=True)
 
         group_combo.currentTextChanged.connect(on_group_changed)
         band_combo.currentTextChanged.connect(on_band_changed)
@@ -7427,14 +7765,14 @@ class DailyScheduleTab(QWidget):
         item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
 
     def _populate_band_combo(self, band_combo: QComboBox, group_name: str):
-        band_combo.blockSignals(True)
+        was_blocked = band_combo.blockSignals(True)
         band_combo.clear()
         bands = sorted(
             {g.get("band") for g in self.operating_groups if g.get("group") == group_name and g.get("band")}
         )
         for b in bands:
             band_combo.addItem(b)
-        band_combo.blockSignals(False)
+        band_combo.blockSignals(was_blocked)
 
     def _matching_operating_groups(self, group: str, band: str) -> List[Dict]:
         return [
@@ -7457,13 +7795,18 @@ class DailyScheduleTab(QWidget):
         select = self.table.cellWidget(row, self.COL_SELECT)
         return str(select.property("operating_group_frequency_key") or "").strip() if isinstance(select, QWidget) else ""
 
-    def _set_frequency_choice(self, row: int, group: str, band: str, mode: str, frequency: str = "", frequency_key: str = "") -> None:
+    def _set_frequency_choice(self, row: int, group: str, band: str, mode: str, frequency: str = "", frequency_key: str = "", *, selection_changed: bool = False) -> None:
         result = resolve_operating_group_frequency(
             self.operating_groups, group=group, band=band, mode=mode,
             frequency_key=frequency_key, frequency=frequency or None,
         )
+        if selection_changed and not result.resolved:
+            # Choosing a new group/band/mode is an explicit change of destination.
+            # Its previous frequency is not a saved broken reference to carry over.
+            frequency, frequency_key = '', ''
+            result = resolve_operating_group_frequency(self.operating_groups, group=group, band=band, mode=mode)
         candidates = [g for g in result.candidates if normalize_frequency_hz(g.get("frequency")) is not None]
-        if not candidates and not frequency_key:
+        if not candidates and not frequency_key and not selection_changed:
             # Preserve legacy free-text schedule rows when no valid configured
             # frequency variant exists for this group/mode.
             self.table.removeCellWidget(row, self.COL_FREQ)
@@ -7477,7 +7820,7 @@ class DailyScheduleTab(QWidget):
         combo = QComboBox()
         combo.setMinimumContentsLength(7)
         combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
-        combo.addItem("Select frequency…", "")
+        combo.addItem("Choose frequency…" if candidates else "No frequencies set for this group/band", "")
         combo.setItemData(0, "", Qt.UserRole + 1)
         for candidate in candidates:
             value = str(candidate.get("frequency") or "").strip()
@@ -7491,12 +7834,15 @@ class DailyScheduleTab(QWidget):
         elif frequency or frequency_key:
             # Keep stale or incompatible references visible and intact until the
             # operator explicitly selects a configured alternative.
-            combo.addItem(f"Unresolved — {frequency}" if frequency else "Unresolved frequency reference", frequency_key)
+            combo.addItem(f"Not available for this group/band — {format_frequency_mhz(frequency)}" if frequency else "Saved frequency is unavailable", frequency_key)
             combo.setItemData(combo.count() - 1, frequency, Qt.UserRole + 1)
             selected = combo.count() - 1
         if selected >= 0:
             combo.setCurrentIndex(selected)
-        combo.setToolTip(result.reason if result.state != "resolved" else "Choose the configured frequency for this schedule row.")
+        combo.setToolTip(
+            f'Choose a listed frequency for {group} on {band}. The saved frequency is no longer available.' if frequency_key and not result.resolved else
+            f'Choose a frequency for {group} on {band}.' if candidates else
+            f'No frequencies are configured for {group} on {band}. Choose another group/band or add a frequency in Configuration > HF Operating Groups.')
         combo.currentIndexChanged.connect(lambda _idx, r=row: self._on_frequency_choice_changed(r))
         combo.currentIndexChanged.connect(self._mark_dirty)
         self.table.setCellWidget(row, self.COL_FREQ, combo)
@@ -7513,7 +7859,7 @@ class DailyScheduleTab(QWidget):
             self._auto_start_for_mode(mode)
 
     def _set_mode_widget(
-        self, row: int, group: str, band: str, preferred_mode: str = "", entries: Optional[List[Dict]] = None
+        self, row: int, group: str, band: str, preferred_mode: str = "", entries: Optional[List[Dict]] = None, *, selection_changed: bool = False
     ) -> QComboBox:
         if entries is None:
             entries = self._matching_operating_groups(group, band)
@@ -7523,28 +7869,31 @@ class DailyScheduleTab(QWidget):
             combo.addItems(modes)
         else:
             combo.addItem("")
-        if preferred_mode and preferred_mode in modes:
+        if preferred_mode and (preferred_mode in modes or not selection_changed):
+            if preferred_mode not in modes:
+                combo.addItem(preferred_mode)
+                combo.setToolTip('Saved mode is no longer configured for this group and band. Choose a listed mode or another group/band.')
             combo.setCurrentText(preferred_mode)
         elif modes:
             combo.setCurrentIndex(0)
-        combo.setEnabled(len(modes) > 1)
-        combo.currentTextChanged.connect(lambda _m, r=row: self._update_mode_freq(r))
+        combo.setEnabled(combo.count() > 1)
+        combo.currentTextChanged.connect(lambda _m, r=row: self._update_mode_freq(r, selection_changed=True))
         combo.currentTextChanged.connect(self._mark_dirty)
         self.table.setCellWidget(row, self.COL_MODE, combo)
         return combo
 
-    def _update_mode_freq(self, row: int):
+    def _update_mode_freq(self, row: int, *, selection_changed: bool = False):
         group = self._get_combo_value(row, self.COL_GROUP, "")
         band = self._get_combo_value(row, self.COL_BAND, "")
         entries = self._matching_operating_groups(group, band)
         preferred_mode = self._get_combo_value(row, self.COL_MODE, "")
-        mode_combo = self._set_mode_widget(row, group, band, preferred_mode, entries)
+        mode_combo = self._set_mode_widget(row, group, band, preferred_mode, entries, selection_changed=selection_changed)
         mode_val = mode_combo.currentText().strip() if isinstance(mode_combo, QComboBox) else preferred_mode
         old_frequency = self._frequency_value(row)
         old_key = self._frequency_key(row)
-        self._set_frequency_choice(row, group, band, mode_val, old_frequency, old_key)
+        self._set_frequency_choice(row, group, band, mode_val, old_frequency, old_key, selection_changed=selection_changed)
         # trigger autostart if mode changes
-        if mode_val:
+        if mode_val and selection_changed:
             self._auto_start_for_mode(mode_val)
 
     # ---------------- Auto-start radio software ---------------- #

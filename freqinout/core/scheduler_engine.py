@@ -869,9 +869,14 @@ class SchedulerEngine(QObject, NetTuningMixin):
         return validated_timer_policy(getattr(self, "_runtime_timer_policy_override", {}))
 
     def _scheduler_enabled(self) -> bool:
-        override = self._runtime_scheduler_enabled_override
+        override = getattr(self, '_runtime_scheduler_enabled_override', None)
         if override is not None:
             return bool(override)
+        manager = getattr(self, 'station_runtime_manager', None)
+        if manager is not None and hasattr(manager, '_runtimes'):
+            from freqinout.core.scheduler_permission import model_allows_scheduling
+            return any(model_allows_scheduling(getattr(runtime, 'operating_profile', {}) or {})
+                       for runtime in getattr(manager, '_runtimes', {}).values())
         try:
             return bool(self.settings.get("use_scheduler", True))
         except Exception:
@@ -883,8 +888,11 @@ class SchedulerEngine(QObject, NetTuningMixin):
         if runtime is not None:
             policy_getter = getattr(runtime, "operating_policy", None)
             if callable(policy_getter):
-                return bool(policy_getter().get("scheduler_enabled", True))
-            return bool(getattr(runtime, "operating_profile", {}).get("scheduler_enabled", True))
+                return bool(policy_getter().get("scheduler_enabled", False))
+            from freqinout.core.scheduler_permission import model_allows_scheduling
+            return model_allows_scheduling(getattr(runtime, "operating_profile", {}) or {})
+        if manager is not None and hasattr(manager, '_runtimes'):
+            return False
         return self._scheduler_enabled()
 
     def set_manual_net_active(

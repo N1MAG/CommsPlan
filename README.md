@@ -2,7 +2,7 @@
   <img src="assets/CommsPlan_logo.png" alt="CommsPlan logo" width="150">
 </p>
 
-# CommsPlan 2.0.9
+# CommsPlan 2.0.10
 
 See the [CommsPlan release page](https://github.com/N1MAG/CommsPlan/releases/latest)
 for available platform packages, checksums, and release notes.
@@ -30,7 +30,13 @@ exercise messages. Radio readbacks and green Mesh connection status are simulate
 for illustration; no live radio or Mesh connection was used. Detail images show
 the individual workspaces.*
 
-## What is new in 2.0.9
+## What is new in 2.0.10
+
+- **Plan Builder:** save a plan, choose radios, and review each proposed assignment in one guided workflow.
+- **RF Guard:** go directly to the affected finding and open the named repair action.
+- **Scheduling:** retain permission through restarts and save Daily, Net, and SOP schedules in the background.
+
+## What was new in 2.0.9
 
 - **JS8 net control:** scan a full-width station intelligence table with decoded
   Spotter/CommStat summaries, topics, state, region and group filters. View the
@@ -296,11 +302,11 @@ storage and compatibility identities so companion applications and saved
 stations continue to work. Follow the installation guide when upgrading, and
 make a verified backup before the first upgrade.
 
-## Download CommsPlan 2.0.9
+## Download CommsPlan 2.0.10
 
 Use the [CommsPlan release page](https://github.com/N1MAG/CommsPlan/releases/latest)
 for published installers, source archives, checksums, and release notes.
-Choose 2.0.9 only when it is listed as a published release.
+Choose 2.0.10 only when it is listed as a published release.
 Use only the artifacts actually listed there. Unsigned Windows/macOS packages
 are identified in their filenames and release notes.
 
@@ -308,7 +314,7 @@ Verify downloaded files against the checksums published on the release page.
 
 ## Install or update from the public source release
 
-After v2.0.9 is published, clone the public repository and select that release tag. For an existing
+After v2.0.10 is published, clone the public repository and select that release tag. For an existing
 checkout, fetch the public tag and select it before running the installer.
 Close CommsPlan and its companion applications, use the same application folder
 as the existing installation, and require the final `Installation verified`
@@ -317,14 +323,14 @@ line before launching CommsPlan. A Git pull by itself is not a complete update.
 ```bash
 git clone https://github.com/N1MAG/CommsPlan.git
 cd CommsPlan
-git checkout v2.0.9
+git checkout v2.0.10
 ```
 
 For an existing checkout:
 
 ```bash
 git fetch origin --tags
-git checkout v2.0.9
+git checkout v2.0.10
 ```
 
 ### Windows PowerShell
@@ -351,7 +357,7 @@ The guided installer installs required system packages where supported,
 creates CommsPlan's virtual environment, and prepares the desktop launcher.
 Use `setup` for first setup, `update` for a source update, and `desktop` to
 refresh desktop integration after an update, including when an older package
-launcher is still installed. Run these commands from the checked-out 2.0.9
+launcher is still installed. Run these commands from the checked-out 2.0.10
 release:
 
 ```bash

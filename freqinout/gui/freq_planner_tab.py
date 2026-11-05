@@ -11,7 +11,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
 from PySide6.QtCore import QEvent, QItemSelectionModel, QObject, Qt, QTimer, Signal
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QWidget,
@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QComboBox,
     QTableWidget,
+    QTableView,
     QTableWidgetItem,
     QHeaderView,
     QFrame,
@@ -35,6 +36,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QScrollArea,
     QMenu,
+    QTabBar,
 )
 
 from pathlib import Path
@@ -43,8 +45,13 @@ from freqinout.core.settings_manager import SettingsManager
 from freqinout.core.planner_radio_projection import build_radio_windows
 from freqinout.core.planner_guard_rules import PlannerGuardRules, guard_key
 from freqinout.core.planner_input_catalog import PlannerCatalogReader
-from freqinout.core.planner_catalog_worker import PlannerCatalogWorker
+from freqinout.core.planner_catalog_worker import PlannerCatalogWorker, same_authoring_inputs
 from freqinout.core.planner_catalog_views import PlannerSettingsView, PlannerStoreView, PlannerContextView
+from freqinout.gui.plan_assignment_panel import PlanAssignmentPanel
+from freqinout.gui.current_page_stack import CurrentPageStack
+from freqinout.gui.plan_relink_panel import PlanRelinkPanel
+from freqinout.core.schedule_source_sets import plan_source_link_description
+from freqinout.gui.plan_assignment_controller import PlanAssignmentController
 from freqinout.core.product_identity import STORAGE_NAME
 from freqinout.core.schedule_configuration_cache import ScheduleRevisionTracker
 from freqinout.core.scheduler_serial_executor import DaemonSerialExecutor
@@ -75,7 +82,6 @@ from freqinout.core.schedule_source_sets import (
     assigned_plan_rf_guard_impacts_for_source_update,
     save_source_schedule,
     plan_source_usage_summary,
-    source_set_row_by_id_for_category,
     source_sets_for_category,
 )
 from freqinout.core.schedule_source_inputs import ScheduleSourceError, MissingScheduleSourceError, read_plan_schedule_table
@@ -103,6 +109,7 @@ from freqinout.gui.theme import (
     font_derived_widget_height,
     apply_text_size_accessibility_guards,
     band_cell_colors,
+    contrast_text_for_background,
     qcolor,
     BAND_COLORS_LIGHT,
     BAND_COLORS_DARK,
@@ -120,6 +127,10 @@ DAY_NAMES = [
 DAY_NAMES_UPPER = [d.upper() for d in DAY_NAMES]
 FREQPLANNER_CONTEXT_FALLBACK_TEXT = PLAN_CONTEXT_FALLBACK_TEXT
 
+
+_UNSELECTED_LAYER = "__unselected_layer__"
+_NO_SOP_LAYER = "__no_sop__"
+_NO_SOP_REF = "sop:none"
 
 @dataclass(frozen=True)
 class EffectiveWindowCell:
@@ -152,6 +163,7 @@ class _PlanProjectionResult:
     policy_rows: Tuple[Dict[str, Any], ...]
     week_sunday: datetime.date
     projection: Optional[object] = None
+    window_cells: tuple[EffectiveWindowCell, ...] = ()
     selected_plan: Optional[Dict[str, Any]] = None
     selected_plan_refs: Tuple[Dict[str, Any], ...] = ()
     started_at: float = 0.0
@@ -244,6 +256,10 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         self._fresh_guard_reviews = {}
         self._fresh_source_impacts = ()
         self._fresh_action_token = None
+        self._plan_save_pending = False
+        self._plan_save_cancelled = None
+        self._plan_save_emitter = _PlanProjectionEmitter(self)
+        self._plan_save_emitter.finished.connect(self._on_plan_saved)
         self._action_emitter = _PlanProjectionEmitter(self)
         self._action_emitter.finished.connect(self._on_fresh_action_ready)
         self._catalog_emitter = _PlanProjectionEmitter(self)
@@ -281,15 +297,34 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         self._action_projection_emitter = _PlanProjectionEmitter(self)
         self._action_projection_emitter.finished.connect(self._on_action_projection_ready)
         self._projection_latest = None
+        self._window_view_positions = {}
+        self._window_view_results = {}
+        self._new_plan_explicit_layers = False
+        self._published_window_view = None
         self._projection_emitter = _PlanProjectionEmitter(self)
         self._projection_emitter.finished.connect(self._on_projection_ready)
         self._latest_projection_snapshot: str = ""
         self._latest_projection_mode: str = ""
         self._latest_projection: Optional[object] = None
         self._creating_new_frequency_plan: bool = False
+        self._committed_plan_pending_catalog = None
         self._frequency_plan_layers_dirty: bool = False
         self._guided_plan_handoff_device_profile_id: int = 0
+        self._assignment_open = False
+        self._assignment_request = {}
+        self._assignment_return_scroll_value = None
+        self._pending_assignment_scroll_restore = None
+        self._assignment_source_repair_plan_id = 0
+        self._assignment_source_repair_snapshot = None
+        self._assignment_return_restore_snapshot = None
+        self._preserve_assignment_choices_on_next_open = False
+        self._assignment_choices_restore_snapshot = None
+        self._saved_plan_drafts = {}
+        self._automatic_edit_review_plan_id = 0
+        self._relink_committed_focus = None
         self._build_ui()
+        self._assignment_controller = PlanAssignmentController(self.settings.config_dir, self)
+        self._assignment_controller.result_ready.connect(self._on_assignment_result)
         self._apply_theme()
         self._request_input_catalog()
 
@@ -318,6 +353,14 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
                      for name, widget in vars(self).items()
                      if name.startswith("inline_") and isinstance(widget, (QLineEdit, QComboBox)))
 
+    def _assignment_authoring_signature(self):
+        # Background catalogue/projection publications are not new user edits.
+        return (self.frequency_plan_combo.currentData(), self.frequency_plan_combo.currentText(),
+                bool(self._frequency_plan_layers_dirty),
+                self.hf_daily_source_combo.currentData(), self.hf_net_source_combo.currentData(),
+                self.sop_plan_source_combo.currentData(),
+                self._inline_draft_state() if self._inline_draft_dirty() else None)
+
     def _assert_fresh_action(self):
         token = self._fresh_action_token
         if token is None or token != self._draft_identity() or not self._tab_active or self._revision_closed:
@@ -340,22 +383,23 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
             if not self._catalog_pending:
                 self._request_input_catalog()
         if self._catalog_review_required:
-            self.frequency_plan_action_hint_label.setText("Current inputs differ from this draft. Choose Review changed inputs before applying it.")
+            self._set_action_feedback("Current inputs differ from this draft. Choose Review changed inputs before applying it.")
             return True
         if self._input_read_error:
             self._show_plan_input_failure()
             return True
         if self._catalog_pending or self._catalog_model is None:
-            self.frequency_plan_action_hint_label.setText("Wait for current inputs before changing a plan. Entered work is retained.")
+            self._set_action_feedback("Wait for current inputs before changing a plan. Entered work is retained.")
             return True
         identity = self._draft_identity()
         request = self._catalog_request(False)
         self._fresh_action_pending = True
         plan = self._selected_frequency_plan_row()
-        self.frequency_plan_action_hint_label.setText("Verifying current inputs before applying this action…")
+        self._set_action_feedback("Verifying current inputs before applying this action…")
         future = self._revision_executor.submit(
             self._catalog_worker.verify_action,
             expected_revision=self._catalog_model.catalog.revision,
+            expected_catalog=self._catalog_model.catalog,
             plan_id=int(target_plan_id if target_plan_id is not None else (plan or {}).get("id") or 0),
             source_ids=request["source_ids"], validation_requests=request["validation_requests"],
             runtime_status=request["runtime_status"], guard_context=request["guard_context"],
@@ -380,9 +424,10 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         if self._revision_closed or not self._tab_active:
             return
         if identity != self._draft_identity():
-            self.frequency_plan_action_hint_label.setText("The draft or selected inputs changed during verification. Review them, then choose the action again.")
+            self._set_action_feedback("The draft or selected inputs changed during verification. Review them, then choose the action again.")
             return
         if error is not None:
+            self._operation_feedback = 'Action not completed. Repair the inputs, then retry saving. Your entries are retained.'
             self._handle_plan_input_failure(error)
             return
         model, expected = value
@@ -394,7 +439,7 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         try:
             action(*args, **kwargs)
         except Exception as exc:
-            self.frequency_plan_action_hint_label.setText(f"Unable to apply action: {exc}")
+            self._set_action_feedback(f"Unable to apply action: {exc}")
             log.exception("Plan Builder explicit action failed")
         finally:
             self._fresh_action_token = None
@@ -435,30 +480,54 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         name = str((plan or {}).get("name") or "").strip()
         return bool(text and text not in {name, f"{name} (draft)"})
 
-    def _review_changed_inputs(self):
+    def _has_unsaved_authoring_draft(self):
+        return (self._has_authoring_draft()
+                and getattr(self, '_saved_draft_identity', None) != self._assignment_authoring_signature())
+
+    def _review_changed_inputs(self, *, for_create=False):
         if not self._catalog_review_required or self._catalog_pending or self._catalog_model is None:
-            return
+            if for_create:
+                self._set_action_feedback('Plan not saved yet: current inputs are still loading. Your name and layer choices are retained; try Save Plan when loading finishes.')
+            return False
         generation = self._catalog_generation
-        context_identity = self._host_selection_identity(), self._guided_plan_handoff_device_profile_id
-        response = QMessageBox.question(
-            self, "Review Changed Inputs",
-            "The schedule inputs or radio context changed while entered work was retained.\n\n"
-            + self._source_selection_summary()
-            + "\n\nReview the current plan windows and selected sources. Keep this draft against the current inputs? "
-              "This does not save it; choose Save or Update separately after review.",
-            QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
-        if (response == QMessageBox.Yes and generation == self._catalog_generation and not self._catalog_pending
-                and context_identity == (self._host_selection_identity(), self._guided_plan_handoff_device_profile_id)):
+        context_identity = (self._host_selection_identity(), self._guided_plan_handoff_device_profile_id, self._host_runtime_status())
+        if for_create:
+            text = (f"Plan: {self._current_frequency_plan_name() or 'New plan'}\n\n"
+                    'Configuration changed after this draft was opened. This does not mean your Daily or Net choices are invalid. Your name and selections have been kept.\n\n'
+                    + self._source_selection_summary()
+                    + '\n\nReview the current windows and sources, then choose Save Plan using these inputs. RF Guard and source checks still run. No radio assignment changes until you assign the plan.')
+            confirmation = QMessageBox(QMessageBox.Question, 'Save Plan', text, QMessageBox.Cancel, self)
+            create_button = confirmation.addButton('Save Plan', QMessageBox.AcceptRole)
+            confirmation.setDefaultButton(QMessageBox.Cancel)
+            confirmation.exec()
+            accepted = confirmation.clickedButton() is create_button
+        else:
+            response = QMessageBox.question(
+                self, 'Review Changed Inputs',
+                'The schedule inputs or radio context changed while entered work was retained.\n\n'
+                + self._source_selection_summary()
+                + '\n\nReview the current plan windows and selected sources. Keep this draft against the current inputs? '
+                  'This does not save it; choose the plan action separately after review.',
+                QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
+            accepted = response == QMessageBox.Yes
+        if (accepted and generation == self._catalog_generation and not self._catalog_pending
+                and context_identity == (self._host_selection_identity(), self._guided_plan_handoff_device_profile_id, self._host_runtime_status())):
             self._catalog_review_required = False
             self.review_plan_inputs_btn.hide()
-            self.frequency_plan_action_hint_label.setText("Current inputs acknowledged. Entered work retained; choose Save or Update when ready.")
+            self._update_plan_action_styles()
+            self.frequency_plan_action_hint_label.setText('Current inputs reviewed. Saving the plan…' if for_create else 'Current inputs acknowledged. Entered work retained; choose the plan action when ready.')
+            return True
+        if for_create:
+            self._set_action_feedback('Plan not saved. Your draft is retained. Choose Save Plan to review again.' if not accepted else
+                'Plan not saved: inputs changed again during review. Your draft is retained; review current inputs and try Save Plan again.')
+        return False
 
     def _ensure_action_projection(self, mode, callback):
         if self._catalog_model is None or self._catalog_pending or self._input_read_error:
             if self._input_read_error:
                 self._show_plan_input_failure()
             else:
-                self.frequency_plan_action_hint_label.setText("Wait for current Plan Builder inputs before this action.")
+                self._set_action_feedback("Wait for current Plan Builder inputs before this action.")
             return True
         snapshot = self._snapshot((), (), (), ())
         expected_type = OperationalDayProjection if mode == "operational" else BlendedScheduleProjection
@@ -477,7 +546,7 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
             self._build_projection_snapshot, 0, mode, snapshot, hf, net, sop, policies,
             self._catalog_model.resources, week, None, (), time.perf_counter(),
             frozenset(self._configured_operating_group_names()))
-        self.frequency_plan_action_hint_label.setText("Preparing the current plan for this action…")
+        self._set_action_feedback("Preparing the current plan for this action…")
         emitter = self._action_projection_emitter
         def completed(done):
             try:
@@ -497,9 +566,10 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         if self._revision_closed or not self._tab_active:
             return
         if identity != self._draft_identity():
-            self.frequency_plan_action_hint_label.setText("The draft or selected inputs changed during preparation; choose the action again after review.")
+            self._set_action_feedback("The draft or selected inputs changed during preparation; choose the action again after review.")
             return
         if error is not None or result.error:
+            self._operation_feedback = 'Action not completed. Repair the inputs, then retry saving. Your entries are retained.'
             self._handle_plan_input_failure(error or ScheduleSourceError(result.error))
             return
         self._action_projection_prepared = (mode, snapshot, result.projection)
@@ -508,6 +578,8 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
     def _set_action_feedback(self, text):
         self._operation_feedback = str(text)
         self.frequency_plan_action_hint_label.setText(self._operation_feedback)
+        if 'not created' in self._operation_feedback.lower() or 'not saved' in self._operation_feedback.lower():
+            log.info('Plan Builder action outcome: %s', self._operation_feedback)
 
     def _catalog_mutated(self, table=None, identity=None, value=None):
         if table is not None:
@@ -620,9 +692,18 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         context_changed = self._published_guard_context is not None and (
             self._published_guard_context != incoming_guard_context or self._published_runtime_status != request["runtime_status"])
         if (old_model is not None and self._has_authoring_draft()
-                and (context_changed or (old_model.catalog.revision != model.catalog.revision and not model.acknowledged_mutation))):
+                and (context_changed or (old_model.catalog.revision != model.catalog.revision and not model.acknowledged_mutation
+                                         and not same_authoring_inputs(old_model.catalog,model.catalog)))):
             self._catalog_review_required = True
             self.review_plan_inputs_btn.show()
+        pending = self._committed_plan_pending_catalog
+        if pending and any(table == 'settings:frequency_plans' and str(identity) == str(pending['id'])
+                           for table, identity, _value in request['accepted_mutations']) and pending['id'] not in model.plan_index:
+            # A request that includes this committed mutation was issued after
+            # the save. Its coherent absence is authoritative (e.g. deletion).
+            self._committed_plan_pending_catalog = None
+            self._catalog_review_required = True
+            self._set_action_feedback('The saved plan is no longer available. Select another saved plan, or choose New Plan to recreate it. No assignment was made.')
         for table, identity, value in request["accepted_mutations"]:
             if self._catalog_mutations.get((table, identity)) == value:
                 self._catalog_mutations.pop((table, identity), None)
@@ -642,6 +723,14 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
                                     for key in ("ui_theme", "ui_text_size", "band_colors")):
             self._apply_theme()
         self.rebuild_table()
+        committed_focus = self._relink_committed_focus
+        if committed_focus is not None:
+            self._relink_committed_focus = None
+            if committed_focus['signature'] == self._assignment_authoring_signature():
+                self._saved_draft_identity = None
+                self._catalog_review_required = False
+                self.review_plan_inputs_btn.hide()
+                self.focus_frequency_plan(committed_focus['plan_id'])
         if self._pending_guided_handoff is not None:
             profile, choice = self._pending_guided_handoff
             self._pending_guided_handoff = None
@@ -653,12 +742,20 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
             plan_id, radio_id = self._pending_catalog_focus
             self._pending_catalog_focus = None
             self.focus_frequency_plan(plan_id, device_profile_id=radio_id)
+        if self._assignment_open and not self.assignment_panel._busy:
+            self._load_assignment_context()
+        elif not self._assignment_open and not getattr(self, '_relink_open', False):
+            plan = self._selected_frequency_plan_row() or {}
+            if plan.get('id'):
+                self._assignment_controller.submit('context', {'plan_id': int(plan['id']), 'operation': 'assign'})
 
     # ------------- UI ------------- #
 
     def _build_ui(self):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
+        self._plan_task_stack = CurrentPageStack(self)
+        outer.addWidget(self._plan_task_stack)
         self.planner_scroll = QScrollArea(self)
         self.planner_scroll.setObjectName("freqPlannerContentScroll")
         self.planner_scroll.setWidgetResizable(True)
@@ -670,7 +767,7 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         self.planner_scroll.viewport().installEventFilter(self)
         self.planner_scroll.verticalScrollBar().rangeChanged.connect(self._queue_geometry_settle)
         self.setProperty("fioOwnsContentScroll", True)
-        outer.addWidget(self.planner_scroll)
+        self._plan_task_stack.addWidget(self.planner_scroll)
         layout = QVBoxLayout(self.planner_body)
 
         header = QHBoxLayout()
@@ -723,6 +820,7 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         if self.frequency_plan_combo.lineEdit() is not None:
             self.frequency_plan_combo.lineEdit().setPlaceholderText("Name or select a Frequency Plan")
         self.frequency_plan_combo.currentIndexChanged.connect(self._on_frequency_plan_selected)
+        self.frequency_plan_combo.lineEdit().textEdited.connect(self._on_plan_name_edited)
         plan_select_row.addWidget(self.frequency_plan_combo, 0, 1)
         plan_select_row.addWidget(self.plan_mode_label, 0, 2)
         plan_actions_row = QVBoxLayout()
@@ -734,9 +832,9 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         self.save_sop_plan_btn = QPushButton("Save SOP Plan")
         self.rename_plan_btn = QPushButton("Rename Plan")
         self.delete_plan_btn = QPushButton("Delete Plan")
-        self.assign_plan_btn = QPushButton("Assign in Configuration")
+        self.assign_plan_btn = QPushButton("Assign to radios…")
         self.new_plan_btn.clicked.connect(self._on_new_plan_clicked)
-        self.new_plan_btn.setToolTip("Start a new Frequency Plan from the selected Daily, Net, and SOP layers.")
+        self.new_plan_btn.setToolTip("Start a blank plan and choose its schedule layers.")
         self.save_plan_btn.clicked.connect(self._on_save_plan_clicked)
         self.save_plan_btn.setToolTip("Save or update the visible HF Daily + HF Nets + SOP projection as a named Frequency Plan.")
         self.save_sop_plan_btn.clicked.connect(self._on_save_sop_plan_clicked)
@@ -749,7 +847,7 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         self.assign_plan_btn.clicked.connect(self._on_assign_plan_clicked)
         self.assign_plan_btn.setEnabled(False)
         self.assign_plan_btn.setToolTip(
-            "Select or save a Frequency Plan, then use Configuration > Radios > Schedule Assignment to assign it with RF Guard."
+            "Select or save a Frequency Plan, then choose radios and review RF Guard here in Plan Builder."
         )
         assignment_header_layout = QHBoxLayout(self.plan_assignment_header_host)
         assignment_header_layout.setContentsMargins(0, 0, 0, 0)
@@ -803,11 +901,34 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         self.plan_assignment_label.setTextFormat(Qt.PlainText)
         self.plan_assignment_label.setWordWrap(True)
         self.plan_assignment_label.setToolTip(
-            "Configuration assignment selects the schedule this radio follows after current validation. "
+            "Plan Builder assignment selects the schedule this radio follows after current validation. "
             "Manual QSY changes the radio frequency, not the saved plan."
         )
         self.plan_assignment_label.setVisible(False)
         plan_workspace.addWidget(self.plan_assignment_label)
+        self.review_saved_plan_changes_btn = QPushButton("Review pending changes…")
+        self.review_saved_plan_changes_btn.clicked.connect(self._review_pending_plan_changes)
+        self.review_saved_plan_changes_btn.hide()
+        plan_workspace.addWidget(self.review_saved_plan_changes_btn, alignment=Qt.AlignLeft)
+        self.plan_source_link_label = QLabel('')
+        self.plan_source_link_label.setWordWrap(True)
+        self.plan_source_link_label.setTextFormat(Qt.PlainText)
+        plan_workspace.addWidget(self.plan_source_link_label)
+        self.relink_plan_btn = QPushButton('Link to source schedules…')
+        self.relink_plan_btn.clicked.connect(self.open_plan_relink)
+        plan_workspace.addWidget(self.relink_plan_btn, alignment=Qt.AlignLeft)
+        self._plan_relink_return_btn = QPushButton('Return to source-link review')
+        self._plan_relink_return_btn.clicked.connect(self._return_to_plan_relink)
+        self._plan_relink_return_btn.hide()
+        plan_workspace.addWidget(self._plan_relink_return_btn, alignment=Qt.AlignLeft)
+        self.discard_saved_plan_changes_btn = QPushButton('Discard pending changes…')
+        self.discard_saved_plan_changes_btn.clicked.connect(self._discard_assignment_draft)
+        self.discard_saved_plan_changes_btn.hide()
+        self._plan_assignment_return_btn = QPushButton('Return to assignment review')
+        self._plan_assignment_return_btn.setObjectName('planAssignmentReturnToReview')
+        self._plan_assignment_return_btn.clicked.connect(self._return_from_plan_source_repair)
+        self._plan_assignment_return_btn.hide()
+        plan_workspace.addWidget(self._plan_assignment_return_btn)
 
         self.build_sop_layer_btn = QPushButton("Build SOP Layer")
         self.review_rf_guard_btn = QPushButton("Review RF Guard")
@@ -820,6 +941,48 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         self.resolve_rf_guard_btn.setEnabled(False)
         self.resolve_rf_guard_btn.setToolTip("Review RF Guard issues first, then open the radio assignment area to resolve them.")
         layout.addLayout(plan_workspace)
+        self._assignment_scroll = QScrollArea()
+        self._assignment_scroll.setObjectName('freqPlannerAssignmentScroll')
+        self._assignment_scroll.setFrameShape(QFrame.NoFrame)
+        self._assignment_scroll.setWidgetResizable(True)
+        self._assignment_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._assignment_scroll.setProperty('fioOwnsContentScroll', True)
+        assignment_body = QWidget()
+        self._assignment_scroll.setWidget(assignment_body)
+        self._plan_task_stack.addWidget(self._assignment_scroll)
+        assignment_layout = QVBoxLayout(assignment_body)
+        self._assignment_loading = QWidget()
+        loading_layout = QVBoxLayout(self._assignment_loading)
+        loading_layout.setContentsMargins(0, 0, 0, 0)
+        loading_layout.addWidget(QLabel('Loading assignment choices…'))
+        loading_back = QPushButton('Back to Plan Builder')
+        loading_back.clicked.connect(self._cancel_assignment)
+        loading_layout.addWidget(loading_back, alignment=Qt.AlignLeft)
+        assignment_layout.addWidget(self._assignment_loading)
+        self.assignment_panel = PlanAssignmentPanel(assignment_body)
+        self.assignment_panel.cancel_button.setText('Back to Plan Builder')
+        self.assignment_panel.hide()
+        self.assignment_panel.review_requested.connect(self._review_assignment)
+        self.assignment_panel.schedule_page_requested.connect(self._request_assignment_schedule_page)
+        self.assignment_panel.commit_requested.connect(self._commit_assignment)
+        self.assignment_panel.repair_requested.connect(self._repair_assignment)
+        self.assignment_panel.cancel_requested.connect(self._cancel_assignment)
+        self.assignment_panel.operation_changed.connect(self._assignment_operation_changed)
+        assignment_layout.addWidget(self.assignment_panel)
+        assignment_layout.addWidget(self.discard_saved_plan_changes_btn, alignment=Qt.AlignLeft)
+        assignment_layout.addStretch()
+        for key in ('Escape', 'Alt+Left'):
+            shortcut = QShortcut(QKeySequence(key), self._assignment_scroll)
+            shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(self._cancel_assignment)
+        self._relink_open = False
+        self.relink_panel = PlanRelinkPanel(self.planner_body)
+        self.relink_panel.hide()
+        self.relink_panel.preview_requested.connect(self._preview_plan_relink)
+        self.relink_panel.commit_requested.connect(self._commit_plan_relink)
+        self.relink_panel.cancel_requested.connect(self._cancel_plan_relink)
+        self.relink_panel.repair_requested.connect(self._repair_plan_relink)
+        layout.addWidget(self.relink_panel)
 
         source_workspace = QGridLayout()
         source_workspace.setSpacing(8)
@@ -937,8 +1100,8 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         review_controls_layout.setSpacing(2)
         view_workspace = QHBoxLayout()
         view_workspace.setSpacing(6)
-        view_workspace.addWidget(QLabel("Table View:"))
-        self.planner_view_combo = QComboBox()
+        self.planner_view_combo = QComboBox(self)
+        self.planner_view_combo.hide()
         self.planner_view_combo.setObjectName("freqPlannerViewCombo")
         self.planner_view_combo.addItem("Effective Windows", "effective")
         self.planner_view_combo.addItem("Pattern Summary", "patterns")
@@ -946,7 +1109,6 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         self.planner_view_combo.addItem("Week Grid", "blended")
         self.planner_view_combo.addItem("SOP Lanes", "operational")
         self.planner_view_combo.currentIndexChanged.connect(self._on_planner_view_changed)
-        view_workspace.addWidget(self.planner_view_combo)
         view_workspace.addWidget(self.time_toggle_btn)
         self.band_toggle_btn = QPushButton("Band/Freq: Band")
         self.band_toggle_btn.setStyleSheet(button_style("info", theme))
@@ -1059,6 +1221,22 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         self.cell_inspector_label.setObjectName("freqPlannerCellInspector")
         self.cell_inspector_label.setWordWrap(True)
         self.cell_inspector_label.setVisible(False)
+        self.plan_windows_header = QWidget()
+        self.plan_windows_header.setObjectName("freqPlannerPlanWindowsHeader")
+        window_header = WrappingControlLayout(self.plan_windows_header, alignment=Qt.AlignLeft)
+        self.plan_windows_heading = QLabel("Plan windows")
+        self.plan_windows_heading.setObjectName("freqPlannerPlanWindowsHeading")
+        self.plan_windows_heading.setStyleSheet(label_style("text", theme, weight=700))
+        window_header.addWidget(self.plan_windows_heading)
+        self.window_view_tabs = QTabBar()
+        self.window_view_tabs.setObjectName("freqPlannerWindowTabs")
+        self.window_view_tabs.setAccessibleName("Plan window view")
+        self.window_view_tabs.setExpanding(False)
+        self.window_view_tabs.setUsesScrollButtons(False)
+        for index in range(self.planner_view_combo.count()):
+            self.window_view_tabs.addTab(self.planner_view_combo.itemText(index))
+        self.window_view_tabs.currentChanged.connect(self.planner_view_combo.setCurrentIndex)
+        window_header.addWidget(self.window_view_tabs)
         self.selected_window_card = QFrame()
         self.selected_window_card.setObjectName("freqPlannerSelectedWindowCard")
         self.selected_window_card.setFrameShape(QFrame.StyledPanel)
@@ -1142,11 +1320,10 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         self.inline_update_hf_daily_btn = QPushButton("Update Source")
         self.inline_update_plan_btn.clicked.connect(self._on_inline_update_plan_clicked)
         self.inline_update_hf_daily_btn.clicked.connect(self._on_inline_update_hf_daily_clicked)
+        self.inline_update_hf_daily_btn.hide()
         inline_timing_row.addWidget(self.inline_update_plan_btn, 0, 6)
         inline_timing_row.addWidget(self.inline_update_hf_daily_btn, 0, 7)
         inline_layout.addLayout(inline_timing_row)
-        inspector_actions = QGridLayout()
-        self.inspector_actions_layout = inspector_actions
         self.edit_hf_daily_btn = QPushButton("Edit HF Daily")
         self.edit_hf_net_btn = QPushButton("Edit HF Net")
         self.open_sop_builder_btn = QPushButton("Open SOP Builder")
@@ -1155,10 +1332,23 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         self.edit_hf_net_btn.clicked.connect(self._on_edit_hf_net_clicked)
         self.open_sop_builder_btn.clicked.connect(self._on_open_sop_builder_clicked)
         self.edit_sop_plan_entry_btn.clicked.connect(self._on_edit_sop_plan_entry_clicked)
-        for column, btn in enumerate((self.edit_hf_daily_btn, self.edit_hf_net_btn, self.open_sop_builder_btn, self.edit_sop_plan_entry_btn)):
-            btn.setEnabled(False)
-            inspector_actions.addWidget(btn, 0, column)
-        inspector_actions.setColumnStretch(4, 1)
+        self._window_edit_buttons = {
+            "HF": self.edit_hf_daily_btn, "NET": self.edit_hf_net_btn,
+            "SOP": self.open_sop_builder_btn, "PLAN": self.edit_sop_plan_entry_btn,
+        }
+        for button in self._window_edit_buttons.values():
+            button.setParent(self.selected_window_card)
+            button.setEnabled(False)
+            button.hide()
+        self.window_edit_button = QPushButton()
+        self.window_edit_button.setStyleSheet(button_style("secondary", theme))
+        self.window_edit_button.hide()
+        self.window_edit_button.clicked.connect(self._invoke_window_edit)
+        self.other_window_layers = QPushButton("Other layers…")
+        self.other_window_layers.setMenu(QMenu(self.other_window_layers))
+        self.other_window_layers.hide()
+        selected_layout.addWidget(self.window_edit_button)
+        selected_layout.addWidget(self.other_window_layers)
         self._refresh_plan_workspace_header()
 
         self.table = QTableWidget()
@@ -1167,6 +1357,7 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.SingleSelection)
         self.table.cellClicked.connect(self._on_schedule_cell_clicked)
+        self.table.currentCellChanged.connect(self._on_window_keyboard_selection)
 
         # Set headers with local TZ name in Local column
         tz_name, tz_abbr = self._current_timezone_label()
@@ -1191,11 +1382,11 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
             hv.setSectionResizeMode(col, QHeaderView.Stretch)
         hv.setHighlightSections(False)
 
+        layout.addWidget(self.plan_windows_header)
+        layout.addWidget(self.selected_window_card)
         layout.addWidget(self.table, stretch=1)
         layout.addWidget(self.cell_inspector_label)
-        layout.addWidget(self.selected_window_card)
         layout.addWidget(self.inline_editor_card)
-        layout.addLayout(inspector_actions)
 
         self._setup_clock_timer()
         self._load_band_colors()
@@ -1479,11 +1670,6 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
             inline_identity, inline_timing = _inline_placements(True)
             self._reflow_grid(self.inline_identity_row, inline_identity)
             self._reflow_grid(self.inline_timing_row, inline_timing)
-        buttons = (self.edit_hf_daily_btn, self.edit_hf_net_btn, self.open_sop_builder_btn, self.edit_sop_plan_entry_btn)
-        columns = 2 if mode == "compact" else 4
-        self.inspector_actions_layout.setColumnStretch(4, 0 if mode == "compact" else 1)
-        self._reflow_grid(self.inspector_actions_layout,
-                          [(button, index // columns, index % columns, 1, 1) for index, button in enumerate(buttons)])
         self._fit_assignment_button_text()
         self._update_responsive_height_bounds()
         if mode == "compact":
@@ -1621,7 +1807,12 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
             layout.addLayout(row_layout)
 
     def _on_planner_view_changed(self) -> None:
+        self._cancel_window_source_load()
         self._operation_feedback = ""
+        index = self.planner_view_combo.currentIndex()
+        self.window_view_tabs.blockSignals(True)
+        self.window_view_tabs.setCurrentIndex(index)
+        self.window_view_tabs.blockSignals(False)
         day_visible = self._planner_view_mode() == "operational"
         if hasattr(self, "operational_day_label"):
             self.operational_day_label.setVisible(day_visible)
@@ -1711,10 +1902,21 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         return inspected.get(settings_key, selected_source_set_id(self.settings, settings_key))
 
     def _visible_source_dependency_refs(self) -> List[str]:
-        return selected_source_schedule_dependency_refs({
+        selections = {
             key: self._selected_source_set_id(key)
             for key in (SELECTED_HF_DAILY_SOURCE_SET_KEY, SELECTED_HF_NET_SOURCE_SET_KEY)
+        }
+        refs = selected_source_schedule_dependency_refs({
+            key: value for key, value in selections.items() if value != _UNSELECTED_LAYER
         })
+        plan = self._selected_frequency_plan_row()
+        existing = self._source_refs_from_plan_row(plan) if plan else ()
+        for key, category in ((SELECTED_HF_DAILY_SOURCE_SET_KEY, HF_DAILY_SOURCE_CATEGORY),
+                              (SELECTED_HF_NET_SOURCE_SET_KEY, HF_NET_SOURCE_CATEGORY)):
+            live_ref = f"{category}:{LIVE_SOURCE_SET_ID}"
+            if selections[key] == LIVE_SOURCE_SET_ID and (self._new_plan_explicit_layers or live_ref in existing):
+                refs.append(live_ref)
+        return refs
 
     def _active_source_label(self, sets_key: str) -> str:
         return "Active Daily Schedule" if sets_key == HF_DAILY_SOURCE_SETS_KEY else "Active Net Schedule"
@@ -1726,11 +1928,13 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         indices = model.choice_indices.get(sets_key, {}) if model else {LIVE_SOURCE_SET_ID: 0}
         combo.blockSignals(True)
         combo.publish_choices(choices, indices)
-        if selected not in {LIVE_SOURCE_SET_ID, NO_NET_SOURCE_SET_ID} and combo.findData(selected) < 0:
+        if selected not in {LIVE_SOURCE_SET_ID, NO_NET_SOURCE_SET_ID, _UNSELECTED_LAYER} and combo.findData(selected) < 0:
             label = "Missing HF Daily source" if sets_key == HF_DAILY_SOURCE_SETS_KEY else "Missing HF Net source"
             combo.addItem(f"{label}: {selected}", selected)
+        layer_label = "HF Daily" if sets_key == HF_DAILY_SOURCE_SETS_KEY else "HF Nets"
+        combo.setPlaceholderText(f"Choose {layer_label}…")
         index = combo.findData(selected)
-        combo.setCurrentIndex(index if index >= 0 else 0)
+        combo.setCurrentIndex(-1 if selected == _UNSELECTED_LAYER else max(0, index))
         combo.blockSignals(False)
 
 
@@ -1779,10 +1983,12 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         combo.blockSignals(True)
         combo.publish_choices(model.choices["sop"] if model else (("Active SOP Builder Layers", LIVE_SOURCE_SET_ID),),
                               model.choice_indices["sop"] if model else {LIVE_SOURCE_SET_ID: 0})
-        if selected != LIVE_SOURCE_SET_ID and combo.findData(selected) < 0:
+        combo.addItem("No SOP layer", _NO_SOP_LAYER)
+        combo.setPlaceholderText("Choose SOP…")
+        if selected not in {LIVE_SOURCE_SET_ID, _UNSELECTED_LAYER, _NO_SOP_LAYER} and combo.findData(selected) < 0:
             combo.addItem(f"Missing SOP source: {selected}", selected)
         index = combo.findData(selected)
-        combo.setCurrentIndex(index if index >= 0 else 0)
+        combo.setCurrentIndex(-1 if selected == _UNSELECTED_LAYER else max(0, index))
         combo.blockSignals(False)
 
 
@@ -1795,6 +2001,15 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         self._refresh_plan_layer_summary()
         self._update_plan_action_styles()
 
+    def _on_plan_name_edited(self, _text):
+        self._cancel_plan_save()
+        # User typing updates cached guidance only; no save, read or RF command.
+        if self._creating_new_frequency_plan or self.frequency_plan_combo.currentIndex() < 0:
+            if not (self._fresh_action_pending or self._action_projection_pending or self._input_read_error):
+                if not self._operation_feedback.startswith(('Plan not saved', 'Unable to save', 'The draft or', 'Current inputs differ')):
+                    self._set_action_feedback('Not saved. Click Save Plan to save these layers, then Assign to radios….')
+            self._update_plan_action_styles()
+
     def _set_frequency_plan_layers_dirty(self, dirty: bool) -> None:
         self._frequency_plan_layers_dirty = bool(dirty)
         self._update_plan_action_styles()
@@ -1806,10 +2021,12 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
 
     def _save_plan_button_text(self, plan: Optional[Mapping[str, Any]] = None) -> str:
         if bool(getattr(self, "_creating_new_frequency_plan", False)) or not isinstance(plan, Mapping):
-            return "Create Plan"
+            return "Save Plan"
         if self._selected_frequency_plan_category(plan) == "sop_schedule":
             return "Create Frequency Plan"
-        return "Update Plan" if getattr(self, "_frequency_plan_layers_dirty", False) else "Save Plan"
+        if self._plan_has_live_consumers(int(plan.get('id') or 0)):
+            return 'Review changes…' if self._has_unsaved_authoring_draft() else 'Saved'
+        return "Save Plan" if self._has_unsaved_authoring_draft() else "Saved"
 
     def _plan_source_dependency_refs(self, plan: Optional[Mapping[str, Any]] = None) -> List[str]:
         """Return explicit source dependencies; legacy live markers are not dependencies."""
@@ -1827,13 +2044,13 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
     def _missing_source_dependencies(self) -> List[str]:
         missing: List[str] = []
         daily_id = self._selected_source_set_id(SELECTED_HF_DAILY_SOURCE_SET_KEY)
-        if daily_id != LIVE_SOURCE_SET_ID and self._source_set_row_by_id(HF_DAILY_SOURCE_SETS_KEY, daily_id) is None:
+        if daily_id not in {LIVE_SOURCE_SET_ID, _UNSELECTED_LAYER} and self._source_set_row_by_id(HF_DAILY_SOURCE_SETS_KEY, daily_id) is None:
             missing.append(f"HF Daily source {daily_id}")
         net_id = self._selected_source_set_id(SELECTED_HF_NET_SOURCE_SET_KEY)
-        if net_id not in {LIVE_SOURCE_SET_ID, NO_NET_SOURCE_SET_ID} and self._source_set_row_by_id(HF_NET_SOURCE_SETS_KEY, net_id) is None:
+        if net_id not in {LIVE_SOURCE_SET_ID, NO_NET_SOURCE_SET_ID, _UNSELECTED_LAYER} and self._source_set_row_by_id(HF_NET_SOURCE_SETS_KEY, net_id) is None:
             missing.append(f"HF Net source {net_id}")
         sop_id = self._selected_sop_plan_source_id()
-        if sop_id != LIVE_SOURCE_SET_ID and self._sop_schedule_plan_row_by_id(sop_id) is None:
+        if sop_id not in {LIVE_SOURCE_SET_ID, _UNSELECTED_LAYER, _NO_SOP_LAYER} and self._sop_schedule_plan_row_by_id(sop_id) is None:
             missing.append(f"SOP source {sop_id}")
         return missing
 
@@ -1856,9 +2073,11 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
 
     def _plan_mode_text(self, plan: Optional[Mapping[str, Any]] = None) -> str:
         if bool(getattr(self, "_creating_new_frequency_plan", False)) or not isinstance(plan, Mapping):
-            return "New"
+            return 'Unavailable' if self.frequency_plan_combo.currentData() else 'Not saved'
         if self._selected_frequency_plan_category(plan) == "sop_schedule":
             return "SOP Plan"
+        if not self._has_unsaved_authoring_draft() and self._saved_plan_drafts.get(int(plan.get('id') or 0)):
+            return 'Saved · Earlier changes pending'
         return "Modified" if getattr(self, "_frequency_plan_layers_dirty", False) else "Saved"
 
     def _sync_plan_more_actions(self) -> None:
@@ -1960,14 +2179,22 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
             theme = resolve_theme(self.settings)
         plan = self._selected_frequency_plan_row()
         if hasattr(self, "save_plan_btn"):
-            role = "eligible_warning" if getattr(self, "_frequency_plan_layers_dirty", False) else "primary"
-            self.save_plan_btn.setText(self._save_plan_button_text(plan))
+            unchanged = bool(plan and self._selected_frequency_plan_category(plan) == 'normal'
+                             and not self._creating_new_frequency_plan and not self._has_unsaved_authoring_draft())
+            role = 'muted' if unchanged else "eligible_warning" if getattr(self, "_frequency_plan_layers_dirty", False) else "primary"
+            action_text = self._save_plan_button_text(plan)
+            self.save_plan_btn.setText(action_text)
             missing_text = self._source_dependency_block_text()
-            self.save_plan_btn.setEnabled(not bool(missing_text or getattr(self, "_input_read_error", "")))
+            self.save_plan_btn.setEnabled(not bool(unchanged or missing_text or getattr(self, "_input_read_error", "") or getattr(self, '_plan_draft_saving', False) or self._plan_save_pending))
             self.save_plan_btn.setStyleSheet(button_style(role if not missing_text else "muted", theme))
             self.save_plan_btn.setToolTip(
                 missing_text
                 if missing_text
+                else 'No new changes to save. Earlier pending changes can be reviewed separately.'
+                if unchanged and self._saved_plan_drafts.get(int(plan.get('id') or 0))
+                else 'Plan saved. No further save is needed.' if unchanged
+                else "Review the effects of these edits before applying them. Assigned radios keep using the saved plan until Apply changes."
+                if plan and self._plan_has_live_consumers(int(plan.get('id') or 0))
                 else "Layer selections changed. The highlighted save action updates the selected plan with the visible Daily, Net, and SOP layers."
                 if getattr(self, "_frequency_plan_layers_dirty", False)
                 else "Save or update the visible HF Daily + HF Nets + SOP projection as a named Frequency Plan."
@@ -1989,24 +2216,38 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
             theme = resolve_theme(self.settings)
         if plan is None:
             plan = self._selected_frequency_plan_row()
+        if hasattr(self, 'plan_source_link_label'):
+            eligible = isinstance(plan, Mapping) and plan.get('category') == 'normal' and plan.get('status') == 'saved'
+            self.plan_source_link_label.setText(plan_source_link_description(plan) if eligible else '')
+            self.plan_source_link_label.setVisible(bool(eligible))
+            linked = bool(eligible and any(ref.startswith((HF_DAILY_SOURCE_CATEGORY + ':', HF_NET_SOURCE_CATEGORY + ':'))
+                                          for ref in self._plan_source_dependency_refs(plan)))
+            self.relink_plan_btn.setVisible(bool(eligible and not linked))
         if not isinstance(plan, Mapping):
             if hasattr(self, "plan_assignment_label"):
-                self.plan_assignment_label.setText("Radio assignment: No saved plan selected")
-            self.assign_plan_btn.setText("Assign in Configuration")
-            self.assign_plan_btn.setAccessibleName("Assign in Configuration")
-            self.assign_plan_btn.setProperty("fioAssignmentFullText", "Assign in Configuration")
+                unavailable = bool(self.frequency_plan_combo.currentData())
+                self.plan_assignment_label.setText(
+                    'Saved plan unavailable. Select another saved plan or choose New Plan to recreate it.' if unavailable else
+                    "Not saved. Click Save Plan to save these layers, then Assign to radios….")
+                self.plan_assignment_label.show()
+            self.assign_plan_btn.setText("Assign to radios…")
+            self.assign_plan_btn.setAccessibleName("Assign to radios…")
+            self.assign_plan_btn.setProperty("fioAssignmentFullText", "Assign to radios…")
             self.assign_plan_btn.setEnabled(False)
             self.assign_plan_btn.setStyleSheet(button_style("muted", theme))
             self.assign_plan_btn.setToolTip(
-                "Select or save a Frequency Plan, then use Configuration > Radios > Schedule Assignment to assign it with RF Guard."
+                "Select or save a Frequency Plan, then use Plan Builder > Radio assignments to assign it with RF Guard."
             )
             return
         assigned_ids = self._assigned_radio_ids_for_plan(plan)
         if hasattr(self, "plan_assignment_label"):
             names = ", ".join(self._radio_label_for_id(ident) for ident in assigned_ids)
-            self.plan_assignment_label.setText(f"Assigned to: {names}" if names else "Radio assignment: Not assigned")
+            self.plan_assignment_label.setText(f"Assigned to: {names}" if names else "Saved · Not assigned. Choose Assign to radios… to select radios and review RF Guard.")
+            self.plan_assignment_label.setVisible(not bool(names))
         plan_name = str(plan.get("name") or "Frequency Plan").strip()
         self.assign_plan_btn.setEnabled(True)
+        if getattr(self, '_plan_draft_saving', False) or self._plan_save_pending:
+            self.assign_plan_btn.setEnabled(False)
         if assigned_ids:
             labels = ", ".join(self._radio_label_for_id(radio_id) for radio_id in assigned_ids)
             full_assignment = f"Assigned: {labels} · Change…"
@@ -2015,31 +2256,31 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
             self.assign_plan_btn.setAccessibleName(full_assignment)
             self.assign_plan_btn.setStyleSheet(button_style("muted", theme))
             self.assign_plan_btn.setToolTip(
-                f"{full_assignment}\n'{plan_name}' is assigned to {labels}. Open Configuration to review or change assignment."
+                f"{full_assignment}\n'{plan_name}' is assigned to {labels}. Review or change assignment here in Plan Builder."
             )
             self._fit_assignment_button_text()
         else:
-            self.assign_plan_btn.setText("Assign with RF Guard")
-            self.assign_plan_btn.setAccessibleName("Assign with RF Guard")
-            self.assign_plan_btn.setProperty("fioAssignmentFullText", "Assign with RF Guard")
+            self.assign_plan_btn.setText("Assign to radios…")
+            self.assign_plan_btn.setAccessibleName("Assign to radios…")
+            self.assign_plan_btn.setProperty("fioAssignmentFullText", "Assign to radios…")
             self.assign_plan_btn.setStyleSheet(button_style("eligible_warning", theme))
             self.assign_plan_btn.setToolTip(
-                f"'{plan_name}' is not assigned to a radio yet. Open Configuration > Radios > Schedule Assignment to assign it with RF Guard."
+                f"'{plan_name}' is not assigned to a radio yet. Open Plan Builder > Radio assignments to assign it with RF Guard."
             )
 
     def _on_source_set_selected(self, *_args: Any) -> None:
+        self._cancel_plan_save()
+        self._cancel_window_source_load()
         self._operation_feedback = ""
         # Combo population happens before the table exists; construction-time
         # index signals must not persist inspected plan sources as operator defaults.
         if not hasattr(self, "table"):
             return
-        self._inspected_source_ids = {}
-        if hasattr(self, "hf_daily_source_combo"):
-            self.settings.set(SELECTED_HF_DAILY_SOURCE_SET_KEY, str(self.hf_daily_source_combo.currentData() or LIVE_SOURCE_SET_ID))
-        if hasattr(self, "hf_net_source_combo"):
-            self.settings.set(SELECTED_HF_NET_SOURCE_SET_KEY, str(self.hf_net_source_combo.currentData() or LIVE_SOURCE_SET_ID))
-        if hasattr(self, "sop_plan_source_combo"):
-            self._set_selected_sop_plan_source_id(self.sop_plan_source_combo.currentData())
+        self._inspected_source_ids = {
+            SELECTED_HF_DAILY_SOURCE_SET_KEY: self.hf_daily_source_combo.currentData() or _UNSELECTED_LAYER,
+            SELECTED_HF_NET_SOURCE_SET_KEY: self.hf_net_source_combo.currentData() or _UNSELECTED_LAYER,
+            "freqplanner_selected_sop_schedule_plan_id": self.sop_plan_source_combo.currentData() or _UNSELECTED_LAYER,
+        }
         self._set_frequency_plan_layers_dirty(True)
         self._input_retry_after = 0.0
         self._input_retry_attempt = 0
@@ -2050,10 +2291,12 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
             return
         plan_name = self._current_frequency_plan_name() or "this plan"
         action = self._save_plan_button_text(self._selected_frequency_plan_row())
-        self._set_action_feedback(
-            f"Layer selection changed for '{plan_name}'. {action} saves the visible Daily, Nets, and SOP layers; "
-            "choose New Plan first to save a separate plan."
-        )
+        if self._creating_new_frequency_plan:
+            self._set_action_feedback('Not saved. Click Save Plan to save these layers, then Assign to radios….')
+        else:
+            self._set_action_feedback(
+                f"Layer selection changed for '{plan_name}'. {action} saves the visible Daily, Nets, and SOP layers; "
+                "choose New Plan first to save a separate plan.")
         self._queue_geometry_settle()
 
     def _source_set_row_by_id(self, sets_key, set_id):
@@ -2065,23 +2308,15 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
 
 
     def _source_selection_summary(self) -> str:
-        hf_id = self._selected_source_set_id(SELECTED_HF_DAILY_SOURCE_SET_KEY)
-        net_id = self._selected_source_set_id(SELECTED_HF_NET_SOURCE_SET_KEY)
-        sop_id = self._selected_sop_plan_source_id()
-        hf_row = self._source_set_row_by_id(HF_DAILY_SOURCE_SETS_KEY, hf_id)
-        net_row = self._source_set_row_by_id(HF_NET_SOURCE_SETS_KEY, net_id)
-        sop_row = self._sop_schedule_plan_row_by_id(sop_id)
-        hf_label = str((hf_row or {}).get("name") or (f"Missing source: {hf_id}" if hf_id != LIVE_SOURCE_SET_ID else self._active_source_label(HF_DAILY_SOURCE_SETS_KEY)))
-        net_label = (
-            NO_NET_SOURCE_SET_LABEL
-            if str(net_id or "").strip() == NO_NET_SOURCE_SET_ID
-            else str((net_row or {}).get("name") or (f"Missing source: {net_id}" if net_id != LIVE_SOURCE_SET_ID else self._active_source_label(HF_NET_SOURCE_SETS_KEY)))
-        )
-        sop_label = str((sop_row or {}).get("name") or (f"Missing source: {sop_id}" if sop_id != LIVE_SOURCE_SET_ID else "Active SOP Builder layers"))
+        hf_label = self._selected_source_layer_label(HF_DAILY_SOURCE_SETS_KEY, SELECTED_HF_DAILY_SOURCE_SET_KEY)
+        net_label = self._selected_source_layer_label(HF_NET_SOURCE_SETS_KEY, SELECTED_HF_NET_SOURCE_SET_KEY)
+        sop_label = self._selected_sop_layer_label()
         return f"HF Daily: {hf_label}; HF Nets: {net_label}; SOP: {sop_label}"
 
     def _selected_source_layer_label(self, sets_key: str, selected_key: str) -> str:
         set_id = self._selected_source_set_id(selected_key)
+        if set_id == _UNSELECTED_LAYER:
+            return "Not selected"
         if sets_key == HF_NET_SOURCE_SETS_KEY and str(set_id or "").strip() == NO_NET_SOURCE_SET_ID:
             return NO_NET_SOURCE_SET_LABEL
         row = self._source_set_row_by_id(sets_key, set_id)
@@ -2090,6 +2325,8 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
     def _selected_sop_layer_label(self) -> str:
         row = self._sop_schedule_plan_row_by_id(self._selected_sop_plan_source_id())
         plan_id = self._selected_sop_plan_source_id()
+        if plan_id in {_UNSELECTED_LAYER, _NO_SOP_LAYER}:
+            return "Not selected" if plan_id == _UNSELECTED_LAYER else "No SOP layer"
         return str((row or {}).get("name") or (f"Missing source: {plan_id}" if plan_id != LIVE_SOURCE_SET_ID else "Active SOP Builder layers"))
 
     def _selected_sop_plan_dependency_refs(self) -> List[str]:
@@ -2227,7 +2464,7 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
             self.plan_ingredient_plan,
             "Plan",
             plan_name,
-            f"{plan_kind} | linked by default",
+            f"{plan_kind} | {plan_source_link_description(plan) if plan else 'Not saved'}",
         )
         self._set_ingredient_text(
             self.plan_ingredient_daily,
@@ -2242,7 +2479,7 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
             net_usage,
         )
         self._set_ingredient_text(self.plan_ingredient_sop, "SOP", sop_label, "What-to-do layer")
-        self._set_ingredient_text(self.plan_ingredient_assignments, "Assigned", assigned_text, "Manage assignment in Configuration > Radios")
+        self._set_ingredient_text(self.plan_ingredient_assignments, "Assigned", assigned_text, "Manage assignment here in Plan Builder")
         if hasattr(self, "frequency_plan_combo"):
             self.frequency_plan_combo.setToolTip(
                 f"Plan: {plan_name}\n{plan_kind}; Daily: {daily_label}; Nets: {net_label}; SOP: {sop_label}; Assigned: {assigned_text}"
@@ -2380,6 +2617,7 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
                         or (0 if creating_new else int(selected_id or 0) or context_plan_id))
         if self._catalog_model is not None and preferred_id in self._catalog_model.plan_index:
             self._pending_saved_plan_id = 0
+            self._committed_plan_pending_catalog = None
         self.frequency_plan_combo.blockSignals(True)
         model = self._catalog_model
         self.frequency_plan_combo.publish_choices(model.choices["plans"] if model else (),
@@ -2388,6 +2626,9 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
             idx = self.frequency_plan_combo.findData(preferred_id)
             if idx >= 0:
                 self.frequency_plan_combo.setCurrentIndex(idx)
+            elif (getattr(self, '_committed_plan_pending_catalog', None) or {}).get('id') == preferred_id:
+                self.frequency_plan_combo.addItem(self._committed_plan_pending_catalog['name'], preferred_id)
+                self.frequency_plan_combo.setCurrentIndex(self.frequency_plan_combo.count() - 1)
             elif self._catalog_review_required:
                 self.frequency_plan_combo.addItem(f"Missing plan: {typed_name}", preferred_id)
                 self.frequency_plan_combo.setCurrentIndex(self.frequency_plan_combo.count() - 1)
@@ -2403,6 +2644,7 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         ):
             self._apply_frequency_plan_source_refs(selected_plan, persist=False)
         self._update_frequency_plan_summary()
+        self.review_saved_plan_changes_btn.setVisible(bool(selected_plan and self._saved_plan_drafts.get(int(selected_plan["id"]))))
         self._refresh_plan_ingredients(plan_payload=selected_plan)
         self._update_assign_plan_action_state(plan=selected_plan)
         self._refresh_radio_window_radio_combo(selected_plan)
@@ -2428,6 +2670,9 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
                 selected_id = 0
         if selected_id <= 0:
             return None
+        pending = getattr(self, '_committed_plan_pending_catalog', None)
+        if pending and int(pending['id']) == selected_id:
+            return dict(pending)
         try:
             return self.plan_context_service.store.get_frequency_plan(selected_id)
         except Exception as exc:
@@ -2443,6 +2688,8 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         if not hasattr(self, "frequency_plan_combo"):
             return
         self._creating_new_frequency_plan = True
+        self._committed_plan_pending_catalog = None
+        self._pending_saved_plan_id = 0
         self._set_frequency_plan_layers_dirty(False)
         self.frequency_plan_combo.blockSignals(True)
         self.frequency_plan_combo.setCurrentIndex(-1)
@@ -2459,19 +2706,59 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         if hasattr(self, "selected_window_title_label"):
             self.selected_window_title_label.setText("New Frequency Plan")
         if hasattr(self, "selected_window_detail_label"):
-            self.selected_window_detail_label.setText("Choose Daily and Net schedules, add SOP layers if needed, then enter a plan name and Save Plan.")
+            self.selected_window_detail_label.setText("Choose HF Daily, add optional Net/SOP layers, enter a name, then click Save Plan. After saving, choose Assign to radios….")
         if hasattr(self, "frequency_plan_action_hint_label"):
             self.frequency_plan_action_hint_label.setText(
-                "Creating a new plan. Select Daily and Net schedules, enter a plan name, then Save Plan."
+                "Not saved. Choose layers and enter a name, then click Save Plan. After saving, choose Assign to radios…."
             )
         self._set_rf_guard_review_card({})
 
     def _on_new_plan_clicked(self) -> None:
-        self._pending_saved_plan_id = 0
+        if self._plan_save_pending or getattr(self, "_plan_draft_saving", False):
+            self._set_action_feedback("Wait for the current save to finish before starting another plan.")
+            return
+        blank = (self._creating_new_frequency_plan and not self._current_frequency_plan_name()
+                 and not self._frequency_plan_layers_dirty and not self._inline_draft_dirty())
+        if not blank and self._has_unsaved_authoring_draft():
+            answer = QMessageBox.question(
+                self, "Start a new plan?",
+                "The current editor has unsaved changes. Discard those edits and start a blank plan?",
+                QMessageBox.Discard | QMessageBox.Cancel, QMessageBox.Cancel,
+            )
+            if answer != QMessageBox.Discard:
+                return
+        self._sop_edit_draft = None
+        for name in ("inline_group_edit", "inline_band_edit", "inline_frequency_edit",
+                     "inline_start_edit", "inline_end_edit", "inline_mode_edit"):
+            getattr(self, name).setModified(False)
         self._operation_feedback = ""
+        self._catalog_review_required = False
+        self.review_plan_inputs_btn.hide()
+        self.review_saved_plan_changes_btn.hide()
+        self.discard_saved_plan_changes_btn.hide()
+        self._guided_plan_handoff_device_profile_id = 0
+        self._new_plan_explicit_layers = True
+        self.frequency_plan_combo.lineEdit().setPlaceholderText("Name or select a Frequency Plan")
+        self._inspected_source_ids = {
+            SELECTED_HF_DAILY_SOURCE_SET_KEY: _UNSELECTED_LAYER,
+            SELECTED_HF_NET_SOURCE_SET_KEY: _UNSELECTED_LAYER,
+            "freqplanner_selected_sop_schedule_plan_id": _UNSELECTED_LAYER,
+        }
+        self._projection_request_id += 1
+        self._latest_projection = None
+        self._action_projection_prepared = None
+        self._window_view_positions.clear()
+        self._window_view_results.clear()
+        self._published_window_view = None
+        self.table.clearSelection()
+        self.table.clearContents()
+        self.table.setRowCount(0)
+        self._set_projection_inspector(None)
         self._set_plan_manager_new_plan_state()
+        self._refresh_source_set_controls()
+        self.planner_view_combo.setCurrentIndex(0)
         self.rebuild_table()
-        self._set_plan_manager_new_plan_state()
+        self.frequency_plan_combo.lineEdit().setFocus(Qt.OtherFocusReason)
 
     def begin_guided_radio_plan_handoff(
         self,
@@ -2494,8 +2781,11 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
             return
         radio_name = str((device_profile or {}).get("name") or "this radio").strip() or "this radio"
         built_plans = self._catalog_model.choices["plans"]
+        if self._new_plan_explicit_layers:
+            self._inspected_source_ids = {}
         self._refresh_source_set_controls()
         self._refresh_plan_workspace_header()
+        self._new_plan_explicit_layers = False
         self._set_plan_manager_new_plan_state()
         schedule_choice = str(schedule_choice or "").strip()
         if schedule_choice in {SCHEDULE_JS8_STANDARD, SCHEDULE_DAILY_NO_NETS} and hasattr(self, "hf_net_source_combo"):
@@ -2515,25 +2805,25 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         if schedule_choice == SCHEDULE_JS8_STANDARD:
             path_message = (
                 "Start with a JS8Call-standard daily plan. Choose the JS8Call frequency set, name the plan, "
-                "then Save Plan and Assign with RF Guard."
+                "then Save Plan and Assign to radios…."
             )
             path_detail = "Build a no-net JS8Call operating plan for this radio, then assign it after RF Guard review."
         elif schedule_choice == SCHEDULE_DAILY_NO_NETS:
             path_message = (
                 "Build a Daily with No Nets plan. Choose or create the HF Daily schedule, keep Nets set to No Nets, "
-                "name the plan, then Save Plan and Assign with RF Guard."
+                "name the plan, then Save Plan and Assign to radios…."
             )
             path_detail = "Use this when the radio follows a daily frequency pattern without net overlays."
         elif schedule_choice == SCHEDULE_DAILY_PLUS_NETS:
             path_message = (
                 "Build a Daily + Nets plan. Choose the HF Daily baseline and the HF Net schedule to layer over it, "
-                "review the effective windows, then Save Plan and Assign with RF Guard."
+                "review the effective windows, then Save Plan and Assign to radios…."
             )
             path_detail = "Layer net windows over the daily baseline so the user can see where to be and when."
         elif schedule_choice == SCHEDULE_SOP_CONDITION:
             path_message = (
                 "Build an SOP condition plan. Choose Daily and Net layers, add the SOP condition layer, "
-                "review RF Guard, then Save Plan and Assign with RF Guard."
+                "review RF Guard, then Save Plan and Assign to radios…."
             )
             path_detail = "Use this when the plan also defines what to do when condition levels are active."
 
@@ -2542,12 +2832,12 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         elif built_plans:
             message = (
                 f"{radio_name} was saved without a Frequency Plan. Choose an existing plan above, "
-                "or keep New Plan selected, choose Daily/Nets/SOP layers, name the plan, then Save Plan and Assign with RF Guard."
+                "or keep New Plan selected, choose Daily/Nets/SOP layers, name the plan, then Save Plan and Assign to radios…."
             )
         else:
             message = (
                 f"{radio_name} was saved. Build its first Frequency Plan here: choose an HF Daily schedule, "
-                "choose No Nets or a Net schedule, add an SOP layer if needed, name the plan, then Save Plan and Assign with RF Guard."
+                "choose No Nets or a Net schedule, add an SOP layer if needed, name the plan, then Save Plan and Assign to radios…."
             )
         if hasattr(self, "frequency_plan_action_hint_label"):
             self.frequency_plan_action_hint_label.setText(message)
@@ -2683,9 +2973,10 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
                 self._refresh_source_set_controls()
             return False
         changed = False
-        daily_set_id = self._source_set_id_from_refs(source_refs, HF_DAILY_SOURCE_CATEGORY) or LIVE_SOURCE_SET_ID
-        net_set_id = self._source_set_id_from_refs(source_refs, HF_NET_SOURCE_CATEGORY) or LIVE_SOURCE_SET_ID
-        sop_plan_id = self._sop_plan_id_from_refs(source_refs) or LIVE_SOURCE_SET_ID
+        daily_ref = self._source_set_id_from_refs(source_refs, HF_DAILY_SOURCE_CATEGORY)
+        daily_set_id = daily_ref or LIVE_SOURCE_SET_ID
+        net_set_id = self._source_set_id_from_refs(source_refs, HF_NET_SOURCE_CATEGORY) or (NO_NET_SOURCE_SET_ID if daily_ref else LIVE_SOURCE_SET_ID)
+        sop_plan_id = _NO_SOP_LAYER if _NO_SOP_REF in source_refs else (self._sop_plan_id_from_refs(source_refs) or LIVE_SOURCE_SET_ID)
         changed = (
             self._set_source_combo_to_id(
                 self.hf_daily_source_combo,
@@ -2723,7 +3014,7 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
                 changed = True
         return changed
 
-    def focus_frequency_plan(self, plan_id: int, *, device_profile_id: int) -> bool:
+    def focus_frequency_plan(self, plan_id: int, *, device_profile_id: int = 0) -> bool:
         """Inspect a card's assigned plan without changing command authority."""
         if self._catalog_model is None or self._catalog_pending:
             self._pending_catalog_focus = (int(plan_id), int(device_profile_id))
@@ -2755,7 +3046,14 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         return True
 
     def _on_frequency_plan_selected(self, *_args: Any, inspect_only: bool = False) -> None:
+        self._cancel_plan_save()
+        self._cancel_window_source_load()
+        if (getattr(self, '_relink_open', False)
+                and int(self.frequency_plan_combo.currentData() or 0) != int((self.relink_panel._context.get('plan') or {}).get('id') or 0)):
+            self._cancel_plan_relink()
         self._pending_saved_plan_id = 0
+        self._committed_plan_pending_catalog = None
+        self._new_plan_explicit_layers = False
         self._operation_feedback = ""
         if self.frequency_plan_combo.currentIndex() < 0 and self._current_frequency_plan_name():
             self._creating_new_frequency_plan = True
@@ -2802,6 +3100,8 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
             self._input_missing_source = False
             self.rebuild_table()
         self._refresh_assigned_plan_rf_guard_review(plan)
+        if not inspect_only and hasattr(self, '_assignment_controller') and plan and not self._assignment_open:
+            self._assignment_controller.submit('context', {'plan_id': int(plan['id']), 'operation': 'assign'})
 
     def _sync_command_radio_for_selected_plan(self, plan: Optional[Mapping[str, Any]]) -> str:
         if not isinstance(plan, Mapping):
@@ -2810,7 +3110,7 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         assigned_ids = self._assigned_radio_ids_for_plan(plan)
         if not assigned_ids:
             self._update_assign_plan_action_state(plan=plan)
-            return f"'{plan_name}' is not assigned to a radio yet. Use Assign in Configuration before relying on this plan operationally."
+            return f"'{plan_name}' is not assigned to a radio yet. Use Assign to radios… before relying on this plan operationally."
         self._update_assign_plan_action_state(plan=plan)
         if len(assigned_ids) > 1:
             labels = ", ".join(self._radio_label_for_id(radio_id) for radio_id in assigned_ids[:3])
@@ -2831,11 +3131,701 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
             return f"'{plan_name}' is assigned to {label}; command bar switched to that radio."
         return f"'{plan_name}' is assigned to {label}."
 
+    def open_plan_relink(self):
+        plan = self._selected_frequency_plan_row() or {}
+        if not plan.get('id') or self._assignment_controller._write_pending:
+            return
+        if self._assignment_open:
+            self._set_action_feedback('Finish or cancel the open radio assignment review before linking source schedules. Your staged radio and Operating Model choices are still in that review.')
+            return
+        if self._has_unsaved_authoring_draft():
+            self._set_action_feedback('Save or discard the current editor changes before linking source schedules. Existing radios keep their current plan.')
+            return
+        self._assignment_open = False
+        self.assignment_panel.hide()
+        self._relink_return_plan_id = 0
+        self._plan_relink_return_btn.hide()
+        self._relink_open = True
+        self._relink_entry_identity = self._assignment_authoring_signature()
+        self._assignment_controller.set_active(True)
+        self.relink_panel.show()
+        self.relink_panel.set_busy(True)
+        self._assignment_controller.submit('relink_context', {'plan_id': int(plan['id'])})
+        self.planner_scroll.ensureWidgetVisible(self.relink_panel)
+
+    def _preview_plan_relink(self, request):
+        self.relink_panel.set_busy(True)
+        if not self._assignment_controller.submit('preview_relink', request):
+            self.relink_panel.set_busy(False)
+
+    def _commit_plan_relink(self, request):
+        self.relink_panel.set_busy(True)
+        if not self._assignment_controller.submit('commit_refresh', request):
+            self.relink_panel.set_busy(False)
+
+    def _review_pending_plan_changes(self):
+        plan = self._selected_frequency_plan_row() or {}
+        if self._has_unsaved_authoring_draft():
+            self._set_action_feedback('Review the new editor changes first. Earlier pending changes are kept until you explicitly replace or discard them.')
+            return
+        self._automatic_edit_review_plan_id = int(plan.get('id') or 0)
+        self.open_radio_assignments(operation='apply')
+
+    def _cancel_plan_relink(self):
+        if getattr(self, '_relink_open', False) and self._assignment_controller._write_pending:
+            return
+        if getattr(self, '_relink_open', False):
+            self._assignment_controller.set_active(False)
+            self._assignment_controller.set_active(self._tab_active)
+        self._relink_open = False
+        if hasattr(self, 'relink_panel'):
+            self.relink_panel.hide()
+
+    def _repair_plan_relink(self, issue):
+        raw_target = issue.get('target')
+        context = {**issue, **(dict(raw_target) if isinstance(raw_target, Mapping) else {})}
+        target = str(context.get('target') or '')
+        if target in {'retry_review', 'assignment_choices'} or (target == 'source' and not context.get('source_ref') and not context.get('window')):
+            self.relink_panel._back()
+            self.relink_panel.status.setText(str(issue.get('instructions') or issue.get('message') or '') +
+                ' Choose current sources here, then Review changes again. The current plan has not changed.')
+            self.relink_panel.daily_combo.setFocus()
+            return
+        self._relink_return_plan_id = int((self.relink_panel._context.get('plan') or {}).get('id') or 0)
+        self._cancel_plan_relink()
+        self._plan_relink_return_btn.show()
+        self._assignment_request = {'plan_id': self._relink_return_plan_id, 'device_profile_id': 0, 'operation': 'assign'}
+        self._repair_assignment(issue)
+
+    def _return_to_plan_relink(self):
+        ident = int(getattr(self, '_relink_return_plan_id', 0) or 0)
+        if not ident:
+            return
+        if self._has_unsaved_authoring_draft():
+            self._set_action_feedback('Save the current editor changes before returning to source-link review. Your source choices are retained.')
+            return
+        self.focus_frequency_plan(ident)
+        self.open_plan_relink()
+
+    def open_radio_assignments(self, *, device_profile_id=None, frequency_plan_id=None,
+                               repair_context=None, operation=None):
+        """Canonical cached entry point; loading/review is owned by the worker."""
+        if (repair_context or {}).get('returning_to_review') and getattr(self, '_relink_return_plan_id', 0):
+            self._return_to_plan_relink()
+            return
+        if self._assignment_controller._write_pending:
+            return
+        if getattr(self, '_relink_open', False):
+            self._cancel_plan_relink()
+        plan = self._selected_frequency_plan_row() or {}
+        plan_id = int(frequency_plan_id or plan.get('id') or 0)
+        radio_id = int(device_profile_id or 0)
+        previous = self._assignment_request
+        preserve = (self._assignment_open and int(previous.get('plan_id') or 0) == plan_id
+                    and (not radio_id or radio_id == int(previous.get('device_profile_id') or 0)))
+        chosen_operation = operation or (previous.get('operation') if preserve else 'assign') or 'assign'
+        self._assignment_request = {'plan_id': plan_id, 'device_profile_id': radio_id,
+                                    'operation': chosen_operation}
+        returning = bool((repair_context or {}).get('returning_to_review'))
+        self._assignment_recheck_on_return = returning and bool((repair_context or {}).get('recheck_on_return'))
+        if returning and preserve and self._assignment_return_restore_snapshot is None:
+            self._assignment_return_restore_snapshot = self._capture_assignment_choice_snapshot()
+        elif not returning:
+            self._assignment_return_restore_snapshot = None
+        source_repair_apply = (int(getattr(self, '_assignment_source_repair_plan_id', 0) or 0) == plan_id
+                               and chosen_operation == 'apply')
+        if not returning and not source_repair_apply:
+            self._assignment_source_repair_plan_id = 0
+            self._plan_assignment_return_btn.hide()
+            self._assignment_source_repair_snapshot = None
+        if self._preserve_assignment_choices_on_next_open:
+            self._assignment_choices_restore_snapshot = self._capture_assignment_choice_snapshot()
+            self._preserve_assignment_choices_on_next_open = False
+        else:
+            self._assignment_choices_restore_snapshot = None
+        self._assignment_reset_selection = bool((radio_id or not self._assignment_open) and not returning)
+        if returning and self._assignment_return_scroll_value is not None:
+            self._pending_assignment_scroll_restore = int(self._assignment_return_scroll_value)
+        self._assignment_open = True
+        self._assignment_controller.set_active(True)
+        self.assignment_panel.hide()
+        self.discard_saved_plan_changes_btn.hide()
+        self._assignment_loading.show()
+        if self._plan_task_stack.currentWidget() is self.planner_scroll:
+            self._builder_scroll_before_assignment = self.planner_scroll.verticalScrollBar().value()
+        self._plan_task_stack.setCurrentWidget(self._assignment_scroll)
+        self.assignment_panel.message.setText('Loading assignment choices…')
+        self._load_assignment_context()
+        if not returning:
+            self._assignment_scroll.verticalScrollBar().setValue(0)
+
+    def _load_assignment_context(self):
+        if (self._assignment_open and self._tab_active
+                and self._plan_task_stack.currentWidget() is self._assignment_scroll):
+            self._assignment_controller.submit('context', dict(self._assignment_request))
+
+    def _assignment_operation_changed(self, operation):
+        self._assignment_request['operation'] = operation
+        self._load_assignment_context()
+
+    def _review_assignment(self, request):
+        self._cancel_window_source_load()
+        self._assignment_controller.submit('review', request)
+
+    def _request_assignment_schedule_page(self, request):
+        if not self._assignment_controller.submit('schedule_page', request):
+            self.assignment_panel.append_schedule_page({
+                'error': 'Wait for the current operation, then try again.',
+                'review_token': request.get('review_token'),
+            })
+
+    def _commit_assignment(self, request):
+        self._assignment_controller.submit('commit_refresh' if request.get('refresh_token') else 'commit', request)
+
+    def _cancel_assignment(self):
+        if self._assignment_controller._write_pending:
+            return
+        self._cancel_window_source_load()
+        self._assignment_open = False
+        self._automatic_edit_review_plan_id = 0
+        self._pending_assignment_scroll_restore = None
+        self.assignment_panel.hide()
+        self._assignment_controller.set_active(False)
+        self._assignment_controller.set_active(self._tab_active)
+        self._plan_task_stack.setCurrentWidget(self.planner_scroll)
+        selected_id = int((self._selected_frequency_plan_row() or {}).get('id') or 0)
+        self.review_saved_plan_changes_btn.setVisible(bool(self._saved_plan_drafts.get(selected_id)))
+        self.planner_scroll.setFocus(Qt.OtherFocusReason)
+        value = getattr(self, '_builder_scroll_before_assignment', 0)
+        self.planner_scroll.verticalScrollBar().setValue(value)
+        QTimer.singleShot(0, lambda: self._restore_builder_scroll(value))
+
+    def _restore_builder_scroll(self, value):
+        if (self._tab_active and not self._revision_closed and not self._assignment_open
+                and self._plan_task_stack.currentWidget() is self.planner_scroll):
+            self.planner_scroll.verticalScrollBar().setValue(value)
+
+    def _show_builder_for_assignment_repair(self):
+        self._assignment_controller.set_active(False)
+        self._assignment_controller.set_active(self._tab_active)
+        self._plan_task_stack.setCurrentWidget(self.planner_scroll)
+        self.planner_scroll.verticalScrollBar().setValue(getattr(self, '_builder_scroll_before_assignment', 0))
+
+    def _on_assignment_result(self, message):
+        operation, result = message['operation'], message.get('result')
+        if operation == 'schedule_page':
+            self.assignment_panel.append_schedule_page(result or {
+                'error': message['error'],
+                'review_token': message['payload'].get('review_token'),
+            })
+            return
+        if operation in {'relink_context', 'preview_relink'} or (operation == 'commit_refresh' and self._relink_open):
+            if not self._relink_open:
+                return
+            self.relink_panel.set_busy(False)
+            if message.get('error'):
+                self.relink_panel.set_error(message['error'])
+            elif operation == 'relink_context':
+                self.relink_panel.set_context(result)
+            elif operation == 'preview_relink':
+                self.relink_panel.set_review(result)
+            else:
+                self._relink_committed_focus = {'plan_id': int(self.relink_panel._context['plan']['id']),
+                    'signature': self._relink_entry_identity}
+                self._cancel_plan_relink()
+                self._set_action_feedback(result['message'])
+                self._request_input_catalog(force=True)
+                self.schedule_saved.emit()
+            return
+        if message.get('error'):
+            if operation == 'save_draft':
+                self._plan_draft_saving = False
+                self._automatic_edit_review_plan_id = 0
+                self._update_plan_action_styles()
+            if operation == 'context' and self._assignment_open and self.assignment_panel.isHidden():
+                self._assignment_loading.hide()
+                self.assignment_panel.set_context({'operation': self._assignment_request.get('operation', 'assign')})
+                self.assignment_panel.show()
+            self.assignment_panel._back()
+            self.assignment_panel.message.setText(message['error'] + ' Your entered choices are retained. Review again before saving.')
+            self.frequency_plan_action_hint_label.setText(message['error'])
+            if operation == 'save_draft':
+                self._assignment_controller.submit('context', {'plan_id': int(message['payload']['payload'].get('id') or 0)})
+            return
+        if operation == 'context':
+            if not self._assignment_controller._write_pending:
+                self._plan_draft_saving = False
+            plan_id = int((result.get('plan') or {}).get('id') or 0)
+            self._assignment_request['plan_id'] = plan_id
+            self._saved_plan_drafts[plan_id] = result.get('draft')
+            self.discard_saved_plan_changes_btn.setVisible(bool(result.get('plan_draft') and result.get('operation') == 'apply'))
+            selected_id = int((self._selected_frequency_plan_row() or {}).get('id') or 0)
+            repair_plan_id = int(getattr(self, '_assignment_source_repair_plan_id', 0) or 0)
+            if (not self._assignment_open and plan_id and self._catalog_model is not None and plan_id != selected_id
+                    and not self._has_authoring_draft() and plan_id != repair_plan_id):
+                self.focus_frequency_plan(plan_id, device_profile_id=int(self._assignment_request.get('device_profile_id') or 0))
+                selected_id = plan_id
+            self.review_saved_plan_changes_btn.setVisible(bool(self._saved_plan_drafts.get(selected_id)))
+            result['reset_selection'] = bool(getattr(self, '_assignment_reset_selection', False))
+            self._assignment_reset_selection = False
+            task_operation = result.get('operation')
+            continue_review = (self._assignment_open and task_operation
+                and not getattr(self, '_assignment_return_restore_snapshot', None)
+                and not getattr(self, '_assignment_choices_restore_snapshot', None)
+                and self.assignment_panel._context.get('operation') == task_operation
+                and int((self.assignment_panel._context.get('plan') or {}).get('id') or 0) == plan_id
+                and ((self.assignment_panel._review or {}).get('operation') == task_operation
+                     or (self.assignment_panel._review is None and self.assignment_panel._pending_review)))
+            result['keep_visible_review'] = bool(continue_review) and not result['reset_selection']
+            self.assignment_panel.set_context(result)
+            if self.assignment_panel.message.text().strip() == 'Loading assignment choices…':
+                self.assignment_panel.message.clear()
+            restore = (getattr(self, '_assignment_return_restore_snapshot', None)
+                       or getattr(self, '_assignment_choices_restore_snapshot', None))
+            if restore is not None:
+                available = {int(r.get('id')) for r in result.get('radios', ()) if r.get('id') is not None}
+                self.assignment_panel._selected = set(restore.get('selected', ())) & available
+                self.assignment_panel._remedies = {
+                    key: value for key, value in restore.get('remedies', {}).items()
+                    if int(key) in self.assignment_panel._selected
+                }
+                self.assignment_panel._copy_names = {
+                    key: value for key, value in restore.get('copy_names', {}).items()
+                    if int(key) in self.assignment_panel._selected
+                }
+                self.assignment_panel._stage = 'choose'
+                self.assignment_panel._review = None
+                self.assignment_panel._pending_review = None
+                self.assignment_panel._render()
+                self.assignment_panel.message.setText(
+                    'Settings may have changed while this repair was open. Your staged choices are restored; review again to refresh validation.'
+                )
+                self._assignment_return_restore_snapshot = None
+                self._assignment_choices_restore_snapshot = None
+            if self._assignment_open:
+                self._assignment_loading.hide()
+                self.assignment_panel.show()
+            recheck_return = bool(getattr(self, '_assignment_recheck_on_return', False))
+            if self._pending_assignment_scroll_restore is not None and not recheck_return:
+                restore_value = int(self._pending_assignment_scroll_restore)
+                self._pending_assignment_scroll_restore = None
+                review_context = self.assignment_panel._context
+                QTimer.singleShot(0, lambda: self._restore_assignment_scroll(restore_value, review_context))
+            self._update_plan_action_styles()
+            if (continue_review or recheck_return
+                    or (task_operation == 'apply' and getattr(self, '_automatic_edit_review_plan_id', 0) == plan_id)):
+                self._automatic_edit_review_plan_id = 0
+                self._assignment_recheck_on_return = False
+                if self.assignment_panel._review is None and self.assignment_panel.primary_button.isEnabled():
+                    self.assignment_panel._primary()
+        elif operation == 'review':
+            was_reviewing = self.assignment_panel._review is not None
+            self.assignment_panel.set_review(result)
+            if self._pending_assignment_scroll_restore is not None:
+                value = int(self._pending_assignment_scroll_restore)
+                self._pending_assignment_scroll_restore = None
+                context = self.assignment_panel._context
+                QTimer.singleShot(0, lambda: self._restore_assignment_scroll(value, context))
+            elif not was_reviewing and self.assignment_panel._review is not None:
+                self._assignment_scroll.verticalScrollBar().setValue(0)
+        elif operation == 'commit':
+            self.assignment_panel.show_result(result)
+            self._set_action_feedback(result['message'])
+            if result.get('operation') == 'apply':
+                self._saved_plan_drafts.pop(int(message['payload'].get('plan_id') or 0), None)
+            if result.get('operation') == 'apply' and getattr(self, '_saved_draft_identity', None) == self._assignment_authoring_signature():
+                self._relink_committed_focus = {'plan_id': int(message['payload']['plan_id']),
+                    'signature': self._saved_draft_identity}
+            self._cancel_assignment()
+            self._request_input_catalog(force=True)
+            self.schedule_saved.emit()
+        elif operation == 'save_draft':
+            self._plan_draft_saving = False
+            plan_id = int(result['plan_id'])
+            self._saved_plan_drafts[plan_id] = result
+            self.review_saved_plan_changes_btn.show()
+            self._set_action_feedback('Changes are ready for review. The saved plan stays in use until Apply changes.')
+            self._update_plan_action_styles()
+            saved_identity = getattr(self, '_saving_draft_identity', None) == self._assignment_authoring_signature()
+            if saved_identity and int(getattr(self, '_assignment_source_repair_plan_id', 0) or 0) != plan_id:
+                self._saved_draft_identity = self._assignment_authoring_signature()
+                self._update_plan_action_styles()
+                self.open_radio_assignments(frequency_plan_id=plan_id, operation='apply')
+            else:
+                self._automatic_edit_review_plan_id = 0
+                if saved_identity:
+                    self._saved_draft_identity = self._assignment_authoring_signature()
+                self._set_action_feedback(
+                    'Pending changes kept for the plan being inspected. Assignment choices are retained; use Review pending changes only when you intend to apply those edits.'
+                    if saved_identity and int(getattr(self, '_assignment_source_repair_plan_id', 0) or 0) == plan_id else
+                    'Pending changes kept. Newer editor changes are retained and still need review; Review pending changes opens the earlier version.'
+                )
+        elif operation == 'preview_refresh':
+            self.assignment_panel._pending_review = self.assignment_panel._intent()
+            self.assignment_panel.set_review(result)
+        elif operation == 'commit_refresh':
+            self.assignment_panel._back()
+            self._set_action_feedback(result['message'])
+            self._request_input_catalog(force=True)
+            self.schedule_saved.emit()
+            self._load_assignment_context()
+        elif operation == 'discard_draft':
+            plan_id = int(result['plan_id'])
+            preserve_editor = self._has_unsaved_authoring_draft()
+            self._saved_plan_drafts.pop(plan_id, None)
+            self._saved_draft_identity = None
+            self.review_saved_plan_changes_btn.hide()
+            self.discard_saved_plan_changes_btn.hide()
+            if (int((self._selected_frequency_plan_row() or {}).get('id') or 0) == plan_id
+                    and not preserve_editor):
+                self.focus_frequency_plan(plan_id)
+            self._set_action_feedback(result['message'])
+            if self._assignment_open:
+                self._cancel_assignment()
+
+    def _restore_assignment_scroll(self, value, review_context):
+        if (self._tab_active and not self._revision_closed and self._assignment_open
+                and self._plan_task_stack.currentWidget() is self._assignment_scroll
+                and self.assignment_panel._context is review_context):
+            self._assignment_scroll.verticalScrollBar().setValue(value)
+
+    def _discard_assignment_draft(self):
+        plan_id = int(self._assignment_request.get('plan_id') or 0) if self._assignment_open else 0
+        draft = self._saved_plan_drafts.get(plan_id) or {}
+        if not draft or self._assignment_controller._write_pending:
+            return
+        answer = QMessageBox.question(self, 'Discard pending changes',
+            'Discard this pending version? Radios keep using the saved plan.',
+            QMessageBox.Discard | QMessageBox.Cancel, QMessageBox.Cancel)
+        if answer == QMessageBox.Discard:
+            self._assignment_controller.submit('discard_draft', {'plan_id': plan_id, 'expected_version': draft['version']})
+
+    def _repair_assignment(self, issue):
+        issue = issue if isinstance(issue, Mapping) else {}
+        raw_target = issue.get('target')
+        context = {key: value for key, value in issue.items() if key != 'target'}
+        if isinstance(raw_target, Mapping):
+            context.update(dict(raw_target))
+        elif raw_target is not None:
+            context['target'] = raw_target
+        target = str(context.get('target') or '').strip().lower()
+        context['target'] = target
+        if 'device_profile_id' not in context:
+            context['device_profile_id'] = context.get('radio_id', 0)
+        if 'frequency_plan_id' not in context:
+            context['frequency_plan_id'] = context.get('plan_id', self._assignment_request.get('plan_id', 0))
+        try:
+            context['device_profile_id'] = int(context.get('device_profile_id') or 0)
+        except (TypeError, ValueError):
+            context['device_profile_id'] = 0
+        try:
+            context['frequency_plan_id'] = int(context.get('frequency_plan_id') or 0)
+        except (TypeError, ValueError):
+            context['frequency_plan_id'] = 0
+        label = str(issue.get('remedy_label') or issue.get('action_label') or 'Repair this issue')
+        instructions = str(issue.get('remedy_instructions') or issue.get('instructions') or issue.get('message') or '')
+        if target == 'assignment_choices':
+            self.assignment_panel._back()
+            self.assignment_panel.message.setText((instructions + ' ' if instructions else '') +
+                'Choose a radio or plan below, then review again. Your choices remain staged until the final save.')
+            if context.get('field') == 'radio' and context['device_profile_id'] > 0:
+                button = self.assignment_panel.findChild(QCheckBox, f"assignment_radio_{context['device_profile_id']}")
+                if button is not None:
+                    self._assignment_scroll.ensureWidgetVisible(button)
+                    button.setFocus()
+                else:
+                    self.assignment_panel.message.setText(
+                        f"Radio {context['device_profile_id']} is not available in these assignment choices. Refresh the choices or select a visible radio; no other radio was selected."
+                    )
+            elif context.get('field') == 'model':
+                radio_id = context['device_profile_id']
+                control = (self.assignment_panel.findChild(QPushButton, f"assignment_allow_{radio_id}")
+                           or self.assignment_panel.findChild(QCheckBox, f"assignment_radio_{radio_id}"))
+                if control is not None:
+                    self._assignment_scroll.ensureWidgetVisible(control)
+                    control.setFocus()
+                    self.assignment_panel.message.setText(
+                        'Choose the scheduling permission or Operating Model for this radio below, then review again. Changes stay staged until the final save.'
+                    )
+                else:
+                    self.assignment_panel.message.setText(
+                        'This radio is no longer available in assignment choices. Refresh the choices and select a current radio before reviewing again.'
+                    )
+            elif context.get('field') == 'plan':
+                self._preserve_assignment_choices_on_next_open = True
+                self._show_builder_for_assignment_repair()
+                self.frequency_plan_combo.setFocus()
+                self._set_action_feedback(
+                    (instructions + ' ' if instructions else '') +
+                    'Choose another plan above, then choose Assign to radios… to continue. Your selected radios and other staged choices will be kept; review the new plan before saving.'
+                )
+            elif context.get('field') == 'source':
+                plan_id = int(context.get('frequency_plan_id') or 0)
+                selected_plan_id = int((self._selected_frequency_plan_row() or {}).get('id') or 0)
+                if plan_id > 0 and plan_id != selected_plan_id and self._has_unsaved_authoring_draft():
+                    self._show_builder_for_assignment_repair()
+                    self._set_action_feedback(
+                        (instructions + ' ' if instructions else '') +
+                        'Save the current plan draft before opening the named plan. Your assignment choices remain staged.'
+                    )
+                    self.save_plan_btn.setFocus()
+                elif not self._focus_assignment_plan_source(context):
+                    self.assignment_panel.message.setText(
+                        (instructions + ' ' if instructions else '') +
+                        'The exact source selector is unavailable in Plan Builder. Open the named plan and choose a current source there; no source was changed.'
+                    )
+                else:
+                    self._set_action_feedback(
+                        (instructions + ' ' if instructions else '') +
+                        'Choose a replacement in the focused Plan Builder source selector, save the plan explicitly, then review this assignment again. The assignment choices remain staged.'
+                    )
+            elif context.get('field'):
+                self.assignment_panel.message.setText(
+                    f"Assignment field '{context.get('field')}' is not available here. Choose a visible radio or plan and review again; no choice was changed."
+                )
+            return
+        if target == 'retry_review':
+            self.assignment_panel._back()
+            self.assignment_panel.message.setText((instructions + ' ' if instructions else '') +
+                'Review this assignment again to check the current plan and radio settings. No changes have been made.')
+            self._assignment_scroll.ensureWidgetVisible(self.assignment_panel)
+            return
+        if context.get('target') == 'refresh_sources':
+            self.assignment_panel.set_busy(True)
+            self.assignment_panel.message.setText('Reviewing source window changes and every affected radio. No changes have been saved.')
+            self._assignment_controller.submit('preview_refresh', {'plan_ids': context.get('refresh_plan_ids') or []})
+            return
+        if context.get('target') == 'source':
+            if self._open_assignment_source_repair(context, instructions):
+                return
+            self.assignment_panel.message.setText(
+                'The exact source row is unavailable in this view. Return to assignment review or choose a current source row in Plan Builder; no other row was selected.'
+            )
+            return
+        opener = getattr(self.window(), 'open_plan_assignment_repair', None)
+        if callable(opener):
+            self._assignment_return_scroll_value = self._assignment_scroll.verticalScrollBar().value()
+            win = self.window()
+            win._plan_assignment_return_context = {
+                'device_profile_id': int(self._assignment_request.get('device_profile_id') or 0),
+                'frequency_plan_id': int(self._assignment_request.get('plan_id') or 0),
+                'repair_context': {'returning_to_review': True},
+            }
+            opened = bool(opener(context))
+            if not opened:
+                self.assignment_panel.message.setText(
+                    (instructions + ' ' if instructions else '') +
+                    f"{label} is not available for the named target. No setting or radio control was changed. Return here and review again."
+                )
+        else:
+            self.assignment_panel.message.setText(
+                (instructions + ' ' if instructions else '') +
+                f"{label} cannot be opened because its owner is unavailable. No changes were made."
+            )
+
+    def _open_assignment_source_repair(self, context, instructions=''):
+        source_ref = str(context.get('source_ref') or '').strip()
+        window = context.get('window') if isinstance(context.get('window'), Mapping) else {}
+        source_label = context.get('source_label')
+        if source_ref.startswith('sop_schedule_plan:'):
+            identity = source_ref.split(':', 1)[1]
+            if identity.isdigit():
+                return self._open_assignment_source_repair(
+                    {**context, 'frequency_plan_id': int(identity), 'source_ref': ''}, instructions)
+        if not source_ref:
+            plan_id = int(context.get('frequency_plan_id') or 0)
+            selected_id = int((self._selected_frequency_plan_row() or {}).get('id') or 0)
+            if plan_id <= 0:
+                return False
+            if plan_id != selected_id:
+                if self._has_unsaved_authoring_draft():
+                    self._show_builder_for_assignment_repair()
+                    self._set_action_feedback(
+                        f"Save the current plan draft before opening Frequency Plan {plan_id}. Your assignment choices remain staged."
+                    )
+                    self.save_plan_btn.setFocus()
+                    return True
+                if not self._enter_assignment_source_repair_plan(plan_id, int(context.get('device_profile_id') or 0)):
+                    self._set_action_feedback('The affected plan is unavailable. Your assignment choices remain staged.')
+                    self._plan_assignment_return_btn.hide()
+                    self._assignment_source_repair_snapshot = None
+                    self._assignment_source_repair_plan_id = 0
+                    return True
+            else:
+                self._enter_assignment_source_repair_plan(plan_id, int(context.get('device_profile_id') or 0))
+            self._set_action_feedback(
+                (instructions + ' ' if instructions else '') +
+                'The affected plan is open in Plan Builder. Edit and save its windows explicitly, then return to assignment review and review again. Your radio choices remain staged.'
+            )
+            if window and self._open_exact_local_window(window):
+                return True
+            self.planner_scroll.ensureWidgetVisible(self.table)
+            self.table.setFocus()
+            return True
+        category, _, source_id = source_ref.partition(':')
+        if category == HF_DAILY_SOURCE_CATEGORY:
+            owner = 'HF'
+        elif category == HF_NET_SOURCE_CATEGORY:
+            owner = 'NET'
+        elif category == 'sop_schedule_layer':
+            owner = 'SOP'
+        else:
+            return False
+        target = dict(window)
+        for key in ('source_row_id', 'source_key', 'sop_profile_id', 'sop_layer_id', 'resource_id'):
+            if context.get(key) and not target.get(key):
+                target[key] = context[key]
+        if owner == 'SOP' and not target.get('sop_layer_id') and target.get('source_row_id'):
+            target['sop_layer_id'] = target['source_row_id']
+        exact = any(target.get(key) for key in ('source_row_id', 'source_key', 'sop_layer_id', 'resource_id'))
+        return self._request_window_source(owner, source_id, target if exact else None,
+                                           review=True, source_name=str(source_label or ""), instructions=instructions)
+
+    def _open_exact_local_window(self, window):
+        plan = self._selected_frequency_plan_row()
+        if not plan or self._source_backed_normal_plan(plan):
+            return False
+        matches = self._exact_plan_window_matches(self._schedule_refs_from_plan_row(plan), window)
+        if len(matches) != 1:
+            self._set_action_feedback("The exact saved window is unavailable. Select the window you want to edit in the plan.")
+            return False
+        ref = matches[0]
+        start = self._parse_guard_hhmm(str(ref.get("start_utc") or ""))
+        end = self._parse_guard_hhmm(str(ref.get("end_utc") or ""))
+        if start is None or end is None:
+            return False
+        segment = ScheduleSegment(
+            source=str(ref.get("source") or "HF"), day_utc=str(ref.get("day_utc") or "ALL"),
+            start_minute=start, end_minute=end, band=str(ref.get("band") or ""),
+            frequency=str(ref.get("frequency") or ""), mode=str(ref.get("mode") or ""),
+            group_name=str(ref.get("group_name") or ""), net_name=str(ref.get("net_name") or ""),
+            profile_name=str(ref.get("profile_name") or ""), raw=ref,
+        )
+        self._set_projection_inspector(EffectiveWindowCell(segment))
+        if self.inline_update_plan_btn.isEnabled():
+            self._open_selected_inline_editor()
+            return True
+        return False
+
+    def _capture_assignment_choice_snapshot(self):
+        panel = getattr(self, 'assignment_panel', None)
+        if panel is None:
+            return {'selected': set(), 'remedies': {}, 'copy_names': {}}
+        return {
+            'selected': set(getattr(panel, '_selected', set())),
+            'remedies': dict(getattr(panel, '_remedies', {})),
+            'copy_names': dict(getattr(panel, '_copy_names', {})),
+        }
+
+    def _focus_assignment_plan_source(self, context):
+        plan_id = int(context.get('frequency_plan_id') or 0)
+        selected_id = int((self._selected_frequency_plan_row() or {}).get('id') or 0)
+        if plan_id <= 0:
+            return False
+        if plan_id != selected_id:
+            if self._has_unsaved_authoring_draft():
+                self.frequency_plan_action_hint_label.setText(
+                    'Save the current plan draft before opening the named plan. No plan or source was changed.'
+                )
+                self.save_plan_btn.setFocus()
+                return True
+            if not self._enter_assignment_source_repair_plan(plan_id, int(context.get('device_profile_id') or 0)):
+                return False
+        source_ref = str(context.get('source_ref') or '').strip()
+        selectors = (
+            ('hf_daily_schedule:', 'hf_daily_source_combo'),
+            ('hf_net_schedule:', 'hf_net_source_combo'),
+            ('sop_schedule_plan:', 'sop_plan_source_combo'),
+            ('sop_schedule_layer:', 'sop_plan_source_combo'),
+        )
+        attr = next((name for prefix, name in selectors if source_ref.startswith(prefix)), '')
+        combo = getattr(self, attr, None) if attr else None
+        if combo is None:
+            return False
+        if plan_id == selected_id:
+            self._enter_assignment_source_repair_plan(plan_id, int(context.get('device_profile_id') or 0))
+        combo.setFocus()
+        return True
+
+    def _enter_assignment_source_repair_plan(self, plan_id, device_profile_id=0):
+        if self._assignment_source_repair_snapshot is None:
+            self._assignment_source_repair_snapshot = {
+                'request': dict(self._assignment_request),
+                **self._capture_assignment_choice_snapshot(),
+                'scroll': int(self._assignment_scroll.verticalScrollBar().value()),
+            }
+        self._assignment_source_repair_plan_id = int(plan_id)
+        self._plan_assignment_return_btn.show()
+        self._assignment_return_scroll_value = self._assignment_source_repair_snapshot['scroll']
+        self._show_builder_for_assignment_repair()
+        if int((self._selected_frequency_plan_row() or {}).get('id') or 0) == int(plan_id):
+            return True
+        return bool(self.focus_frequency_plan(int(plan_id), device_profile_id=int(device_profile_id or 0)))
+
+    def _return_from_plan_source_repair(self):
+        snapshot = getattr(self, '_assignment_source_repair_snapshot', None)
+        if not snapshot:
+            self._plan_assignment_return_btn.hide()
+            self.assignment_panel.message.setText('No assignment review is available to return to.')
+            return
+        if self._has_unsaved_authoring_draft():
+            self.frequency_plan_action_hint_label.setText('Save the current plan draft before returning to assignment review. No draft or staged choice was discarded.')
+            self.save_plan_btn.setFocus()
+            return
+        request = dict(snapshot.get('request') or {})
+        self._assignment_request = request
+        self._assignment_return_restore_snapshot = snapshot
+        self._assignment_source_repair_plan_id = 0
+        self._plan_assignment_return_btn.hide()
+        original_plan_id = int(request.get('plan_id') or 0)
+        if original_plan_id > 0:
+            self.focus_frequency_plan(original_plan_id, device_profile_id=int(request.get('device_profile_id') or 0))
+        self.open_radio_assignments(
+            device_profile_id=int(request.get('device_profile_id') or 0),
+            frequency_plan_id=int(request.get('plan_id') or 0),
+            operation=request.get('operation') or 'assign',
+            repair_context={'returning_to_review': True},
+        )
+        self._assignment_source_repair_snapshot = None
+
+    @staticmethod
+    def _set_assignment_source_owner_message(tab, text):
+        label = getattr(tab, '_plan_assignment_repair_hint_label', None)
+        if label is None:
+            label = QLabel(tab)
+            label.setObjectName('planAssignmentRepairHint')
+            label.setWordWrap(True)
+            tab._plan_assignment_repair_hint_label = label
+            layout = tab.layout()
+            if layout is not None and hasattr(layout, 'insertWidget'):
+                layout.insertWidget(1, label)
+            elif layout is not None:
+                layout.addWidget(label)
+        label.setText(str(text or ''))
+        label.setVisible(True)
+
+    def _plan_has_live_consumers(self, plan_id):
+        model = getattr(self, '_catalog_model', None)
+        if model is None:
+            return False
+        affected = {int(plan_id)}
+        changed = True
+        while changed:
+            changed = False
+            for plan in model.plans:
+                ident = int(plan.get('id') or 0)
+                refs = self._source_refs_from_plan_row(plan)
+                if ident not in affected and any(str(ref).rsplit(':', 1)[-1] in {str(i) for i in affected}
+                        and str(ref).startswith(('hf_daily_schedule:plan:', 'hf_net_schedule:plan:', 'sop_schedule_plan:')) for ref in refs):
+                    affected.add(ident)
+                    changed = True
+        return any(int(row.get('frequency_plan_id') or 0) in affected for row in model.assignments)
+
     def _on_assign_plan_clicked(self) -> None:
         plan = self._selected_frequency_plan_row()
         if not plan:
             self.frequency_plan_action_hint_label.setText(
-                "Select or save a Frequency Plan before assigning it in Configuration."
+                "Select or save a Frequency Plan, then choose the radios here in Plan Builder."
             )
             return
         try:
@@ -2850,7 +3840,7 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         ):
             return
         self.frequency_plan_action_hint_label.setText(
-            f"Assign '{str(plan.get('name') or 'Frequency Plan')}' from Configuration > Radios > Schedule Assignment. "
+            f"Assign '{str(plan.get('name') or 'Frequency Plan')}' from Plan Builder > Radio assignments. "
             "Choose the radio and save with RF Guard before the schedule changes."
         )
 
@@ -3283,11 +4273,11 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         if "antenna support does not include" in lower:
             return "Open Configuration > Radios and adjust the radio antenna bands or choose a plan layer on a supported band."
         if "prevent band overlap" in lower or "would both be assigned on" in lower:
-            return "Open Configuration > Radios and separate the assignments, change one plan window, or adjust the RF Guard group/mode."
+            return "Review the affected radio assignments here, or open the exact radio RF Guard settings. Separate the conflicting plan windows before applying."
         if "advanced guard" in lower or ("within" in lower and "hz" in lower):
-            return "Open Configuration > Radios and review the Advanced RF Guard spacing or move one schedule window/frequency."
+            return "Review the affected RF Guard settings or edit the conflicting schedule window/frequency. Protection settings are not changed automatically."
         if "observer" in lower or "receive-only" in lower:
-            return "Open Configuration > Radios and assign a receive-only plan or change the radio role."
+            return "Assign a receive-only plan here, or open Configuration > Radios to review the radio role."
         return "Review the affected plan window and radio assignment before saving."
 
     def _set_rf_guard_resolution_available(self, enabled: bool) -> None:
@@ -3295,7 +4285,7 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
             return
         self.resolve_rf_guard_btn.setEnabled(bool(enabled))
         self.resolve_rf_guard_btn.setToolTip(
-            "Open Configuration > Radios > Schedule Assignment to resolve the RF Guard issue(s)."
+            "Open Plan Builder > Radio assignments to resolve the RF Guard issue(s)."
             if enabled
             else "Review RF Guard issues first, then open the radio assignment area to resolve them."
         )
@@ -3350,12 +4340,9 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
                 item = QTableWidgetItem(value)
                 item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
                 item.setToolTip(value)
-                if level == "Blocked":
-                    item.setBackground(qcolor(theme.get("danger_bg", "#F8D7DA")))
-                    item.setForeground(qcolor(theme.get("danger_fg", theme.get("text", "#1f2328"))))
-                else:
-                    item.setBackground(qcolor(theme.get("warning_bg", "#FFF3CD")))
-                    item.setForeground(qcolor(theme.get("warning_fg", theme.get("text", "#1f2328"))))
+                background = theme['danger' if level == 'Blocked' else 'warning']
+                item.setBackground(qcolor(background))
+                item.setForeground(qcolor(contrast_text_for_background(background, theme)))
                 self.rf_guard_review_table.setItem(row_index, col, item)
         self.rf_guard_review_table.resizeRowsToContents()
         self.rf_guard_review_card.setVisible(True)
@@ -3419,42 +4406,9 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         plan_id: int = 0,
         device_profile_id: int = 0,
     ) -> bool:
-        win = self.window()
-        if hasattr(win, "open_settings_section"):
-            try:
-                win.open_settings_section("schedule_assignments", settings_nav_context="radios")
-                label = str(plan_name or "the selected plan").strip()
-                assigned_ids: List[int] = []
-                if plan_id > 0:
-                    assigned_ids = self._assigned_radio_ids_for_plan({"id": int(plan_id)})
-                try:
-                    target_radio_id = int(device_profile_id or 0)
-                except Exception:
-                    target_radio_id = 0
-                if target_radio_id <= 0:
-                    target_radio_id = int(assigned_ids[0]) if assigned_ids else 0
-                settings_tab = getattr(win, "settings_tab", None)
-                opener = getattr(settings_tab, "open_schedule_assignment_editor", None)
-                if callable(opener):
-                    QTimer.singleShot(
-                        0,
-                        lambda pid=int(plan_id or 0), rid=int(target_radio_id or 0): opener(
-                            plan_id=pid,
-                            device_profile_id=rid,
-                        ),
-                    )
-                if str(purpose or "").strip().lower() == "assign":
-                    self.frequency_plan_action_hint_label.setText(
-                        f"Opened Configuration > Radios > Schedule Assignment for '{label}'. Choose the radio and save with RF Guard."
-                    )
-                else:
-                    self.frequency_plan_action_hint_label.setText(
-                        f"Opened Configuration > Radios > Schedule Assignment to resolve RF Guard issues for {label}."
-                    )
-                return True
-            except Exception as exc:
-                log.debug("FreqPlanner: failed opening Settings schedule assignment: %s", exc)
-        return False
+        self.open_radio_assignments(device_profile_id=int(device_profile_id or 0),
+                                    frequency_plan_id=int(plan_id or 0))
+        return True
 
     def _on_resolve_rf_guard_clicked(self) -> None:
         plan = self._selected_frequency_plan_row()
@@ -3466,7 +4420,7 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         if self._open_schedule_assignment_settings(plan_name=plan_name, plan_id=plan_id):
             return
         self.frequency_plan_action_hint_label.setText(
-            "Open Configuration > Radios > Schedule Assignment to resolve the RF Guard issue(s)."
+            "Open Plan Builder > Radio assignments to resolve the RF Guard issue(s)."
         )
 
     def _on_review_rf_guard_clicked(self) -> None:
@@ -3531,13 +4485,46 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         success_kind: str = "Frequency Plan",
         after_save=None,
     ) -> Optional[Dict[str, Any]]:
+        plan_id = int(plan_payload.get('id') or 0)
+        if plan_id and self._plan_has_live_consumers(plan_id):
+            if getattr(self, '_plan_draft_saving', False) or self._assignment_controller._write_pending:
+                self._set_action_feedback('A save is already in progress. Your current entries are retained.')
+                return None
+            expected = self._catalog_model.plan_index.get(plan_id) if self._catalog_model else None
+            draft = self._saved_plan_drafts.get(plan_id) or {}
+            if draft:
+                box = QMessageBox(QMessageBox.Question, 'Replace earlier pending changes?',
+                    'This plan already has pending changes that are not in use. '
+                    'Reviewing these new edits will replace those earlier pending changes. '
+                    'The saved live plan stays in use until Apply changes.', parent=self)
+                replace = box.addButton('Replace pending changes', QMessageBox.DestructiveRole)
+                cancel = box.addButton(QMessageBox.Cancel)
+                box.setDefaultButton(cancel)
+                box.exec()
+                if box.clickedButton() is not replace:
+                    self._automatic_edit_review_plan_id = 0
+                    self._set_action_feedback('Earlier pending changes kept. Your new editor changes are also retained; nothing was replaced or applied.')
+                    return None
+            self._set_action_feedback('Preparing changes for review. Assigned radios keep using the saved plan until Apply changes.')
+            self._assignment_controller.set_active(True)
+            self._plan_draft_saving = True
+            self._saving_draft_identity = self._assignment_authoring_signature()
+            self._update_plan_action_styles()
+            self._assignment_controller.submit('save_draft', {'payload': dict(plan_payload), 'expected': expected,
+                'expected_draft_version': int(draft.get('version') or 0)})
+            return None
         if "_catalog_action_nonce" not in plan_payload:
             import uuid
             plan_payload["_catalog_action_nonce"] = str(uuid.uuid4())
         # Populate advisory validation requests before the fresh worker check.
         # Pending validation is never permission to commit.
         if self._fresh_action_token is None:
-            self._rf_guard_preflight_for_plan(plan_payload)
+            try:
+                self._rf_guard_preflight_for_plan(plan_payload)
+            except Exception as exc:
+                log.exception('Plan Builder preflight unavailable; plan was not saved')
+                self._set_action_feedback(f'Plan not saved: RF Guard could not complete: {exc}. Use Review RF Guard, then retry saving after resolving the issue.')
+                return None
         if self._request_fresh_action(self._save_plan_payload_with_guard, (dict(plan_payload),),
                                       {"schedule_count": schedule_count, "success_kind": success_kind, "after_save": after_save},
                                       guard_payload=dict(plan_payload), target_plan_id=int(plan_payload.get("id") or 0)):
@@ -3547,29 +4534,29 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
             return
         missing_text = self._source_dependency_block_text()
         if missing_text:
-            self.frequency_plan_action_hint_label.setText(missing_text)
+            self._set_action_feedback(missing_text)
             return None
         try:
             validation = self._rf_guard_preflight_for_plan(plan_payload)
         except ValueError as exc:
-            self.frequency_plan_action_hint_label.setText(f"RF Guard blocked this plan before save: {exc}")
+            self._set_action_feedback(f"RF Guard blocked this plan before save: {exc}")
             return None
         except Exception as exc:
             log.exception("FreqPlanner: RF Guard preflight failed.")
-            validation = {
-                "state": "warning",
-                "messages": [f"RF Guard preflight could not complete: {exc}"],
-            }
+            self._set_action_feedback(f"Plan not saved: RF Guard could not complete: {exc}. Use Review RF Guard, then retry saving after resolving the issue.")
+            return None
         if str(validation.get("state") or "").lower() in {"pending", "unavailable"} or validation.get("rf_guard_validation") == "unavailable":
-            self.frequency_plan_action_hint_label.setText("RF Guard verification is incomplete. Review current inputs before saving.")
+            self._set_action_feedback("RF Guard verification is incomplete. Review current inputs before saving.")
             return None
         validation = self._merge_frequency_variant_validation(validation, plan_payload)
         state = str(validation.get("state") or "").strip().lower()
         messages = [str(item) for item in validation.get("messages", []) if str(item or "").strip()]
         if state == "blocked":
-            self.frequency_plan_action_hint_label.setText(
-                "RF Guard blocked this Frequency Plan before save. " + (messages[0] if messages else "")
+            self._set_action_feedback(
+                "Plan not saved: RF Guard blocked this save. " + (messages[0] if messages else "") + " Use Review RF Guard for details, resolve the named issue, then retry saving."
             )
+            self._set_rf_guard_review_card(validation)
+            log.warning('Plan Builder save blocked by RF Guard: %s', messages[0] if messages else 'validation blocked')
             return None
         if state == "warning":
             response = QMessageBox.question(
@@ -3582,6 +4569,7 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
                 QMessageBox.Cancel,
             )
             if response != QMessageBox.Save:
+                self._set_action_feedback('Plan not saved. Save cancelled; your entries are retained. Retry saving when ready.')
                 return None
         if state in {"off", "not_enforced"} or str(validation.get("rf_guard_validation") or "").strip().lower() == "not_enforced":
             response = QMessageBox.question(
@@ -3593,25 +4581,82 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
                 QMessageBox.Cancel,
             )
             if response != QMessageBox.Save:
+                self._set_action_feedback('Plan not saved. Save cancelled; your entries are retained. Retry saving when ready.')
                 return None
         if getattr(self, "_input_read_error", ""):
             self._show_plan_input_failure()
             return None
-        try:
-            saved = self.plan_context_service.store.save_frequency_plan(plan_payload)
-        except Exception as exc:
-            log.exception("FreqPlanner: failed saving Frequency Plan.")
-            self.frequency_plan_action_hint_label.setText(f"Unable to save Frequency Plan: {exc}")
-            return None
+        self._assert_fresh_action()
+        self.settings.assert_mutation_root()
+        signature = self._assignment_authoring_signature()
+        from threading import Event
+        self._plan_save_cancelled = Event()
+        self._plan_save_pending = True
+        self._update_plan_action_styles()
+        self._set_action_feedback("Saving plan…")
+        future = self._revision_executor.submit(
+            self._catalog_worker.save_plan, dict(plan_payload), catalog=self._catalog_model.catalog,
+            guard_context=(self._effective_guard_radio_id(), self._guided_plan_handoff_device_profile_id),
+            guard_review=self._fresh_guard_reviews[guard_key(
+                plan_payload, self._effective_guard_radio_id(), self._guided_plan_handoff_device_profile_id)],
+            runtime_status=self._host_runtime_status(), cancelled=self._plan_save_cancelled,
+        )
+        emitter = self._plan_save_emitter
+
+        def completed(done):
+            try:
+                saved, error = done.result(), None
+            except Exception as exc:
+                saved, error = None, exc
+            try:
+                emitter.finished.emit((signature, saved, error, schedule_count, success_kind, validation, after_save))
+            except RuntimeError:
+                pass
+
+        future.add_done_callback(completed)
+        return None
+
+    def _cancel_plan_save(self):
+        if self._plan_save_cancelled is not None:
+            self._plan_save_cancelled.set()
+
+    def _on_plan_saved(self, result):
+        signature, saved, error, schedule_count, success_kind, validation, after_save = result
+        self._plan_save_pending = False
+        self._plan_save_cancelled = None
+        if self._revision_closed:
+            return
+        self._update_plan_action_styles()
+        if error is not None:
+            if self._tab_active and signature == self._assignment_authoring_signature():
+                self._set_action_feedback(f"Unable to save {success_kind}: {error}")
+            return
+        self._catalog_mutated("settings:frequency_plans", int(saved["id"]), dict(saved))
+        if not self._tab_active or signature != self._assignment_authoring_signature():
+            return
+        state = str(validation.get("state") or "").strip().lower()
         self._creating_new_frequency_plan = False
         self._set_frequency_plan_layers_dirty(False)
         self.plan_context_service.invalidate()
         saved_id = int(saved.get("id", 0) or 0)
         self._pending_saved_plan_id = saved_id
+        self._committed_plan_pending_catalog = dict(saved)
         if saved_id:
-            idx = self.frequency_plan_combo.findData(saved_id)
-            if idx >= 0:
+            # This is the committed return value, not an optimistic draft. The
+            # catalog can arrive later without keeping assignment disabled.
+            self.frequency_plan_combo.blockSignals(True)
+            try:
+                idx = self.frequency_plan_combo.findData(saved_id)
+                if idx < 0:
+                    self.frequency_plan_combo.addItem(str(saved['name']), saved_id)
+                    idx = self.frequency_plan_combo.count() - 1
                 self.frequency_plan_combo.setCurrentIndex(idx)
+                self.frequency_plan_combo.setEditText(str(saved['name']))
+                self._editing_frequency_plan_id = saved_id
+            finally:
+                self.frequency_plan_combo.blockSignals(False)
+            self._update_plan_action_styles()
+        log.info('Plan Builder save committed: plan_id=%s name=%r; ready for assignment review', saved_id, saved.get('name'))
         if state in {"", "ok"}:
             guard_text = "RF Guard preflight passed."
         elif state in {"off", "not_enforced"} or str(validation.get("rf_guard_validation") or "").strip().lower() == "not_enforced":
@@ -3619,14 +4664,31 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         else:
             guard_text = "RF Guard warning accepted."
         self._set_action_feedback(
-            f"Saved {success_kind} '{str(saved.get('name') or plan_payload.get('name') or 'Plan')}' "
-            f"with {schedule_count} effective window(s). {guard_text}"
+            f"Saved {success_kind} '{str(saved.get('name') or 'Plan')}' "
+            f"with {schedule_count} effective window(s). {guard_text} Choose Assign to radios… to select radios and review the assignment."
         )
         if after_save is not None:
             after_save(saved)
         return saved
 
     def _on_save_plan_clicked(self) -> None:
+        log.info('Plan Builder save requested: name=%r selected_plan_id=%s',
+                 self._current_frequency_plan_name(), self.frequency_plan_combo.currentData())
+        plan = self._selected_frequency_plan_row()
+        if (plan and self._selected_frequency_plan_category(plan) == 'normal'
+                and not self._creating_new_frequency_plan and not self._has_unsaved_authoring_draft()
+                and not self._source_dependency_block_text()):
+            self._set_action_feedback('Plan saved. No new changes to save. Earlier pending changes, if any, can be reviewed separately.')
+            return
+        if self._plan_save_pending:
+            return
+        if self._selected_source_set_id(SELECTED_HF_DAILY_SOURCE_SET_KEY) == _UNSELECTED_LAYER:
+            self._set_action_feedback("Choose an HF Daily schedule before saving. HF Nets and SOP are optional.")
+            self.hf_daily_source_combo.setFocus(Qt.OtherFocusReason)
+            return
+        if (self._catalog_review_required and self._save_plan_button_text(self._selected_frequency_plan_row()) == 'Save Plan'
+                and not self._review_changed_inputs(for_create=True)):
+            return
         if self._ensure_action_projection("shared", self._on_save_plan_clicked):
             return
         if getattr(self, "_input_read_error", ""):
@@ -3636,10 +4698,10 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
             projection = self._build_blended_projection()
         except Exception as exc:
             log.exception("FreqPlanner: failed building blended projection.")
-            self.frequency_plan_action_hint_label.setText(f"Unable to build the blended schedule projection: {exc}")
+            self._set_action_feedback(f"Unable to build the blended schedule projection: {exc}")
             return
         if not projection.effective_segments:
-            self.frequency_plan_action_hint_label.setText(
+            self._set_action_feedback(
                 "No effective HF Daily, HF Nets, or SOP windows are available to save."
             )
             return
@@ -3649,6 +4711,10 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         selected_category = str((selected_plan or {}).get("category") or "").strip().lower()
         existing_id = int(selected_plan.get("id", 0) or 0) if selected_plan and selected_category != "sop_schedule" else 0
         name = self._current_frequency_plan_name()
+        if self._creating_new_frequency_plan and self._new_plan_explicit_layers and not name:
+            self._set_action_feedback("Enter a name for this plan, then choose Save Plan.")
+            self.frequency_plan_combo.lineEdit().setFocus(Qt.OtherFocusReason)
+            return
         if selected_plan and selected_category == "sop_schedule" and name == str(selected_plan.get("name") or "").strip():
             name = self._default_save_plan_name(projection)
             if hasattr(self, "frequency_plan_combo"):
@@ -3658,7 +4724,7 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
             if hasattr(self, "frequency_plan_combo"):
                 self.frequency_plan_combo.setEditText(name)
         if not name:
-            self.frequency_plan_action_hint_label.setText("Enter a clear Frequency Plan name before saving.")
+            self._set_action_feedback("Enter a clear Frequency Plan name before saving.")
             return
         schedule_refs = projection.schedule_refs()
         source_refs = (
@@ -3666,6 +4732,10 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
             + self._visible_source_dependency_refs()
             + self._selected_sop_plan_dependency_refs()
         )
+        if self._selected_source_set_id(SELECTED_HF_NET_SOURCE_SET_KEY) == _UNSELECTED_LAYER:
+            source_refs.append(f"{HF_NET_SOURCE_CATEGORY}:{NO_NET_SOURCE_SET_ID}")
+        if self._selected_sop_plan_source_id() in {_UNSELECTED_LAYER, _NO_SOP_LAYER}:
+            source_refs.append(_NO_SOP_REF)
         plan_payload: Dict[str, Any] = {
             "name": name,
             "status": "saved",
@@ -3682,6 +4752,8 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         }
         if existing_id > 0:
             plan_payload["id"] = existing_id
+            if self._plan_has_live_consumers(existing_id):
+                self._automatic_edit_review_plan_id = existing_id
         self._save_plan_payload_with_guard(
             plan_payload,
             schedule_count=len(schedule_refs),
@@ -3768,21 +4840,25 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         selected_net = self._selected_source_set_id(SELECTED_HF_NET_SOURCE_SET_KEY)
         hf_set = self._source_set_row_by_id(HF_DAILY_SOURCE_SETS_KEY, selected_hf)
         net_set = self._source_set_row_by_id(HF_NET_SOURCE_SETS_KEY, selected_net)
-        if selected_hf != LIVE_SOURCE_SET_ID and hf_set is None:
+        if selected_hf not in {LIVE_SOURCE_SET_ID, _UNSELECTED_LAYER} and hf_set is None:
             raise MissingScheduleSourceError(f"Declared schedule source is unavailable: {HF_DAILY_SOURCE_CATEGORY}:{selected_hf}")
-        if selected_net not in {LIVE_SOURCE_SET_ID, NO_NET_SOURCE_SET_ID} and net_set is None:
+        if selected_net not in {LIVE_SOURCE_SET_ID, NO_NET_SOURCE_SET_ID, _UNSELECTED_LAYER} and net_set is None:
             raise MissingScheduleSourceError(f"Declared schedule source is unavailable: {HF_NET_SOURCE_CATEGORY}:{selected_net}")
         selected_sop = self._selected_sop_plan_source_id()
         sop_plan = self._sop_schedule_plan_row_by_id(selected_sop)
-        if selected_sop != LIVE_SOURCE_SET_ID and sop_plan is None:
+        if selected_sop not in {LIVE_SOURCE_SET_ID, _UNSELECTED_LAYER, _NO_SOP_LAYER} and sop_plan is None:
             raise MissingScheduleSourceError(f"Declared SOP source is unavailable: sop_schedule_plan:{selected_sop}")
         hf, net, sop, policies = self._load_live_schedules()
+        if selected_hf == _UNSELECTED_LAYER:
+            hf = []
         if hf_set is not None:
             hf = hf_set.get("rows", ())
-        if str(selected_net or "").strip() == NO_NET_SOURCE_SET_ID:
+        if selected_net in {NO_NET_SOURCE_SET_ID, _UNSELECTED_LAYER}:
             net = []
         if net_set is not None:
             net = net_set.get("rows", ())
+        if selected_sop in {_UNSELECTED_LAYER, _NO_SOP_LAYER}:
+            sop = []
         if sop_plan is not None:
             if sop_plan.get("_catalog_error"):
                 raise ScheduleSourceError(sop_plan["_catalog_error"])
@@ -4273,7 +5349,8 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
             parts.append(f"{len(source_cell.sop_segments)} SOP layer(s)")
         return "; ".join(parts)
 
-    def _effective_window_cell_for_segment(self, segment: ScheduleSegment, projection: BlendedScheduleProjection) -> EffectiveWindowCell:
+    @staticmethod
+    def _effective_window_cell_for_segment(segment: ScheduleSegment, projection: BlendedScheduleProjection) -> EffectiveWindowCell:
         hf = tuple(
             candidate
             for candidate in projection.source_segments
@@ -4888,10 +5965,15 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
             return
         if cell is None:
             self.cell_inspector_label.setText("Select a schedule cell to review the blended HF Daily, HF Nets, and SOP sources.")
-            self._set_selected_window_card(
-                "Select a window",
-                "Click a row to review its Daily baseline, Net override, and SOP source. Use the edit buttons to open the exact source row.",
-            )
+            blank = (self._creating_new_frequency_plan
+                     and self._selected_source_set_id(SELECTED_HF_DAILY_SOURCE_SET_KEY) == _UNSELECTED_LAYER)
+            if blank:
+                self._set_selected_window_card(
+                    "Choose schedule layers", "Choose HF Daily to preview the plan. HF Nets and SOP are optional.",
+                )
+            else:
+                title = "Select a pattern" if self._planner_view_mode() == "patterns" else "Select a window"
+                self._set_selected_window_card(title, "See its schedule and available edit actions.")
             return
         if isinstance(cell, EffectiveWindowCell):
             segment = cell.segment
@@ -4900,7 +5982,7 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
                 title = f"{title} {segment.frequency}"
             detail_bits = [
                 self._effective_window_time_label(segment),
-                f"Layer: {self._effective_window_source_label(segment.source)}",
+                f"Source: {self._window_source_name(segment)}",
                 f"Mode: {segment.mode or '--'}",
                 self._effective_window_notes(segment, cell) or "Effective operating window",
             ]
@@ -4954,11 +6036,45 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
             lines.append(f"{title}: {detail}")
         self.cell_inspector_label.setText("\n".join(lines))
 
+    def _invoke_window_edit(self):
+        if self._window_primary_edit is not None:
+            self._window_primary_edit()
+
+    def _refresh_window_edit_actions(self):
+        if not hasattr(self, "window_edit_button"):
+            return
+        cell = self._selected_projection_cell
+        owner = str(getattr(cell, "effective_source", "") or "").upper()
+        labels = {"HF": "Edit HF Daily…", "NET": "Edit HF Net…",
+                  "SOP": "Edit SOP source…", "PLAN": "Edit plan entry…"}
+        routes = {key: button.click for key, button in self._window_edit_buttons.items()
+                  if button.isEnabled()}
+        if self._inline_edit_segment is not None and self.inline_update_plan_btn.isEnabled():
+            routes.setdefault("PLAN", self._open_selected_inline_editor)
+        primary = owner if owner in routes else next(iter(routes), None)
+        self._window_primary_edit = routes.pop(primary, None)
+        self.window_edit_button.setVisible(primary is not None)
+        if primary:
+            self.window_edit_button.setText(labels[primary])
+        menu = self.other_window_layers.menu()
+        menu.clear()
+        for key, route in routes.items():
+            menu.addAction(labels[key], route)
+        self.other_window_layers.setVisible(bool(routes))
+
+    def _open_selected_inline_editor(self):
+        self._inline_editor_open_segment = self._inline_edit_segment
+        self.inline_editor_card.show()
+        self.planner_scroll.ensureWidgetVisible(self.inline_editor_card)
+        self.inline_group_edit.setFocus(Qt.OtherFocusReason)
+
     def _set_selected_window_card(self, title: str, detail: str) -> None:
         if hasattr(self, "selected_window_title_label"):
             self.selected_window_title_label.setText(str(title or "Select a window"))
         if hasattr(self, "selected_window_detail_label"):
             self.selected_window_detail_label.setText(str(detail or "Click a row to review or edit its source."))
+        self.selected_window_card.show()
+        self._refresh_window_edit_actions()
         self._queue_geometry_settle()
 
     def _inline_draft_dirty(self) -> bool:
@@ -4997,7 +6113,7 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
             if widget is not None:
                 widget.setText(str(value or ""))
                 widget.setEnabled(segment is not None and not missing_text)
-        self.inline_editor_card.setVisible(segment is not None)
+        self.inline_editor_card.setVisible(segment is not None and segment == getattr(self, "_inline_editor_open_segment", None))
         plan_ready = bool(segment is not None and self._selected_frequency_plan_row())
         source_backed = self._source_backed_normal_plan(self._selected_frequency_plan_row())
         source_target = self._single_source_update_target()
@@ -5103,28 +6219,19 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         right_row = str(right.get("source_row_id") or "").strip()
         return bool(left_row and right_row and left_row == right_row)
 
+    def _exact_plan_window_matches(self, refs, target):
+        timing = ("day_utc", "start_utc", "end_utc")
+        return [ref for ref in refs if self._same_source_key(ref, target)
+                and all(str(ref.get(field) or "").upper() == str(target.get(field) or "").upper()
+                        for field in timing)]
+
     def _updated_plan_payload_for_segment(self, plan: Mapping[str, Any], segment: ScheduleSegment, updates: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
-        refs = self._schedule_refs_from_plan_row(plan)
+        refs = [dict(ref) for ref in self._schedule_refs_from_plan_row(plan)]
         target = segment.to_schedule_ref()
-        match_index = -1
-        for idx, ref in enumerate(refs):
-            if self._same_source_key(ref, target):
-                match_index = idx
-                break
-        if match_index < 0:
-            for idx, ref in enumerate(refs):
-                if (
-                    str(ref.get("source") or "").strip().upper() == segment.source
-                    and str(ref.get("day_utc") or "").strip().upper() == segment.day_utc.upper()
-                    and str(ref.get("start_utc") or "").strip() == segment.start_utc
-                    and str(ref.get("end_utc") or "").strip() == segment.end_utc
-                    and str(ref.get("band") or "").strip().upper() == segment.band.upper()
-                    and str(ref.get("frequency") or "").strip() == segment.frequency
-                ):
-                    match_index = idx
-                    break
-        if match_index < 0:
+        matches = self._exact_plan_window_matches(refs, target)
+        if len(matches) != 1:
             return None
+        match_index = refs.index(matches[0])
         refs[match_index].update({k: v for k, v in updates.items() if v not in (None, "")})
         payload = dict(plan)
         payload["id"] = int(plan.get("id") or 0)
@@ -5400,7 +6507,12 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
                 return value
         return None
 
+    def _on_window_keyboard_selection(self, row, column, _previous_row, _previous_column):
+        if row >= 0 and self.table.isEnabled() and self.table.hasFocus() and not self._inline_draft_dirty():
+            self._on_schedule_cell_clicked(row, column)
+
     def _on_schedule_cell_clicked(self, row: int, col: int) -> None:
+        self._cancel_window_source_load()
         if self._inline_draft_dirty():
             choice = QMessageBox.question(self, "Retain window edits",
                 "Window edits are still entered. Discard them and inspect the selected current row?",
@@ -5435,17 +6547,15 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         segments = self._segments_for_source(cell, source)
         return segments[0] if len(segments) == 1 else None
 
+    def _window_source_name(self, segment):
+        if segment.source == "HF":
+            return self.hf_daily_source_combo.currentText() or "HF Daily"
+        if segment.source == "NET":
+            return self.hf_net_source_combo.currentText() or "HF Nets"
+        return segment.profile_name or self.sop_plan_source_combo.currentText() or "SOP"
+
     def _segment_choice_label(self, segment: ScheduleSegment, index: int) -> str:
-        identity = str(segment.raw.get("source_key") or "").strip()
-        source_row_id = segment.raw.get("source_row_id")
-        resource_id = segment.raw.get("resource_id")
-        if source_row_id not in (None, "", 0):
-            identity = f"row {source_row_id}"
-        elif resource_id not in (None, "", 0):
-            identity = f"resource {resource_id}"
-        elif not identity:
-            identity = f"candidate {index + 1}"
-        return f"{index + 1}. {self._format_segment_for_inspector(segment)} [{identity}]"
+        return f"{index + 1}. {self._window_source_name(segment)} · {self._format_segment_for_inspector(segment)}"
 
     def _choose_source_segment(self, source: str, title: str) -> Optional[ScheduleSegment]:
         cell = self._selected_projection_cell
@@ -5484,230 +6594,154 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         except Exception as exc:
             log.debug("FreqPlanner: failed navigating to %s: %s", tab_label, exc)
 
-    def _load_selected_source_schedule_in_tab(
-        self,
-        tab: Any,
-        *,
-        selected_key: str,
-        sets_key: str,
-        category: str,
-        live_loader_name: str,
-    ) -> Optional[bool]:
+    def _window_source_feedback(self, text, review):
+        if review:
+            self.assignment_panel.message.setText(text)
+        else:
+            self._set_action_feedback(text)
+
+    def _cancel_window_source_load(self):
+        pending = getattr(self, '_window_source_load', None)
+        if pending:
+            self._window_source_load = None
+            tab, request_id = pending[:2]
+            tab.cancel_plan_destination_load(request_id)
+
+    def _request_window_source(self, owner, source_id, target, *, review=False, source_name="", instructions=""):
+        routes = {
+            'HF': ('HF Schedule', 'hf_schedule_tab', 'HF Daily'),
+            'NET': ('Net Schedule', 'net_tab', 'HF Nets'),
+            'SOP': ('SOP', 'sop_tab', 'SOP Builder'),
+        }
+        screen, attr, label = routes[owner]
+        label = source_name or label
+        win = self.window()
+        tab = getattr(win, attr, None)
+        if tab is None and owner == 'HF':
+            tab = getattr(win, 'daily_tab', None)
         if tab is None:
-            return False
-        selected_id = self._selected_source_set_id(selected_key)
-        if hasattr(tab, "_refresh_freqplanner_source_combo"):
-            try:
-                tab._refresh_freqplanner_source_combo()
-            except Exception:
-                pass
-        combo = getattr(tab, "schedule_source_combo", None)
-        if combo is not None:
-            try:
-                idx = combo.findData(selected_id)
-                if idx >= 0:
-                    combo.setCurrentIndex(idx)
-            except Exception:
-                pass
-        if hasattr(tab, "_confirm_discard_unsaved_source_load"):
-            try:
-                if not tab._confirm_discard_unsaved_source_load():
-                    return None
-            except Exception:
-                pass
-        if selected_id == LIVE_SOURCE_SET_ID:
-            loader = getattr(tab, live_loader_name, None)
-            if callable(loader):
-                try:
-                    loader()
-                    return True
-                except Exception as exc:
-                    log.debug("FreqPlanner: failed loading live source schedule: %s", exc)
-                    return False
+            ensure = getattr(win, 'prepare_plan_source_destination', None)
+            tab = ensure(screen) if callable(ensure) else None
+        worker = getattr(tab, '_source_save_worker', None)
+        if worker is not None and worker.busy:
+            self._window_source_feedback(f'{label} is saving. Open the source after the save finishes.', review)
             return True
-        row = source_set_row_by_id_for_category(self.settings, sets_key, category, selected_id)
-        if row is None:
-            return False
-        loader = getattr(tab, "_load_source_rows_into_table", None)
-        if not callable(loader):
-            return False
+        request = getattr(tab, 'request_plan_sop_load' if owner == 'SOP' else 'request_plan_source_load', None)
+        if not callable(request) or not source_id or (owner == 'SOP' and not str(source_id).isdigit()):
+            self._window_source_feedback(f'{label} is unavailable. Choose a current source and try again.', review)
+            return True
+        self._cancel_window_source_load()
+        from uuid import uuid4
+        request_id = uuid4().hex
+        if not getattr(tab, '_plan_builder_route_connected', False):
+            tab.plan_destination_load_finished.connect(self._on_window_source_loaded)
+            tab._plan_builder_route_connected = True
+        table = (self.assignment_panel.findChild(QTableView, 'assignment_differences_table')
+                 if review else self.table)
+        if review and table is not None:
+            selection = table.selectionModel()
+            if not selection.property("planBuilderRouteConnected"):
+                selection.selectionChanged.connect(self._cancel_window_source_load)
+                selection.setProperty("planBuilderRouteConnected", True)
+        row = table.currentIndex().row() if table is not None else -1
+        signature = (self._assignment_authoring_signature(), self._planner_view_mode(), self._assignment_open, row)
+        self._window_source_load = (tab, request_id, screen, label, review, signature, target is not None, instructions)
+        self._window_source_feedback(f'Opening {label}…', review)
         try:
-            loader([dict(item) for item in row.get("rows", []) if isinstance(item, dict)])
+            queued = request(request_id, int(source_id) if owner == 'SOP' else source_id, target)
+        except Exception:
+            self._window_source_load = None
+            log.exception("Unable to start %s source load", label)
+            self._window_source_feedback(f'Unable to open {label}. Try opening the source again.', review)
             return True
-        except Exception as exc:
-            log.debug("FreqPlanner: failed loading selected source schedule %s: %s", selected_id, exc)
-            return False
+        if not queued:
+            if getattr(self, '_window_source_load', None):
+                self._window_source_load = None
+                self._window_source_feedback(f'Opening {label} was cancelled. The destination editor is unchanged.', review)
+        return True
 
-    @staticmethod
-    def _normalize_freq_text(value: Any) -> str:
-        text = str(value or "").strip()
-        if not text:
-            return ""
-        return format_frequency_mhz(text)
+    def _on_window_source_loaded(self, result):
+        pending = getattr(self, '_window_source_load', None)
+        if not pending or result.get('request_id') != pending[1]:
+            return
+        self._window_source_load = None
+        tab, request_id, screen, label, review, signature, exact, instructions = pending
+        table = (self.assignment_panel.findChild(QTableView, 'assignment_differences_table')
+                 if review else self.table)
+        row = table.currentIndex().row() if table is not None else -1
+        if not self._tab_active or signature != (
+                self._assignment_authoring_signature(), self._planner_view_mode(), self._assignment_open, row):
+            return
+        if not result.get('loaded'):
+            error = (f'Opening {label} was cancelled. Your edits were kept.' if result.get('cancelled') else
+                     result.get('error') or f'{label} is unavailable. Choose a current source and try again.')
+            self._window_source_feedback(error, review)
+            return
+        found = exact and result.get('target_found')
+        if exact and not found:
+            reply = QMessageBox.question(
+                self, 'Source row unavailable',
+                f'The exact row is unavailable in {label}. Open the named schedule and choose a row there?',
+                QMessageBox.Open | QMessageBox.Cancel, QMessageBox.Cancel,
+            )
+            if reply != QMessageBox.Open:
+                self._window_source_feedback(f'The exact row is unavailable in {label}.', review)
+                return
+        if review:
+            self._assignment_return_scroll_value = self._assignment_scroll.verticalScrollBar().value()
+        self._install_window_source_return(tab, review)
+        self._navigate_to_tab(screen)
+        if found:
+            tab.focus_plan_destination_target(request_id)
+        self._set_assignment_source_owner_message(
+            tab, (instructions + ' ' if instructions else '')
+            + (f'Opened the selected {label} row.' if found else f'Choose the row to edit in {label}.')
+            + ' Save any edits explicitly before returning to Plan Builder.',
+        )
 
-    @staticmethod
-    def _widget_text(widget: Any) -> str:
-        if widget is None:
-            return ""
-        if hasattr(widget, "currentText"):
-            try:
-                return str(widget.currentText() or "").strip()
-            except Exception:
-                return ""
-        if isinstance(widget, QLineEdit) or hasattr(widget, "text"):
-            try:
-                return str(widget.text() or "").strip()
-            except Exception:
-                return ""
-        return ""
+    def _install_window_source_return(self, tab, review):
+        tab._plan_builder_return_to_review = review
+        button = getattr(tab, '_plan_assignment_return_btn', None)
+        if button is None:
+            button = QPushButton(tab)
+            tab._plan_assignment_return_btn = button
+            tab.layout().insertWidget(0, button)
 
-    def _focus_tab_row_for_segment(self, tab: Any, segment: ScheduleSegment, *, source: str) -> bool:
-        table = getattr(tab, "table", None)
-        if table is None:
-            return False
-        col_day = getattr(tab, "COL_DAY", None)
-        col_group = getattr(tab, "COL_GROUP", None)
-        col_band = getattr(tab, "COL_BAND", None)
-        col_freq = getattr(tab, "COL_FREQ", None)
-        col_start = getattr(tab, "COL_START", None)
-        col_end = getattr(tab, "COL_END", None)
-        col_net = getattr(tab, "COL_NETNAME", None)
-        target_day = str(segment.day_utc or "").strip().upper()
-        target_group = str(segment.group_name or "").strip().upper()
-        target_band = str(segment.band or "").strip().upper()
-        target_freq = self._normalize_freq_text(segment.frequency)
-        target_start = str(segment.start_utc or "").strip()
-        target_end = str(segment.end_utc or "").strip()
-        target_net = str(segment.net_name or "").strip().upper()
-        for row in range(table.rowCount()):
-            def combo_value(col: Optional[int]) -> str:
-                if col is None:
-                    return ""
-                if hasattr(tab, "_get_combo_value"):
-                    try:
-                        return str(tab._get_combo_value(row, col, "") or "").strip()
-                    except Exception:
-                        pass
-                return self._widget_text(table.cellWidget(row, col))
+            def back():
+                worker = getattr(tab, '_source_save_worker', None)
+                if worker is not None and worker.busy:
+                    self._set_assignment_source_owner_message(tab, 'Saving the source schedule. Return after the save finishes.')
+                    return
+                button.hide()
+                if tab._plan_builder_return_to_review:
+                    opener = getattr(self.window(), 'open_plan_assignment', None)
+                    if callable(opener):
+                        opener(device_profile_id=self._assignment_request.get('device_profile_id'),
+                               frequency_plan_id=self._assignment_request.get('plan_id'),
+                               repair_context={'returning_to_review': True, 'recheck_on_return': True})
+                else:
+                    self._navigate_to_tab('FreqPlanner')
 
-            def item_value(col: Optional[int]) -> str:
-                if col is None:
-                    return ""
-                item = table.item(row, col)
-                return str(item.text() if item is not None else "").strip()
+            button.clicked.connect(back)
+        button.setText('Return to assignment review' if review else 'Return to Plan Builder')
+        button.show()
 
-            day_val = combo_value(col_day).upper()
-            group_val = combo_value(col_group).upper()
-            band_val = combo_value(col_band).upper()
-            freq_val = self._normalize_freq_text(item_value(col_freq))
-            start_val = item_value(col_start)
-            end_val = item_value(col_end)
-            net_val = self._widget_text(table.cellWidget(row, col_net)).upper() if col_net is not None else ""
-            if target_day and day_val and day_val != target_day:
-                continue
-            if target_group and group_val and group_val != target_group:
-                continue
-            if target_band and band_val and band_val != target_band:
-                continue
-            if target_freq and freq_val and freq_val != target_freq:
-                continue
-            if target_start and start_val and start_val != target_start:
-                continue
-            if target_end and end_val and end_val != target_end:
-                continue
-            if source.upper() == "NET" and target_net and net_val and net_val != target_net:
-                continue
-            table.selectRow(row)
-            focus_col = col_net if source.upper() == "NET" and col_net is not None else col_freq
-            if focus_col is not None and table.item(row, focus_col) is not None:
-                table.scrollToItem(table.item(row, focus_col))
-            table.setFocus(Qt.TabFocusReason)
-            return True
-        return False
-
-    def _on_edit_hf_daily_clicked(self) -> None:
-        segment = self._choose_source_segment("HF", "HF Daily")
+    def _edit_selected_source(self, owner, label, setting_key=None):
+        segment = self._choose_source_segment(owner, label)
         if segment is None:
-            self.frequency_plan_action_hint_label.setText("Select a cell with an HF Daily source row first.")
             return
-        self._navigate_to_tab("HF Schedule")
-        tab = getattr(self.window(), "hf_schedule_tab", None)
-        loaded = self._load_selected_source_schedule_in_tab(
-            tab,
-            selected_key=SELECTED_HF_DAILY_SOURCE_SET_KEY,
-            sets_key=HF_DAILY_SOURCE_SETS_KEY,
-            category=HF_DAILY_SOURCE_CATEGORY,
-            live_loader_name="_load_schedule",
-        )
-        if loaded is None:
-            self.frequency_plan_action_hint_label.setText(
-                "HF Daily load was cancelled; the selected source row was not opened."
-            )
-            return
-        focused = False
-        if tab is not None and hasattr(tab, "focus_source_segment"):
-            try:
-                focused = bool(tab.focus_source_segment(segment))
-            except Exception:
-                focused = False
-        if not focused and tab is not None and hasattr(tab, "_focus_daily_row"):
-            try:
-                tab._focus_daily_row(segment.group_name, segment.band, segment.frequency)
-                focused = True
-            except Exception:
-                focused = False
-        if not focused and tab is not None:
-            focused = self._focus_tab_row_for_segment(tab, segment, source="HF")
-        self.frequency_plan_action_hint_label.setText(
-            (
-                "Opened the selected HF Daily schedule and source row for review."
-                if focused and loaded
-                else (
-                    "Opened HF Daily source row for review."
-                    if focused
-                    else "Opened HF Daily. Review the matching source row before editing."
-                )
-            )
-        )
+        target = dict(segment.raw)
+        if owner == 'SOP':
+            source_id = target.get('sop_profile_id')
+        else:
+            source_id = self._selected_source_set_id(setting_key)
+        self._request_window_source(owner, source_id, target, source_name=self._window_source_name(segment))
 
-    def _on_edit_hf_net_clicked(self) -> None:
-        segment = self._choose_source_segment("NET", "HF Net")
-        if segment is None:
-            self.frequency_plan_action_hint_label.setText("Select a cell with an HF Net source row first.")
-            return
-        self._navigate_to_tab("Net Schedule")
-        tab = getattr(self.window(), "net_tab", None)
-        loaded = self._load_selected_source_schedule_in_tab(
-            tab,
-            selected_key=SELECTED_HF_NET_SOURCE_SET_KEY,
-            sets_key=HF_NET_SOURCE_SETS_KEY,
-            category=HF_NET_SOURCE_CATEGORY,
-            live_loader_name="_load",
-        )
-        if loaded is None:
-            self.frequency_plan_action_hint_label.setText(
-                "HF Net load was cancelled; the selected source row was not opened."
-            )
-            return
-        focused = False
-        if tab is not None and hasattr(tab, "focus_source_segment"):
-            try:
-                focused = bool(tab.focus_source_segment(segment))
-            except Exception:
-                focused = False
-        if not focused:
-            focused = self._focus_tab_row_for_segment(tab, segment, source="NET") if tab is not None else False
-        self.frequency_plan_action_hint_label.setText(
-            (
-                "Opened the selected HF Net schedule and source row for review."
-                if focused and loaded
-                else (
-                    "Opened HF Net source row for review."
-                    if focused
-                    else "Opened HF Nets. Review the matching source row before editing."
-                )
-            )
-        )
+    def _on_edit_hf_daily_clicked(self):
+        self._edit_selected_source('HF', 'HF Daily', SELECTED_HF_DAILY_SOURCE_SET_KEY)
+
+    def _on_edit_hf_net_clicked(self):
+        self._edit_selected_source('NET', 'HF Nets', SELECTED_HF_NET_SOURCE_SET_KEY)
 
     def _on_build_sop_layer_clicked(self) -> None:
         self._navigate_to_tab("SOP")
@@ -5715,44 +6749,8 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
             "Opened SOP Builder. Create or update condition-based what-to-do layers, then return to Plan Builder to review Effective Windows and RF Guard."
         )
 
-    def _on_open_sop_builder_clicked(self) -> None:
-        segment = self._choose_source_segment("SOP", "SOP")
-        if segment is None:
-            self.frequency_plan_action_hint_label.setText("Select a cell with an SOP source row first.")
-            return
-        self._navigate_to_tab("SOP")
-        profile_id = int(segment.raw.get("sop_profile_id") or 0)
-        tab = getattr(self.window(), "sop_tab", None)
-        selected = False
-        focused = False
-        if tab is not None and hasattr(tab, "focus_source_segment"):
-            try:
-                focused = bool(tab.focus_source_segment(segment))
-                selected = focused
-            except Exception as exc:
-                log.debug("FreqPlanner: failed focusing SOP layer source: %s", exc)
-                focused = False
-        if not focused and tab is not None and profile_id > 0:
-            try:
-                if hasattr(tab, "select_profile"):
-                    selected = bool(tab.select_profile(profile_id))
-                elif hasattr(tab, "profile_combo"):
-                    for idx in range(tab.profile_combo.count()):
-                        if int(tab.profile_combo.itemData(idx) or 0) == profile_id:
-                            tab.profile_combo.setCurrentIndex(idx)
-                            selected = True
-                            break
-            except Exception as exc:
-                log.debug("FreqPlanner: failed selecting SOP profile %s: %s", profile_id, exc)
-        self.frequency_plan_action_hint_label.setText(
-            "Opened SOP Builder source row for review."
-            if focused
-            else (
-                "Opened SOP Builder source profile for review."
-                if selected
-                else "Opened SOP Builder. Review the matching SOP source before editing."
-            )
-        )
+    def _on_open_sop_builder_clicked(self):
+        self._edit_selected_source('SOP', 'SOP Builder')
 
     def mark_schedule_dirty(self) -> None:
         self._pending_rebuild = True
@@ -5773,6 +6771,8 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         return self._projection_executor
 
     def _shutdown_projection_worker(self) -> None:
+        if hasattr(self, '_assignment_controller'):
+            self._assignment_controller.close()
         if not self._revision_closed:
             self._revision_closed = True
             self._revision_executor.submit(self._close_revision_tracker)
@@ -5783,6 +6783,9 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
             executor.shutdown(wait=False, cancel_futures=True)
 
     def closeEvent(self, event) -> None:  # pragma: no cover - Qt lifecycle glue
+        self._cancel_plan_save()
+        self._cancel_window_source_load()
+        self._assignment_controller.close()
         self._catalog_generation += 1
         self._catalog_latest = None
         self.settings.close()
@@ -5839,6 +6842,13 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
                     [dict(row) for row in policy_rows],
                     week_start_utc=week_sunday,
                 )
+            cells = ()
+            if mode in {"effective", "patterns"}:
+                segments = projection.effective_segments
+                if mode == "effective":
+                    segments = segments[:FreqPlannerTab.MAX_PROJECTION_TABLE_ROWS]
+                cells = tuple(FreqPlannerTab._effective_window_cell_for_segment(segment, projection)
+                              for segment in segments)
             return _PlanProjectionResult(
                 request_id=request_id,
                 mode=mode,
@@ -5849,6 +6859,7 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
                 policy_rows=policy_rows,
                 week_sunday=week_sunday,
                 projection=projection,
+                window_cells=cells,
                 selected_plan=dict(selected_plan) if isinstance(selected_plan, dict) else None,
                 selected_plan_refs=selected_plan_refs,
                 started_at=started_at,
@@ -5910,6 +6921,12 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
             return
         request_id, mode, snapshot = arguments[:3]
         started_at = arguments[11]
+        view = self._planner_view_mode()
+        cached = self._window_view_results.get(view)
+        if (cached is not None and cached.snapshot == snapshot and self._published_window_view
+                and view != self._published_window_view[0] and not self._input_read_error):
+            self._on_projection_ready(replace(cached, request_id=request_id, started_at=started_at))
+            return
         self._projection_future = self._projection_worker().submit(self._build_projection_snapshot, *arguments)
         self._projection_future.add_done_callback(
             lambda done: self._on_projection_future_done(request_id, mode, snapshot, started_at, done))
@@ -6046,6 +7063,15 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         hf_sched, net_sched, sop_sched, policy_rows = result.hf_sched, result.net_sched, result.sop_sched, result.policy_rows
         theme = resolve_theme(self.settings)
         retained_display = self._capture_table_display()
+        view_identity = (self._planner_view_mode(), self._assignment_authoring_signature()[:6])
+        if self._published_window_view is not None:
+            rows, cols, headers, cells, spans, v, h, row, col, selection = retained_display
+            self._window_view_positions[self._published_window_view] = (
+                rows, cols, headers, [(r, c, item) for r, c, item in cells if r == row],
+                spans, v, h, row, col, selection,
+            )
+            if len(self._window_view_positions) > 16:
+                self._window_view_positions.pop(next(iter(self._window_view_positions)))
         self.table.setUpdatesEnabled(False)
         try:
             self.table.setSortingEnabled(False)
@@ -6074,6 +7100,7 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
                     result.week_sunday,
                     theme,
                     projection=result.projection if isinstance(result.projection, BlendedScheduleProjection) else None,
+                    window_cells=result.window_cells,
                 )
             elif result.mode == "patterns":
                 self._rebuild_pattern_summary_table(
@@ -6084,6 +7111,7 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
                     result.week_sunday,
                     theme,
                     projection=result.projection if isinstance(result.projection, BlendedScheduleProjection) else None,
+                    window_cells=result.window_cells,
                 )
             else:
                 self._rebuild_shared_week_table(
@@ -6101,13 +7129,19 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
             return
         finally:
             self.table.setUpdatesEnabled(True)
-        self._restore_equivalent_table_position(retained_display)
+        remembered = self._window_view_positions.get(view_identity)
+        if remembered is not None:
+            self._restore_equivalent_table_position(remembered)
+        elif self._published_window_view is None or self._published_window_view[1] == view_identity[1]:
+            self._restore_equivalent_table_position(retained_display)
         if failure_generation != getattr(self, "_input_failure_generation", 0):
             self._restore_table_display(retained_display)
             return
         if not self._clear_plan_input_failure():
             self._restore_table_display(retained_display)
             return
+        self._published_window_view = view_identity
+        self._window_view_results[view_identity[0]] = result
         self.table.setEnabled(True)
         if self._operation_feedback and not self._catalog_review_required:
             self.frequency_plan_action_hint_label.setText(self._operation_feedback)
@@ -6234,6 +7268,7 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         theme: Dict[str, Any],
         *,
         projection: Optional[BlendedScheduleProjection] = None,
+        window_cells: tuple[EffectiveWindowCell, ...],
     ) -> None:
         projection = projection or build_blended_schedule_projection(
             hf_sched,
@@ -6275,8 +7310,8 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
             return
         grouped: Dict[Tuple[str, str, str, str, str, str, str], Dict[str, Any]] = {}
         visible_bands: set[str] = set()
-        for segment in projection.effective_segments:
-            source_cell = self._effective_window_cell_for_segment(segment, projection)
+        for source_cell in window_cells:
+            segment = source_cell.segment
             day_label, time_label = self._effective_window_day_and_time(segment)
             label = self._effective_window_label(segment)
             band_or_freq = segment.band if self._show_band else segment.frequency
@@ -6374,6 +7409,7 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         theme: Dict[str, Any],
         *,
         projection: Optional[BlendedScheduleProjection] = None,
+        window_cells: tuple[EffectiveWindowCell, ...],
     ) -> None:
         projection = projection or build_blended_schedule_projection(
             hf_sched,
@@ -6413,10 +7449,13 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
                 sop_sched=sop_sched,
                 effective_count=0,
             )
-            self.frequency_plan_action_hint_label.setText("No effective HF Daily, HF Nets, or SOP windows are available.")
+            if self._selected_source_set_id(SELECTED_HF_DAILY_SOURCE_SET_KEY) == _UNSELECTED_LAYER:
+                self.frequency_plan_action_hint_label.clear()
+            else:
+                self.frequency_plan_action_hint_label.setText("No effective HF Daily, HF Nets, or SOP windows are available.")
             return
-        for row, segment in enumerate(visible_segments):
-            source_cell = self._effective_window_cell_for_segment(segment, projection)
+        for row, source_cell in enumerate(window_cells):
+            segment = source_cell.segment
             day_label, time_label = self._effective_window_day_and_time(segment)
             band_or_freq = segment.band if self._show_band else segment.frequency
             values = [
@@ -6513,12 +7552,13 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
             else:
                 message = "Select a saved Frequency Plan or SOP Plan with radio assignments to review Radio Windows."
             item = QTableWidgetItem(message)
-            item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            item.setFlags(Qt.ItemIsEnabled)
             self.table.setItem(0, 0, item)
             self.table.setSpan(0, 0, 1, len(headers))
             self._visible_bands = []
             self._render_band_legend()
             self._set_projection_inspector(None)
+            self.selected_window_card.hide()
             self._refresh_plan_layer_summary(
                 hf_sched=hf_sched,
                 net_sched=net_sched,
@@ -6528,7 +7568,7 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
                 plan_payload=selected_plan,
             )
             self.frequency_plan_action_hint_label.setText(
-                "Radio Windows shows assigned plan windows by radio. Assign this plan in Configuration to review cross-radio windows here."
+                "Radio Windows shows assigned plan windows by radio. Use Assign to radios… to review cross-radio windows here."
             )
             return
 
@@ -6796,7 +7836,10 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         self._input_retry_after = 0.0
         if self._catalog_review_required:
             self.review_plan_inputs_btn.show()
-            self.frequency_plan_action_hint_label.setText("Inputs changed; entered work retained. Choose Review changed inputs before saving.")
+            self.frequency_plan_action_hint_label.setText(
+                'Plan not saved yet: inputs changed after this draft was opened. Your choices are retained. Click Save Plan to review and continue; radio assignments are unchanged.'
+                if self._save_plan_button_text(self._selected_frequency_plan_row()) == 'Save Plan' else
+                'Changes not saved: inputs changed. Your edits are retained. Choose Review changed inputs, then the plan action to continue.')
         button = getattr(self, "retry_plan_inputs_btn", None)
         if button is not None:
             button.hide()
@@ -6868,6 +7911,8 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         if mode not in {"radio", "operational", "effective", "patterns"}:
             mode = "shared"
         self.table.setEnabled(False)
+        self.window_edit_button.hide()
+        self.other_window_layers.hide()
         for name in ("edit_hf_daily_btn", "edit_hf_net_btn", "inline_update_plan_btn", "inline_update_hf_daily_btn", "edit_sop_plan_entry_btn"):
             getattr(self, name).setEnabled(False)
         self.frequency_plan_action_hint_label.setText(
@@ -7011,7 +8056,13 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
 
     def set_tab_active(self, active: bool) -> None:
         self._tab_active = bool(active)
+        if hasattr(self, '_assignment_controller'):
+            self._assignment_controller.set_active(bool(active))
+            if active and self._assignment_open:
+                self._load_assignment_context()
         if not active:
+            self._cancel_plan_save()
+            self._cancel_window_source_load()
             self._catalog_generation += 1
             self._catalog_latest = None
             self._pending_catalog_focus = None
@@ -7191,8 +8242,13 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
         return dark if self._luminance(bg_hex) > 0.6 else light
 
     def _apply_theme(self):
+        if hasattr(self, 'assignment_panel'):
+            self.assignment_panel.apply_theme()
+        if hasattr(self, 'relink_panel'):
+            self.relink_panel.apply_theme()
         theme = resolve_theme(self.settings)
         self._refresh_plan_builder_theme_styles(theme)
+        self.window_edit_button.setStyleSheet(button_style("secondary", theme))
         self._update_toggle_button_styles(theme=theme)
         self._update_plan_action_styles(theme=theme)
         self._render_band_legend()
@@ -7219,7 +8275,7 @@ class FreqPlannerTab(QWidget, PlannerGuardRules):
                     f"QLabel {{ color: {theme['text']}; border: 1px solid {theme['border']}; "
                     f"border-radius: 6px; padding: 4px 8px; background: {theme['surface_alt']}; }}"
                 )
-        for name in ("selected_window_title_label", "inline_editor_title_label", "rf_guard_review_title_label"):
+        for name in ("plan_windows_heading", "selected_window_title_label", "inline_editor_title_label", "rf_guard_review_title_label"):
             label = getattr(self, name, None)
             if label is not None:
                 label.setStyleSheet(label_style("text", theme, weight=700))

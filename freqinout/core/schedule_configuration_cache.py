@@ -41,6 +41,46 @@ class ConfigurationChanged(RuntimeError):
     """A configuration load crossed an edit; its rows must not be published."""
 
 
+def install_revision_triggers(conn, tables):
+    """Schema-owner setup; no commit or connection ownership changes."""
+    conn.execute(f'CREATE TABLE IF NOT EXISTS {_COUNTER} '
+                 '(id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL)')
+    conn.execute(f'INSERT OR IGNORE INTO {_COUNTER} VALUES (1, 0)')
+    existing = {row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    for table in tables:
+        if table not in existing:
+            continue
+        for operation in ('INSERT', 'UPDATE', 'DELETE'):
+            condition = ''
+            if table == 'kv':
+                keys = ','.join("'" + key + "'" for key in CONFIGURATION_KEYS)
+                references = ('NEW',) if operation == 'INSERT' else ('OLD',) if operation == 'DELETE' else ('OLD', 'NEW')
+                condition = ' WHEN ' + ' OR '.join(f'{ref}.key IN ({keys})' for ref in references)
+            if operation == 'UPDATE':
+                columns = [str(row[1]) for row in conn.execute(f'PRAGMA table_info("{table}")')]
+                # Settings timestamps are bookkeeping, not command
+                # inputs. Keep every other column (including unknown
+                # future fields) and all nets fields fail-conservative.
+                fields = [column for column in columns
+                          if not (table in SETTINGS_TABLES and column in {'updated_utc', 'created_utc'})]
+                changed = ' OR '.join(f'OLD."{column}" IS NOT NEW."{column}"' for column in fields)
+                if changed:
+                    condition = (' WHEN (' + condition[6:] + ') AND (' + changed + ')'
+                                 if condition else ' WHEN ' + changed)
+            name = f'_fio_schedule_{table}_{operation}'
+            definition = (f'CREATE TRIGGER {name} '
+                          f'AFTER {operation} ON "{table}"{condition} BEGIN '
+                          f'UPDATE {_COUNTER} SET revision=revision+1 WHERE id=1; END')
+            existing_trigger = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (name,)).fetchone()
+            if existing_trigger is not None and existing_trigger[0] != definition:
+                conn.execute(f'DROP TRIGGER {name}')
+                existing_trigger = None
+            if existing_trigger is None:
+                conn.execute(definition)
+
+
 class _DatabaseRevision:
     def __init__(self, path: Path, tables: tuple[str, ...], *, allow_missing=False):
         self.path, self.tables = Path(path), tables
@@ -65,47 +105,12 @@ class _DatabaseRevision:
         conn.execute('PRAGMA query_only=OFF')
         try:
             with conn:
-                conn.execute(f'CREATE TABLE IF NOT EXISTS {_COUNTER} '
-                             '(id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL)')
-                conn.execute(f'INSERT OR IGNORE INTO {_COUNTER} VALUES (1, 0)')
-                existing = {row[0] for row in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'")}
-                for table in self.tables:
-                    if table not in existing:
-                        continue
-                    for operation in ('INSERT', 'UPDATE', 'DELETE'):
-                        condition = ''
-                        if table == 'kv':
-                            keys = ','.join("'" + key + "'" for key in CONFIGURATION_KEYS)
-                            references = ('NEW',) if operation == 'INSERT' else ('OLD',) if operation == 'DELETE' else ('OLD', 'NEW')
-                            condition = ' WHEN ' + ' OR '.join(f'{ref}.key IN ({keys})' for ref in references)
-                        if operation == 'UPDATE':
-                            columns = [str(row[1]) for row in conn.execute(f'PRAGMA table_info("{table}")')]
-                            # Settings timestamps are bookkeeping, not command
-                            # inputs. Keep every other column (including unknown
-                            # future fields) and all nets fields fail-conservative.
-                            fields = [column for column in columns
-                                      if not (table in SETTINGS_TABLES and column in {'updated_utc', 'created_utc'})]
-                            changed = ' OR '.join(f'OLD."{column}" IS NOT NEW."{column}"' for column in fields)
-                            if changed:
-                                condition = (' WHEN (' + condition[6:] + ') AND (' + changed + ')'
-                                             if condition else ' WHEN ' + changed)
-                        name = f'_fio_schedule_{table}_{operation}'
-                        definition = (f'CREATE TRIGGER {name} '
-                                      f'AFTER {operation} ON "{table}"{condition} BEGIN '
-                                      f'UPDATE {_COUNTER} SET revision=revision+1 WHERE id=1; END')
-                        existing_trigger = conn.execute(
-                            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (name,)).fetchone()
-                        if existing_trigger is not None and existing_trigger[0] != definition:
-                            conn.execute(f'DROP TRIGGER {name}')
-                            existing_trigger = None
-                        if existing_trigger is None:
-                            conn.execute(definition)
+                install_revision_triggers(conn, self.tables)
         finally:
             conn.execute('PRAGMA query_only=ON')
         self.schema = conn.execute('PRAGMA schema_version').fetchone()[0]
 
-    def key(self):
+    def key(self, *, install=True):
         self._check_owner()
         try:
             stat = self.path.stat()  # Missing/replaced databases cannot reuse authority.
@@ -116,18 +121,21 @@ class _DatabaseRevision:
             raise
         identity = (stat.st_dev, stat.st_ino)
         if self.connection is None or identity != self.identity:
+            if not install:
+                raise ConfigurationChanged("A schedule database was replaced during the save.")
             self.close()
             self.connection = sqlite3.connect(self.path.resolve().as_uri() + '?mode=rw',
                                               uri=True, timeout=0.5)
             self.identity = identity
             self._install()
         schema = self.connection.execute('PRAGMA schema_version').fetchone()[0]
-        if schema != self.schema:
+        if schema != self.schema and install:
             self._install()  # Track newly created/replaced authoring tables too.
+            schema = self.schema
         revision = self.connection.execute(f'SELECT revision FROM {_COUNTER} WHERE id=1').fetchone()
         if revision is None:
             raise RuntimeError('Schedule revision counter is unavailable')
-        return (*identity, self.schema, int(revision[0]))
+        return (*identity, schema, int(revision[0]))
 
 
 class ScheduleRevisionTracker:
@@ -135,8 +143,8 @@ class ScheduleRevisionTracker:
         self.databases = (_DatabaseRevision(Path(config_dir) / 'freqinout.db', SETTINGS_TABLES, allow_missing=allow_missing),
                           _DatabaseRevision(Path(config_dir) / 'freqinout_nets.db', NETS_TABLES, allow_missing=allow_missing))
 
-    def key(self):
-        return tuple(database.key() for database in self.databases)
+    def key(self, *, install=True):
+        return tuple(database.key(install=install) for database in self.databases)
 
     def close(self):
         for database in self.databases:

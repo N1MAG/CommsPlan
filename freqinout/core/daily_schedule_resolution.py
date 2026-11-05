@@ -15,6 +15,11 @@ DAY_INDEX = {name.upper(): index for index, name in enumerate(DAY_NAMES)}
 class DailyScheduleResolutionError(ValueError):
     """Raised when Daily HF rows cannot be resolved without guessing."""
 
+    def __init__(self, message, *, rows=(), window=None):
+        super().__init__(message)
+        self.rows = tuple(dict(row) for row in rows)
+        self.window = dict(window or {})
+
 
 @dataclass(frozen=True)
 class ResolvedDailySegment:
@@ -394,14 +399,18 @@ def _validate_occurrences(occurrences: Sequence[_Occurrence]) -> None:
             if left.start_utc == right.start_utc:
                 raise DailyScheduleResolutionError(
                     f"Daily schedule rows {left.source_index + 1} and {right.source_index + 1} "
-                    f"start together at {left.start_utc.isoformat()} with different settings."
+                    f"start together at {left.start_utc.isoformat()} with different settings.",
+                    rows=(left.row, right.row), window={'start_utc': left.start_utc.isoformat(),
+                        'end_utc': min(left.end_utc, right.end_utc).isoformat()}
                 )
             left_contains = left.start_utc <= right.start_utc and right.end_utc <= left.end_utc
             right_contains = right.start_utc <= left.start_utc and left.end_utc <= right.end_utc
             if not left_contains and not right_contains:
                 raise DailyScheduleResolutionError(
                     f"Daily schedule rows {left.source_index + 1} and {right.source_index + 1} "
-                    f"cross at {max(left.start_utc, right.start_utc).isoformat()}."
+                    f"cross at {max(left.start_utc, right.start_utc).isoformat()}.",
+                    rows=(left.row, right.row), window={'start_utc': max(left.start_utc,right.start_utc).isoformat(),
+                        'end_utc': min(left.end_utc,right.end_utc).isoformat()}
                 )
 
 

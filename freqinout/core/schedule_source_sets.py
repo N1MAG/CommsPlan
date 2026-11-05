@@ -6,9 +6,12 @@ import re
 import sqlite3
 from typing import Any, Dict, List, Optional
 
-from freqinout.core.multi_radio_store import MultiRadioStore
+from freqinout.core.multi_radio_store import MultiRadioStore, schedule_name_key, _assert_schedule_name_available
 from freqinout.core.schedule_projection import build_blended_schedule_projection
-from freqinout.core.schedule_source_inputs import ScheduleSourceError, load_sop_projection_sources
+from freqinout.core.schedule_source_inputs import (
+    ScheduleSourceError, load_sop_projection_sources, normalize_active_daily_rows,
+    normalize_active_net_rows, read_plan_schedule_table,
+)
 from freqinout.core.settings_manager import SettingsManager
 
 
@@ -158,15 +161,8 @@ def plan_source_usage_summary(
     """Return plans/radios that use a linked Daily or Net source schedule."""
     clean_category = str(category or "").strip().lower()
     clean_set_id = str(set_id or "").strip() or LIVE_SOURCE_SET_ID
-    if clean_set_id == LIVE_SOURCE_SET_ID:
-        if clean_category == HF_DAILY_SOURCE_CATEGORY:
-            dependency_refs = {"hf_daily"}
-        elif clean_category == HF_NET_SOURCE_CATEGORY:
-            dependency_refs = {"hf_nets"}
-        else:
-            dependency_refs = {str(live_label or "live").strip()}
-    else:
-        dependency_refs = {source_schedule_dependency_ref(clean_category, clean_set_id)}
+    # Bare legacy layer labels record snapshot provenance, never live usage.
+    dependency_refs = {f'{clean_category}:{clean_set_id}'} if clean_category in _SOURCE_DEPENDENCY_PREFIXES else set()
     dependency_refs = {ref for ref in dependency_refs if ref}
 
     try:
@@ -237,6 +233,20 @@ def plan_source_usage_summary(
     }
 
 
+def plan_source_link_description(plan: Dict[str, Any]) -> str:
+    """Pure presentation of actual dependencies; never infer a link by name."""
+    refs = _parse_ref_values(plan.get('source_refs_json', plan.get('source_refs', [])))
+    daily = any(ref.startswith(HF_DAILY_SOURCE_CATEGORY + ':') for ref in refs)
+    nets = any(ref.startswith(HF_NET_SOURCE_CATEGORY + ':') and not ref.endswith(':' + NO_NET_SOURCE_SET_ID) for ref in refs)
+    sop = any(ref.startswith(('sop_schedule_layer:', 'sop_schedule_plan:')) for ref in refs)
+    sop_text = ' SOP sources remain linked.' if sop else ''
+    if daily or nets:
+        linked = ' and '.join(label for label, active in [('Daily', daily), ('Net', nets)] if active)
+        return f'Linked {linked} schedules: this plan follows the selected sources when available and safety checks pass.' + sop_text
+    return ('Saved Daily/Net schedule snapshot: source edits do not change its saved windows. '
+            'The table previews the source choices below. Link to source schedules… to compare the saved windows before changing this plan.') + sop_text
+
+
 def _dependency_set_id(source_refs: List[str], category: str) -> str:
     prefix = f"{category}:"
     for ref in source_refs:
@@ -248,10 +258,20 @@ def _dependency_set_id(source_refs: List[str], category: str) -> str:
 def _rows_for_dependency(settings: Any, category: str, set_id: str, *, store: Any = None) -> List[Dict[str, Any]]:
     if category == HF_NET_SOURCE_CATEGORY and str(set_id or "").strip() == NO_NET_SOURCE_SET_ID:
         return []
-    sets_key = HF_DAILY_SOURCE_SETS_KEY if category == HF_DAILY_SOURCE_CATEGORY else HF_NET_SOURCE_SETS_KEY
+    daily = category == HF_DAILY_SOURCE_CATEGORY
+    if set_id == LIVE_SOURCE_SET_ID:
+        db_name = "freqinout.db" if daily else "freqinout_nets.db"
+        tables = ("daily_schedule_tab",) if daily else ("net_schedule_tab", "net_schedule")
+        data = read_plan_schedule_table(settings.config_dir / db_name, tables)
+        if data is not None:
+            normalize = normalize_active_daily_rows if daily else normalize_active_net_rows
+            return normalize(*data)
+        fallback = (settings.get("hf_schedule") or settings.get("daily_schedule")) if daily else settings.get("net_schedule")
+        return [dict(row) for row in fallback or () if isinstance(row, dict)]
+    sets_key = HF_DAILY_SOURCE_SETS_KEY if daily else HF_NET_SOURCE_SETS_KEY
     if str(set_id).startswith("plan:"):
         try:
-            plan = (store if store is not None else MultiRadioStore()).get_frequency_plan(int(set_id.split(":", 1)[1]))
+            plan = (store if store is not None else MultiRadioStore(getattr(settings, 'db_path', None))).get_frequency_plan(int(set_id.split(":", 1)[1]))
         except Exception as exc:
             raise ScheduleSourceError(f"Cannot read declared schedule source {set_id}: {exc}") from exc
         if not plan or str(plan.get("category") or "").lower() != category:
@@ -385,6 +405,7 @@ def _reproject_refs_for_sop_update(
 def assigned_plan_rf_guard_impacts_for_sop_update(
     profile_id: int,
     updated_rows: List[Dict[str, Any]],
+    *, settings: Any = None, store: Any = None,
 ) -> List[Dict[str, Any]]:
     try:
         pid = int(profile_id or 0)
@@ -393,8 +414,14 @@ def assigned_plan_rf_guard_impacts_for_sop_update(
     dependency_ref = sop_schedule_dependency_ref(pid)
     if not dependency_ref:
         return []
-    store = MultiRadioStore()
-    settings = SettingsManager()
+    if settings is None:
+        from contextlib import closing
+        with closing(SettingsManager()) as owned_settings:
+            return assigned_plan_rf_guard_impacts_for_sop_update(pid, updated_rows, settings=owned_settings)
+    if store is None:
+        store = MultiRadioStore(getattr(settings, "db_path", None))
+        with store.configuration_read_transaction():
+            return assigned_plan_rf_guard_impacts_for_sop_update(pid, updated_rows, settings=settings, store=store)
     plans_by_id = {int(row.get("id", 0) or 0): dict(row) for row in store.list_frequency_plans()}
     devices_by_id = {int(row.get("id", 0) or 0): dict(row) for row in store.list_device_profiles()}
     impacts: List[Dict[str, Any]] = []
@@ -443,10 +470,17 @@ def assigned_plan_rf_guard_impacts_for_source_update(
     updated_rows: List[Dict[str, Any]],
     *, store: Any = None,
 ) -> List[Dict[str, Any]]:
-    dependency_ref = source_schedule_dependency_ref(category, set_id)
+    dependency_ref = (
+        f"{category}:{LIVE_SOURCE_SET_ID}"
+        if set_id == LIVE_SOURCE_SET_ID and category in _SOURCE_DEPENDENCY_PREFIXES
+        else source_schedule_dependency_ref(category, set_id)
+    )
     if not dependency_ref:
         return []
-    store = store if store is not None else MultiRadioStore()
+    if store is None:
+        store = MultiRadioStore(getattr(settings, "db_path", None))
+        with store.configuration_read_transaction():
+            return assigned_plan_rf_guard_impacts_for_source_update(settings, category, set_id, updated_rows, store=store)
     plans_by_id = {int(row.get("id", 0) or 0): dict(row) for row in store.list_frequency_plans()}
     devices_by_id = {int(row.get("id", 0) or 0): dict(row) for row in store.list_device_profiles()}
     impacts: List[Dict[str, Any]] = []
@@ -510,6 +544,7 @@ def reproject_frequency_plans_for_source_update(
     category: str,
     set_id: str,
     updated_rows: List[Dict[str, Any]],
+    *, store: Any = None,
 ) -> List[Dict[str, Any]]:
     """Refresh saved Frequency Plans that depend on a named HF Daily/Net schedule.
 
@@ -519,10 +554,14 @@ def reproject_frequency_plans_for_source_update(
     the scheduler reads it again; otherwise radios keep following stale windows.
     """
 
-    dependency_ref = source_schedule_dependency_ref(category, set_id)
+    dependency_ref = (
+        f"{category}:{LIVE_SOURCE_SET_ID}"
+        if set_id == LIVE_SOURCE_SET_ID and category in _SOURCE_DEPENDENCY_PREFIXES
+        else source_schedule_dependency_ref(category, set_id)
+    )
     if not dependency_ref:
         return []
-    store = MultiRadioStore()
+    store = store if store is not None else MultiRadioStore(getattr(settings, 'db_path', None))
     updated: List[Dict[str, Any]] = []
     for plan in store.list_frequency_plans():
         plan_id = int(plan.get("id", 0) or 0)
@@ -536,8 +575,8 @@ def reproject_frequency_plans_for_source_update(
             continue
         daily_set_id = _dependency_set_id(source_refs, HF_DAILY_SOURCE_CATEGORY)
         net_set_id = _dependency_set_id(source_refs, HF_NET_SOURCE_CATEGORY)
-        daily_rows = _rows_for_dependency(settings, HF_DAILY_SOURCE_CATEGORY, daily_set_id) if daily_set_id else []
-        net_rows = _rows_for_dependency(settings, HF_NET_SOURCE_CATEGORY, net_set_id) if net_set_id else []
+        daily_rows = _rows_for_dependency(settings, HF_DAILY_SOURCE_CATEGORY, daily_set_id, store=store) if daily_set_id else []
+        net_rows = _rows_for_dependency(settings, HF_NET_SOURCE_CATEGORY, net_set_id, store=store) if net_set_id else []
         if category == HF_DAILY_SOURCE_CATEGORY:
             daily_rows = [dict(row) for row in updated_rows]
         elif category == HF_NET_SOURCE_CATEGORY:
@@ -576,7 +615,7 @@ def reproject_frequency_plans_for_source_update(
     return [store.save_frequency_plan(payload) for payload in updated]
 
 
-def _source_backed_plan_payload(settings: Any, plan: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _source_backed_plan_payload(settings: Any, plan: Dict[str, Any], *, store: Any = None) -> Optional[Dict[str, Any]]:
     """Validate/materialize one plan without writing or affecting another plan."""
     plan_id = int(plan.get("id", 0) or 0)
     if plan_id <= 0:
@@ -591,8 +630,8 @@ def _source_backed_plan_payload(settings: Any, plan: Dict[str, Any]) -> Optional
         if any(ref.startswith(f"{SOP_SCHEDULE_LAYER_CATEGORY}:") for ref in source_refs):
             _sop_sources_for_plan(settings, plan, source_refs)
         return None
-    daily_rows = _rows_for_dependency(settings, HF_DAILY_SOURCE_CATEGORY, daily_set_id) if daily_set_id else []
-    net_rows = _rows_for_dependency(settings, HF_NET_SOURCE_CATEGORY, net_set_id) if net_set_id else []
+    daily_rows = _rows_for_dependency(settings, HF_DAILY_SOURCE_CATEGORY, daily_set_id, store=store) if daily_set_id else []
+    net_rows = _rows_for_dependency(settings, HF_NET_SOURCE_CATEGORY, net_set_id, store=store) if net_set_id else []
     sop_rows, policies = _sop_sources_for_plan(settings, plan, source_refs)
     projection = build_blended_schedule_projection(
         daily_rows,
@@ -635,7 +674,7 @@ def refresh_source_backed_frequency_plans(
     every plan before saving any derived rows, retaining their existing contract.
     """
     if store is None:
-        store = MultiRadioStore()
+        store = MultiRadioStore(getattr(settings, 'db_path', None))
         plans = store.list_frequency_plans()
     else:
         # Scheduler owns a migrated store; enumerating sources must not repeat
@@ -646,7 +685,7 @@ def refresh_source_backed_frequency_plans(
     expected_by_id = {}
     for plan in plans:
         try:
-            payload = _source_backed_plan_payload(settings, plan)
+            payload = _source_backed_plan_payload(settings, plan, store=store)
         except (ScheduleSourceError, ValueError) as exc:
             cause = exc
             while cause is not None:
@@ -675,7 +714,7 @@ def refresh_source_backed_frequency_plans(
 def source_sets_for_category(settings: Any, legacy_key: str, category: str, *, strict: bool = False, store: Any = None) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     try:
-        store = store if store is not None else MultiRadioStore()
+        store = store if store is not None else MultiRadioStore(getattr(settings, 'db_path', None))
         for plan in store.list_frequency_plans():
             if str(plan.get("category") or "").strip().lower() != category:
                 continue
@@ -734,34 +773,128 @@ def source_set_row_by_id_for_category(
     return None
 
 
+def describe_duplicate_schedule_choices(rows, category, plans, assignments, devices):
+    """Pure labels: actual effective links outrank save time, never choose/delete."""
+    result=[dict(row) for row in rows]
+    groups={}
+    for row in result:
+        groups.setdefault(schedule_name_key(row.get('name')),[]).append(row)
+    radio_names={int(row['id']):str(row.get('name') or 'Radio') for row in devices}
+    reverse={}
+    for plan in plans:
+        for ref in _parse_ref_values(plan.get('source_refs_json',plan.get('source_refs',[]))):
+            reverse.setdefault(ref,set()).add(int(plan['id']))
+    def timestamp(value):
+        try:
+            parsed=datetime.datetime.fromisoformat(str(value).replace('Z','+00:00'))
+            return (parsed if parsed.tzinfo else parsed.replace(tzinfo=datetime.timezone.utc)).timestamp()
+        except (ValueError,TypeError,OverflowError):
+            return float('-inf')
+    for group in groups.values():
+        if len(group)<2:
+            continue
+        latest=max(timestamp(row.get('updated_utc') or row.get('created_utc')) for row in group)
+        for ordinal,row in enumerate(group,1):
+            linked={int(row['db_id'])} if row.get('db_id') else set()
+            pending=[source_schedule_dependency_ref(category,str(row['id']))]
+            seen=set()
+            while pending:
+                ref=pending.pop()
+                if ref in seen:
+                    continue
+                seen.add(ref)
+                for plan_id in reverse.get(ref,()):
+                    if plan_id not in linked:
+                        linked.add(plan_id)
+                        pending.extend((f'hf_daily_schedule:plan:{plan_id}',f'hf_net_schedule:plan:{plan_id}',f'sop_schedule_plan:{plan_id}'))
+            uses=[dict(a) for a in assignments if int(a.get('frequency_plan_id') or 0) in linked]
+            names=sorted({radio_names.get(int(a['device_profile_id']),'Radio') for a in uses})
+            row['linked_radio_names']=names
+            row['latest_effective_assignment_utc']=max((str(a.get('created_utc') or '') for a in uses),default='',key=timestamp)
+            row['latest_saved']=latest!=float('-inf') and timestamp(row.get('updated_utc') or row.get('created_utc'))==latest
+            status='assigned' if uses else 'no linked radio'
+            if row['latest_saved']:
+                status+=' · latest saved'
+            row['choice_label']=f"Copy {ordinal}/{len(group)} · {row.get('name') or 'Schedule'} · {status}"
+            row['choice_tooltip']=(f"Saved: {row.get('updated_utc') or row.get('created_utc') or 'Unknown'}\n"
+                + ('Linked radios: '+', '.join(names) if names else 'No radio is explicitly linked to this copy. Legacy snapshot plans do not identify a saved copy.')
+                + f"\nSource identity: {row['id']}. Updating this copy preserves this identity and its plan links.")
+        ranked=[(timestamp(row['latest_effective_assignment_utc']),row) for row in group if timestamp(row['latest_effective_assignment_utc'])!=float('-inf')]
+        if ranked:
+            newest=max(item[0] for item in ranked)
+            winners=[row for time,row in ranked if time==newest]
+            if len(winners)==1:
+                winners[0]['most_recently_assigned']=True
+                winners[0]['choice_label']+=' · most recently assigned'
+    return result
+
+
+def resolve_source_schedule_save_target(settings, category, name, *, selected_id=''):
+    """Resolve identities before RF review; ambiguity never chooses a winner."""
+    key = HF_DAILY_SOURCE_SETS_KEY if category == HF_DAILY_SOURCE_CATEGORY else HF_NET_SOURCE_SETS_KEY
+    store = MultiRadioStore(getattr(settings, "db_path", None))
+    with store.configuration_read_transaction():
+        catalog = source_sets_for_category(settings, key, category, strict=True, store=store)
+    selected = next((row for row in catalog if row['id'] == selected_id), None)
+    matches = [row for row in catalog if schedule_name_key(row.get('name')) == schedule_name_key(name)]
+    if selected:
+        if schedule_name_key(selected.get('name')) == schedule_name_key(name):
+            return selected
+        if matches:
+            raise ValueError('Another schedule already uses that name. Keep this name or choose a different name; no schedules were changed.')
+        return selected
+    if selected_id and selected_id != LIVE_SOURCE_SET_ID:
+        raise ValueError('The selected schedule is unavailable. Reload and select it again before saving.')
+    if len(matches) > 1:
+        raise ValueError('Multiple saved schedules already use this name. Select the copy whose rows you want to keep, or enter a different name. No schedules were changed.')
+    return matches[0] if matches else None
+
+
+def _save_legacy_source(settings, sets_key, selected_key, name, rows, *, existing_id=None, store=None):
+    category = HF_DAILY_SOURCE_CATEGORY if sets_key == HF_DAILY_SOURCE_SETS_KEY else HF_NET_SOURCE_CATEGORY
+    reload_settings = store is None
+    store = store if store is not None else MultiRadioStore(getattr(settings, 'db_path', None))
+    with store.configuration_save_transaction() as transaction:
+        with store.connect() as conn:
+            saved = conn.execute('SELECT value FROM kv WHERE key=?', (sets_key,)).fetchone()
+            sources = json.loads(saved[0]) if saved else []
+            if not isinstance(sources, list):
+                raise ValueError('Saved schedules could not be verified. Reload before saving.')
+            existing = next((row for row in sources if isinstance(row, dict) and row.get('id') == existing_id), None)
+            if existing_id and not existing:
+                raise ValueError('The selected schedule no longer exists. Reload before saving.')
+            if not existing_id:
+                matches = [row for row in sources if isinstance(row,dict) and schedule_name_key(row.get('name')) == schedule_name_key(name)]
+                if len(matches)>1:
+                    raise ValueError('Multiple schedules already use this name. Select one explicitly before updating.')
+                existing = matches[0] if matches else None
+            now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            set_id = str(existing['id']) if existing else slug_source_set_id(name)
+            taken = {str(row.get('id')) for row in sources if isinstance(row,dict)}
+            if not existing:
+                suffix=2
+                while set_id in taken:
+                    set_id=slug_source_set_id(name)+'-'+str(suffix);suffix+=1
+            _assert_schedule_name_available(conn,name,category,legacy_id=set_id,existing=existing)
+            result = {**(existing or {}),'id':set_id,'name':str(name).strip(),'rows':[dict(row) for row in (rows if rows is not None else (existing or {}).get('rows',[]))],
+                      'created_utc':(existing or {}).get('created_utc',now),'updated_utc':now}
+            if existing:
+                sources[sources.index(existing)] = result
+            else:
+                sources.append(result)
+            conn.executemany('INSERT OR REPLACE INTO kv(key,value) VALUES(?,?)',
+                [(sets_key,json.dumps(sources)),(selected_key,json.dumps(set_id))])
+        transaction.complete()
+    if reload_settings:
+        settings.reload()
+    return result
+
+
 def save_source_set(settings: Any, sets_key: str, selected_key: str, name: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    clean_name = str(name or "").strip()
+    clean_name=str(name or '').strip()
     if not clean_name:
-        raise ValueError("Enter a clear schedule source name before saving.")
-    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    base_id = slug_source_set_id(clean_name)
-    set_id = base_id
-    existing_sets = source_sets(settings, sets_key)
-    taken = {str(row.get("id") or "") for row in existing_sets}
-    if set_id in taken:
-        set_id = f"{base_id}-{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
-    counter = 2
-    while set_id in taken:
-        set_id = f"{base_id}-{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d%H%M%S%f')}-{counter}"
-        counter += 1
-    saved = {
-        "id": set_id,
-        "name": clean_name,
-        "rows": [dict(row) for row in rows],
-        "created_utc": now,
-        "updated_utc": now,
-    }
-    existing_sets.append(saved)
-    settings.set(sets_key, existing_sets)
-    settings.set(selected_key, set_id)
-    if hasattr(settings, "save"):
-        settings.save()
-    return saved
+        raise ValueError('Enter a clear schedule source name before saving.')
+    return _save_legacy_source(settings,sets_key,selected_key,clean_name,rows)
 
 
 def save_source_schedule(
@@ -772,10 +905,21 @@ def save_source_schedule(
     rows: List[Dict[str, Any]],
     *,
     existing_plan_id: Optional[int] = None,
+    existing_source_id: Optional[str] = None,
+    store: Any = None,
 ) -> Dict[str, Any]:
     clean_name = str(name or "").strip()
     if not clean_name:
         raise ValueError("Enter a clear schedule name before saving.")
+    if existing_source_id and not str(existing_source_id).startswith('plan:'):
+        key=HF_DAILY_SOURCE_SETS_KEY if category==HF_DAILY_SOURCE_CATEGORY else HF_NET_SOURCE_SETS_KEY
+        return _save_legacy_source(settings,key,selected_key,clean_name,rows,existing_id=existing_source_id, store=store)
+    atomic = store is not None
+    store = store if atomic else MultiRadioStore(getattr(settings, 'db_path', None))
+    if existing_plan_id:
+        current=store.get_frequency_plan(int(existing_plan_id))
+        if not current or current.get('category') != category:
+            raise ValueError('Select the matching saved source schedule before updating.')
     payload: Dict[str, Any] = {
         "name": clean_name,
         "status": "saved",
@@ -795,12 +939,18 @@ def save_source_schedule(
     }
     if existing_plan_id is not None and int(existing_plan_id) > 0:
         payload["id"] = int(existing_plan_id)
-    saved = MultiRadioStore().save_frequency_plan(payload)
+    saved = store.save_frequency_plan(payload)
     saved_id = int(saved.get("id", 0) or 0)
     if saved_id > 0:
-        settings.set(selected_key, f"plan:{saved_id}")
-        if hasattr(settings, "save"):
-            settings.save()
+        selection = f"plan:{saved_id}"
+        if atomic:
+            with store.connect() as conn:
+                conn.execute("INSERT OR REPLACE INTO kv(key,value) VALUES(?,?)",
+                             (selected_key, json.dumps(selection)))
+        else:
+            settings.set(selected_key, selection)
+            if hasattr(settings, "save"):
+                settings.save()
     return {
         "id": f"plan:{saved_id}" if saved_id > 0 else "",
         "db_id": saved_id,
@@ -828,14 +978,11 @@ def rename_source_schedule(
         plan_id = int(target.split(":", 1)[1] or 0)
         if plan_id <= 0:
             raise ValueError("Select a saved schedule before renaming.")
-        store = MultiRadioStore()
+        store = MultiRadioStore(getattr(settings, 'db_path', None))
         plan = store.get_frequency_plan(plan_id)
         if not plan or str(plan.get("category") or "").strip().lower() != str(category or "").strip().lower():
             raise ValueError("Only the matching HF Daily or HF Net schedule can be renamed here.")
-        payload = dict(plan)
-        payload["id"] = plan_id
-        payload["name"] = clean_name
-        saved = store.save_frequency_plan(payload)
+        saved = store.save_frequency_plan({'id':plan_id,'name':clean_name},expected=plan)
         settings.set(selected_key, f"plan:{plan_id}")
         if hasattr(settings, "save"):
             settings.save()
@@ -847,17 +994,10 @@ def rename_source_schedule(
             "storage": "db",
         }
 
-    rows = source_sets(settings, expected_key)
-    for row in rows:
-        if str(row.get("id") or "").strip() == target:
-            row["name"] = clean_name
-            row["updated_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-            settings.set(expected_key, rows)
-            settings.set(selected_key, target)
-            if hasattr(settings, "save"):
-                settings.save()
-            return dict(row)
-    raise ValueError("Could not find the selected saved schedule.")
+    current=source_set_row_by_id(settings,expected_key,target)
+    if current is None:
+        raise ValueError('Could not find the selected saved schedule.')
+    return _save_legacy_source(settings,expected_key,selected_key,clean_name,None,existing_id=target)
 
 
 def delete_source_schedule(settings: Any, sets_key: str, selected_key: str, set_id: str) -> bool:
@@ -868,7 +1008,7 @@ def delete_source_schedule(settings: Any, sets_key: str, selected_key: str, set_
     if target.startswith("plan:"):
         plan_id = int(target.split(":", 1)[1] or 0)
         if plan_id > 0:
-            store = MultiRadioStore()
+            store = MultiRadioStore(getattr(settings, 'db_path', None))
             plan = store.get_frequency_plan(plan_id)
             if not plan or str(plan.get("category") or "").strip().lower() != expected_category:
                 raise ValueError("Only the matching HF Daily or HF Net source schedule can be deleted here.")
