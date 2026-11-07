@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.0.11]
+- Fixed: VarAC BBS keeps the selected location open when a visitor types an alias and refreshes the file list. Older disconnects no longer override newer commands in the same log batch.
+- Fixed: BBS refresh preserves VarAC's temporary compressed transfer files. Disabling or removing the open location, or revoking the visitor's callsign access, returns the live listing to the main menu.
+- Changed: The saved BBS access summary shows the current number of entries in the allowlist.
+- Fixed: Export Diagnostics runs in the background, captures consistent SQLite snapshots with recent committed changes, and verifies their contents. ZIP entries show their capture dates.
+
 ## [2.0.10]
 - Fixed: Scheduling permission stays consistent across restarts and unrelated settings saves. The status identifies the setting that blocks a radio from following its plan.
 - Changed: New Plan starts with blank source choices. Save Plan saves the plan, and the guided radio assignment flow shows each proposed change before confirmation. Existing assignments can be swapped or removed from Plan Builder.

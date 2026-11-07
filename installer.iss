@@ -1,6 +1,6 @@
 ; installer.iss
 #define MyAppName "CommsPlan"
-#define MyAppVersion "2.0.10"
+#define MyAppVersion "2.0.11"
 #define MyAppExeName "CommsPlan.exe"
 
 [Setup]
