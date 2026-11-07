@@ -6,14 +6,23 @@ description: Install CommsPlan from the latest published release or update an es
 # Install or upgrade CommsPlan
 
 <div class="doc-badge-row">
-  <span class="doc-badge">CommsPlan 2.0.10</span>
+  <span class="doc-badge">CommsPlan 2.0.11</span>
   <span class="doc-badge">Windows · Linux · macOS</span>
   <span class="doc-badge">Back up before upgrade</span>
 </div>
 
-CommsPlan 2.0.10 is available for Windows x86-64, Linux amd64, Apple Silicon and
-Intel macOS. The [2.0.10 release page](https://github.com/N1MAG/CommsPlan/releases/tag/v2.0.10)
-contains the packages, checksums and release notes.
+The CommsPlan 2.0.11 release is being verified. The
+[GitHub Releases page](https://github.com/N1MAG/CommsPlan/releases/latest) is
+the authority for published packages, checksums and release notes. Use only
+packages listed there; this guide does not announce 2.0.11 downloads before
+they are verified and published.
+
+For the previous release, see the [CommsPlan 2.0.10 release page](https://github.com/N1MAG/CommsPlan/releases/tag/v2.0.10).
+
+### Previously published 2.0.10 packages
+
+These links are retained for the previous release. Use the latest release page
+above to confirm current package availability.
 
 | Your computer | CommsPlan 2.0.10 download |
 | --- | --- |
@@ -34,27 +43,28 @@ the release notes and verify the downloaded file against the published checksum
 before opening it. Windows or macOS may show an operating-system security
 prompt for an unsigned package; follow the release-specific instructions.
 
-The source commands below use the published CommsPlan 2.0.10 installer entry points. Use
-the 2.0.10 source tree for these instructions. When using a source checkout,
+The source commands below use the CommsPlan 2.0.11 installer entry points. Use
+the 2.0.11 source tree for these instructions after its release tag is
+published. When using a source checkout,
 install Git and Python 3.11 (3.10–3.13 are accepted; 3.11 is recommended).
 Close CommsPlan and companion applications before installing or updating.
 
-### Windows source installation — CommsPlan 2.0.10
+### Windows source installation — CommsPlan 2.0.11
 
 ```powershell
 git clone https://github.com/N1MAG/CommsPlan.git "$HOME\CommsPlan"
 Set-Location "$HOME\CommsPlan"
-git checkout v2.0.10
+git checkout v2.0.11
 py -3.11 install-commsplan.py
 .\start-commsplan.cmd
 ```
 
-### macOS source installation — CommsPlan 2.0.10
+### macOS source installation — CommsPlan 2.0.11
 
 ```bash
 git clone https://github.com/N1MAG/CommsPlan.git "$HOME/CommsPlan"
 cd "$HOME/CommsPlan"
-git checkout v2.0.10
+git checkout v2.0.11
 python3.11 install-commsplan.py
 ./start-commsplan.sh
 ```
@@ -64,7 +74,7 @@ python3.11 install-commsplan.py
 Install the Debian package offered by the release page, then launch CommsPlan
 from your applications menu or with the `commsplan` command when available.
 
-### Linux source installation and maintenance — CommsPlan 2.0.10
+### Linux source installation and maintenance — CommsPlan 2.0.11
 
 The guided installer supports setup, update, repair, and desktop launcher
 refresh. With no action supplied, it runs setup.
@@ -72,7 +82,7 @@ refresh. With no action supplied, it runs setup.
 ```bash
 git clone https://github.com/N1MAG/CommsPlan.git "$HOME/CommsPlan"
 cd "$HOME/CommsPlan"
-git checkout v2.0.10
+git checkout v2.0.11
 bash install-commsplan.sh setup
 ```
 

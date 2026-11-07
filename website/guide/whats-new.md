@@ -1,11 +1,29 @@
 ---
-title: What's New in CommsPlan 2.0.10
-description: Plan Builder, guided radio assignment, and scheduling reliability in CommsPlan 2.0.10.
+title: What's New in CommsPlan 2.0.11
+description: VarAC BBS access continuity and more consistent background diagnostics in CommsPlan 2.0.11.
 ---
 
-# What's new in CommsPlan 2.0.10
+# What's new in CommsPlan 2.0.11
 
-Get the published packages and checksums from the [2.0.10 release page](https://github.com/N1MAG/CommsPlan/releases/tag/v2.0.10).
+Check the [GitHub Releases page](https://github.com/N1MAG/CommsPlan/releases/latest) for published packages, checksums and release notes. This overview does not announce package availability before release verification.
+
+## VarAC BBS access and transfers
+
+An authorized BBS location stays open during the next refresh. Helper downloads
+retain their transfer files, and the access summary reports the current
+allowlist count.
+
+## Diagnostics export
+
+Diagnostics export runs in the background and captures consistent SQLite
+snapshots. ZIP entries use their capture times so the archive preserves the
+report's timeline.
+
+## From 2.0.10
+
+CommsPlan 2.0.10 introduced the guided Plan Builder assignment workflow,
+scheduling reliability improvements, and operator workflow updates described
+below.
 
 ## Build and assign a plan
 

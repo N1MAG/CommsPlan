@@ -158,5 +158,5 @@ scheduled changes may occur, and all transmit/busy and endpoint checks still app
 ## Continue
 
 - [Understand the operating picture](/guide/operating-picture)
-- [See what's new in CommsPlan 2.0.10](/guide/whats-new)
+- [See what's new in CommsPlan 2.0.11](/guide/whats-new)
 - [Install or upgrade](/install/)
