@@ -2186,7 +2186,7 @@
     <li><strong>Enable DEBUG For</strong>: temporarily raises logging detail for troubleshooting and then automatically returns to the previous logging level. This is safer than leaving DEBUG on indefinitely.</li>
     <li><strong>Open Logs</strong>: opens the current log view so you can inspect recent activity.</li>
     <li><strong>Open Log Folder</strong>: opens the folder where CommsPlan stores log files.</li>
-    <li><strong>Export Diagnostics</strong>: packages logs and troubleshooting context for support review. Use this when a support helper needs more than a screenshot.</li>
+    <li><strong>Export Diagnostics</strong>: captures verified SQLite snapshots of the active profile databases, including committed WAL changes, and packages them with the log for support. Export runs in the background; the button shows <code>Exporting Diagnostics…</code>. The result reports any missing optional files. A failed export keeps an existing archive intact. The ZIP includes <code>diagnostics_manifest.json</code> with capture times, hashes and a profile fingerprint. Each database is consistent separately; the databases and log are not captured at one shared instant.</li>
   </ul>
 
   <h2 id="help">Help</h2>

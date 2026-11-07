@@ -228,7 +228,7 @@ class BbsVaracSyncPanel(QWidget):
             self._dirty = False
             count = len(effective_callsigns(self.access_editor.policy()))
             self.admission_summary.setText(
-                f"Saved CommsPlan admission: limited to {count} callsigns." if self.limit_check.isChecked()
+                f"Saved BBS access: restricted to the allowlist. Current entries: {count}." if self.limit_check.isChecked()
                 else "Saved CommsPlan admission: no native callsign restriction. Location policies still apply."
             )
             self.status.setText("Saved in CommsPlan. VarAC INIs are unchanged." if action == "save" else "Saved station admission loaded. VarAC INIs are unchanged.")

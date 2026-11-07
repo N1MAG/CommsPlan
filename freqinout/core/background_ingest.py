@@ -2048,12 +2048,12 @@ class BackgroundIngestController(QObject):
                 for profile in profiles:
                     profile_name = str(profile.get("name", "") or profile.get("system_key", "") or profile.get("id", "") or "radio").strip()
                     live_key = self._normalized_bbs_dir(profile.get("varac_bbs_dir", ""))
+                    profile_id = int(profile.get("id", 0) or 0)
                     if live_key in duplicate_dirs:
                         summary = (
                             "Managed BBS Library skipped: duplicate live BBS directory is configured on more than one active radio."
                         )
                         try:
-                            profile_id = int(profile.get("id", 0) or 0)
                             # Runtime discovery may return a cached profile;
                             # compare the persisted warning on this worker.
                             saved_profile = store.get_device_profile(profile_id) if profile_id > 0 else None
@@ -2072,7 +2072,24 @@ class BackgroundIngestController(QObject):
                         if warn_duplicates:
                             log.warning("BackgroundIngest: VarAC vault skipped duplicate live BBS directory for %s", profile_name)
                         continue
-                    vault_result = run_varac_bbs_vault(_DeviceProfileVaultSettings(profile, worker_settings, store))
+                    # The active-profile cache is fenced by configuration
+                    # changes, not by the vault's session and cursor writes.
+                    # Read those fields from storage before touching the live
+                    # directory; falling back to the cached cursor replays old
+                    # commands and disconnects on every poll.
+                    try:
+                        saved_profile = store.get_device_profile(profile_id)
+                    except Exception as exc:
+                        log.warning("BackgroundIngest: could not read VarAC vault state for %s: %s", profile_name, exc)
+                        continue
+                    if saved_profile is None:
+                        continue
+                    vault_profile = {
+                        **profile,
+                        "varac_bbs_vault_runtime_state_v1": saved_profile.get("varac_bbs_vault_runtime_state_v1", {}),
+                        "varac_bbs_vault_last_summary": saved_profile.get("varac_bbs_vault_last_summary", ""),
+                    }
+                    vault_result = run_varac_bbs_vault(_DeviceProfileVaultSettings(vault_profile, worker_settings, store))
                     results.append(vault_result)
                     if bool(vault_result.enabled) and (
                         int(vault_result.processed_events or 0) > 0 or bool(vault_result.published)

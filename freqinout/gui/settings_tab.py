@@ -18819,45 +18819,42 @@ class SettingsTab(QWidget):
             QMessageBox.critical(self, "Error", f"Could not open log folder:\n{e}")
 
     def _export_diagnostics(self) -> None:
+        controller = getattr(self, '_diagnostic_export_controller', None)
+        if controller is not None and controller._pending:
+            return
         default_name = f"commsplan_diagnostics_{datetime.datetime.now():%Y%m%d_%H%M%S}.zip"
-        out_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Export Diagnostics",
-            default_name,
-            "ZIP Files (*.zip)",
-        )
+        out_path, _ = QFileDialog.getSaveFileName(self, 'Export Diagnostics', default_name, 'ZIP Files (*.zip)')
         if not out_path:
             return
-        if not out_path.lower().endswith(".zip"):
-            out_path += ".zip"
-        cfg_dir = get_config_dir() / "config"
-        files = [
-            Path(_get_log_file()),
-            cfg_dir / "freqinout.db",
-            cfg_dir / "freqinout_nets.db",
-        ]
-        added = 0
-        try:
-            with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                for p in files:
-                    if p.exists() and p.is_file():
-                        zf.write(p, arcname=p.name)
-                        added += 1
-                info = (
-                    f"CommsPlan version: {__version__}\n"
-                    f"Exported: {datetime.datetime.now(datetime.timezone.utc).isoformat()}\n"
-                    f"Platform: {platform.platform()}\n"
-                    f"Log level: {(self.settings.get('log_level', 'DISABLED') or 'DISABLED')}\n"
-                )
-                zf.writestr("diagnostics_info.txt", info)
-        except Exception as e:
-            QMessageBox.critical(self, "Export Diagnostics", f"Failed to export diagnostics:\n{e}")
+        if not out_path.lower().endswith('.zip'):
+            out_path += '.zip'
+        if controller is None:
+            from freqinout.gui.diagnostic_export_controller import DiagnosticExportController
+            controller = DiagnosticExportController(self)
+            self._diagnostic_export_controller = controller
+            controller.finished.connect(self._on_diagnostic_export_finished)
+        self.export_diag_btn.setEnabled(False)
+        self.export_diag_btn.setText('Exporting Diagnostics…')
+        if not controller.submit(out_path, settings_db_path=Path(self.settings.db_path),
+                log_path=Path(_get_log_file()), version=__version__,
+                log_level=str(self.settings.get('log_level', 'DISABLED') or 'DISABLED')):
+            self.export_diag_btn.setEnabled(True)
+            self.export_diag_btn.setText('Export Diagnostics')
+
+    def _on_diagnostic_export_finished(self, message) -> None:
+        self.export_diag_btn.setEnabled(True)
+        self.export_diag_btn.setText('Export Diagnostics')
+        if str(self.settings.db_path) != message['settings_db_path']:
+            log.info('Diagnostic export finished for an earlier configuration profile.')
             return
-        QMessageBox.information(
-            self,
-            "Export Diagnostics",
-            f"Export complete.\nFiles included: {added} (+ diagnostics_info.txt).",
-        )
+        if message['error']:
+            QMessageBox.critical(self, 'Export Diagnostics', 'Diagnostics were not exported. Any previous archive was kept.\n' + message['error'])
+            return
+        result = message['result']
+        missing = ('\nNot included: ' + ', '.join(result['missing'])) if result['missing'] else ''
+        QMessageBox.information(self, 'Export Diagnostics',
+            'Export complete. Database snapshots include committed changes and were verified.\n'
+            + 'Files included: ' + ', '.join(result['included']) + missing)
 
     def _update_enforcement_visibility(self) -> None:
         freq_prompt = self.freq_enforce_combo.currentText().strip() == "Prompt"

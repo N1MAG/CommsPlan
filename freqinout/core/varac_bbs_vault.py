@@ -1335,6 +1335,10 @@ def _entry_map(entries: Sequence[VaultPublishManifestEntry]) -> Dict[str, VaultP
     return {entry.live_name: entry for entry in entries}
 
 
+def _is_varac_transfer_file(name: str) -> bool:
+    return name.casefold().endswith(".varac_gzip")
+
+
 def _is_fio_bbs_generated_listing(name: object) -> bool:
     clean = Path(str(name or "").strip()).name.upper()
     if clean.startswith((
@@ -1468,6 +1472,9 @@ def _publish_manifest_entries(
     manifest_path = _manifest_path_for(managed_root, live_bbs_dir)
     previous_manifest = read_publish_manifest(manifest_path)
     previous_map = _entry_map(previous_manifest)
+    # VarAC owns these sidecars until the transfer ends, even if a prior
+    # manifest tracked one or its basename resembles a generated helper.
+    entries = [entry for entry in entries if not _is_varac_transfer_file(entry.live_name)]
     next_map = _entry_map(entries)
     virtual_map = {f"@virtual/{entry.name}": entry for entry in virtual_files}
 
@@ -1493,8 +1500,8 @@ def _publish_manifest_entries(
         published += 1
 
     removed = 0
-    for live_name, previous in previous_map.items():
-        if live_name in next_map:
+    for live_name in previous_map:
+        if live_name in next_map or _is_varac_transfer_file(live_name):
             continue
         target = live_dir / live_name
         if target.exists():
@@ -1506,7 +1513,7 @@ def _publish_manifest_entries(
     for child in sorted(live_dir.iterdir(), key=lambda item: item.name.lower()):
         if not child.is_file():
             continue
-        if child.name in next_map:
+        if child.name in next_map or _is_varac_transfer_file(child.name):
             continue
         if _is_fio_bbs_generated_listing(child.name):
             try:
@@ -1538,7 +1545,7 @@ def _publish_manifest_entries(
     for child in sorted(live_dir.iterdir(), key=lambda item: item.name.lower()):
         if not child.is_file():
             continue
-        if child.name.startswith(".fio-vault-"):
+        if child.name.startswith(".fio-vault-") or _is_varac_transfer_file(child.name):
             continue
         if child.name not in tracked:
             unmanaged.append(child.name)
@@ -4155,20 +4162,47 @@ def _reconcile_current_location(
     manifest_db_path: object = "",
 ) -> Tuple[VaultRuntimeState, bool]:
     try:
-        if runtime_state.current_view_mode == "location":
-            current_location = _location_by_id(locations, runtime_state.current_location_id)
+        mode = runtime_state.current_view_mode
+        current_location = _location_by_id(locations, runtime_state.current_location_id)
+        if mode in {"location", "access-prompt"} or mode.startswith("flamp"):
+            reset_reason = ""
             if current_location is None or not current_location.enabled:
-                return runtime_state, False
+                reset_reason = "location_unavailable"
+            elif (
+                mode != "access-prompt"
+                and current_location.id != default_location_id
+                and current_location.open_rule != "Public"
+                and not _location_sender_allowed(
+                    runtime_state.current_session_callsign,
+                    location=current_location,
+                    global_allowed_callsigns=global_allowed_callsigns,
+                    limit_access_enabled=limit_access_enabled,
+                )
+            ):
+                reset_reason = "location_access_revoked"
+            if reset_reason:
+                result = reset_to_default_location(
+                    locations=locations,
+                    live_bbs_dir=live_bbs_dir,
+                    managed_root=managed_root,
+                    default_location_id=default_location_id,
+                    runtime_state=runtime_state,
+                    global_allowed_callsigns=global_allowed_callsigns,
+                    limit_access_enabled=limit_access_enabled,
+                    global_code_policy=global_code_policy,
+                    flamp_enabled=flamp_enabled,
+                    reason=reset_reason,
+                    manifest_db_path=manifest_db_path,
+                )
+                return result.runtime_state, bool(result.publish_result and result.publish_result.changed)
+        if mode == "location" and current_location is not None:
             publish_result = publish_location_view(
                 current_location,
                 live_bbs_dir=live_bbs_dir,
                 managed_root=managed_root,
                 manifest_db_path=manifest_db_path,
             )
-        elif runtime_state.current_view_mode == "access-prompt":
-            current_location = _location_by_id(locations, runtime_state.current_location_id)
-            if current_location is None or not current_location.enabled:
-                return runtime_state, False
+        elif mode == "access-prompt" and current_location is not None:
             prompt_reason = "code_required"
             if runtime_state.last_error == "invalid_code":
                 prompt_reason = "incorrect_code"
@@ -4243,7 +4277,7 @@ def _reconcile_current_location(
     next_state = _update_state(
         runtime_state,
         last_publish_manifest_path=publish_result.manifest_path,
-        last_publish_ts=time.time(),
+        last_publish_ts=time.time() if publish_result.changed else runtime_state.last_publish_ts,
         unmanaged_live_files=list(publish_result.unmanaged_live_files),
     )
     return next_state, bool(publish_result.changed)
@@ -4781,7 +4815,10 @@ def run_varac_bbs_vault(settings) -> VaracBbsVaultRunResult:
     if max_scanned_datastream_id > int(runtime_state.last_datastream_id or 0):
         runtime_state = _update_state(runtime_state, last_datastream_id=max_scanned_datastream_id)
 
-    for event in log_events_for_run:
+    # VarAC can record the same disconnect in both logs. Process the merged
+    # batch in time order so an older disconnect from the second log cannot
+    # close a location the caller just opened in the traffic log.
+    for event in sorted(log_events_for_run, key=lambda item: item.timestamp_utc):
             scanned += 1
             key = _state_key(event)
             if key in seen_keys and not (event.kind == "open_alias" and bool(event.code_text)):
