@@ -5,7 +5,7 @@ description: VarAC BBS access continuity and more consistent background diagnost
 
 # What's new in CommsPlan 2.0.11
 
-Check the [GitHub Releases page](https://github.com/N1MAG/CommsPlan/releases/latest) for published packages, checksums and release notes. This overview does not announce package availability before release verification.
+See the [CommsPlan 2.0.11 release page](https://github.com/N1MAG/CommsPlan/releases/tag/v2.0.11) for packages, checksums and release notes.
 
 ## VarAC BBS access and transfers
 

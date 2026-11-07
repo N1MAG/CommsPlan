@@ -11,27 +11,18 @@ description: Install CommsPlan from the latest published release or update an es
   <span class="doc-badge">Back up before upgrade</span>
 </div>
 
-The CommsPlan 2.0.11 release is being verified. The
-[GitHub Releases page](https://github.com/N1MAG/CommsPlan/releases/latest) is
-the authority for published packages, checksums and release notes. Use only
-packages listed there; this guide does not announce 2.0.11 downloads before
-they are verified and published.
+CommsPlan 2.0.11 is available for Windows x86-64, Linux amd64, Apple Silicon and
+Intel macOS. The [2.0.11 release page](https://github.com/N1MAG/CommsPlan/releases/tag/v2.0.11)
+contains the packages, checksums and release notes.
 
-For the previous release, see the [CommsPlan 2.0.10 release page](https://github.com/N1MAG/CommsPlan/releases/tag/v2.0.10).
-
-### Previously published 2.0.10 packages
-
-These links are retained for the previous release. Use the latest release page
-above to confirm current package availability.
-
-| Your computer | CommsPlan 2.0.10 download |
+| Your computer | CommsPlan 2.0.11 download |
 | --- | --- |
-| Windows 10/11 x86-64 | [CommsPlan-2.0.10-windows-x86_64-setup-unsigned.exe](https://github.com/N1MAG/CommsPlan/releases/download/v2.0.10/CommsPlan-2.0.10-windows-x86_64-setup-unsigned.exe) |
-| Debian/Ubuntu-family Linux amd64 | [CommsPlan-2.0.10-linux-amd64.deb](https://github.com/N1MAG/CommsPlan/releases/download/v2.0.10/CommsPlan-2.0.10-linux-amd64.deb) |
-| Apple Silicon macOS | [CommsPlan-2.0.10-macos-arm64-unsigned.dmg](https://github.com/N1MAG/CommsPlan/releases/download/v2.0.10/CommsPlan-2.0.10-macos-arm64-unsigned.dmg) |
-| Intel macOS | [CommsPlan-2.0.10-macos-x86_64-unsigned.dmg](https://github.com/N1MAG/CommsPlan/releases/download/v2.0.10/CommsPlan-2.0.10-macos-x86_64-unsigned.dmg) |
+| Windows 10/11 x86-64 | [CommsPlan-2.0.11-windows-x86_64-setup-unsigned.exe](https://github.com/N1MAG/CommsPlan/releases/download/v2.0.11/CommsPlan-2.0.11-windows-x86_64-setup-unsigned.exe) |
+| Debian/Ubuntu-family Linux amd64 | [CommsPlan-2.0.11-linux-amd64.deb](https://github.com/N1MAG/CommsPlan/releases/download/v2.0.11/CommsPlan-2.0.11-linux-amd64.deb) |
+| Apple Silicon macOS | [CommsPlan-2.0.11-macos-arm64-unsigned.dmg](https://github.com/N1MAG/CommsPlan/releases/download/v2.0.11/CommsPlan-2.0.11-macos-arm64-unsigned.dmg) |
+| Intel macOS | [CommsPlan-2.0.11-macos-x86_64-unsigned.dmg](https://github.com/N1MAG/CommsPlan/releases/download/v2.0.11/CommsPlan-2.0.11-macos-x86_64-unsigned.dmg) |
 
-Verify your download against [SHA256SUMS.txt](https://github.com/N1MAG/CommsPlan/releases/download/v2.0.10/SHA256SUMS.txt).
+Verify your download against [SHA256SUMS.txt](https://github.com/N1MAG/CommsPlan/releases/download/v2.0.11/SHA256SUMS.txt).
 The Windows installer and macOS images are unsigned; macOS images are not
 Developer ID signed or notarized. Review the release signing notice before opening.
 
@@ -43,9 +34,8 @@ the release notes and verify the downloaded file against the published checksum
 before opening it. Windows or macOS may show an operating-system security
 prompt for an unsigned package; follow the release-specific instructions.
 
-The source commands below use the CommsPlan 2.0.11 installer entry points. Use
-the 2.0.11 source tree for these instructions after its release tag is
-published. When using a source checkout,
+The source commands below use the published CommsPlan 2.0.11 installer entry points. Use
+the 2.0.11 source tree for these instructions. When using a source checkout,
 install Git and Python 3.11 (3.10–3.13 are accepted; 3.11 is recommended).
 Close CommsPlan and companion applications before installing or updating.
 
